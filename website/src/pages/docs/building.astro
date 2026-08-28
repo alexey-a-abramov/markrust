@@ -1,0 +1,26 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+import Callout from '../../components/Callout.astro';
+---
+
+<DocsLayout title="Building from source">
+  <h2>Prerequisites</h2>
+  <ul>
+    <li>Rust 1.96+ (<code>rustup update</code>)</li>
+    <li>macOS: Xcode with Metal toolchain</li>
+    <li>Linux: GPUI system dependencies (<code>scripts/install-linux-deps.sh</code>)</li>
+  </ul>
+
+  <CodeBlock code={`git clone https://github.com/alexey-a-abramov/markrust.git\ncd markrust\ncargo build --release -p markrust`} terminal />
+
+  <Callout type="note">
+    <p>On macOS, if Metal compilation fails, run: <code>sudo xcode-select -s /Applications/Xcode.app/Contents/Developer</code></p>
+  </Callout>
+
+  <h2>Development</h2>
+  <CodeBlock code={`cargo test -p markrust-core -p markrust-editor\ncargo clippy --workspace -- -D warnings\ncargo run -p markrust`} terminal />
+
+  <h2>Website</h2>
+  <CodeBlock code={`cd website\nnpm install\nnpm run dev    # http://localhost:4321\nnpm run build`} terminal />
+</DocsLayout>

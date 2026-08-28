@@ -1,0 +1,26 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+
+const headings = [
+  { id: 'location', text: 'Config location', level: 2 },
+  { id: 'options', text: 'Options', level: 2 },
+  { id: 'privacy', text: 'Privacy', level: 2 },
+];
+---
+
+<DocsLayout title="Settings" headings={headings}>
+  <h2 id="location">Config location</h2>
+  <p>User settings live at:</p>
+  <ul>
+    <li><strong>macOS / Linux:</strong> <code>~/.config/markrust/config.toml</code></li>
+  </ul>
+
+  <h2 id="options">Options</h2>
+  <CodeBlock code={`theme = "dark"          # "dark" or "light"\nfont_family = "Inter"\nfont_size = 16\nautosave_ms = 1000    # debounce in milliseconds`} lang="toml" filename="config.toml" />
+
+  <p>Recent workspaces are stored separately in <code>~/.config/markrust/recent.json</code>.</p>
+
+  <h2 id="privacy">Privacy</h2>
+  <p>MarkRust collects no telemetry. No analytics, crash reporters, or account systems are included. Configuration and recent-workspace data stay on your machine.</p>
+</DocsLayout>

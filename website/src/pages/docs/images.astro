@@ -1,0 +1,14 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+---
+
+<DocsLayout title="Images">
+  <p>Insert images using standard Markdown syntax:</p>
+  <pre><code>![Alt text](./assets/screenshot.png)</code></pre>
+
+  <h2>Drag and drop</h2>
+  <p>Drop an image file onto the editor. MarkRust copies it to an <code>assets/</code> subdirectory (when possible) and inserts a relative image reference at the cursor.</p>
+
+  <h2>Rendering</h2>
+  <p>When syntax delimiters are masked, images display alt text with a placeholder indicator. Full inline image rendering is planned for a future release.</p>
+</DocsLayout>

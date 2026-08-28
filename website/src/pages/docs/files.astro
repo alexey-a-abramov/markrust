@@ -1,0 +1,29 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+---
+
+<DocsLayout title="Files and workspaces">
+  <p>MarkRust treats the filesystem as the source of truth. Every document is a normal file.</p>
+
+  <h2>Supported extensions</h2>
+  <ul>
+    <li><code>.md</code>, <code>.markdown</code> — Markdown with inline preview</li>
+    <li><code>.txt</code> — plain text, no parsing</li>
+  </ul>
+
+  <h2>Tabs</h2>
+  <p>Each open file appears in the tab bar. Unsaved changes show a dot indicator. Close with <kbd>⌘W</kbd>.</p>
+
+  <h2>Autosave</h2>
+  <p>Changes save automatically after a configurable debounce. Manual save (<kbd>⌘S</kbd>) writes immediately.</p>
+
+  <h2>Atomic saves</h2>
+  <p>MarkRust writes to a temporary file and renames atomically, reducing the risk of partial writes on crash.</p>
+
+  <h2>Drag and drop</h2>
+  <ul>
+    <li>Drop a folder onto the window to open it as a workspace</li>
+    <li>Drop a <code>.md</code> file to open it</li>
+    <li>Drop an image onto the editor to insert a Markdown image reference</li>
+  </ul>
+</DocsLayout>

@@ -1,0 +1,16 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+---
+
+<DocsLayout title="Frontmatter">
+  <p>YAML frontmatter at the top of a document is preserved in the buffer and passed through on save.</p>
+
+  <CodeBlock code={`---\ntitle: Project README\nauthor: Alexey\n---\n\n# Content starts here`} lang="yaml" filename="document.md" />
+
+  <h2>Status bar</h2>
+  <p>When a <code>title:</code> field is present, the status bar shows <code>FM: &lt;title&gt;</code>.</p>
+
+  <h2>Export</h2>
+  <p>HTML export via comrak strips frontmatter from rendered output. The source file retains the YAML block.</p>
+</DocsLayout>

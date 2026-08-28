@@ -1,0 +1,21 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+---
+
+<DocsLayout title="Preview">
+  <p>MarkRust uses inline preview — there is no separate preview pane. Formatted text appears directly in the editor as you type.</p>
+
+  <h2>How it works</h2>
+  <p>When your cursor is outside a formatted region, syntax markers (<code>**</code>, <code>#</code>, <code>`</code>) are hidden and text renders with appropriate styling. Move the cursor into the region to edit the raw Markdown.</p>
+
+  <h2>Selection</h2>
+  <p>Selecting text that overlaps formatted regions reveals the underlying syntax, preventing visual jumps during drag-selection.</p>
+
+  <h2>Plain text mode</h2>
+  <p>Files with a <code>.txt</code> extension bypass Markdown parsing entirely. No formatting, no delimiter masking — raw text only.</p>
+
+  <h2>Export</h2>
+  <p>For a full HTML render, use the CLI:</p>
+  <pre><code>markrust export document.md -o document.html</code></pre>
+  <p>Or choose <strong>Export HTML</strong> from the command palette (<kbd>⌘P</kbd>) when a saved document is open.</p>
+</DocsLayout>

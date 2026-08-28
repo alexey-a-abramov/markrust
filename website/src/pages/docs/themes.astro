@@ -1,0 +1,21 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+---
+
+<DocsLayout title="Themes">
+  <p>MarkRust ships with dark and light themes. Toggle via the command palette or set a default in config.</p>
+
+  <h2>Dark theme</h2>
+  <p>Default. Graphite background (<code>#1e1e1e</code>), light text, restrained rust accent for links and active states.</p>
+
+  <h2>Light theme</h2>
+  <p>Warm paper-white background with matching accent colors. Toggle with the theme command in the palette.</p>
+
+  <h2>Configuration</h2>
+  <pre><code>theme = "dark"  # or "light"</code></pre>
+
+  <h2>Fonts</h2>
+  <p>Body text uses your configured sans-serif (default Inter). Code uses Menlo/monospace. Adjust in <code>config.toml</code>:</p>
+  <pre><code>font_family = "Inter"
+font_size = 16</code></pre>
+</DocsLayout>

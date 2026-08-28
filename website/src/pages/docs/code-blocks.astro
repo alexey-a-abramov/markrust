@@ -1,0 +1,25 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+---
+
+<DocsLayout title="Code blocks">
+  <p>Fenced code blocks with a language tag receive syntax highlighting.</p>
+
+  <CodeBlock code={`\`\`\`rust\nfn main() {\n    println!("Hello");\n}\n\`\`\``} lang="markdown" />
+
+  <h2>Supported languages</h2>
+  <ul>
+    <li>Rust</li>
+    <li>JSON</li>
+    <li>YAML</li>
+    <li>Bash / shell</li>
+  </ul>
+  <p>Other language tags render as monospace plain text.</p>
+
+  <h2>Inline code</h2>
+  <p>Wrap inline code in single backticks: <code>`like this`</code></p>
+
+  <h2>Delimiter masking</h2>
+  <p>Triple-backtick fences hide when the cursor is outside the code block. Move into the block to edit fences and language tags.</p>
+</DocsLayout>

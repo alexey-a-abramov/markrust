@@ -1,0 +1,30 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+
+const headings = [
+  { id: 'crates', text: 'Crates', level: 2 },
+  { id: 'pipeline', text: 'Pipeline', level: 2 },
+  { id: 'parsing', text: 'Parsing', level: 2 },
+];
+---
+
+<DocsLayout title="Architecture" headings={headings}>
+  <p>MarkRust is a Rust workspace with a GUI-agnostic core and a GPUI application shell.</p>
+
+  <h2 id="crates">Crates</h2>
+  <CodeBlock code={`markrust-core     Buffer, parser, undo, spans\nmarkrust-editor   Layout, masking, GPUI element\nmarkrust-app      Window, workspace, file tree\nmarkrust          Binary entry point + CLI`} lang="text" />
+
+  <h2 id="pipeline">Pipeline</h2>
+  <ol>
+    <li>User input modifies a <code>ropey</code> text buffer</li>
+    <li>Background thread re-parses with <code>tree-sitter-markdown</code></li>
+    <li>Syntax spans with delimiter ranges are extracted</li>
+    <li>Layout engine computes visibility (masked vs revealed delimiters)</li>
+    <li>GPUI paints styled glyph runs each frame</li>
+  </ol>
+
+  <h2 id="parsing">Parsing</h2>
+  <p>Tree-sitter provides incremental CST parsing on the hot path. Comrak handles HTML export only — not per-keystroke rendering.</p>
+  <p>See <code>docs/architecture.md</code> in the repository for detailed design notes.</p>
+</DocsLayout>

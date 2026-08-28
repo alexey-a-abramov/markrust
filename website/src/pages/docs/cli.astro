@@ -1,0 +1,25 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+
+const headings = [
+  { id: 'gui', text: 'GUI', level: 2 },
+  { id: 'export', text: 'Export', level: 2 },
+  { id: 'flags', text: 'Flags', level: 2 },
+];
+---
+
+<DocsLayout title="CLI" headings={headings}>
+  <p>The <code>markrust</code> binary provides both the desktop application and command-line utilities.</p>
+
+  <h2 id="gui">GUI</h2>
+  <CodeBlock code="markrust" terminal />
+  <p>Launches the MarkRust editor. This is the default when no subcommand is given.</p>
+
+  <h2 id="export">Export</h2>
+  <CodeBlock code={`markrust export README.md\nmarkrust export README.md -o dist/README.html`} terminal />
+  <p>Converts a Markdown file to HTML using comrak with GFM extensions. Output defaults to a <code>.html</code> file beside the source.</p>
+
+  <h2 id="flags">Flags</h2>
+  <CodeBlock code={`markrust --version\nmarkrust --help\nmarkrust --gui    # explicit GUI launch`} terminal />
+</DocsLayout>

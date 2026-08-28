@@ -1,0 +1,33 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+---
+
+<DocsLayout title="Contributing">
+  <p>MarkRust welcomes contributions. The project is licensed under MPL-2.0.</p>
+
+  <h2>Getting started</h2>
+  <ol>
+    <li>Fork the repository on GitHub</li>
+    <li>Clone and build (<a href="/docs/building">building from source</a>)</li>
+    <li>Create a feature branch</li>
+    <li>Run tests and clippy before submitting</li>
+  </ol>
+
+  <h2>Guidelines</h2>
+  <ul>
+    <li>Keep <code>markrust-core</code> free of GUI dependencies</li>
+    <li>Write tests for core logic changes</li>
+    <li>Follow existing code style (<code>cargo fmt</code>)</li>
+    <li>One logical change per pull request</li>
+  </ul>
+
+  <h2>Good first issues</h2>
+  <ul>
+    <li>Syntax themes</li>
+    <li>Tree-sitter grammars for additional languages</li>
+    <li>Documentation improvements</li>
+    <li>Website enhancements</li>
+  </ul>
+
+  <p>See <code>CONTRIBUTING.md</code> in the repository for details.</p>
+</DocsLayout>

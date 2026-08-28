@@ -1,0 +1,21 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+---
+
+<DocsLayout title="Tables">
+  <p>MarkRust supports GitHub Flavored Markdown pipe tables. Edit tables as raw pipe syntax — there is no interactive matrix editor in v0.1.</p>
+
+  <CodeBlock code={`| Column A | Column B |\n|----------|----------|\n| Cell 1   | Cell 2   |`} lang="markdown" />
+
+  <h2>Alignment</h2>
+  <p>Use colons in the delimiter row for alignment:</p>
+  <ul>
+    <li><code>:---</code> left (default)</li>
+    <li><code>:---:</code> center</li>
+    <li><code>---:</code> right</li>
+  </ul>
+
+  <h2>Rendering</h2>
+  <p>Header rows render bold. Delimiter rows use muted styling. Column padding respects alignment markers.</p>
+</DocsLayout>
