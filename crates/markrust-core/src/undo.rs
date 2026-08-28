@@ -10,7 +10,8 @@ pub enum EditOperation {
 }
 
 impl EditOperation {
-    fn inverse(&self) -> EditOperation {
+    /// Return the operation that reverses `self`.
+    pub fn inverse(&self) -> EditOperation {
         match self {
             EditOperation::Insert { byte_offset, text } => EditOperation::Delete {
                 byte_offset: *byte_offset,
@@ -73,6 +74,18 @@ impl UndoStack {
         !self.redo.is_empty()
     }
 
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    pub fn redo_depth(&self) -> usize {
+        self.redo.len()
+    }
+
+    pub fn has_open_transaction(&self) -> bool {
+        self.open.is_some()
+    }
+
     pub fn undo(&mut self) -> Option<Vec<EditOperation>> {
         let group = self.undo.pop()?;
         let inverse: Vec<_> = group.iter().rev().map(EditOperation::inverse).collect();
@@ -121,5 +134,118 @@ mod tests {
         stack.commit_transaction();
         let undo_ops = stack.undo().unwrap();
         assert_eq!(undo_ops.len(), 2);
+    }
+
+    fn insert(offset: usize, text: &str) -> EditOperation {
+        EditOperation::Insert {
+            byte_offset: offset,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn inverse_swaps_insert_and_delete() {
+        let op = insert(3, "ab");
+        assert_eq!(
+            op.inverse(),
+            EditOperation::Delete {
+                byte_offset: 3,
+                text: "ab".into(),
+            }
+        );
+        assert_eq!(op.inverse().inverse(), op);
+    }
+
+    #[test]
+    fn empty_stack_cannot_undo_or_redo() {
+        let mut stack = UndoStack::new();
+        assert!(!stack.can_undo());
+        assert!(!stack.can_redo());
+        assert_eq!(stack.undo_depth(), 0);
+        assert_eq!(stack.redo_depth(), 0);
+        assert!(stack.undo().is_none());
+        assert!(stack.redo().is_none());
+    }
+
+    #[test]
+    fn multi_step_undo_redo() {
+        let mut stack = UndoStack::new();
+        stack.push_single(insert(0, "a"));
+        stack.push_single(insert(1, "b"));
+        stack.push_single(insert(2, "c"));
+        assert_eq!(stack.undo_depth(), 3);
+
+        let first = stack.undo().unwrap();
+        assert_eq!(
+            first[0],
+            EditOperation::Delete {
+                byte_offset: 2,
+                text: "c".into(),
+            }
+        );
+        let second = stack.undo().unwrap();
+        assert_eq!(second[0], insert(1, "b").inverse());
+        assert_eq!(stack.undo_depth(), 1);
+        assert_eq!(stack.redo_depth(), 2);
+
+        let redo = stack.redo().unwrap();
+        assert_eq!(redo[0], insert(1, "b"));
+        assert_eq!(stack.undo_depth(), 2);
+        assert_eq!(stack.redo_depth(), 1);
+    }
+
+    #[test]
+    fn new_edit_clears_redo_stack() {
+        let mut stack = UndoStack::new();
+        stack.push_single(insert(0, "a"));
+        stack.push_single(insert(1, "b"));
+        stack.undo();
+        assert!(stack.can_redo());
+        stack.push_single(insert(1, "z"));
+        assert!(!stack.can_redo());
+        assert_eq!(stack.redo_depth(), 0);
+        assert_eq!(stack.undo_depth(), 2);
+    }
+
+    #[test]
+    fn empty_transaction_is_not_recorded() {
+        let mut stack = UndoStack::new();
+        stack.push_single(insert(0, "keep"));
+        stack.undo();
+        assert!(stack.can_redo());
+
+        stack.begin_transaction();
+        assert!(stack.has_open_transaction());
+        stack.commit_transaction();
+        assert!(!stack.has_open_transaction());
+        assert!(!stack.can_undo());
+        assert!(stack.can_redo());
+    }
+
+    #[test]
+    fn grouped_undo_returns_reverse_inverses() {
+        let mut stack = UndoStack::new();
+        stack.begin_transaction();
+        stack.record(insert(0, "a"));
+        stack.record(insert(1, "b"));
+        stack.commit_transaction();
+        assert_eq!(stack.undo_depth(), 1);
+
+        let undo_ops = stack.undo().unwrap();
+        assert_eq!(
+            undo_ops,
+            vec![
+                EditOperation::Delete {
+                    byte_offset: 1,
+                    text: "b".into(),
+                },
+                EditOperation::Delete {
+                    byte_offset: 0,
+                    text: "a".into(),
+                },
+            ]
+        );
+        assert!(!stack.can_undo());
+        assert!(stack.can_redo());
     }
 }

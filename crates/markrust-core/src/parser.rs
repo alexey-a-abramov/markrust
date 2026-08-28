@@ -4,6 +4,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use tree_sitter::Node;
 use tree_sitter_md::{MarkdownCursor, MarkdownParser, MarkdownTree};
@@ -107,11 +108,7 @@ fn extract_code_language(node: Node, source: &str) -> Option<String> {
     for child in node.children(&mut cursor) {
         if child.kind() == "info_string" {
             let raw = &source[child.start_byte()..child.end_byte()];
-            let language = raw
-                .split_whitespace()
-                .next()
-                .unwrap_or(raw)
-                .trim();
+            let language = raw.split_whitespace().next().unwrap_or(raw).trim();
             if language.is_empty() {
                 return None;
             }
@@ -159,6 +156,11 @@ fn is_delimiter_node(kind: &str) -> bool {
             | "fenced_code_block_delimiter"
             | "block_quote_marker"
             | "list_marker"
+            | "list_marker_minus"
+            | "list_marker_plus"
+            | "list_marker_star"
+            | "list_marker_dot"
+            | "list_marker_parenthesis"
             | "task_list_marker_checked"
             | "task_list_marker_unchecked"
             | "atx_h1_marker"
@@ -169,7 +171,10 @@ fn is_delimiter_node(kind: &str) -> bool {
             | "atx_h6_marker"
             | "setext_h1_underline"
             | "setext_h2_underline"
-    ) || matches!(kind, "[" | "]" | "(" | ")" | "`" | "*" | "_" | "|" | ">" | "!")
+    ) || matches!(
+        kind,
+        "[" | "]" | "(" | ")" | "`" | "*" | "_" | "|" | ">" | "!"
+    )
 }
 
 /// Dedicated background thread for Markdown parsing.
@@ -212,6 +217,32 @@ impl BackgroundMarkdownParser {
         }
         updates
     }
+
+    /// Block until any parse update is available, returning the newest drained result.
+    pub fn wait_for_update(&self, timeout: Duration) -> Option<ParseUpdate> {
+        self.wait_for_revision(0, timeout)
+    }
+
+    /// Block until a parse update at least as new as `min_revision` arrives.
+    pub fn wait_for_revision(&self, min_revision: u64, timeout: Duration) -> Option<ParseUpdate> {
+        let deadline = Instant::now() + timeout;
+        let mut latest = None;
+        loop {
+            for update in self.drain_updates() {
+                latest = Some(update);
+            }
+            if latest
+                .as_ref()
+                .is_some_and(|update| update.revision >= min_revision)
+            {
+                return latest;
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
 }
 
 impl Default for BackgroundMarkdownParser {
@@ -248,20 +279,36 @@ fn extract_spans_from_tree(tree: &MarkdownTree, source: &str) -> Vec<SyntaxNodeS
 mod tests {
     use super::*;
     use crate::spans::TableRowKind;
+    use crate::test_support::PARSE_TIMEOUT;
+
+    fn has_kind(spans: &[SyntaxNodeSpan], kind: SyntaxKind) -> bool {
+        spans.iter().any(|s| s.kind == kind)
+    }
 
     #[test]
     fn extracts_bold_and_italic() {
         let spans = extract_syntax_spans("**bold** and *italic*");
-        assert!(spans.iter().any(|s| s.kind == SyntaxKind::Bold));
-        assert!(spans.iter().any(|s| s.kind == SyntaxKind::Italic));
+        assert!(has_kind(&spans, SyntaxKind::Bold));
+        assert!(has_kind(&spans, SyntaxKind::Italic));
         let bold = spans.iter().find(|s| s.kind == SyntaxKind::Bold).unwrap();
         assert_eq!(bold.delimiter_spans.len(), 4);
     }
 
     #[test]
+    fn extracts_nested_bold_italic() {
+        let spans = extract_syntax_spans("**bold *italic* bold**");
+        assert!(has_kind(&spans, SyntaxKind::Bold));
+        assert!(has_kind(&spans, SyntaxKind::Italic));
+        let bold = spans.iter().find(|s| s.kind == SyntaxKind::Bold).unwrap();
+        let italic = spans.iter().find(|s| s.kind == SyntaxKind::Italic).unwrap();
+        assert!(italic.start_byte >= bold.start_byte);
+        assert!(italic.end_byte <= bold.end_byte);
+    }
+
+    #[test]
     fn extracts_heading_and_code_block() {
         let spans = extract_syntax_spans("# Title\n\n```rust\nfn main() {}\n```");
-        assert!(spans.iter().any(|s| s.kind == SyntaxKind::Heading));
+        assert!(has_kind(&spans, SyntaxKind::Heading));
         let code = spans
             .iter()
             .find(|s| s.kind == SyntaxKind::CodeBlock)
@@ -270,16 +317,32 @@ mod tests {
     }
 
     #[test]
+    fn extracts_code_fence_language_and_inline_code() {
+        let spans = extract_syntax_spans("```Rust\nlet x = 1;\n```\n\nUse `code` here.\n");
+        let fence = spans
+            .iter()
+            .find(|s| s.kind == SyntaxKind::CodeBlock)
+            .unwrap();
+        assert_eq!(fence.language.as_deref(), Some("rust"));
+        assert!(has_kind(&spans, SyntaxKind::CodeInline));
+
+        let plain_fence = extract_syntax_spans("```\nplain\n```\n");
+        let code = plain_fence
+            .iter()
+            .find(|s| s.kind == SyntaxKind::CodeBlock)
+            .unwrap();
+        assert!(code.language.is_none());
+    }
+
+    #[test]
     fn extracts_tables_tasks_blockquotes_links() {
         let source = "> quote\n\n| H | V |\n|---|---|\n| a | b |\n\n- [ ] open\n- [x] done\n\n[link](https://x)\n![alt](img.png)\n";
         let spans = extract_syntax_spans(source);
-        assert!(spans.iter().any(|s| s.kind == SyntaxKind::BlockQuote));
-        assert!(spans.iter().any(|s| s.kind == SyntaxKind::Table));
-        assert!(
-            spans
-                .iter()
-                .any(|s| s.kind == SyntaxKind::Table && s.table_row == Some(TableRowKind::Header))
-        );
+        assert!(has_kind(&spans, SyntaxKind::BlockQuote));
+        assert!(has_kind(&spans, SyntaxKind::Table));
+        assert!(spans
+            .iter()
+            .any(|s| s.kind == SyntaxKind::Table && s.table_row == Some(TableRowKind::Header)));
         let tasks: Vec<_> = spans
             .iter()
             .filter(|s| s.kind == SyntaxKind::TaskList)
@@ -287,14 +350,42 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert!(tasks.iter().any(|t| t.task_checked == Some(false)));
         assert!(tasks.iter().any(|t| t.task_checked == Some(true)));
-        assert!(spans.iter().any(|s| s.kind == SyntaxKind::Link));
-        assert!(spans.iter().any(|s| s.kind == SyntaxKind::Image));
+        assert!(has_kind(&spans, SyntaxKind::Link));
+        assert!(has_kind(&spans, SyntaxKind::Image));
+    }
+
+    #[test]
+    fn extracts_table_header_delimiter_and_body() {
+        let spans = extract_syntax_spans("| H | V |\n|---|---|\n| a | b |\n");
+        let rows: Vec<_> = spans
+            .iter()
+            .filter(|s| s.kind == SyntaxKind::Table)
+            .filter_map(|s| s.table_row)
+            .collect();
+        assert!(rows.contains(&TableRowKind::Header));
+        assert!(rows.contains(&TableRowKind::Delimiter));
+        assert!(rows.contains(&TableRowKind::Body));
     }
 
     #[test]
     fn extracts_frontmatter() {
         let spans = extract_syntax_spans("---\ntitle: X\n---\n\n# Hi");
-        assert!(spans.iter().any(|s| s.kind == SyntaxKind::Frontmatter));
+        assert!(has_kind(&spans, SyntaxKind::Frontmatter));
+        assert!(has_kind(&spans, SyntaxKind::Heading));
+    }
+
+    #[test]
+    fn extracts_strikethrough() {
+        let spans = extract_syntax_spans("~~gone~~");
+        assert!(has_kind(&spans, SyntaxKind::Strikethrough));
+    }
+
+    #[test]
+    fn empty_source_has_no_construct_spans() {
+        let spans = extract_syntax_spans("");
+        assert!(!has_kind(&spans, SyntaxKind::Heading));
+        assert!(!has_kind(&spans, SyntaxKind::Bold));
+        assert!(!has_kind(&spans, SyntaxKind::Table));
     }
 
     #[test]
@@ -305,14 +396,30 @@ mod tests {
             text: "**test**".into(),
         });
 
-        for _ in 0..100 {
-            if let Some(update) = parser.poll_update() {
-                assert_eq!(update.revision, 1);
-                assert!(!update.spans.is_empty());
-                return;
-            }
-            thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("timed out waiting for parse update");
+        let update = parser
+            .wait_for_update(PARSE_TIMEOUT)
+            .expect("timed out waiting for parse update");
+        assert_eq!(update.revision, 1);
+        assert!(!update.spans.is_empty());
+        assert!(has_kind(&update.spans, SyntaxKind::Bold));
+    }
+
+    #[test]
+    fn concurrent_edit_and_parse_keeps_latest_revision() {
+        let parser = BackgroundMarkdownParser::new();
+        parser.request_parse(ParseSnapshot {
+            revision: 1,
+            text: "# A".into(),
+        });
+        parser.request_parse(ParseSnapshot {
+            revision: 2,
+            text: "# A\n\n**B**".into(),
+        });
+        let update = parser
+            .wait_for_revision(2, PARSE_TIMEOUT)
+            .expect("timed out waiting for revision 2");
+        assert_eq!(update.revision, 2);
+        assert!(has_kind(&update.spans, SyntaxKind::Heading));
+        assert!(has_kind(&update.spans, SyntaxKind::Bold));
     }
 }

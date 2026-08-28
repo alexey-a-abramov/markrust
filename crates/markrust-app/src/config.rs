@@ -28,7 +28,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::Dark,
-            font_family: "Inter".into(),
+            font_family: ".SystemUIFont".into(),
             font_size: 16.0,
             code_font_family: "Menlo".into(),
             autosave_ms: DEFAULT_AUTOSAVE_MS,
@@ -75,10 +75,26 @@ impl AppConfig {
             ThemeChoice::Dark => markrust_editor::EditorTheme::dark(),
             ThemeChoice::Light => markrust_editor::EditorTheme::light(),
         };
-        theme.font_family = self.font_family.clone();
+        theme.font_family = Self::resolve_ui_font(&self.font_family);
         theme.font_size = self.font_size;
-        theme.code_font_family = self.code_font_family.clone();
+        theme.code_font_family = Self::resolve_code_font(&self.code_font_family);
         theme
+    }
+
+    fn resolve_ui_font(family: &str) -> String {
+        match family {
+            "" | "Inter" | "system-ui" | "Helvetica Neue" | "Helvetica" | ".AppleSystemUIFont" => {
+                ".SystemUIFont".into()
+            }
+            other => other.to_string(),
+        }
+    }
+
+    fn resolve_code_font(family: &str) -> String {
+        match family {
+            "" => "Menlo".into(),
+            other => other.to_string(),
+        }
     }
 
     pub fn toggle_theme(&mut self) {

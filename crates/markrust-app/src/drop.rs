@@ -13,7 +13,16 @@ pub fn is_image(path: &Path) -> bool {
         .map(|ext| {
             matches!(
                 ext.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "heic" | "tif"
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "svg"
+                    | "bmp"
+                    | "ico"
+                    | "heic"
+                    | "tif"
                     | "tiff"
             )
         })
@@ -89,7 +98,7 @@ mod tests {
     fn classify_single_folder_as_workspace() {
         let path = std::env::temp_dir();
         assert_eq!(
-            classify_window_drop(&[path.clone()]),
+            classify_window_drop(std::slice::from_ref(&path)),
             DropIntent::OpenWorkspace(path)
         );
     }
@@ -118,6 +127,72 @@ mod tests {
     #[test]
     fn is_image_detects_common_formats() {
         assert!(is_image(Path::new("x.PNG")));
+        assert!(is_image(Path::new("x.heic")));
+        assert!(is_image(Path::new("x.svg")));
         assert!(!is_image(Path::new("x.md")));
+        assert!(!is_image(Path::new("x.rs")));
+    }
+
+    #[test]
+    fn empty_drop_is_ignored() {
+        assert_eq!(classify_window_drop(&[]), DropIntent::Ignored);
+        assert_eq!(classify_editor_drop(&[]), DropIntent::Ignored);
+    }
+
+    #[test]
+    fn window_ignores_images_and_unknown_files() {
+        let paths = vec![
+            PathBuf::from("/tmp/photo.png"),
+            PathBuf::from("/tmp/notes.pdf"),
+        ];
+        assert_eq!(classify_window_drop(&paths), DropIntent::Ignored);
+    }
+
+    #[test]
+    fn editor_prefers_images_over_markdown() {
+        let paths = vec![
+            PathBuf::from("/tmp/readme.md"),
+            PathBuf::from("/tmp/photo.png"),
+        ];
+        assert_eq!(
+            classify_editor_drop(&paths),
+            DropIntent::InsertImages(vec![PathBuf::from("/tmp/photo.png")])
+        );
+    }
+
+    #[test]
+    fn editor_falls_back_to_folder_and_markdown() {
+        let folder = std::env::temp_dir();
+        assert_eq!(
+            classify_editor_drop(std::slice::from_ref(&folder)),
+            DropIntent::OpenWorkspace(folder)
+        );
+        assert_eq!(
+            classify_editor_drop(&[PathBuf::from("/tmp/notes.markdown")]),
+            DropIntent::OpenDocuments(vec![PathBuf::from("/tmp/notes.markdown")])
+        );
+    }
+
+    #[test]
+    fn markdown_image_reference_copies_into_assets() {
+        let dir = std::env::temp_dir().join(format!(
+            "markrust-drop-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("note.md");
+        std::fs::write(&doc, "# hi\n").unwrap();
+        let image = dir.join("photo.png");
+        std::fs::write(&image, b"fake-png").unwrap();
+
+        let snippet = markdown_image_reference(&image, Some(&doc)).unwrap();
+        assert_eq!(snippet, "![photo.png](assets/photo.png)");
+        assert!(dir.join("assets/photo.png").exists());
+        let copied = std::fs::read(dir.join("assets/photo.png")).unwrap();
+        assert_eq!(copied, b"fake-png");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -22,11 +22,17 @@ pub struct EditorElement {
     pub editor: Entity<MarkdownEditor>,
 }
 
+const EDITOR_GUTTER: f32 = 16.0;
+
 #[derive(Clone)]
 struct LinePaintData {
     shaped: ShapedLine,
     doc_line_start: usize,
     display_line_start: usize,
+    height: Pixels,
+    y: Pixels,
+    is_code_block: bool,
+    is_blockquote: bool,
 }
 
 pub struct EditorPrepaint {
@@ -34,7 +40,7 @@ pub struct EditorPrepaint {
     selection: Option<PaintQuad>,
     cursor: Option<PaintQuad>,
     blockquote_borders: Vec<PaintQuad>,
-    line_height: Pixels,
+    code_block_backgrounds: Vec<PaintQuad>,
 }
 
 impl EditorElement {
@@ -72,12 +78,16 @@ impl Element for EditorElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let editor = self.editor.read(cx);
         let theme = &editor.theme;
-        let line_height = px(theme.stable_line_height(theme.font_size));
         let content = editor.content(cx);
-        let line_count = line_byte_ranges(&content).len().max(1);
+        let spans = editor.document.read(cx).syntax_spans.clone();
+        let carets = editor.carets();
+        let selections = editor.selections();
+        let display_layout = build_display_layout(&content, &spans, &carets, &selections, theme);
+        let total_height = total_layout_height(&display_layout, theme, &content);
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = (line_height * line_count as f32).into();
+        style.size.height =
+            px(total_height.max(theme.line_height_for_font_size(theme.font_size))).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -115,9 +125,7 @@ impl Element for EditorElement {
 
         let display_layout = build_display_layout(&content, &spans, &carets, &selections, &theme);
 
-        let line_height = px(theme.stable_line_height(theme.font_size));
-        let font_size = px(theme.font_size);
-        let lines = shape_lines(window, &display_layout, &theme, font_size, &content);
+        let lines = shape_lines(window, &display_layout, &theme, &content);
 
         let cursor_display = display_layout.display_offset_for_doc(cursor_doc);
         let selection = if selected_range.is_empty() {
@@ -128,37 +136,26 @@ impl Element for EditorElement {
                 &display_layout,
                 &selected_range,
                 bounds,
-                line_height,
                 theme.selection,
             ))
         };
 
         let cursor = if is_focused && cursor_visible {
-            Some(cursor_quad(
-                &lines,
-                cursor_display,
-                bounds,
-                line_height,
-                theme.caret,
-            ))
+            Some(cursor_quad(&lines, cursor_display, bounds, theme.caret))
         } else {
             None
         };
 
-        let blockquote_borders = blockquote_border_quads(
-            &display_layout,
-            &lines,
-            bounds,
-            line_height,
-            theme.blockquote_border,
-        );
+        let blockquote_borders = blockquote_border_quads(&lines, bounds, theme.blockquote_border);
+        let code_block_backgrounds =
+            code_block_background_quads(&lines, bounds, theme.code_block_bg);
 
         EditorPrepaint {
             lines,
             selection,
             cursor,
             blockquote_borders,
-            line_height,
+            code_block_backgrounds,
         }
     }
 
@@ -183,24 +180,19 @@ impl Element for EditorElement {
             window.paint_quad(selection);
         }
 
+        for background in prepaint.code_block_backgrounds.drain(..) {
+            window.paint_quad(background);
+        }
+
         for border in prepaint.blockquote_borders.drain(..) {
             window.paint_quad(border);
         }
 
-        for (index, line) in prepaint.lines.iter().enumerate() {
-            let origin = point(
-                bounds.left(),
-                bounds.top() + prepaint.line_height * index as f32,
-            );
+        let gutter = px(EDITOR_GUTTER);
+        for line in prepaint.lines.iter() {
+            let origin = point(bounds.left() + gutter, bounds.top() + line.y);
             line.shaped
-                .paint(
-                    origin,
-                    prepaint.line_height,
-                    TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                )
+                .paint(origin, line.height, TextAlign::Left, None, window, cx)
                 .unwrap();
         }
 
@@ -209,7 +201,11 @@ impl Element for EditorElement {
         }
 
         self.editor.update(cx, |editor, _| {
-            editor.last_bounds_line_height = prepaint.line_height.into();
+            editor.last_bounds_line_height = prepaint
+                .lines
+                .first()
+                .map(|line| line.height.into())
+                .unwrap_or(0.0);
             editor.layout_cache.line_starts = prepaint
                 .lines
                 .iter()
@@ -220,45 +216,113 @@ impl Element for EditorElement {
                 .iter()
                 .map(|line| line.display_line_start)
                 .collect();
+            editor.layout_cache.line_heights = prepaint
+                .lines
+                .iter()
+                .map(|line| f32::from(line.height))
+                .collect();
         });
     }
+}
+
+fn total_layout_height(layout: &DisplayLayout, theme: &EditorTheme, content: &str) -> f32 {
+    let doc_line_ranges = line_byte_ranges(content);
+    let display_ranges = line_byte_ranges(&layout.display_text);
+    let line_count = display_ranges.len().max(doc_line_ranges.len()).max(1);
+    let mut total = 0.0;
+    for index in 0..line_count {
+        let (doc_start, doc_end) = doc_line_ranges
+            .get(index)
+            .copied()
+            .unwrap_or((0, content.len()));
+        let font_size = font_size_for_line(layout, theme, doc_start, doc_end);
+        total += theme.line_height_for_font_size(font_size);
+    }
+    total
+}
+
+fn font_size_for_line(
+    layout: &DisplayLayout,
+    theme: &EditorTheme,
+    doc_start: usize,
+    doc_end: usize,
+) -> f32 {
+    let heading = layout.segments.iter().find_map(|segment| {
+        if segment.doc_end <= doc_start || segment.doc_start >= doc_end {
+            return None;
+        }
+        match segment.style {
+            SegmentStyle::Heading { level } => Some(level),
+            _ => None,
+        }
+    });
+    match heading {
+        Some(level) => theme.heading_font_size(level),
+        None => theme.font_size,
+    }
+}
+
+fn line_is_style(
+    layout: &DisplayLayout,
+    doc_start: usize,
+    doc_end: usize,
+    pred: impl Fn(SegmentStyle) -> bool,
+) -> bool {
+    layout.segments.iter().any(|segment| {
+        segment.doc_end > doc_start && segment.doc_start < doc_end && pred(segment.style)
+    })
 }
 
 fn shape_lines(
     window: &mut Window,
     layout: &DisplayLayout,
     theme: &EditorTheme,
-    font_size: Pixels,
     content: &str,
 ) -> Vec<LinePaintData> {
     let line_ranges = line_byte_ranges(&layout.display_text);
     let doc_line_ranges = line_byte_ranges(content);
     let mut lines = Vec::new();
+    let mut y = px(0.);
 
     for (line_idx, (display_start, display_end)) in line_ranges.iter().enumerate() {
         let line_text: SharedString = layout.display_text[*display_start..*display_end]
             .trim_end_matches('\n')
             .into();
-        let runs = build_runs_for_line(
-            layout,
-            theme,
-            font_size,
-            *display_start,
-            *display_end,
-            &line_text,
-        );
-        let shaped = window
-            .text_system()
-            .shape_line(line_text.clone(), font_size, &runs, None);
-        let (doc_line_start, _) = doc_line_ranges
+        let (doc_start, doc_end) = doc_line_ranges
             .get(line_idx)
             .copied()
             .unwrap_or((0, content.len()));
+        let font_size = font_size_for_line(layout, theme, doc_start, doc_end);
+        let height = px(theme.line_height_for_font_size(font_size));
+        let runs = build_runs_for_line(layout, theme, *display_start, *display_end, &line_text);
+        let shaped = window
+            .text_system()
+            .shape_line(line_text.clone(), px(font_size), &runs, None);
+        let is_code_block = line_is_style(layout, doc_start, doc_end, |style| {
+            matches!(
+                style,
+                SegmentStyle::CodeBlock | SegmentStyle::SyntaxHighlight(_)
+            )
+        }) || layout
+            .code_block_lines
+            .iter()
+            .any(|&start| start >= doc_start && start < doc_end.max(doc_start + 1));
+        let is_blockquote = line_is_style(layout, doc_start, doc_end, |style| {
+            matches!(style, SegmentStyle::BlockQuote)
+        }) || layout
+            .blockquote_lines
+            .iter()
+            .any(|&start| start >= doc_start && start < doc_end.max(doc_start + 1));
         lines.push(LinePaintData {
             shaped,
-            doc_line_start,
+            doc_line_start: doc_start,
             display_line_start: *display_start,
+            height,
+            y,
+            is_code_block,
+            is_blockquote,
         });
+        y += height;
     }
 
     if lines.is_empty() {
@@ -270,12 +334,17 @@ fn shape_lines(
             underline: None,
             strikethrough: None,
         }];
+        let height = px(theme.line_height_for_font_size(theme.font_size));
         lines.push(LinePaintData {
             shaped: window
                 .text_system()
-                .shape_line("".into(), font_size, &runs, None),
+                .shape_line("".into(), px(theme.font_size), &runs, None),
             doc_line_start: 0,
             display_line_start: 0,
+            height,
+            y: px(0.),
+            is_code_block: false,
+            is_blockquote: false,
         });
     }
 
@@ -285,7 +354,6 @@ fn shape_lines(
 fn build_runs_for_line(
     layout: &DisplayLayout,
     theme: &EditorTheme,
-    _font_size: Pixels,
     display_start: usize,
     display_end: usize,
     line_text: &str,
@@ -358,14 +426,20 @@ fn styled_font(theme: &EditorTheme, style: SegmentStyle) -> gpui::Font {
     gpui::Font {
         family: family.into(),
         features: gpui::FontFeatures::default(),
-        fallbacks: None,
+        fallbacks: Some(EditorTheme::system_font_fallbacks()),
         weight,
         style: font_style,
     }
 }
 
 fn body_font(theme: &EditorTheme) -> gpui::Font {
-    gpui::font(theme.font_family.clone())
+    gpui::Font {
+        family: theme.font_family.clone().into(),
+        features: gpui::FontFeatures::default(),
+        fallbacks: Some(EditorTheme::system_font_fallbacks()),
+        weight: gpui::FontWeight::NORMAL,
+        style: gpui::FontStyle::Normal,
+    }
 }
 
 fn styled_color(theme: &EditorTheme, style: SegmentStyle) -> gpui::Hsla {
@@ -390,9 +464,7 @@ fn styled_background(theme: &EditorTheme, style: SegmentStyle) -> Option<gpui::H
         SegmentStyle::Table {
             row: TableRowKind::Header,
         } => Some(theme.table_header_bg),
-        SegmentStyle::CodeInline | SegmentStyle::CodeBlock => {
-            Some(gpui::hsla(0., 0., 0.08, 1.))
-        }
+        SegmentStyle::CodeInline => Some(theme.code_bg),
         _ => None,
     }
 }
@@ -433,42 +505,56 @@ fn styled_strikethrough(style: SegmentStyle) -> Option<gpui::StrikethroughStyle>
 }
 
 fn blockquote_border_quads(
-    layout: &DisplayLayout,
     lines: &[LinePaintData],
     bounds: Bounds<Pixels>,
-    line_height: Pixels,
     color: gpui::Hsla,
 ) -> Vec<PaintQuad> {
-    let mut quads = Vec::new();
-    for &line_start in &layout.blockquote_lines {
-        let display_start = layout.display_offset_for_doc(line_start);
-        let (line_idx, _) = position_for_display_offset(lines, display_start);
-        quads.push(fill(
-            Bounds::new(
-                point(bounds.left(), bounds.top() + line_height * line_idx as f32),
-                size(px(3.), line_height),
-            ),
-            color,
-        ));
-    }
-    quads
+    lines
+        .iter()
+        .filter(|line| line.is_blockquote)
+        .map(|line| {
+            fill(
+                Bounds::new(
+                    point(bounds.left() + px(4.), bounds.top() + line.y),
+                    size(px(3.), line.height),
+                ),
+                color,
+            )
+        })
+        .collect()
+}
+
+fn code_block_background_quads(
+    lines: &[LinePaintData],
+    bounds: Bounds<Pixels>,
+    color: gpui::Hsla,
+) -> Vec<PaintQuad> {
+    lines
+        .iter()
+        .filter(|line| line.is_code_block)
+        .map(|line| {
+            fill(
+                Bounds::new(
+                    point(bounds.left(), bounds.top() + line.y),
+                    size(bounds.size.width, line.height),
+                ),
+                color,
+            )
+        })
+        .collect()
 }
 
 fn cursor_quad(
     lines: &[LinePaintData],
     display_offset: usize,
     bounds: Bounds<Pixels>,
-    line_height: Pixels,
     color: gpui::Hsla,
 ) -> PaintQuad {
-    let (line_idx, x) = position_for_display_offset(lines, display_offset);
+    let (x, y, height) = position_for_display_offset(lines, display_offset);
     fill(
         Bounds::new(
-            point(
-                bounds.left() + x,
-                bounds.top() + line_height * line_idx as f32,
-            ),
-            size(px(2.), line_height),
+            point(bounds.left() + px(EDITOR_GUTTER) + x, bounds.top() + y),
+            size(px(2.), height),
         ),
         color,
     )
@@ -479,23 +565,20 @@ fn selection_quad(
     layout: &DisplayLayout,
     range: &Range<usize>,
     bounds: Bounds<Pixels>,
-    line_height: Pixels,
     color: gpui::Hsla,
 ) -> PaintQuad {
     let start = layout.display_offset_for_doc(range.start);
     let end = layout.display_offset_for_doc(range.end);
-    let (start_line, start_x) = position_for_display_offset(lines, start);
-    let (end_line, end_x) = position_for_display_offset(lines, end);
-    if start_line == end_line {
+    let (start_x, start_y, start_height) = position_for_display_offset(lines, start);
+    let (end_x, end_y, end_height) = position_for_display_offset(lines, end);
+    let gutter = px(EDITOR_GUTTER);
+    if (f32::from(start_y) - f32::from(end_y)).abs() < 0.5 {
         fill(
             Bounds::from_corners(
+                point(bounds.left() + gutter + start_x, bounds.top() + start_y),
                 point(
-                    bounds.left() + start_x,
-                    bounds.top() + line_height * start_line as f32,
-                ),
-                point(
-                    bounds.left() + end_x,
-                    bounds.top() + line_height * (start_line + 1) as f32,
+                    bounds.left() + gutter + end_x,
+                    bounds.top() + start_y + start_height,
                 ),
             ),
             color,
@@ -503,35 +586,32 @@ fn selection_quad(
     } else {
         fill(
             Bounds::from_corners(
-                point(
-                    bounds.left() + start_x,
-                    bounds.top() + line_height * start_line as f32,
-                ),
-                point(
-                    bounds.right(),
-                    bounds.top() + line_height * (end_line + 1) as f32,
-                ),
+                point(bounds.left() + gutter + start_x, bounds.top() + start_y),
+                point(bounds.right(), bounds.top() + end_y + end_height),
             ),
             color,
         )
     }
 }
 
-fn position_for_display_offset(lines: &[LinePaintData], display_offset: usize) -> (usize, Pixels) {
-    for (index, line) in lines.iter().enumerate() {
+fn position_for_display_offset(
+    lines: &[LinePaintData],
+    display_offset: usize,
+) -> (Pixels, Pixels, Pixels) {
+    for line in lines {
         let line_display_end = line.display_line_start + line.shaped.text.len();
         if display_offset <= line_display_end {
             let local = display_offset.saturating_sub(line.display_line_start);
-            return (index, line.shaped.x_for_index(local));
+            return (line.shaped.x_for_index(local), line.y, line.height);
         }
     }
-    let last = lines.len().saturating_sub(1);
     (
-        last,
         lines
             .last()
             .map(|line| line.shaped.width())
             .unwrap_or(px(0.)),
+        lines.last().map(|line| line.y).unwrap_or(px(0.)),
+        lines.last().map(|line| line.height).unwrap_or(px(20.)),
     )
 }
 
@@ -541,17 +621,29 @@ impl MarkdownEditor {
         position: Point<Pixels>,
         bounds: Bounds<Pixels>,
     ) -> usize {
-        let relative_y = position.y - bounds.top();
-        let line_height = px(self.last_bounds_line_height.max(1.0));
+        let relative_y = f32::from(position.y - bounds.top());
+        if !self.layout_cache.line_heights.is_empty() {
+            let mut y = 0.0;
+            for (line_idx, height) in self.layout_cache.line_heights.iter().enumerate() {
+                if relative_y < y + height || line_idx + 1 == self.layout_cache.line_heights.len() {
+                    return self
+                        .layout_cache
+                        .line_starts
+                        .get(line_idx)
+                        .copied()
+                        .unwrap_or(0);
+                }
+                y += height;
+            }
+        }
+        let line_height = self.last_bounds_line_height.max(1.0);
         let line_idx = ((relative_y / line_height).floor() as usize)
             .min(self.layout_cache.line_starts.len().saturating_sub(1));
-        let doc_line_start = self
-            .layout_cache
+        self.layout_cache
             .line_starts
             .get(line_idx)
             .copied()
-            .unwrap_or(0);
-        doc_line_start
+            .unwrap_or(0)
     }
 
     pub fn on_mouse_down(

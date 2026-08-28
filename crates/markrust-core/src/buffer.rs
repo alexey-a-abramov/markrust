@@ -67,8 +67,12 @@ impl DocumentBuffer {
     }
 
     pub fn slice(&self, start_byte: usize, end_byte: usize) -> String {
-        let start = self.text.byte_to_char(start_byte.min(self.len_bytes()));
-        let end = self.text.byte_to_char(end_byte.min(self.len_bytes()));
+        let len = self.len_bytes();
+        let start = self.text.byte_to_char(start_byte.min(len));
+        let end = self.text.byte_to_char(end_byte.min(len));
+        if start >= end {
+            return String::new();
+        }
         self.text.slice(start..end).to_string()
     }
 
@@ -172,5 +176,128 @@ mod tests {
         let rev = buf.delete(2, 2);
         assert_eq!(rev, 0);
         assert_eq!(buf.content(), "abc");
+    }
+
+    fn assert_line_index_consistent(buf: &DocumentBuffer) {
+        let rebuilt = LineIndex::from_rope(buf.text());
+        assert_eq!(buf.line_index().line_starts(), rebuilt.line_starts());
+    }
+
+    #[test]
+    fn empty_buffer_insert_at_zero() {
+        let mut buf = DocumentBuffer::new();
+        assert!(buf.is_empty());
+        assert_eq!(buf.len_chars(), 0);
+        assert_eq!(buf.len_bytes(), 0);
+        assert_eq!(buf.revision(), 0);
+        buf.insert(0, "a");
+        assert!(!buf.is_empty());
+        assert_eq!(buf.content(), "a");
+        assert_eq!(buf.revision(), 1);
+        assert_eq!(DocumentBuffer::default().content(), "");
+    }
+
+    #[test]
+    fn slice_clamps_and_inverted_range_is_empty() {
+        let buf = DocumentBuffer::with_text("hello");
+        assert_eq!(buf.slice(0, 100), "hello");
+        assert_eq!(buf.slice(5, 5), "");
+        assert_eq!(buf.slice(4, 1), "");
+        assert_eq!(buf.slice(0, 0), "");
+    }
+
+    #[test]
+    fn insert_past_end_appends() {
+        let mut buf = DocumentBuffer::with_text("ab");
+        buf.insert(99, "c");
+        assert_eq!(buf.content(), "abc");
+    }
+
+    #[test]
+    fn delete_inverted_or_empty_is_noop() {
+        let mut buf = DocumentBuffer::with_text("abc");
+        assert_eq!(buf.delete(5, 1), 0);
+        assert_eq!(buf.content(), "abc");
+        buf.delete(0, 1);
+        assert_eq!(buf.content(), "bc");
+        assert_eq!(buf.revision(), 1);
+    }
+
+    #[test]
+    fn replace_deletes_then_inserts() {
+        let mut buf = DocumentBuffer::with_text("hello");
+        let rev = buf.replace(1, 4, "i");
+        assert_eq!(buf.content(), "hio");
+        assert_eq!(rev, 2);
+    }
+
+    #[test]
+    fn utf8_emoji_and_cjk_byte_vs_char() {
+        let mut buf = DocumentBuffer::with_text("👋你好");
+        assert_eq!(buf.len_chars(), 3);
+        assert_eq!(buf.len_bytes(), 10);
+        assert_eq!(buf.slice(0, 4), "👋");
+        assert_eq!(buf.slice(4, 10), "你好");
+        assert_eq!(buf.text().byte_to_char(4), 1);
+        assert_eq!(buf.text().char_to_byte(1), 4);
+        buf.insert(4, "!");
+        assert_eq!(buf.content(), "👋!你好");
+        buf.delete(4, 5);
+        assert_eq!(buf.content(), "👋你好");
+        assert_line_index_consistent(&buf);
+    }
+
+    #[test]
+    fn accented_char_is_one_char_two_bytes() {
+        let buf = DocumentBuffer::with_text("é");
+        assert_eq!(buf.len_chars(), 1);
+        assert_eq!(buf.len_bytes(), 2);
+        assert_eq!(buf.line_col_of_offset(0), (0, 0));
+        assert_eq!(buf.offset_of_line_col(0, 2), 2);
+    }
+
+    #[test]
+    fn large_rope_edits_are_correct() {
+        let mut buf = DocumentBuffer::with_text(&"x".repeat(100_000));
+        assert_eq!(buf.len_chars(), 100_000);
+        assert_eq!(buf.insert(50_000, "Y"), 1);
+        assert_eq!(buf.slice(49_999, 50_002), "xYx");
+        buf.delete(50_000, 50_001);
+        assert_eq!(buf.len_chars(), 100_000);
+        assert_eq!(buf.slice(49_999, 50_001), "xx");
+        buf.insert(0, "\n");
+        buf.insert(buf.len_bytes(), "\n");
+        assert_line_index_consistent(&buf);
+        buf.rebuild_line_index();
+        assert_line_index_consistent(&buf);
+    }
+
+    #[test]
+    fn revision_does_not_change_on_noop_delete() {
+        let mut buf = DocumentBuffer::with_text("ab");
+        assert_eq!(buf.delete(1, 1), 0);
+        assert_eq!(buf.delete(8, 2), 0);
+        assert_eq!(buf.revision(), 0);
+        buf.insert(2, "");
+        assert_eq!(buf.revision(), 1);
+        assert_eq!(buf.content(), "ab");
+    }
+
+    #[test]
+    fn display_and_from_str() {
+        let buf: DocumentBuffer = "hello".parse().unwrap();
+        assert_eq!(buf.to_string(), "hello");
+        assert_eq!(DocumentBuffer::from("x").content(), "x");
+    }
+
+    #[test]
+    fn line_index_tracks_newline_edits() {
+        let mut buf = DocumentBuffer::with_text("ab");
+        buf.insert(2, "\ncd");
+        assert_eq!(buf.line_index().line_count(), 2);
+        assert_eq!(buf.line_col_of_offset(3), (1, 0));
+        buf.delete(2, 3);
+        assert_eq!(buf.content(), "abcd");
+        assert_line_index_consistent(&buf);
     }
 }

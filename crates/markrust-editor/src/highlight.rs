@@ -27,11 +27,7 @@ pub struct HighlightSpan {
 }
 
 /// Highlight code block contents using tree-sitter when a language tag is known.
-pub fn highlight_code_block(
-    language: &str,
-    code: &str,
-    base_offset: usize,
-) -> Vec<HighlightSpan> {
+pub fn highlight_code_block(language: &str, code: &str, base_offset: usize) -> Vec<HighlightSpan> {
     let Some(lang) = language_for_tag(language) else {
         return Vec::new();
     };
@@ -184,5 +180,29 @@ mod tests {
     #[test]
     fn unknown_language_returns_empty() {
         assert!(highlight_code_block("brainfuck", "++++", 0).is_empty());
+    }
+
+    #[test]
+    fn highlights_yaml_keys() {
+        let spans = highlight_code_block("yaml", "name: MarkRust\ncount: 1\n", 0);
+        assert!(!spans.is_empty(), "yaml highlighter should emit spans");
+    }
+
+    #[test]
+    fn highlights_bash_commands() {
+        let spans = highlight_code_block("bash", "echo hello\n", 0);
+        assert!(!spans.is_empty(), "bash highlighter should emit spans");
+    }
+
+    #[test]
+    fn empty_fence_returns_no_or_empty_spans() {
+        assert!(highlight_code_block("rust", "", 0).is_empty());
+        assert!(highlight_code_block("json", "", 0).is_empty());
+    }
+
+    #[test]
+    fn empty_language_tag_falls_back() {
+        assert!(highlight_code_block("", "fn main() {}", 0).is_empty());
+        assert!(highlight_code_block("unknown-lang", "fn main() {}", 0).is_empty());
     }
 }

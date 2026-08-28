@@ -7,9 +7,17 @@
 mod app;
 mod config;
 mod drop;
+mod session;
 mod ui;
 mod window;
 mod workspace;
 
-pub use app::{run_gui, GPUI_GIT_REV};
+pub use app::{run_gui, run_gui_with_open, GPUI_GIT_REV};
 pub use config::{AppConfig, RecentWorkspaces, ThemeChoice};
+pub use drop::{
+    classify_editor_drop, classify_window_drop, is_image, markdown_image_reference, DropIntent,
+};
+pub use session::{
+    list_markdown_files, reload_decision, AutosaveScheduler, DropTarget, HeadlessWorkspace,
+    ReloadDecision, SessionError, WorkspaceCommand,
+};

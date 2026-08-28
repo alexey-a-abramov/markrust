@@ -10,8 +10,8 @@ use gpui::{
     UTF16Selection, Window,
 };
 use markrust_core::Document;
-use unicode_segmentation::UnicodeSegmentation;
 
+use crate::headless::{apply_editor_command, CaretMove, EditorCommand, EditorOutcome, EditorState};
 use crate::masking::{Caret, Selection};
 use crate::theme::EditorTheme;
 
@@ -43,6 +43,7 @@ actions!(
 pub struct LineLayoutCache {
     pub line_starts: Vec<usize>,
     pub display_line_starts: Vec<usize>,
+    pub line_heights: Vec<f32>,
 }
 
 /// GPUI editor state: caret, selection, and document binding.
@@ -97,45 +98,63 @@ impl MarkdownEditor {
         self.document.read(cx).buffer.content()
     }
 
+    fn editor_state(&self) -> EditorState {
+        EditorState {
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        }
+    }
+
+    fn restore_state(&mut self, state: EditorState) {
+        self.selected_range = state.selected_range;
+        self.selection_reversed = state.selection_reversed;
+    }
+
+    /// Map a headless command through the GPUI document entity.
+    pub fn apply_command(
+        &mut self,
+        command: EditorCommand,
+        cx: &mut Context<Self>,
+    ) -> EditorOutcome {
+        let mut state = self.editor_state();
+        let mut outcome = EditorOutcome::Noop;
+        self.document.update(cx, |doc, cx| {
+            if let Ok(result) = apply_editor_command(doc, &mut state, command) {
+                outcome = result;
+                cx.notify();
+            }
+        });
+        self.restore_state(state);
+        if outcome != EditorOutcome::Noop {
+            self.reset_blink(cx);
+        }
+        cx.notify();
+        outcome
+    }
+
     pub fn carets(&self) -> Vec<Caret> {
-        vec![Caret::new(self.cursor_offset())]
+        self.editor_state().carets()
     }
 
     pub fn selections(&self) -> Vec<Selection> {
-        if self.selected_range.is_empty() {
-            Vec::new()
-        } else {
-            vec![Selection::new(
-                self.selected_range.start,
-                self.selected_range.end,
-            )]
-        }
+        self.editor_state().selections()
     }
 
     pub fn cursor_offset(&self) -> usize {
-        if self.selection_reversed {
-            self.selected_range.start
-        } else {
-            self.selected_range.end
-        }
+        self.editor_state().cursor_offset()
     }
 
     pub fn set_cursor(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let len = 0; // clamped in move_to
-        let _ = len;
-        self.move_to(offset, cx);
+        self.apply_command(EditorCommand::JumpTo(offset), cx);
     }
 
     /// Insert plain text at the current caret, replacing any active selection.
-    pub fn insert_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let offset = self.cursor_offset();
-        self.selected_range = offset..offset;
-        self.selection_reversed = false;
-        self.replace_text_in_range(None, text, window, cx);
+    pub fn insert_text(&mut self, text: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::InsertText(text.to_string()), cx);
     }
 
     pub fn jump_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.move_to(offset, cx);
+        self.apply_command(EditorCommand::JumpTo(offset), cx);
     }
 
     fn start_blink(&mut self, cx: &mut Context<Self>) {
@@ -172,232 +191,114 @@ impl MarkdownEditor {
     }
 
     pub fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let len = self.content(cx).len();
-        let offset = offset.min(len);
-        self.selected_range = offset..offset;
-        self.selection_reversed = false;
-        cx.notify();
+        self.apply_command(EditorCommand::JumpTo(offset), cx);
     }
 
     pub fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let len = self.content(cx).len();
-        let offset = offset.min(len);
-        if self.selection_reversed {
-            self.selected_range.start = offset;
+        let anchor = if self.selection_reversed {
+            self.selected_range.end
         } else {
-            self.selected_range.end = offset;
-        }
-        if self.selected_range.end < self.selected_range.start {
-            self.selection_reversed = !self.selection_reversed;
-            self.selected_range = self.selected_range.end..self.selected_range.start;
-        }
-        cx.notify();
-    }
-
-    fn previous_boundary(&self, content: &str, offset: usize) -> usize {
-        content
-            .grapheme_indices(true)
-            .rev()
-            .find_map(|(idx, _)| (idx < offset).then_some(idx))
-            .unwrap_or(0)
-    }
-
-    fn next_boundary(&self, content: &str, offset: usize) -> usize {
-        content
-            .grapheme_indices(true)
-            .find_map(|(idx, _)| (idx > offset).then_some(idx))
-            .unwrap_or(content.len())
-    }
-
-    fn line_start(&self, content: &str, offset: usize) -> usize {
-        content[..offset.min(content.len())]
-            .rfind('\n')
-            .map(|idx| idx + 1)
-            .unwrap_or(0)
-    }
-
-    fn line_end(&self, content: &str, offset: usize) -> usize {
-        content[offset.min(content.len())..]
-            .find('\n')
-            .map(|idx| offset + idx)
-            .unwrap_or(content.len())
-    }
-
-    fn move_vertical(
-        &mut self,
-        content: &str,
-        delta: i32,
-        selecting: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let (line, col) = crate::layout::cursor_line_col(content, self.cursor_offset());
-        let target_line = if delta < 0 {
-            line.saturating_sub((-delta) as usize)
-        } else {
-            line.saturating_add(delta as usize)
+            self.selected_range.start
         };
-        let line_index = self.document.read(cx).buffer.line_index();
-        let target_offset =
-            line_index.offset_of_line_col(target_line, col, self.document.read(cx).buffer.text());
-        if selecting {
-            self.select_to(target_offset, cx);
-        } else {
-            self.move_to(target_offset, cx);
-        }
-        self.reset_blink(cx);
+        self.apply_command(
+            EditorCommand::SetSelection {
+                start: anchor,
+                end: offset,
+            },
+            cx,
+        );
     }
 
     pub fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        if self.selected_range.is_empty() {
-            self.move_to(self.previous_boundary(&content, self.cursor_offset()), cx);
-        } else {
-            self.move_to(self.selected_range.start, cx);
-        }
-        self.reset_blink(cx);
+        self.apply_command(EditorCommand::Move(CaretMove::Left), cx);
     }
 
     pub fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        if self.selected_range.is_empty() {
-            self.move_to(self.next_boundary(&content, self.cursor_offset()), cx);
-        } else {
-            self.move_to(self.selected_range.end, cx);
-        }
-        self.reset_blink(cx);
+        self.apply_command(EditorCommand::Move(CaretMove::Right), cx);
     }
 
     pub fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        self.select_to(self.previous_boundary(&content, self.cursor_offset()), cx);
-        self.reset_blink(cx);
+        self.apply_command(EditorCommand::Select(CaretMove::Left), cx);
     }
 
     pub fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        self.select_to(self.next_boundary(&content, self.cursor_offset()), cx);
-        self.reset_blink(cx);
+        self.apply_command(EditorCommand::Select(CaretMove::Right), cx);
     }
 
     pub fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        self.move_vertical(&content, -1, false, cx);
+        self.apply_command(EditorCommand::Move(CaretMove::Up), cx);
     }
 
     pub fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        self.move_vertical(&content, 1, false, cx);
+        self.apply_command(EditorCommand::Move(CaretMove::Down), cx);
     }
 
     pub fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        self.move_vertical(&content, -1, true, cx);
+        self.apply_command(EditorCommand::Select(CaretMove::Up), cx);
     }
 
     pub fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        self.move_vertical(&content, 1, true, cx);
+        self.apply_command(EditorCommand::Select(CaretMove::Down), cx);
     }
 
     pub fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        self.move_to(self.line_start(&content, self.cursor_offset()), cx);
-        self.reset_blink(cx);
+        self.apply_command(EditorCommand::Move(CaretMove::Home), cx);
     }
 
     pub fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        self.move_to(self.line_end(&content, self.cursor_offset()), cx);
-        self.reset_blink(cx);
+        self.apply_command(EditorCommand::Move(CaretMove::End), cx);
     }
 
     pub fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        self.select_to(self.line_start(&content, self.cursor_offset()), cx);
-        self.reset_blink(cx);
+        self.apply_command(EditorCommand::Select(CaretMove::Home), cx);
     }
 
     pub fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        self.select_to(self.line_end(&content, self.cursor_offset()), cx);
-        self.reset_blink(cx);
+        self.apply_command(EditorCommand::Select(CaretMove::End), cx);
     }
 
     pub fn page_up(&mut self, _: &PageUp, window: &mut Window, cx: &mut Context<Self>) {
         let lines = (window.bounds().size.height / window.line_height()).floor() as i32;
-        let content = self.content(cx);
-        self.move_vertical(&content, -lines.max(1), false, cx);
+        self.apply_command(
+            EditorCommand::Move(CaretMove::Vertical {
+                delta_lines: -lines.max(1),
+            }),
+            cx,
+        );
     }
 
     pub fn page_down(&mut self, _: &PageDown, window: &mut Window, cx: &mut Context<Self>) {
         let lines = (window.bounds().size.height / window.line_height()).floor() as i32;
-        let content = self.content(cx);
-        self.move_vertical(&content, lines.max(1), false, cx);
+        self.apply_command(
+            EditorCommand::Move(CaretMove::Vertical {
+                delta_lines: lines.max(1),
+            }),
+            cx,
+        );
     }
 
     pub fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        let len = self.content(cx).len();
-        self.move_to(0, cx);
-        self.select_to(len, cx);
-        self.reset_blink(cx);
+        self.apply_command(EditorCommand::SelectAll, cx);
     }
 
     pub fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        if self.selected_range.is_empty() {
-            let prev = self.previous_boundary(&content, self.cursor_offset());
-            if prev == self.cursor_offset() {
-                window.play_system_bell();
-                return;
-            }
-            self.select_to(prev, cx);
+        if self.apply_command(EditorCommand::Backspace, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
         }
-        self.replace_text_in_range(None, "", window, cx);
     }
 
     pub fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        let content = self.content(cx);
-        if self.selected_range.is_empty() {
-            let next = self.next_boundary(&content, self.cursor_offset());
-            if next == self.cursor_offset() {
-                window.play_system_bell();
-                return;
-            }
-            self.select_to(next, cx);
+        if self.apply_command(EditorCommand::Delete, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
         }
-        self.replace_text_in_range(None, "", window, cx);
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {
-        self.document.update(cx, |doc, cx| {
-            doc.apply_pending_parse();
-            if doc.undo() {
-                doc.apply_pending_parse();
-                cx.notify();
-            }
-        });
-        self.clamp_cursor(cx);
-        self.reset_blink(cx);
-        cx.notify();
+        self.apply_command(EditorCommand::Undo, cx);
     }
 
     pub fn redo(&mut self, cx: &mut Context<Self>) {
-        self.document.update(cx, |doc, cx| {
-            doc.apply_pending_parse();
-            if doc.redo() {
-                doc.apply_pending_parse();
-                cx.notify();
-            }
-        });
-        self.clamp_cursor(cx);
-        self.reset_blink(cx);
-        cx.notify();
-    }
-
-    fn clamp_cursor(&mut self, cx: &mut Context<Self>) {
-        let len = self.content(cx).len();
-        let cursor = self.cursor_offset().min(len);
-        self.selected_range = cursor..cursor;
+        self.apply_command(EditorCommand::Redo, cx);
     }
 
     fn offset_from_utf16(&self, content: &str, offset: usize) -> usize {
@@ -495,23 +396,10 @@ impl EntityInputHandler for MarkdownEditor {
             .or(self.marked_range.clone())
             .unwrap_or_else(|| self.selected_range.clone());
 
-        self.document.update(cx, |doc, cx| {
-            doc.apply_pending_parse();
-            if !range.is_empty() {
-                doc.delete(range.start, range.end);
-            }
-            if !new_text.is_empty() {
-                doc.insert(range.start, new_text);
-            }
-            doc.apply_pending_parse();
-            cx.notify();
-        });
-
-        let new_cursor = range.start + new_text.len();
-        self.selected_range = new_cursor..new_cursor;
+        self.selected_range = range;
+        self.selection_reversed = false;
+        self.apply_command(EditorCommand::InsertText(new_text.to_string()), cx);
         self.marked_range = None;
-        self.reset_blink(cx);
-        cx.notify();
     }
 
     fn replace_and_mark_text_in_range(
@@ -560,5 +448,28 @@ impl EntityInputHandler for MarkdownEditor {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::headless::{CaretMove, EditorCommand, HeadlessEditor};
+
+    #[test]
+    fn gpui_editor_commands_run_on_headless_backend() {
+        let mut editor = HeadlessEditor::new("alpha beta");
+        editor
+            .apply(EditorCommand::SetSelection { start: 0, end: 5 })
+            .unwrap();
+        editor
+            .apply(EditorCommand::InsertText("gamma".into()))
+            .unwrap();
+        assert_eq!(editor.content(), "gamma beta");
+        editor.apply(EditorCommand::Undo).unwrap();
+        assert_eq!(editor.content(), "alpha beta");
+        editor.apply(EditorCommand::Move(CaretMove::End)).unwrap();
+        editor.apply(EditorCommand::Backspace).unwrap();
+        assert_eq!(editor.content(), "alpha bet");
+        assert_eq!(editor.word_count(), 2);
     }
 }

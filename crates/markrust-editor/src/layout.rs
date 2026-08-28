@@ -6,7 +6,8 @@ use markrust_core::{SyntaxKind, SyntaxNodeSpan, TableRowKind};
 
 use crate::highlight::{highlight_code_block, HighlightKind, HighlightSpan};
 use crate::masking::{
-    compute_delimiter_entries, Caret, DelimiterVisibilityEntry, Selection, VisibilityState,
+    compute_delimiter_entries, delimiter_visibility_for_span, Caret, DelimiterVisibilityEntry,
+    Selection, VisibilityState,
 };
 use crate::theme::EditorTheme;
 
@@ -47,6 +48,7 @@ pub struct DisplayLayout {
     pub segments: Vec<LayoutSegment>,
     pub highlight_spans: Vec<HighlightSpan>,
     pub blockquote_lines: Vec<usize>,
+    pub code_block_lines: Vec<usize>,
 }
 
 impl DisplayLayout {
@@ -79,10 +81,19 @@ pub fn build_display_layout(
 ) -> DisplayLayout {
     let delimiter_entries = compute_delimiter_entries(carets, selections, spans);
     let highlight_spans = collect_code_highlights(content, spans);
-    let segments = build_segments(content, spans, &delimiter_entries, &highlight_spans, theme);
+    let segments = build_segments(
+        content,
+        spans,
+        &delimiter_entries,
+        &highlight_spans,
+        carets,
+        selections,
+        theme,
+    );
     let mut layout = project_display(content, &segments, spans);
     layout.highlight_spans = highlight_spans;
     layout.blockquote_lines = blockquote_line_starts(content, spans);
+    layout.code_block_lines = code_block_line_starts(content, spans);
     apply_table_alignment(&mut layout, content, spans);
     layout
 }
@@ -98,7 +109,10 @@ fn collect_code_highlights(content: &str, spans: &[SyntaxNodeSpan]) -> Vec<Highl
         };
         let block = &content[span.start_byte..span.end_byte.min(content.len())];
         let code_start = block.find('\n').map(|idx| idx + 1).unwrap_or(0);
-        let code_end = block.rfind("\n```").or_else(|| block.rfind("\n~~~")).unwrap_or(block.len());
+        let code_end = block
+            .rfind("\n```")
+            .or_else(|| block.rfind("\n~~~"))
+            .unwrap_or(block.len());
         if code_start >= code_end {
             continue;
         }
@@ -114,6 +128,8 @@ fn build_segments(
     spans: &[SyntaxNodeSpan],
     delimiter_entries: &[DelimiterVisibilityEntry],
     highlight_spans: &[HighlightSpan],
+    carets: &[Caret],
+    selections: &[Selection],
     _theme: &EditorTheme,
 ) -> Vec<LayoutSegment> {
     if content.is_empty() {
@@ -127,6 +143,7 @@ fn build_segments(
         let end = entry.delimiter.end_byte.min(content.len());
         delimiter_map[start..end].fill(Some(visible));
     }
+    seed_implicit_list_markers(content, spans, carets, selections, &mut delimiter_map);
 
     let mut style_at: Vec<SegmentStyle> = vec![SegmentStyle::Plain; content.len()];
     for span in spans {
@@ -155,6 +172,43 @@ fn build_segments(
     coalesce_segments(content.len(), &style_at)
 }
 
+fn seed_implicit_list_markers(
+    content: &str,
+    spans: &[SyntaxNodeSpan],
+    carets: &[Caret],
+    selections: &[Selection],
+    delimiter_map: &mut [Option<bool>],
+) {
+    for span in spans {
+        if span.kind != SyntaxKind::List {
+            continue;
+        }
+        let visible =
+            delimiter_visibility_for_span(span, carets, selections) == VisibilityState::Visible;
+        let end = span.end_byte.min(content.len());
+        if span.start_byte >= end {
+            continue;
+        }
+        let block = &content[span.start_byte..end];
+        let mut offset = span.start_byte;
+        for line in block.split_inclusive('\n') {
+            let indent = line
+                .bytes()
+                .take_while(|byte| *byte == b' ' || *byte == b'\t')
+                .count();
+            if let Some(marker) = line.as_bytes().get(indent) {
+                if matches!(marker, b'-' | b'*' | b'+') {
+                    let at = offset + indent;
+                    if at < delimiter_map.len() && delimiter_map[at].is_none() {
+                        delimiter_map[at] = Some(visible);
+                    }
+                }
+            }
+            offset += line.len();
+        }
+    }
+}
+
 fn span_style(span: &SyntaxNodeSpan) -> SegmentStyle {
     match span.kind {
         SyntaxKind::Bold => SegmentStyle::Bold,
@@ -167,6 +221,7 @@ fn span_style(span: &SyntaxNodeSpan) -> SegmentStyle {
         SyntaxKind::BlockQuote => SegmentStyle::BlockQuote,
         SyntaxKind::Link => SegmentStyle::Link,
         SyntaxKind::Image => SegmentStyle::Image,
+        SyntaxKind::List => SegmentStyle::Plain,
         SyntaxKind::TaskList => SegmentStyle::TaskList {
             checked: span.task_checked.unwrap_or(false),
         },
@@ -234,6 +289,24 @@ fn project_display(
                             doc_to_display[byte] = Some(display_pos);
                         }
                     }
+                } else if is_masked_unordered_list_marker(segment, spans, content) {
+                    let display_pos = display_text.len();
+                    if let Some(bullet) = unordered_list_bullet(slice) {
+                        display_text.push(bullet);
+                        if !slice.ends_with(' ') {
+                            display_text.push(' ');
+                        }
+                    } else {
+                        display_text.push_str(slice);
+                    }
+                    map_display_range(
+                        &mut doc_to_display,
+                        segment.doc_start,
+                        segment.doc_end,
+                        display_pos,
+                        &display_text[display_pos..],
+                        content,
+                    );
                 } else {
                     let display_pos = display_text.len();
                     for byte in segment.doc_start..=segment.doc_end.min(content.len()) {
@@ -279,6 +352,7 @@ fn project_display(
         segments: segments.to_vec(),
         highlight_spans: Vec::new(),
         blockquote_lines: Vec::new(),
+        code_block_lines: Vec::new(),
     }
 }
 
@@ -304,6 +378,58 @@ fn map_display_range(
     }
 }
 
+fn is_masked_unordered_list_marker(
+    segment: &LayoutSegment,
+    spans: &[SyntaxNodeSpan],
+    content: &str,
+) -> bool {
+    if is_masked_list_marker(segment, spans) {
+        return true;
+    }
+    let slice = &content[segment.doc_start..segment.doc_end.min(content.len())];
+    if unordered_list_bullet(slice).is_none() {
+        return false;
+    }
+    let on_list = spans.iter().any(|span| {
+        span.kind == SyntaxKind::List
+            && segment.doc_start >= span.start_byte
+            && segment.doc_end <= span.end_byte
+    });
+    if !on_list {
+        return false;
+    }
+    let prefix = &content[..segment.doc_start];
+    let line_start = prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    content[line_start..segment.doc_start]
+        .bytes()
+        .all(|byte| byte == b' ' || byte == b'\t')
+}
+
+fn is_masked_list_marker(segment: &LayoutSegment, spans: &[SyntaxNodeSpan]) -> bool {
+    let on_task_item = spans.iter().any(|span| {
+        span.kind == SyntaxKind::TaskList
+            && segment.doc_start >= span.start_byte
+            && segment.doc_end <= span.end_byte
+    });
+    if on_task_item {
+        return false;
+    }
+    spans.iter().any(|span| {
+        span.kind == SyntaxKind::List
+            && span
+                .delimiter_spans
+                .iter()
+                .any(|d| d.start_byte == segment.doc_start && d.end_byte == segment.doc_end)
+    })
+}
+
+fn unordered_list_bullet(marker: &str) -> Option<char> {
+    match marker.trim() {
+        "-" | "*" | "+" => Some('•'),
+        _ => None,
+    }
+}
+
 fn is_masked_task_marker(segment: &LayoutSegment, spans: &[SyntaxNodeSpan]) -> bool {
     spans.iter().any(|span| {
         span.kind == SyntaxKind::TaskList
@@ -326,6 +452,31 @@ fn blockquote_line_starts(content: &str, spans: &[SyntaxNodeSpan]) -> Vec<usize>
     let mut lines = Vec::new();
     for span in spans {
         if span.kind != SyntaxKind::BlockQuote {
+            continue;
+        }
+        let block = &content[span.start_byte..span.end_byte.min(content.len())];
+        let offset = span.start_byte;
+        for (idx, ch) in block.char_indices() {
+            if idx == 0 || block[..idx].ends_with('\n') {
+                lines.push(offset + idx);
+            }
+            if ch == '\n' {
+                let next = offset + idx + 1;
+                if next < span.end_byte {
+                    lines.push(next);
+                }
+            }
+        }
+    }
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+fn code_block_line_starts(content: &str, spans: &[SyntaxNodeSpan]) -> Vec<usize> {
+    let mut lines = Vec::new();
+    for span in spans {
+        if span.kind != SyntaxKind::CodeBlock {
             continue;
         }
         let block = &content[span.start_byte..span.end_byte.min(content.len())];
@@ -481,7 +632,9 @@ fn replace_block_in_layout(
     }
     let display_start = layout.display_offset_for_doc(block_start);
     let display_end = layout.display_offset_for_doc(block_start + original.len());
-    layout.display_text.replace_range(display_start..display_end, formatted);
+    layout
+        .display_text
+        .replace_range(display_start..display_end, formatted);
     let delta = formatted.len() as isize - (display_end - display_start) as isize;
     for pos in layout.doc_to_display.iter_mut().skip(block_start).flatten() {
         if *pos >= display_end {
@@ -596,7 +749,13 @@ mod tests {
     fn table_alignment_expands_columns() {
         let content = "| a | bb |\n|---|---|\n| c | d |";
         let spans = markrust_core::extract_syntax_spans(content);
-        let layout = build_display_layout(content, &spans, &[Caret::new(99)], &[], &EditorTheme::dark());
+        let layout = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(99)],
+            &[],
+            &EditorTheme::dark(),
+        );
         assert!(
             layout.display_text.contains("| a  | bb |")
                 || layout.display_text.contains("| a  |")
@@ -614,9 +773,91 @@ mod tests {
     }
 
     #[test]
+    fn table_left_center_right_alignment() {
+        let content = "| L | C | R |\n|:---|:---:|---:|\n| a | bb | ccc |";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let layout = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(999)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        assert!(
+            layout.display_text.contains(':') || layout.display_text.contains('|'),
+            "aligned table display: {:?}",
+            layout.display_text
+        );
+        let alignments = parse_column_alignments("|:---|:---:|---:|");
+        assert_eq!(
+            alignments,
+            vec![ColumnAlign::Left, ColumnAlign::Center, ColumnAlign::Right]
+        );
+        let padded_right = pad_cell("a", 3, ColumnAlign::Right);
+        assert_eq!(padded_right, "  a");
+        let padded_center = pad_cell("a", 3, ColumnAlign::Center);
+        assert_eq!(padded_center.chars().count(), 3);
+    }
+
+    #[test]
+    fn stable_line_height_does_not_depend_on_mask() {
+        let theme = EditorTheme::dark();
+        let body = theme.stable_line_height(theme.font_size);
+        let heading = theme.stable_line_height(theme.heading_font_size(1));
+        assert_eq!(body, heading);
+        assert!(body >= theme.font_size * 2.0 * theme.line_height_multiplier - f32::EPSILON);
+    }
+
+    #[test]
+    fn masked_display_is_narrower_than_unmasked() {
+        let content = "**bold**";
+        let spans = vec![bold_span(0, 8)];
+        let masked = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(20)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        let unmasked =
+            build_display_layout(content, &spans, &[Caret::new(3)], &[], &EditorTheme::dark());
+        assert_eq!(masked.display_text, "bold");
+        assert_eq!(unmasked.display_text, "**bold**");
+        assert!(masked.display_text.len() < unmasked.display_text.len());
+        assert_eq!(masked.doc_to_display.len(), unmasked.doc_to_display.len());
+    }
+
+    #[test]
     fn link_style_applied_from_parser() {
         let content = "[text](url)";
         let spans = markrust_core::extract_syntax_spans(content);
         assert!(spans.iter().any(|s| s.kind == SyntaxKind::Link));
+    }
+
+    #[test]
+    fn unordered_list_uses_bullet_when_masked() {
+        let content = "- first\n- second";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let layout = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(99)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        assert!(
+            layout.display_text.contains('•'),
+            "display: {:?}",
+            layout.display_text
+        );
+    }
+
+    #[test]
+    fn code_block_lines_are_tracked() {
+        let content = "intro\n\n```rust\nfn main() {}\n```\n";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let layout =
+            build_display_layout(content, &spans, &[Caret::new(0)], &[], &EditorTheme::dark());
+        assert!(!layout.code_block_lines.is_empty());
     }
 }

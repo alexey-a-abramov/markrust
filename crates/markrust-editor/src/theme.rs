@@ -54,6 +54,10 @@ pub struct EditorTheme {
     pub toolbar_button_hover: Hsla,
     /// Drag-over highlight background.
     pub drop_zone_bg: Hsla,
+    /// Inline code chip background.
+    pub code_bg: Hsla,
+    /// Fenced code block line background.
+    pub code_block_bg: Hsla,
 }
 
 impl EditorTheme {
@@ -81,8 +85,10 @@ impl EditorTheme {
             drop_zone_bg: gpui::hsla(210. / 360., 0.72, 0.52, 0.12),
             separator: gpui::hsla(0., 0., 1.0, 0.08),
             link: gpui::hsla(210. / 360., 0.75, 0.65, 1.),
-            blockquote_text: gpui::hsla(0., 0., 0.65, 1.),
-            blockquote_border: gpui::hsla(210. / 360., 0.35, 0.45, 0.9),
+            blockquote_text: gpui::hsla(0., 0., 0.72, 1.),
+            blockquote_border: gpui::hsla(210. / 360., 0.85, 0.58, 1.),
+            code_bg: gpui::hsla(0., 0., 0.22, 1.),
+            code_block_bg: gpui::hsla(220. / 360., 0.12, 0.16, 1.),
             image_text: gpui::hsla(120. / 360., 0.25, 0.55, 1.),
             table_header_bg: gpui::hsla(210. / 360., 0.2, 0.22, 1.),
             table_delimiter: gpui::hsla(0., 0., 0.45, 1.),
@@ -93,10 +99,10 @@ impl EditorTheme {
             syntax_comment: gpui::hsla(0., 0., 0.5, 1.),
             syntax_function: gpui::hsla(210. / 360., 0.55, 0.72, 1.),
             syntax_type: gpui::hsla(35. / 360., 0.45, 0.72, 1.),
-            font_family: "Inter".into(),
+            font_family: ".SystemUIFont".into(),
             font_size: 16.0,
             code_font_family: "Menlo".into(),
-            line_height_multiplier: 1.5,
+            line_height_multiplier: 1.55,
         }
     }
 
@@ -124,8 +130,10 @@ impl EditorTheme {
             drop_zone_bg: gpui::hsla(210. / 360., 0.72, 0.52, 0.10),
             separator: gpui::hsla(0., 0., 0.0, 0.08),
             link: gpui::hsla(210. / 360., 0.85, 0.42, 1.),
-            blockquote_text: gpui::hsla(0., 0., 0.45, 1.),
-            blockquote_border: gpui::hsla(210. / 360., 0.35, 0.55, 0.9),
+            blockquote_text: gpui::hsla(0., 0., 0.38, 1.),
+            blockquote_border: gpui::hsla(210. / 360., 0.85, 0.48, 1.),
+            code_bg: gpui::hsla(0., 0., 0.93, 1.),
+            code_block_bg: gpui::hsla(220. / 360., 0.12, 0.95, 1.),
             image_text: gpui::hsla(120. / 360., 0.35, 0.38, 1.),
             table_header_bg: gpui::hsla(210. / 360., 0.15, 0.92, 1.),
             table_delimiter: gpui::hsla(0., 0., 0.55, 1.),
@@ -136,10 +144,10 @@ impl EditorTheme {
             syntax_comment: gpui::hsla(0., 0., 0.55, 1.),
             syntax_function: gpui::hsla(210. / 360., 0.65, 0.42, 1.),
             syntax_type: gpui::hsla(35. / 360., 0.55, 0.42, 1.),
-            font_family: "Inter".into(),
+            font_family: ".SystemUIFont".into(),
             font_size: 16.0,
             code_font_family: "Menlo".into(),
-            line_height_multiplier: 1.5,
+            line_height_multiplier: 1.55,
         }
     }
 
@@ -159,6 +167,15 @@ impl EditorTheme {
         // Use max metrics (heading scale 2.0) so mask toggles never reflow lines.
         font_size.max(self.font_size * 2.0) * self.line_height_multiplier
     }
+
+    /// Line box for a painted run. Headings use their own size; body stays compact.
+    pub fn line_height_for_font_size(&self, font_size: f32) -> f32 {
+        font_size * self.line_height_multiplier
+    }
+
+    pub fn system_font_fallbacks() -> gpui::FontFallbacks {
+        gpui::FontFallbacks::from_fonts(vec![".SystemUIFont".into(), "Menlo".into()])
+    }
 }
 
 #[cfg(test)]
@@ -175,5 +192,23 @@ mod tests {
     fn dark_status_bar_is_muted_not_accent() {
         let theme = EditorTheme::dark();
         assert!((theme.status_bar_bg.h - theme.accent.h).abs() > 0.01);
+    }
+
+    #[test]
+    fn heading_one_is_larger_than_body() {
+        let theme = EditorTheme::dark();
+        assert!(theme.heading_font_size(1) > theme.font_size);
+        assert!(
+            theme.line_height_for_font_size(theme.font_size)
+                < theme.stable_line_height(theme.font_size)
+        );
+    }
+
+    #[test]
+    fn code_block_contrasts_with_editor_background() {
+        let dark = EditorTheme::dark();
+        let light = EditorTheme::light();
+        assert!((dark.code_block_bg.l - dark.editor_bg.l).abs() > 0.02);
+        assert!((light.code_block_bg.l - light.editor_bg.l).abs() > 0.02);
     }
 }

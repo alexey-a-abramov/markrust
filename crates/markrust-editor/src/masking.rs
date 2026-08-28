@@ -270,4 +270,57 @@ mod tests {
         assert!(vis.contains(&VisibilityState::Visible));
         assert!(vis.contains(&VisibilityState::Masked));
     }
+
+    #[test]
+    fn nested_bold_italic_reveals_containing_spans() {
+        let source = "**bold *italic* still**";
+        let spans = markrust_core::extract_syntax_spans(source);
+        assert!(spans.len() >= 2, "expected nested spans, got {spans:?}");
+        let italic_at = source.find("italic").unwrap();
+        let vis = compute_visibility(&[Caret::new(italic_at)], &[], &spans);
+        assert!(vis.contains(&VisibilityState::Visible));
+        let vis_outside = compute_visibility(&[Caret::new(source.len() + 4)], &[], &spans);
+        assert!(
+            vis_outside
+                .iter()
+                .all(|state| *state == VisibilityState::Masked),
+            "{vis_outside:?}"
+        );
+    }
+
+    #[test]
+    fn selection_spanning_multiple_nodes_reveals_all() {
+        let source = "**bold** and *italic*";
+        let spans = markrust_core::extract_syntax_spans(source);
+        let selections = vec![Selection::new(0, source.len())];
+        let vis = compute_visibility(&[Caret::new(0)], &selections, &spans);
+        assert!(
+            vis.iter().all(|state| *state == VisibilityState::Visible),
+            "{vis:?}"
+        );
+    }
+
+    #[test]
+    fn caret_on_delimiter_bytes_reveals() {
+        let spans = vec![bold_span(0, 8)];
+        let vis = compute_visibility(&[Caret::new(1)], &[], &spans);
+        assert_eq!(
+            vis,
+            vec![VisibilityState::Visible, VisibilityState::Visible]
+        );
+    }
+
+    #[test]
+    fn empty_document_has_no_visibility_entries() {
+        assert!(compute_visibility(&[Caret::new(0)], &[], &[]).is_empty());
+        let empty_spans = markrust_core::extract_syntax_spans("");
+        assert!(compute_visibility(&[Caret::new(0)], &[], &empty_spans).is_empty());
+    }
+
+    #[test]
+    fn plaintext_mode_has_no_spans_to_mask() {
+        let doc = markrust_core::Document::plain_text("**not bold**");
+        assert!(doc.syntax_spans.is_empty());
+        assert!(compute_visibility(&[Caret::new(2)], &[], &doc.syntax_spans).is_empty());
+    }
 }

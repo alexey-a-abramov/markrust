@@ -74,4 +74,57 @@ mod tests {
         assert!(html.contains("<h1>Body</h1>") || html.contains("Body</h1>"));
         assert!(!html.contains("title: Test"));
     }
+
+    #[test]
+    fn exports_strikethrough_and_autolink() {
+        let html = markdown_to_html_gfm("~~gone~~ and https://example.com");
+        assert!(
+            html.contains("<del>") && html.contains("gone"),
+            "strikethrough html: {html}"
+        );
+        assert!(
+            html.contains("href=\"https://example.com\""),
+            "autolink html: {html}"
+        );
+    }
+
+    #[test]
+    fn export_file_to_html_writes_temp_file() {
+        let dir = crate::test_support::TempDir::new("export");
+        let input = dir.join("note.md");
+        std::fs::write(&input, "# Hello\n\n- [x] done\n").unwrap();
+
+        let out = export_file_to_html(&input, None).unwrap();
+        assert_eq!(out.extension().and_then(|e| e.to_str()), Some("html"));
+        let html = std::fs::read_to_string(&out).unwrap();
+        assert!(html.contains("Hello"));
+        assert!(html.contains("checkbox") || html.contains("checked"));
+
+        let custom = dir.join("nested/out.html");
+        let written = export_file_to_html(&input, Some(&custom)).unwrap();
+        assert_eq!(written, custom);
+        assert!(custom.exists());
+    }
+
+    #[test]
+    fn export_file_missing_input_errors() {
+        let err =
+            export_file_to_html(Path::new("/no/such/markrust-core-file.md"), None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn export_content_requires_a_path() {
+        let err = export_content_to_html("# Hi", None, None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn write_markdown_creates_parent_dirs() {
+        let dir = crate::test_support::TempDir::new("export-write");
+        let output = dir.join("deep/nested/out.html");
+        write_markdown_to_html_file("| A | B |\n|---|---|\n| 1 | 2 |\n", &output).unwrap();
+        let html = std::fs::read_to_string(&output).unwrap();
+        assert!(html.contains("<table>"));
+    }
 }

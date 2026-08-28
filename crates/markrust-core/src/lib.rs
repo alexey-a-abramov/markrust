@@ -14,6 +14,9 @@ pub mod parser;
 pub mod spans;
 pub mod undo;
 
+#[cfg(test)]
+mod test_support;
+
 pub use buffer::DocumentBuffer;
 pub use document::Document;
 pub use export::{

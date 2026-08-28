@@ -6,6 +6,7 @@
 
 pub mod editor;
 pub mod element;
+pub mod headless;
 pub mod highlight;
 pub mod layout;
 pub mod masking;
@@ -13,6 +14,10 @@ pub mod theme;
 
 pub use editor::MarkdownEditor;
 pub use element::{EditorElement, MarkdownEditorView};
+pub use headless::{
+    apply_editor_command, CaretMove, EditorCommand, EditorError, EditorOutcome, EditorState,
+    HeadlessEditor,
+};
 pub use highlight::{highlight_code_block, HighlightKind, HighlightSpan};
 pub use layout::{
     build_display_layout, cursor_line_col, outline_headings, DisplayLayout, LayoutSegment,

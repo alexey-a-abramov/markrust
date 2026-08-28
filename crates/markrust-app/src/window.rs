@@ -8,10 +8,13 @@ use gpui::{
 };
 use markrust_core::parse_frontmatter;
 use markrust_editor::outline_headings;
+use std::path::Path;
 
 use crate::config::RecentWorkspaces;
+use crate::session::{DropTarget, WorkspaceCommand};
 use crate::ui::{
-    document_tab, empty_sidebar_state, outline_row, section_header, sidebar_row, toolbar_button,
+    document_tab, empty_sidebar_state, muted_hint, outline_row, section_header, sidebar_row,
+    toolbar_button,
 };
 use crate::workspace::{fuzzy_match, Workspace};
 
@@ -50,9 +53,10 @@ impl MarkRustWindow {
         }
     }
 
-    fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
-        self.workspace
-            .update(cx, |workspace, cx| workspace.save_active(cx));
+    fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            let _ = workspace.dispatch(WorkspaceCommand::Save, window, cx);
+        });
     }
 
     fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -67,7 +71,7 @@ impl MarkRustWindow {
             if let Ok(Ok(Some(paths))) = receiver.await {
                 if let Some(path) = paths.into_iter().next() {
                     let _ = workspace.update_in(cx, |workspace, window, cx| {
-                        let _ = workspace.open_document(path, window, cx);
+                        let _ = workspace.dispatch(WorkspaceCommand::OpenFile(path), window, cx);
                     });
                 }
             }
@@ -87,6 +91,7 @@ impl MarkRustWindow {
             if let Ok(Ok(Some(paths))) = receiver.await {
                 if let Some(path) = paths.into_iter().next() {
                     workspace.update(cx, |workspace, cx| {
+                        // OpenFolder does not need a Window; dispatch via a dummy path command.
                         let _ = workspace.open_workspace(path, cx);
                     });
                 }
@@ -97,20 +102,19 @@ impl MarkRustWindow {
 
     fn new_document(&mut self, _: &NewDocument, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace.update(cx, |workspace, cx| {
-            workspace.new_document(window, cx);
+            let _ = workspace.dispatch(WorkspaceCommand::NewDocument, window, cx);
         });
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        let active = self.workspace.read(cx).active_tab;
         self.workspace.update(cx, |workspace, cx| {
-            workspace.close_tab(active, window, cx);
+            let _ = workspace.dispatch(WorkspaceCommand::CloseTab, window, cx);
         });
     }
 
     fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace.update(cx, |workspace, cx| {
-            workspace.toggle_theme(window, cx);
+            let _ = workspace.dispatch(WorkspaceCommand::ToggleTheme, window, cx);
         });
     }
 
@@ -139,38 +143,33 @@ impl MarkRustWindow {
         }
     }
 
-    fn export_html(&mut self, _: &ExportHtml, _: &mut Window, cx: &mut Context<Self>) {
-        let workspace = self.workspace.clone();
-        match workspace.read(cx).export_active_html(cx) {
-            Ok(path) => {
-                eprintln!("Exported HTML to {}", path.display());
+    fn export_html(&mut self, _: &ExportHtml, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            match workspace.dispatch(WorkspaceCommand::ExportHtml { output: None }, window, cx) {
+                Ok(()) => {}
+                Err(error) => eprintln!("Export failed: {error}"),
             }
-            Err(error) => {
-                eprintln!("Export failed: {error}");
-            }
-        }
+        });
     }
 
-    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(editor) = self
-            .workspace
-            .read(cx)
-            .active_tab()
-            .map(|tab| tab.editor.clone())
-        {
-            editor.update(cx, |editor, cx| editor.undo(cx));
-        }
+    fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            let _ = workspace.dispatch(
+                WorkspaceCommand::Editor(markrust_editor::EditorCommand::Undo),
+                window,
+                cx,
+            );
+        });
     }
 
-    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(editor) = self
-            .workspace
-            .read(cx)
-            .active_tab()
-            .map(|tab| tab.editor.clone())
-        {
-            editor.update(cx, |editor, cx| editor.redo(cx));
-        }
+    fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            let _ = workspace.dispatch(
+                WorkspaceCommand::Editor(markrust_editor::EditorCommand::Redo),
+                window,
+                cx,
+            );
+        });
     }
 }
 
@@ -223,7 +222,8 @@ impl Render for MarkRustWindow {
             .flex_col()
             .bg(theme.chrome_bg)
             .text_color(theme.text)
-            .font_family(theme.font_family.clone())
+            .font_family(".SystemUIFont")
+            .text_size(px(14.))
             .track_focus(&self.focus_handle)
             .key_context("MarkRust")
             .on_action(cx.listener(Self::save))
@@ -242,13 +242,18 @@ impl Render for MarkRustWindow {
                 let ws = ws_drop.clone();
                 move |_, paths: &ExternalPaths, window, cx| {
                     ws.update(cx, |workspace, cx| {
-                        workspace.handle_window_drop(paths, window, cx);
+                        let _ = workspace.dispatch(
+                            WorkspaceCommand::DropFiles {
+                                paths: paths.paths().to_vec(),
+                                target: DropTarget::Window,
+                            },
+                            window,
+                            cx,
+                        );
                     });
                 }
             }))
-            .drag_over::<ExternalPaths>(move |style, _, _, _| {
-                style.bg(theme.drop_zone_bg)
-            })
+            .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(theme.drop_zone_bg))
             .children(external_change.map(|(index, path)| {
                 let ws = workspace_entity.clone();
                 div()
@@ -257,7 +262,10 @@ impl Render for MarkRustWindow {
                     .bg(theme.accent.opacity(0.85))
                     .text_color(theme.sidebar_selected_text)
                     .text_sm()
-                    .child(format!("File changed on disk: {}. Click to reload.", path.display()))
+                    .child(format!(
+                        "File changed on disk: {}. Click to reload.",
+                        path.display()
+                    ))
                     .cursor_pointer()
                     .id("external-change-banner")
                     .on_click(cx.listener(move |_, _, _, cx| {
@@ -288,7 +296,9 @@ impl Render for MarkRustWindow {
                         "New",
                         &theme,
                         "toolbar-new",
-                        cx.listener(|this, _, window, cx| this.new_document(&NewDocument, window, cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.new_document(&NewDocument, window, cx)
+                        }),
                     ))
                     .child(toolbar_button(
                         "Open File",
@@ -309,11 +319,21 @@ impl Render for MarkRustWindow {
                         &theme,
                         "toolbar-save",
                         cx.listener(|this, _, window, cx| this.save(&Save, window, cx)),
+                    ))
+                    .child(toolbar_button(
+                        "Theme",
+                        &theme,
+                        "toolbar-theme",
+                        cx.listener(|this, _, window, cx| {
+                            this.toggle_theme(&ToggleTheme, window, cx)
+                        }),
                     )),
             )
             .child(
                 div()
                     .flex()
+                    .items_end()
+                    .h(px(36.))
                     .gap_px()
                     .px_2()
                     .bg(theme.tab_inactive)
@@ -365,43 +385,57 @@ impl Render for MarkRustWindow {
                             .border_r_1()
                             .border_color(theme.separator)
                             .when(root.is_some(), |panel| {
+                                let folder_name = root
+                                    .as_ref()
+                                    .and_then(|p| p.file_name())
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "Workspace".into());
                                 panel
-                                    .child(section_header("Files", &theme))
+                                    .child(section_header(format!("Files · {folder_name}"), &theme))
                                     .children({
                                         let root = root.clone().unwrap();
-                                        files
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(file_index, path)| {
-                                                let display = path
-                                                    .strip_prefix(&root)
-                                                    .unwrap_or(path)
-                                                    .display()
-                                                    .to_string();
-                                                let path = path.clone();
-                                                let selected = active_doc_path
-                                                    .as_ref()
-                                                    .is_some_and(|active| active == &path);
-                                                let ws = workspace_entity.clone();
-                                                sidebar_row(
-                                                    display,
-                                                    &theme,
-                                                    selected,
-                                                    SharedString::from(format!(
-                                                        "sidebar-file-{file_index}"
-                                                    )),
-                                                    cx.listener(move |_, _, window, cx| {
-                                                        ws.update(cx, |workspace, cx| {
-                                                            let _ = workspace.open_document(
-                                                                path.clone(),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }),
-                                                )
-                                            })
-                                            .collect::<Vec<_>>()
+                                        if files.is_empty() {
+                                            vec![muted_hint(
+                                                "No Markdown files in this folder.",
+                                                &theme,
+                                            )
+                                            .into_any_element()]
+                                        } else {
+                                            files
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(file_index, path)| {
+                                                    let display = path
+                                                        .strip_prefix(&root)
+                                                        .unwrap_or(path)
+                                                        .display()
+                                                        .to_string();
+                                                    let path = path.clone();
+                                                    let selected = active_doc_path
+                                                        .as_ref()
+                                                        .is_some_and(|active| active == &path);
+                                                    let ws = workspace_entity.clone();
+                                                    sidebar_row(
+                                                        display,
+                                                        &theme,
+                                                        selected,
+                                                        SharedString::from(format!(
+                                                            "sidebar-file-{file_index}"
+                                                        )),
+                                                        cx.listener(move |_, _, window, cx| {
+                                                            ws.update(cx, |workspace, cx| {
+                                                                let _ = workspace.open_document(
+                                                                    path.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }),
+                                                    )
+                                                    .into_any_element()
+                                                })
+                                                .collect::<Vec<_>>()
+                                        }
                                     })
                             })
                             .when(root.is_none(), |panel| {
@@ -416,42 +450,34 @@ impl Render for MarkRustWindow {
                                         }),
                                     ))
                                     .when(!recent.workspaces.is_empty(), |panel| {
-                                        panel
-                                            .child(section_header("Recent", &theme))
-                                            .children(
-                                                recent
-                                                    .workspaces
-                                                    .iter()
-                                                    .enumerate()
-                                                    .map(|(recent_index, path)| {
-                                                        let label = path.display().to_string();
-                                                        let path = path.clone();
-                                                        let ws = workspace_entity.clone();
-                                                        sidebar_row(
-                                                            label,
-                                                            &theme,
-                                                            false,
-                                                            SharedString::from(format!(
-                                                                "recent-workspace-{recent_index}"
-                                                            )),
-                                                            cx.listener(
-                                                                move |_, _, _, cx| {
-                                                                    ws.update(
-                                                                        cx,
-                                                                        |workspace, cx| {
-                                                                            let _ = workspace
-                                                                                .open_workspace(
-                                                                                    path.clone(),
-                                                                                    cx,
-                                                                                );
-                                                                        },
-                                                                    );
-                                                                },
-                                                            ),
-                                                        )
-                                                    })
-                                                    .collect::<Vec<_>>(),
-                                            )
+                                        panel.child(section_header("Recent", &theme)).children(
+                                            recent
+                                                .workspaces
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(recent_index, path)| {
+                                                    let label = path.display().to_string();
+                                                    let path = path.clone();
+                                                    let ws = workspace_entity.clone();
+                                                    sidebar_row(
+                                                        label,
+                                                        &theme,
+                                                        false,
+                                                        SharedString::from(format!(
+                                                            "recent-workspace-{recent_index}"
+                                                        )),
+                                                        cx.listener(move |_, _, _, cx| {
+                                                            ws.update(cx, |workspace, cx| {
+                                                                let _ = workspace.open_workspace(
+                                                                    path.clone(),
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }),
+                                                    )
+                                                })
+                                                .collect::<Vec<_>>(),
+                                        )
                                     })
                             })
                     } else {
@@ -469,7 +495,14 @@ impl Render for MarkRustWindow {
                                 let ws = ws_editor_drop.clone();
                                 move |_, paths: &ExternalPaths, window, cx| {
                                     ws.update(cx, |workspace, cx| {
-                                        workspace.handle_editor_drop(paths, window, cx);
+                                        let _ = workspace.dispatch(
+                                            WorkspaceCommand::DropFiles {
+                                                paths: paths.paths().to_vec(),
+                                                target: DropTarget::Editor,
+                                            },
+                                            window,
+                                            cx,
+                                        );
                                     });
                                 }
                             }))
@@ -493,6 +526,9 @@ impl Render for MarkRustWindow {
                             .border_l_1()
                             .border_color(theme.separator)
                             .child(section_header("Outline", &theme))
+                            .when(outline_items.is_empty(), |panel| {
+                                panel.child(muted_hint("No headings in this document.", &theme))
+                            })
                             .children(outline_items.iter().map(|(offset, level, title)| {
                                 let ws = workspace_entity.clone();
                                 let offset = *offset;
@@ -502,16 +538,14 @@ impl Render for MarkRustWindow {
                                     level,
                                     &theme,
                                     SharedString::from(format!("outline-item-{offset}")),
-                                    cx.listener(move |_, _, _, cx| {
-                                        if let Some(editor) = ws
-                                            .read(cx)
-                                            .active_tab()
-                                            .map(|tab| tab.editor.clone())
-                                        {
-                                            editor.update(cx, |editor, cx| {
-                                                editor.jump_to(offset, cx);
-                                            });
-                                        }
+                                    cx.listener(move |_, _, window, cx| {
+                                        let _ = ws.update(cx, |workspace, cx| {
+                                            workspace.dispatch(
+                                                WorkspaceCommand::JumpToHeading { offset },
+                                                window,
+                                                cx,
+                                            )
+                                        });
                                     }),
                                 )
                             }))
@@ -523,7 +557,7 @@ impl Render for MarkRustWindow {
                 let tab = workspace.active_tab();
                 let path = tab
                     .and_then(|t| t.document.read(cx).path.clone())
-                    .map(|p| p.display().to_string())
+                    .map(|p| status_path_label(&p))
                     .unwrap_or_else(|| "Untitled".into());
                 let dirty = tab.map(|t| t.document.read(cx).dirty).unwrap_or(false);
                 let words = tab.map(|t| t.document.read(cx).word_count()).unwrap_or(0);
@@ -555,11 +589,7 @@ impl Render for MarkRustWindow {
                     .border_color(theme.separator)
                     .text_xs()
                     .text_color(theme.status_bar_text)
-                    .child(format!(
-                        "{}{}",
-                        path,
-                        if dirty { " — edited" } else { "" }
-                    ))
+                    .child(format!("{}{}", path, if dirty { " — edited" } else { "" }))
                     .child(format!(
                         "Ln {}, Col {}  ·  {words} words{frontmatter_label}",
                         line + 1,
@@ -626,5 +656,18 @@ impl Render for MarkRustWindow {
             } else {
                 div().hidden()
             })
+    }
+}
+
+fn status_path_label(path: &Path) -> String {
+    match (
+        path.parent().and_then(|parent| parent.file_name()),
+        path.file_name(),
+    ) {
+        (Some(dir), Some(file)) => {
+            format!("{}/{}", dir.to_string_lossy(), file.to_string_lossy())
+        }
+        (_, Some(file)) => file.to_string_lossy().into_owned(),
+        _ => path.display().to_string(),
     }
 }

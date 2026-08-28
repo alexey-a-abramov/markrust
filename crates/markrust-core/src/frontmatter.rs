@@ -43,6 +43,9 @@ pub fn parse_frontmatter(source: &str) -> Option<FrontmatterInfo> {
 }
 
 fn find_closing_fence(yaml_body: &str) -> Option<std::ops::Range<usize>> {
+    if yaml_body.starts_with("---\n") || yaml_body.starts_with("---\r\n") || yaml_body == "---" {
+        return Some(0..3);
+    }
     for (idx, _) in yaml_body.match_indices("\n---") {
         let rest = &yaml_body[idx + 1..];
         if rest.starts_with("---\n") || rest.starts_with("---\r\n") || rest == "---" {
@@ -90,5 +93,49 @@ mod tests {
     #[test]
     fn absent_frontmatter_returns_none() {
         assert!(parse_frontmatter("# No frontmatter").is_none());
+    }
+
+    #[test]
+    fn missing_closing_fence_is_invalid() {
+        assert!(parse_frontmatter("---\ntitle: X\n").is_none());
+        assert!(parse_frontmatter("---not a fence").is_none());
+        assert!(parse_frontmatter("title: X\n---\n").is_none());
+    }
+
+    #[test]
+    fn title_extraction_table() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("---\ntitle: My Doc\n---\n", Some("My Doc")),
+            ("---\ntitle: \"Quoted Title\"\n---\n", Some("Quoted Title")),
+            ("---\ntitle: 'Single'\n---\n", Some("Single")),
+            ("---\ntitle:   spaced  \n---\n", Some("spaced")),
+            ("---\nauthor: me\n---\n", None),
+            ("---\n---\n", None),
+            ("\u{feff}---\ntitle: BOM\n---\n", Some("BOM")),
+        ];
+        for &(source, expected) in cases {
+            let info = parse_frontmatter(source).unwrap();
+            assert_eq!(info.title.as_deref(), expected, "source {source:?}");
+        }
+    }
+
+    #[test]
+    fn nested_dashes_in_body_do_not_extend_frontmatter() {
+        let source = "---\ntitle: Doc\n---\n\n# Hello\n\n---\n\nStill body\n";
+        let info = parse_frontmatter(source).unwrap();
+        assert_eq!(info.title.as_deref(), Some("Doc"));
+        let body = &source[info.end_byte..];
+        assert!(body.contains("# Hello"));
+        assert!(body.contains("---"));
+        assert!(body.contains("Still body"));
+        assert!(!source[..info.end_byte].contains("Still body"));
+    }
+
+    #[test]
+    fn crlf_frontmatter() {
+        let source = "---\r\ntitle: Win\r\n---\r\n\r\n# Body";
+        let info = parse_frontmatter(source).unwrap();
+        assert_eq!(info.title.as_deref(), Some("Win"));
+        assert!(info.end_byte < source.find("# Body").unwrap());
     }
 }

@@ -21,7 +21,12 @@ fn load_window_icon() -> Option<Arc<image::RgbaImage>> {
 }
 
 pub fn run_gui() {
-    application().run(|cx: &mut App| {
+    run_gui_with_open(None);
+}
+
+/// Launch the desktop editor, optionally opening a file or workspace folder.
+pub fn run_gui_with_open(open_path: Option<PathBuf>) {
+    application().run(move |cx: &mut App| {
         let config = AppConfig::load();
         cx.bind_keys([
             KeyBinding::new("cmd-s", crate::window::Save, None),
@@ -46,8 +51,18 @@ pub fn run_gui() {
                 icon: load_window_icon(),
                 ..Default::default()
             },
-            |window, cx| {
-                let workspace = cx.new(|cx| Workspace::new(config, window, cx));
+            move |window, cx| {
+                let config = config.clone();
+                let open_path = open_path.clone();
+                let workspace = cx.new(|cx| {
+                    let mut workspace = Workspace::new(config, window, cx);
+                    if let Some(path) = open_path {
+                        if let Err(error) = workspace.open_launch_path(path, window, cx) {
+                            eprintln!("Failed to open path: {error}");
+                        }
+                    }
+                    workspace
+                });
                 cx.new(|cx| MarkRustWindow::new(workspace, cx))
             },
         )

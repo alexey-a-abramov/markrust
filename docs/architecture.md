@@ -7,11 +7,31 @@ MarkRust uses a decoupled reactive pipeline: input mutates a rope-backed buffer,
 | Crate | Responsibility | GUI deps |
 |---|---|---|
 | `markrust-core` | Buffer, undo, line index, tree-sitter spans, revision tokens | None |
-| `markrust-editor` | Delimiter masking, future layout + GPU paint hooks | None |
-| `markrust-app` | GPUI window, file tree, palette, workspace chrome | GPUI (Zed git pin) |
-| `markrust` | CLI and desktop binary entry point | Optional |
+| `markrust-editor` | `HeadlessEditor` + masking/layout; GPUI `MarkdownEditor` adapter | GPUI (view only) |
+| `markrust-app` | `HeadlessWorkspace` session + GPUI window chrome | GPUI (Zed git pin) |
+| `markrust` | CLI (`parse_args` / `run`) and desktop binary | GUI only for `--gui` |
 
-**Rule:** `markrust-core` and `markrust-editor` must remain free of GPUI so the engine is embeddable and testable headlessly.
+**Rule:** `HeadlessEditor` (`markrust-editor::headless`) and `HeadlessWorkspace` (`markrust-app::session`) must not use GPUI types. The GPUI window maps keys/clicks to `WorkspaceCommand` / `EditorCommand`.
+
+## Headless command layer
+
+```
+GPUI window / CLI
+        ↓  WorkspaceCommand / EditorCommand
+HeadlessWorkspace (tabs, drop routing, autosave clock, export)
+        ↓  EditorCommand
+HeadlessEditor (Document + caret/selection)
+        ↓
+compute_visibility / build_display_layout / export HTML
+```
+
+- `EditorCommand`: insert, backspace, delete, move/select caret, undo/redo, jump.
+- `WorkspaceCommand`: save/open/export, drop files, theme, tabs, heading jump, `AdvanceTime` (fake clock), external-change reload.
+- Drop classification stays pure in `drop.rs`.
+- File-watcher reload policy is `reload_decision` (skip dirty tabs).
+
+Unit tests live next to the modules. Headless e2e lives in `crates/markrust-app/tests/e2e.rs` (no window). CLI e2e lives in `crates/markrust/tests/e2e.rs` (`assert_cmd`, never empty args / `--gui`).
+
 
 ## Data flow
 

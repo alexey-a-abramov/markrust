@@ -5,10 +5,20 @@
 use ropey::Rope;
 
 /// Maps byte offsets to line/column positions and back.
-#[derive(Debug, Clone, Default)]
+///
+/// Columns are **byte** offsets from the start of the line so that
+/// [`Self::line_col_of_offset`] and [`Self::offset_of_line_col`] round-trip
+/// for every byte in the document (including UTF-8 and `\r\n`).
+#[derive(Debug, Clone)]
 pub struct LineIndex {
     /// Byte offset of the start of each line (always includes 0).
     line_starts: Vec<usize>,
+}
+
+impl Default for LineIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LineIndex {
@@ -47,23 +57,31 @@ impl LineIndex {
         (line, offset.saturating_sub(line_start))
     }
 
+    /// Convert `(line, col)` to a byte offset.
+    ///
+    /// `col` is a byte offset from the start of `line`, matching
+    /// [`Self::line_col_of_offset`]. Out-of-range values are clamped to the
+    /// line (the newline byte for interior lines, or `rope.len_bytes()` for the
+    /// last line).
     pub fn offset_of_line_col(&self, line: usize, col: usize, rope: &Rope) -> usize {
-        let line_start = self.line_starts.get(line).copied().unwrap_or(0);
-        let char_idx = rope.byte_to_char(line_start);
-        let line_end_char = if line + 1 < self.line_starts.len() {
-            rope.byte_to_char(self.line_starts[line + 1])
-        } else {
-            rope.len_chars()
-        };
-        let target_char = (char_idx + col).min(line_end_char.saturating_sub(1).max(char_idx));
-        rope.char_to_byte(target_char)
+        let doc_len = rope.len_bytes();
+        if self.line_starts.is_empty() {
+            return 0;
+        }
+        let line = line.min(self.line_starts.len() - 1);
+        let line_start = self.line_starts[line];
+        let max_offset = self
+            .line_starts
+            .get(line + 1)
+            .map_or(doc_len, |next| next.saturating_sub(1));
+        line_start.saturating_add(col).min(max_offset)
     }
 
     pub fn on_insert(&mut self, byte_offset: usize, text: &str) {
         let newline_count = text.bytes().filter(|&b| b == b'\n').count();
         if newline_count == 0 {
             for start in &mut self.line_starts {
-                if *start >= byte_offset {
+                if *start > byte_offset {
                     *start += text.len();
                 }
             }
@@ -138,5 +156,123 @@ mod tests {
         let mut index = LineIndex::from_rope(&Rope::from_str("ab\ncd"));
         index.on_delete(2, 3);
         assert_eq!(index.line_starts, vec![0]);
+    }
+
+    fn assert_round_trip(text: &str) {
+        let rope = Rope::from_str(text);
+        let index = LineIndex::from_rope(&rope);
+        let len = rope.len_bytes();
+        for byte in 0..=len {
+            let (line, col) = index.line_col_of_offset(byte, len);
+            let back = index.offset_of_line_col(line, col, &rope);
+            assert_eq!(back, byte, "round-trip failed at byte {byte} in {text:?}");
+        }
+    }
+
+    fn assert_matches_rebuild(index: &LineIndex, rope: &Rope) {
+        let rebuilt = LineIndex::from_rope(rope);
+        assert_eq!(index.line_starts(), rebuilt.line_starts());
+    }
+
+    #[test]
+    fn empty_file_is_a_single_line() {
+        let rope = Rope::from_str("");
+        let index = LineIndex::from_rope(&rope);
+        assert_eq!(index.line_count(), 1);
+        assert_eq!(index.line_starts(), &[0]);
+        assert_eq!(index.line_col_of_offset(0, 0), (0, 0));
+        assert_eq!(index.offset_of_line_col(0, 0, &rope), 0);
+        assert_eq!(LineIndex::default().line_starts(), &[0]);
+        assert_round_trip("");
+    }
+
+    #[test]
+    fn trailing_newline_adds_empty_last_line() {
+        let rope = Rope::from_str("abc\n");
+        let index = LineIndex::from_rope(&rope);
+        assert_eq!(index.line_count(), 2);
+        assert_eq!(index.line_starts(), &[0, 4]);
+        assert_eq!(index.line_col_of_offset(4, rope.len_bytes()), (1, 0));
+        assert_round_trip("abc\n");
+        assert_round_trip("abc\n\n");
+    }
+
+    #[test]
+    fn last_line_without_newline() {
+        let rope = Rope::from_str("abc\ndef");
+        let index = LineIndex::from_rope(&rope);
+        assert_eq!(index.line_count(), 2);
+        assert_eq!(index.line_col_of_offset(7, rope.len_bytes()), (1, 3));
+        assert_eq!(index.offset_of_line_col(1, 3, &rope), 7);
+        assert_round_trip("abc\ndef");
+    }
+
+    #[test]
+    fn crlf_splits_on_lf_only() {
+        let text = "ab\r\ncd";
+        let rope = Rope::from_str(text);
+        let index = LineIndex::from_rope(&rope);
+        assert_eq!(index.line_starts(), &[0, 4]);
+        assert_eq!(index.line_col_of_offset(2, rope.len_bytes()), (0, 2));
+        assert_eq!(index.line_col_of_offset(3, rope.len_bytes()), (0, 3));
+        assert_eq!(index.line_col_of_offset(4, rope.len_bytes()), (1, 0));
+        assert_round_trip(text);
+    }
+
+    #[test]
+    fn utf8_columns_are_byte_offsets() {
+        let text = "👋\n你好";
+        let rope = Rope::from_str(text);
+        let index = LineIndex::from_rope(&rope);
+        assert_eq!(index.line_starts(), &[0, 5]);
+        assert_eq!(index.line_col_of_offset(0, rope.len_bytes()), (0, 0));
+        assert_eq!(index.offset_of_line_col(1, 3, &rope), 8);
+        assert_round_trip(text);
+    }
+
+    #[test]
+    fn offset_of_line_col_clamps() {
+        let rope = Rope::from_str("ab\ncd");
+        let index = LineIndex::from_rope(&rope);
+        assert_eq!(index.offset_of_line_col(0, 99, &rope), 2);
+        assert_eq!(index.offset_of_line_col(1, 99, &rope), 5);
+        assert_eq!(index.offset_of_line_col(9, 0, &rope), 3);
+    }
+
+    #[test]
+    fn incremental_edits_match_rebuild() {
+        let mut rope = Rope::from_str("ab");
+        let mut index = LineIndex::from_rope(&rope);
+        index.on_insert(2, "\ncd\n");
+        rope.insert(2, "\ncd\n");
+        assert_matches_rebuild(&index, &rope);
+
+        index.on_insert(0, "xy");
+        rope.insert(0, "xy");
+        assert_matches_rebuild(&index, &rope);
+
+        index.on_delete(2, 5);
+        rope.remove(2..5);
+        assert_matches_rebuild(&index, &rope);
+        assert_round_trip(&rope.to_string());
+    }
+
+    #[test]
+    fn line_col_byte_round_trip_table() {
+        for text in [
+            "",
+            "a",
+            "abc",
+            "abc\n",
+            "abc\ndef",
+            "abc\ndef\n",
+            "\n",
+            "\n\n",
+            "ab\r\ncd\r\n",
+            "👋你好\n世界",
+            "a\nb\nc",
+        ] {
+            assert_round_trip(text);
+        }
     }
 }

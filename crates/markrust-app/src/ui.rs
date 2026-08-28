@@ -64,7 +64,9 @@ pub fn sidebar_row(
             theme.sidebar_text
         })
         .when(selected, |row| row.bg(theme.sidebar_selected))
-        .when(!selected, |row| row.hover(move |s| s.bg(theme.sidebar_hover)))
+        .when(!selected, |row| {
+            row.hover(move |s| s.bg(theme.sidebar_hover))
+        })
         .child(label.into())
         .on_click(on_click)
 }
@@ -145,6 +147,16 @@ pub fn document_tab(
                 .on_click(on_close),
         )
         .on_click(on_click)
+}
+
+/// Secondary hint used in empty sidebar/outline panels.
+pub fn muted_hint(text: impl Into<SharedString>, theme: &EditorTheme) -> impl IntoElement {
+    div()
+        .px_3()
+        .py_2()
+        .text_sm()
+        .text_color(theme.secondary_text)
+        .child(text.into())
 }
 
 /// Welcome panel shown when no workspace folder is open.
