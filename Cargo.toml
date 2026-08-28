@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/markrust-core",
+    "crates/markrust-editor",
+    "crates/markrust-app",
+    "crates/markrust",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+rust-version = "1.96"
+authors = ["Alexey Abramov"]
+repository = "https://github.com/alexey-a-abramov/markrust"
+homepage = "https://github.com/alexey-a-abramov/markrust"
+description = "Fast native Markdown workspace for developers"
+
+[workspace.dependencies]
+ropey = "1.6"
+tree-sitter = "0.26"
+tree-sitter-md = { version = "0.5.3", features = ["parser"] }
+rayon = "1.10"
+thiserror = "2.0"
+
+# Pin GPUI to a specific Zed git revision (update deliberately).
+gpui-rev = "8166e3d7b8b42d8aaf4d4dee7fcd25ab4ec65105"
+
+[profile.release]
+lto = true
+codegen-units = 1

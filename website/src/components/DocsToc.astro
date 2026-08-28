@@ -1,0 +1,86 @@
+---
+interface Props {
+  headings: { id: string; text: string; level: number }[];
+}
+
+const { headings } = Astro.props;
+---
+
+{headings.length > 0 && (
+  <nav class="toc">
+    <p class="toc__label">On this page</p>
+    <ol class="toc__list">
+      {headings.map((h) => (
+        <li class={`toc__item toc__item--${h.level}`}>
+          <a href={`#${h.id}`}>{h.text}</a>
+        </li>
+      ))}
+    </ol>
+  </nav>
+)}
+
+<style>
+  .toc__label {
+    margin: 0 0 var(--space-3);
+    font-family: var(--font-mono);
+    font-size: 0.625rem;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--color-ink-faint);
+  }
+
+  .toc__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .toc__item a {
+    display: block;
+    padding: 0.25rem 0;
+    font-size: 0.75rem;
+    color: var(--color-ink-faint);
+    text-decoration: none;
+  }
+
+  .toc__item a:hover {
+    color: var(--color-ink);
+  }
+
+  .toc__item--3 {
+    padding-left: var(--space-3);
+  }
+</style>
+
+<script>
+  const links = document.querySelectorAll('.toc__list a');
+  const sections = [...links].map((a) => {
+    const id = a.getAttribute('href')?.slice(1);
+    return id ? document.getElementById(id) : null;
+  }).filter(Boolean);
+
+  if (sections.length && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            const id = entry.target.id;
+            links.forEach((link) => {
+              link.classList.toggle('is-active', link.getAttribute('href') === `#${id}`);
+            });
+          }
+        });
+      },
+      { rootMargin: '-20% 0px -70% 0px', threshold: 0 }
+    );
+    sections.forEach((s) => observer.observe(s!));
+  }
+</script>
+
+<style is:global>
+  .toc__list a.is-active {
+    color: var(--color-rust);
+    font-weight: 500;
+  }
+</style>

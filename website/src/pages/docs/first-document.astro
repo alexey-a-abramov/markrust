@@ -1,0 +1,20 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+---
+
+<DocsLayout title="First document">
+  <p>Launch MarkRust. You will see an empty window with options to open a folder or create a document.</p>
+
+  <h2>Create a new document</h2>
+  <p>Press <kbd>Cmd</kbd>+<kbd>N</kbd> (macOS) or <kbd>Ctrl</kbd>+<kbd>N</kbd> (Linux) to create an untitled document.</p>
+  <p>Save with <kbd>Cmd</kbd>+<kbd>S</kbd> to choose a path. MarkRust writes plain UTF-8 Markdown.</p>
+
+  <h2>Open an existing file</h2>
+  <p>Press <kbd>Cmd</kbd>+<kbd>O</kbd> to open a single <code>.md</code> file, or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd> to open a folder as a workspace.</p>
+
+  <h2>Write Markdown</h2>
+  <p>Type normally. Headings, lists, bold, italic, links, and code fences render inline. Move your cursor into formatted text to reveal the raw syntax markers.</p>
+
+  <h2>Autosave</h2>
+  <p>MarkRust autosaves after a short debounce (default 1 second). The tab shows a dot when the document has unsaved changes.</p>
+</DocsLayout>

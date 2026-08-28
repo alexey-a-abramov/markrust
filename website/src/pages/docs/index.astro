@@ -1,0 +1,37 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import Callout from '../../components/Callout.astro';
+---
+
+<DocsLayout title="Introduction">
+  <p>
+    MarkRust is a fast, local-first Markdown editor for developers and technical writers.
+    It reads and writes ordinary <code>.md</code> files on disk — no proprietary document format,
+    no account, no cloud requirement.
+  </p>
+
+  <h2 id="what-it-is">What it is</h2>
+  <p>
+    MarkRust renders Markdown inline as you write. Syntax delimiters hide when your cursor
+    moves away; formatting appears as styled text. The file on disk remains plain Markdown.
+  </p>
+
+  <h2 id="what-it-is-not">What it is not</h2>
+  <ul>
+    <li>Not a full IDE or code project manager</li>
+    <li>Not a note vault with proprietary sync</li>
+    <li>Not a paid editor with feature gating</li>
+    <li>Not an AI-first product — it is an editor first</li>
+  </ul>
+
+  <Callout type="tip">
+    <p>Open a folder. Edit Markdown. Keep the files. That is the entire workflow.</p>
+  </Callout>
+
+  <h2 id="next-steps">Next steps</h2>
+  <ul>
+    <li><a href="/docs/install">Install MarkRust</a></li>
+    <li><a href="/docs/first-document">Create your first document</a></li>
+    <li><a href="/docs/shortcuts">Learn keyboard shortcuts</a></li>
+  </ul>
+</DocsLayout>

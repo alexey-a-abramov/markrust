@@ -1,0 +1,84 @@
+:root {
+  --color-paper: #f7f6f3;
+  --color-paper-warm: #faf9f6;
+  --color-ink: #1a1a18;
+  --color-ink-muted: #5c5c56;
+  --color-ink-faint: #8a8a82;
+  --color-rule: #d4d3ce;
+  --color-rule-strong: #b8b7b0;
+  --color-rust: #a85a32;
+  --color-rust-hover: #8f4a28;
+  --color-rust-subtle: rgba(168, 90, 50, 0.12);
+  --color-surface: #ffffff;
+  --color-surface-raised: #efeeea;
+  --color-code-bg: #eceae4;
+  --color-code-border: #d8d6d0;
+  --color-selection: rgba(168, 90, 50, 0.18);
+  --color-focus: #a85a32;
+
+  --font-sans: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
+  --font-serif: 'Source Serif 4', Georgia, 'Times New Roman', serif;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-8: 3rem;
+  --space-10: 4rem;
+  --space-12: 6rem;
+
+  --radius-sm: 2px;
+  --radius-md: 4px;
+
+  --max-content: 42rem;
+  --max-wide: 72rem;
+  --header-h: 3.25rem;
+
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  --color-paper: #141412;
+  --color-paper-warm: #181816;
+  --color-ink: #e8e6e1;
+  --color-ink-muted: #9a9890;
+  --color-ink-faint: #6e6c66;
+  --color-rule: #2e2e2a;
+  --color-rule-strong: #3a3a36;
+  --color-rust: #c4704a;
+  --color-rust-hover: #d4845c;
+  --color-rust-subtle: rgba(196, 112, 74, 0.14);
+  --color-surface: #1c1c1a;
+  --color-surface-raised: #242422;
+  --color-code-bg: #1e1e1c;
+  --color-code-border: #333330;
+  --color-selection: rgba(196, 112, 74, 0.22);
+  --color-focus: #c4704a;
+
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --color-paper: #141412;
+    --color-paper-warm: #181816;
+    --color-ink: #e8e6e1;
+    --color-ink-muted: #9a9890;
+    --color-ink-faint: #6e6c66;
+    --color-rule: #2e2e2a;
+    --color-rule-strong: #3a3a36;
+    --color-rust: #c4704a;
+    --color-rust-hover: #d4845c;
+    --color-rust-subtle: rgba(196, 112, 74, 0.14);
+    --color-surface: #1c1c1a;
+    --color-surface-raised: #242422;
+    --color-code-bg: #1e1e1c;
+    --color-code-border: #333330;
+    --color-selection: rgba(196, 112, 74, 0.22);
+    --color-focus: #c4704a;
+    color-scheme: dark;
+  }
+}

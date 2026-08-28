@@ -1,0 +1,41 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+import Callout from '../../components/Callout.astro';
+
+const headings = [
+  { id: 'requirements', text: 'Requirements', level: 2 },
+  { id: 'releases', text: 'GitHub Releases', level: 2 },
+  { id: 'homebrew', text: 'Homebrew', level: 2 },
+  { id: 'cargo', text: 'Cargo', level: 2 },
+  { id: 'build', text: 'Build from source', level: 2 },
+];
+---
+
+<DocsLayout title="Installation" headings={headings}>
+  <h2 id="requirements">Requirements</h2>
+  <ul>
+    <li><strong>macOS</strong> 12+ (Apple Silicon or Intel)</li>
+    <li><strong>Linux</strong> x86_64 with GPUI system libraries</li>
+    <li><strong>Windows</strong> — planned for v0.2</li>
+    <li><strong>Rust 1.96+</strong> when building from source</li>
+  </ul>
+
+  <h2 id="releases">GitHub Releases</h2>
+  <p>Download a prebuilt binary from the <a href="https://github.com/alexey-a-abramov/markrust/releases/latest">latest release</a>:</p>
+  <CodeBlock code={`tar xzf markrust-macos-aarch64.tar.gz\ninstall -m 755 markrust ~/.local/bin/`} terminal />
+
+  <h2 id="homebrew">Homebrew</h2>
+  <CodeBlock code={`brew tap alexey-a-abramov/markrust\nbrew install markrust`} terminal />
+
+  <h2 id="cargo">Cargo</h2>
+  <p>The desktop binary depends on GPUI from a pinned git revision:</p>
+  <CodeBlock code="cargo install --git https://github.com/alexey-a-abramov/markrust markrust" terminal />
+  <Callout type="note">
+    <p>Once GPUI is available on crates.io, <code>cargo install markrust</code> will work without the git URL.</p>
+  </Callout>
+
+  <h2 id="build">Build from source</h2>
+  <CodeBlock code={`git clone https://github.com/alexey-a-abramov/markrust.git\ncd markrust\ncargo build --release -p markrust\n./target/release/markrust`} terminal />
+  <p>On Linux, install GPUI dependencies first: <code>bash scripts/install-linux-deps.sh</code></p>
+</DocsLayout>

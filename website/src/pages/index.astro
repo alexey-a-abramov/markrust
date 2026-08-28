@@ -1,0 +1,580 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+import AppMockup from '../components/AppMockup.astro';
+import CodeBlock from '../components/CodeBlock.astro';
+---
+
+<BaseLayout
+  title="MarkRust"
+  description="Markdown, without the machinery. A fast, local-first Markdown editor. Free and open source."
+>
+  <Header />
+  <main>
+    <!-- Hero -->
+    <section class="hero section">
+      <div class="hero__grid container">
+        <div class="hero__copy">
+          <p class="label">markrust · v0.1.0</p>
+          <h1 class="hero__title">
+            <span class="hero__wordmark">MarkRust</span>
+          </h1>
+          <p class="hero__tagline">
+            Markdown,<br />
+            <em>without the machinery.</em>
+          </p>
+          <p class="hero__desc">
+            A fast, local-first Markdown editor.<br />
+            Free and open source. Your files stay files.
+          </p>
+          <div class="hero__actions">
+            <a href="#download" class="btn btn--primary">Download MarkRust</a>
+            <a href="https://github.com/alexey-a-abramov/markrust" class="btn btn--secondary" target="_blank" rel="noopener noreferrer">View source</a>
+          </div>
+          <div class="hero__install">
+            <CodeBlock code="cargo install --git https://github.com/alexey-a-abramov/markrust markrust" terminal />
+          </div>
+        </div>
+        <div class="hero__visual">
+          <AppMockup />
+        </div>
+      </div>
+    </section>
+
+    <hr class="rule container" />
+
+    <!-- Principles -->
+    <section class="principles section" id="principles">
+      <div class="container">
+        <p class="label">Principles</p>
+        <div class="principles__list">
+          <article class="principle">
+            <p class="principle__num">01</p>
+            <h2>Your files are the product.</h2>
+            <p>MarkRust reads and writes ordinary Markdown. No proprietary document database.</p>
+          </article>
+          <article class="principle">
+            <p class="principle__num">02</p>
+            <h2>Fast means fast.</h2>
+            <p>Launch quickly, handle large documents smoothly, stay out of the way.</p>
+          </article>
+          <article class="principle">
+            <p class="principle__num">03</p>
+            <h2>Local first.</h2>
+            <p>No account required. No connection required.</p>
+          </article>
+          <article class="principle">
+            <p class="principle__num">04</p>
+            <h2>Free forever.</h2>
+            <p>The editor is open source and the core product is not a trial for something else.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <hr class="rule container" />
+
+    <!-- Features -->
+    <section class="features section" id="features">
+      <div class="container">
+        <div class="features__header">
+          <p class="label">Capabilities</p>
+          <h2>What MarkRust does</h2>
+        </div>
+        <div class="features__grid">
+          <div class="feature-demo">
+            <div class="feature-demo__md">
+              <pre><code># Roadmap
+
+- [x] Markdown parser
+- [x] Workspace
+- [ ] World domination
+
+| Feature | Status |
+|---------|--------|
+| Tables  | done   |</code></pre>
+            </div>
+            <div class="feature-demo__render">
+              <p class="render-h1">Roadmap</p>
+              <p><span class="check">☑</span> Markdown parser</p>
+              <p><span class="check">☑</span> Workspace</p>
+              <p><span class="box">☐</span> World domination</p>
+            </div>
+          </div>
+          <ul class="features__list">
+            <li>Write</li>
+            <li>Preview inline</li>
+            <li>Navigate outline</li>
+            <li>Search in document</li>
+            <li>Organize workspaces</li>
+            <li>Git-friendly plain files</li>
+            <li>YAML frontmatter</li>
+            <li>GFM tables</li>
+            <li>Task lists</li>
+            <li>Fenced code blocks</li>
+            <li>Keyboard navigation</li>
+            <li>Command palette</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <hr class="rule container" />
+
+    <!-- Comparison -->
+    <section class="compare section">
+      <div class="container">
+        <p class="label">Position</p>
+        <h2>Why MarkRust</h2>
+        <div class="compare__table-wrap">
+          <table class="compare__table">
+            <thead>
+              <tr>
+                <th></th>
+                <th>Text editor</th>
+                <th>Developer IDE</th>
+                <th>MarkRust</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Markdown rendering</td>
+                <td>None</td>
+                <td>Extension</td>
+                <td>Native</td>
+              </tr>
+              <tr>
+                <td>Startup weight</td>
+                <td>Light</td>
+                <td>Heavy</td>
+                <td>Light</td>
+              </tr>
+              <tr>
+                <td>File format</td>
+                <td>Plain text</td>
+                <td>Plain text</td>
+                <td>Plain .md</td>
+              </tr>
+              <tr>
+                <td>Focus</td>
+                <td>Everything</td>
+                <td>Code projects</td>
+                <td>Documents</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="compare__note">
+          MarkRust occupies the space between an overly simplistic editor and an entire IDE.
+          Built for READMEs, specs, agent prompts, and technical documentation.
+        </p>
+      </div>
+    </section>
+
+    <hr class="rule container" />
+
+    <!-- Open source -->
+    <section class="opensource section">
+      <div class="container opensource__grid">
+        <div>
+          <p class="label">License</p>
+          <h2>Free means free.</h2>
+          <p>
+            MarkRust is open source and intended to remain free forever.
+            There is no account requirement, document lock-in, or "Pro editor"
+            waiting behind the download button.
+          </p>
+          <ul class="opensource__meta">
+            <li><strong>MPL-2.0</strong></li>
+            <li><a href="https://github.com/alexey-a-abramov/markrust">GitHub repository</a></li>
+            <li><a href="/docs/contributing">Contribution guide</a></li>
+          </ul>
+        </div>
+        <div class="opensource__tree">
+          <pre><code>markrust/
+├── crates/
+│   ├── markrust-core/
+│   ├── markrust-editor/
+│   └── markrust-app/
+├── LICENSE-MPL-2.0
+└── README.md</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <hr class="rule container" />
+
+    <!-- Future -->
+    <section class="future section section--tight">
+      <div class="container container--narrow">
+        <p class="label">Extensibility</p>
+        <p class="future__text">
+          Markdown is becoming an interface between humans and machines.
+          MarkRust intends to remain a very good editor while making those
+          workflows safer and easier.
+        </p>
+        <p class="future__items">
+          Future directions: Git integration · document history · extensions · MCP · agent-aware workspaces
+        </p>
+      </div>
+    </section>
+
+    <hr class="rule container" />
+
+    <!-- Download -->
+    <section class="download section" id="download">
+      <div class="container">
+        <p class="label">Release</p>
+        <h2>Download</h2>
+        <div class="download__grid">
+          <div class="download__platform">
+            <h3>macOS</h3>
+            <p class="download__arch">aarch64 · x86_64</p>
+            <a href="https://github.com/alexey-a-abramov/markrust/releases/latest" class="btn btn--secondary">GitHub Releases</a>
+          </div>
+          <div class="download__platform">
+            <h3>Linux</h3>
+            <p class="download__arch">x86_64</p>
+            <a href="https://github.com/alexey-a-abramov/markrust/releases/latest" class="btn btn--secondary">GitHub Releases</a>
+          </div>
+          <div class="download__platform">
+            <h3>Windows</h3>
+            <p class="download__arch">planned v0.2</p>
+            <span class="download__soon">Not yet available</span>
+          </div>
+        </div>
+        <div class="download__install">
+          <h3>Install via package manager</h3>
+          <CodeBlock code={`brew tap alexey-a-abramov/markrust\nbrew install markrust`} terminal />
+          <CodeBlock code="cargo install --git https://github.com/alexey-a-abramov/markrust markrust" terminal />
+        </div>
+        <p class="download__meta">
+          Requires Rust 1.96+ for building from source. Version 0.1.0.
+        </p>
+      </div>
+    </section>
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .hero__grid {
+    display: grid;
+    grid-template-columns: 1fr 1.1fr;
+    gap: var(--space-10);
+    align-items: center;
+  }
+
+  .hero__title {
+    margin: var(--space-3) 0 var(--space-4);
+  }
+
+  .hero__wordmark {
+    font-family: var(--font-mono);
+    font-size: clamp(2rem, 4vw, 2.75rem);
+    font-weight: 500;
+    letter-spacing: -0.04em;
+  }
+
+  .hero__tagline {
+    margin: 0 0 var(--space-5);
+    font-family: var(--font-serif);
+    font-size: clamp(1.75rem, 3.5vw, 2.5rem);
+    font-weight: 400;
+    font-style: normal;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+  }
+
+  .hero__tagline em {
+    font-style: italic;
+    color: var(--color-ink-muted);
+  }
+
+  .hero__desc {
+    margin: 0 0 var(--space-6);
+    color: var(--color-ink-muted);
+    font-size: 1rem;
+    line-height: 1.6;
+  }
+
+  .hero__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    margin-bottom: var(--space-6);
+  }
+
+  .hero__install :global(.code-block) {
+    margin: 0;
+  }
+
+  .principles__list {
+    display: grid;
+    gap: var(--space-8);
+    margin-top: var(--space-6);
+  }
+
+  .principle {
+    display: grid;
+    grid-template-columns: 3rem 1fr;
+    gap: var(--space-4) var(--space-6);
+    padding-bottom: var(--space-6);
+    border-bottom: 1px solid var(--color-rule);
+  }
+
+  .principle:last-child {
+    border-bottom: 0;
+    padding-bottom: 0;
+  }
+
+  .principle__num {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    color: var(--color-rust);
+  }
+
+  .principle h2 {
+    margin: 0 0 var(--space-2);
+    font-size: 1.25rem;
+  }
+
+  .principle p {
+    margin: 0;
+    color: var(--color-ink-muted);
+    max-width: 36rem;
+  }
+
+  .features__header h2 {
+    margin: var(--space-3) 0 0;
+    font-size: 1.5rem;
+  }
+
+  .features__grid {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: var(--space-8);
+    margin-top: var(--space-8);
+    align-items: start;
+  }
+
+  .feature-demo {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    border: 1px solid var(--color-rule);
+    background: var(--color-surface);
+  }
+
+  .feature-demo__md,
+  .feature-demo__render {
+    padding: var(--space-4);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    line-height: 1.55;
+  }
+
+  .feature-demo__md {
+    border-right: 1px solid var(--color-rule);
+    background: var(--color-code-bg);
+    color: var(--color-ink-muted);
+  }
+
+  .feature-demo__md pre {
+    margin: 0;
+    white-space: pre-wrap;
+  }
+
+  .feature-demo__render .render-h1 {
+    font-weight: 600;
+    font-size: 0.875rem;
+    margin: 0 0 0.5rem;
+  }
+
+  .feature-demo__render p {
+    margin: 0 0 0.25rem;
+  }
+
+  .feature-demo__render .check {
+    color: var(--color-rust);
+  }
+
+  .features__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    columns: 2;
+    column-gap: var(--space-6);
+  }
+
+  .features__list li {
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--color-rule);
+    font-size: 0.9375rem;
+    break-inside: avoid;
+  }
+
+  .compare h2 {
+    margin: var(--space-3) 0 var(--space-6);
+    font-size: 1.5rem;
+  }
+
+  .compare__table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+  }
+
+  .compare__table th,
+  .compare__table td {
+    padding: var(--space-3);
+    border: 1px solid var(--color-rule);
+    text-align: left;
+  }
+
+  .compare__table th {
+    font-weight: 600;
+    background: var(--color-surface-raised);
+  }
+
+  .compare__table td:last-child {
+    font-weight: 500;
+  }
+
+  .compare__note {
+    margin-top: var(--space-5);
+    color: var(--color-ink-muted);
+    max-width: 36rem;
+  }
+
+  .opensource__grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-10);
+    align-items: start;
+  }
+
+  .opensource h2 {
+    margin: var(--space-3) 0 var(--space-4);
+    font-size: 1.5rem;
+  }
+
+  .opensource p {
+    color: var(--color-ink-muted);
+    max-width: 32rem;
+  }
+
+  .opensource__meta {
+    list-style: none;
+    margin: var(--space-5) 0 0;
+    padding: 0;
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+  }
+
+  .opensource__meta li {
+    margin-bottom: var(--space-2);
+  }
+
+  .opensource__tree pre {
+    margin: 0;
+    padding: var(--space-4);
+    font-size: 0.75rem;
+    line-height: 1.5;
+    background: var(--color-code-bg);
+    border: 1px solid var(--color-code-border);
+    overflow-x: auto;
+  }
+
+  .future__text {
+    font-size: 1.0625rem;
+    line-height: 1.65;
+    color: var(--color-ink-muted);
+    margin: var(--space-4) 0;
+  }
+
+  .future__items {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--color-ink-faint);
+    margin: 0;
+  }
+
+  .download h2 {
+    margin: var(--space-3) 0 var(--space-6);
+    font-size: 1.5rem;
+  }
+
+  .download__grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--space-4);
+    margin-bottom: var(--space-8);
+  }
+
+  .download__platform {
+    padding: var(--space-5);
+    border: 1px solid var(--color-rule);
+    background: var(--color-surface);
+  }
+
+  .download__platform h3 {
+    margin: 0 0 var(--space-2);
+    font-size: 1rem;
+  }
+
+  .download__arch {
+    margin: 0 0 var(--space-4);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--color-ink-faint);
+  }
+
+  .download__soon {
+    font-size: 0.8125rem;
+    color: var(--color-ink-faint);
+  }
+
+  .download__install h3 {
+    margin: 0 0 var(--space-4);
+    font-size: 0.9375rem;
+    font-weight: 600;
+  }
+
+  .download__meta {
+    margin-top: var(--space-5);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--color-ink-faint);
+  }
+
+  @media (max-width: 900px) {
+    .hero__grid,
+    .features__grid,
+    .opensource__grid {
+      grid-template-columns: 1fr;
+    }
+
+    .hero__visual {
+      order: -1;
+    }
+
+    .feature-demo {
+      grid-template-columns: 1fr;
+    }
+
+    .feature-demo__md {
+      border-right: 0;
+      border-bottom: 1px solid var(--color-rule);
+    }
+
+    .download__grid {
+      grid-template-columns: 1fr;
+    }
+
+    .features__list {
+      columns: 1;
+    }
+  }
+</style>

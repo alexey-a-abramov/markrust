@@ -1,0 +1,244 @@
+<div class="app-mockup" role="img" aria-label="MarkRust application showing file tree, editor, and document outline">
+  <div class="app-mockup__chrome">
+    <div class="app-mockup__titlebar">
+      <span class="app-mockup__dots" aria-hidden="true">
+        <i></i><i></i><i></i>
+      </span>
+      <span class="app-mockup__title">MarkRust — README.md</span>
+    </div>
+    <div class="app-mockup__body">
+      <aside class="app-mockup__sidebar">
+        <p class="app-mockup__sidebar-label">workspace</p>
+        <ul>
+          <li class="is-active">README.md</li>
+          <li>docs/</li>
+          <li class="indent">install.md</li>
+          <li class="indent">markdown.md</li>
+          <li>src/</li>
+          <li>LICENSE-MPL-2.0</li>
+        </ul>
+      </aside>
+      <main class="app-mockup__editor">
+        <div class="app-mockup__line"><span class="h1">MarkRust</span></div>
+        <div class="app-mockup__line muted">A fast, local-first Markdown editor.</div>
+        <div class="app-mockup__line">&nbsp;</div>
+        <div class="app-mockup__line"><span class="h2">Principles</span></div>
+        <div class="app-mockup__line">Your files are the product. No proprietary database.</div>
+        <div class="app-mockup__line">&nbsp;</div>
+        <div class="app-mockup__line"><span class="h2">Roadmap</span></div>
+        <div class="app-mockup__line"><span class="task done">☑</span> Markdown parser</div>
+        <div class="app-mockup__line"><span class="task done">☑</span> Workspace</div>
+        <div class="app-mockup__line"><span class="task">☐</span> World domination</div>
+        <div class="app-mockup__line">&nbsp;</div>
+        <div class="app-mockup__line"><span class="code">cargo install markrust</span></div>
+        <div class="app-mockup__cursor" aria-hidden="true"></div>
+      </main>
+      <aside class="app-mockup__outline">
+        <p class="app-mockup__sidebar-label">outline</p>
+        <ul>
+          <li class="is-active">MarkRust</li>
+          <li class="indent">Principles</li>
+          <li class="indent">Roadmap</li>
+        </ul>
+      </aside>
+    </div>
+    <div class="app-mockup__status">
+      <span>README.md</span>
+      <span>142 words</span>
+      <span>Ln 12, Col 4</span>
+    </div>
+  </div>
+</div>
+
+<style>
+  .app-mockup {
+    width: 100%;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    line-height: 1.5;
+  }
+
+  .app-mockup__chrome {
+    border: 1px solid var(--color-rule-strong);
+    background: var(--color-surface);
+    box-shadow: 0 1px 0 var(--color-rule), 0 24px 48px rgba(0, 0, 0, 0.06);
+  }
+
+  [data-theme='dark'] .app-mockup__chrome,
+  :root:not([data-theme='light']) .app-mockup__chrome {
+    box-shadow: 0 1px 0 var(--color-rule), 0 24px 48px rgba(0, 0, 0, 0.35);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme='light']) .app-mockup__chrome {
+      box-shadow: 0 1px 0 var(--color-rule), 0 24px 48px rgba(0, 0, 0, 0.35);
+    }
+  }
+
+  .app-mockup__titlebar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--color-rule);
+    background: var(--color-surface-raised);
+    color: var(--color-ink-faint);
+  }
+
+  .app-mockup__dots {
+    display: flex;
+    gap: 4px;
+  }
+
+  .app-mockup__dots i {
+    display: block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--color-rule-strong);
+  }
+
+  .app-mockup__dots i:first-child { background: #c45c5c; }
+  .app-mockup__dots i:nth-child(2) { background: #c4a85c; }
+  .app-mockup__dots i:nth-child(3) { background: #5c9a5c; }
+
+  .app-mockup__title {
+    flex: 1;
+    text-align: center;
+    font-size: 0.625rem;
+  }
+
+  .app-mockup__body {
+    display: grid;
+    grid-template-columns: 9rem 1fr 7rem;
+    min-height: 16rem;
+  }
+
+  .app-mockup__sidebar,
+  .app-mockup__outline {
+    padding: var(--space-3);
+    border-right: 1px solid var(--color-rule);
+    background: var(--color-paper-warm);
+    color: var(--color-ink-muted);
+  }
+
+  .app-mockup__outline {
+    border-right: 0;
+    border-left: 1px solid var(--color-rule);
+  }
+
+  .app-mockup__sidebar-label {
+    margin: 0 0 var(--space-2);
+    font-size: 0.5625rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--color-ink-faint);
+  }
+
+  .app-mockup__sidebar ul,
+  .app-mockup__outline ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .app-mockup__sidebar li,
+  .app-mockup__outline li {
+    padding: 0.15rem 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .app-mockup__sidebar li.indent,
+  .app-mockup__outline li.indent {
+    padding-left: var(--space-3);
+  }
+
+  .app-mockup__sidebar li.is-active,
+  .app-mockup__outline li.is-active {
+    color: var(--color-ink);
+    font-weight: 500;
+  }
+
+  .app-mockup__editor {
+    position: relative;
+    padding: var(--space-4);
+    color: var(--color-ink);
+    background: var(--color-surface);
+  }
+
+  .app-mockup__line {
+    min-height: 1.05rem;
+  }
+
+  .app-mockup__line .h1 {
+    font-size: 0.875rem;
+    font-weight: 600;
+  }
+
+  .app-mockup__line .h2 {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--color-ink);
+  }
+
+  .app-mockup__line.muted {
+    color: var(--color-ink-muted);
+  }
+
+  .app-mockup__line .code {
+    color: var(--color-rust);
+  }
+
+  .app-mockup__line .task {
+    color: var(--color-ink-faint);
+    margin-right: 0.25rem;
+  }
+
+  .app-mockup__line .task.done {
+    color: var(--color-rust);
+  }
+
+  .app-mockup__cursor {
+    position: absolute;
+    width: 1px;
+    height: 0.75rem;
+    background: var(--color-rust);
+    left: 11.5rem;
+    top: 11.2rem;
+    animation: blink 1.1s step-end infinite;
+  }
+
+  @keyframes blink {
+    50% { opacity: 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .app-mockup__cursor {
+      animation: none;
+    }
+  }
+
+  .app-mockup__status {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    border-top: 1px solid var(--color-rule);
+    font-size: 0.5625rem;
+    color: var(--color-ink-faint);
+    background: var(--color-surface-raised);
+  }
+
+  @media (max-width: 640px) {
+    .app-mockup__body {
+      grid-template-columns: 1fr;
+    }
+
+    .app-mockup__sidebar,
+    .app-mockup__outline {
+      display: none;
+    }
+  }
+</style>

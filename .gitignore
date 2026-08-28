@@ -1,0 +1,38 @@
+# Rust build artifacts
+/target/
+
+# Backup files
+**/*.rs.bk
+
+# macOS
+.DS_Store
+*.dmg
+*.app
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Machine-local workspace data
+/data/
+/logs/
+.markrust/
+
+# Secrets / local config
+.env
+.env.*
+
+# Distribution
+/dist/
+
+# Website (Node / Astro)
+website/node_modules/
+website/dist/
+website/.astro/
+
+# Editor temp files
+*.tmp
+*.bak

@@ -1,0 +1,90 @@
+---
+interface Props {
+  minimal?: boolean;
+}
+
+const { minimal = false } = Astro.props;
+---
+
+<footer class="site-footer">
+  <div class="site-footer__inner container">
+    <div class="site-footer__brand">
+      <p class="wordmark"><span class="wordmark__hash">#</span> MarkRust</p>
+      {!minimal && <p class="site-footer__tagline">Free and open source. MPL-2.0.</p>}
+    </div>
+    <nav class="site-footer__nav" aria-label="Footer">
+      <a href="/docs">Docs</a>
+      <a href="https://github.com/alexey-a-abramov/markrust">GitHub</a>
+      <a href="https://github.com/alexey-a-abramov/markrust/releases">Releases</a>
+      <a href="/docs/license">License</a>
+      <a href="/docs/contributing">Contributing</a>
+      <a href="/docs/configuration#privacy">Privacy</a>
+    </nav>
+  </div>
+  <div class="site-footer__meta container">
+    <p>markrust.org · Local-first Markdown editor</p>
+  </div>
+</footer>
+
+<style>
+  .site-footer {
+    border-top: 1px solid var(--color-rule);
+    background: var(--color-paper-warm);
+    margin-top: auto;
+  }
+
+  .site-footer__inner {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: var(--space-6);
+    padding-block: var(--space-8);
+  }
+
+  .wordmark {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--color-ink);
+  }
+
+  .wordmark__hash {
+    color: var(--color-rust);
+  }
+
+  .site-footer__tagline {
+    margin: var(--space-2) 0 0;
+    font-size: 0.8125rem;
+    color: var(--color-ink-faint);
+  }
+
+  .site-footer__nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4) var(--space-5);
+  }
+
+  .site-footer__nav a {
+    font-size: 0.8125rem;
+    color: var(--color-ink-muted);
+    text-decoration: none;
+  }
+
+  .site-footer__nav a:hover {
+    color: var(--color-ink);
+  }
+
+  .site-footer__meta {
+    padding-block: var(--space-4);
+    border-top: 1px solid var(--color-rule);
+  }
+
+  .site-footer__meta p {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    color: var(--color-ink-faint);
+    letter-spacing: 0.02em;
+  }
+</style>

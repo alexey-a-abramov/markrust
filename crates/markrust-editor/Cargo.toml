@@ -1,0 +1,23 @@
+[package]
+name = "markrust-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Text layout and delimiter masking for MarkRust"
+
+[dependencies]
+markrust-core = { path = "../markrust-core" }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "8166e3d7b8b42d8aaf4d4dee7fcd25ab4ec65105" }
+unicode-segmentation = "1.12"
+tree-sitter = { workspace = true }
+tree-sitter-rust = "0.24"
+tree-sitter-json = "0.24"
+tree-sitter-yaml = "0.7"
+tree-sitter-bash = "0.25"
+
+[dev-dependencies]
+pretty_assertions = "1.4"

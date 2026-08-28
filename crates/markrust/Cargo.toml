@@ -1,0 +1,22 @@
+[package]
+name = "markrust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Fast native Markdown workspace — CLI and desktop entry point"
+readme = "../../README.md"
+keywords = ["markdown", "editor", "gpui", "documentation", "wysiwyg"]
+categories = ["command-line-utilities", "text-editors"]
+exclude = ["../../target", "../../.github", "../../packaging", "../../scripts"]
+
+[[bin]]
+name = "markrust"
+path = "src/main.rs"
+
+[dependencies]
+markrust-core = { path = "../markrust-core" }
+markrust-app = { path = "../markrust-app" }

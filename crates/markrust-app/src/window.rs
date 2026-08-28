@@ -1,0 +1,630 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+use gpui::{
+    actions, div, prelude::*, px, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    FontWeight, PathPromptOptions, Render, SharedString, Window,
+};
+use markrust_core::parse_frontmatter;
+use markrust_editor::outline_headings;
+
+use crate::config::RecentWorkspaces;
+use crate::ui::{
+    document_tab, empty_sidebar_state, outline_row, section_header, sidebar_row, toolbar_button,
+};
+use crate::workspace::{fuzzy_match, Workspace};
+
+actions!(
+    markrust_app,
+    [
+        Save,
+        OpenFile,
+        OpenFolder,
+        NewDocument,
+        CloseTab,
+        ToggleTheme,
+        ToggleSidebar,
+        ToggleOutline,
+        CommandPalette,
+        ExportHtml,
+        Undo,
+        Redo
+    ]
+);
+
+pub struct MarkRustWindow {
+    pub workspace: Entity<Workspace>,
+    pub palette_query: String,
+    pub palette_selection: usize,
+    pub focus_handle: FocusHandle,
+}
+
+impl MarkRustWindow {
+    pub fn new(workspace: Entity<Workspace>, cx: &mut Context<Self>) -> Self {
+        Self {
+            workspace,
+            palette_query: String::new(),
+            palette_selection: 0,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| workspace.save_active(cx));
+    }
+
+    fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open Markdown file".into()),
+        });
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = workspace.update_in(cx, |workspace, window, cx| {
+                        let _ = workspace.open_document(path, window, cx);
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open workspace folder".into()),
+        });
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                if let Some(path) = paths.into_iter().next() {
+                    workspace.update(cx, |workspace, cx| {
+                        let _ = workspace.open_workspace(path, cx);
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn new_document(&mut self, _: &NewDocument, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.new_document(window, cx);
+        });
+    }
+
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.workspace.read(cx).active_tab;
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.close_tab(active, window, cx);
+        });
+    }
+
+    fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.toggle_theme(window, cx);
+        });
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.sidebar_open = !workspace.sidebar_open;
+            cx.notify();
+        });
+    }
+
+    fn toggle_outline(&mut self, _: &ToggleOutline, _: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.outline_open = !workspace.outline_open;
+            cx.notify();
+        });
+    }
+
+    fn command_palette(&mut self, _: &CommandPalette, _: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.palette_open = !workspace.palette_open;
+            cx.notify();
+        });
+        if self.workspace.read(cx).palette_open {
+            self.palette_query.clear();
+            self.palette_selection = 0;
+        }
+    }
+
+    fn export_html(&mut self, _: &ExportHtml, _: &mut Window, cx: &mut Context<Self>) {
+        let workspace = self.workspace.clone();
+        match workspace.read(cx).export_active_html(cx) {
+            Ok(path) => {
+                eprintln!("Exported HTML to {}", path.display());
+            }
+            Err(error) => {
+                eprintln!("Export failed: {error}");
+            }
+        }
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self
+            .workspace
+            .read(cx)
+            .active_tab()
+            .map(|tab| tab.editor.clone())
+        {
+            editor.update(cx, |editor, cx| editor.undo(cx));
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self
+            .workspace
+            .read(cx)
+            .active_tab()
+            .map(|tab| tab.editor.clone())
+        {
+            editor.update(cx, |editor, cx| editor.redo(cx));
+        }
+    }
+}
+
+impl Focusable for MarkRustWindow {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for MarkRustWindow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let outline_items = {
+            let mut items = Vec::new();
+            if let Some(document) = self
+                .workspace
+                .read(cx)
+                .active_tab()
+                .map(|tab| tab.document.clone())
+            {
+                document.update(cx, |doc, _| {
+                    doc.apply_pending_parse();
+                    items = outline_headings(&doc.syntax_spans, &doc.buffer.content());
+                });
+            }
+            items
+        };
+
+        let workspace = self.workspace.read(cx);
+        let theme = workspace.config.editor_theme();
+        let active = workspace.active_tab;
+        let tab_count = workspace.tabs.len();
+        let files = workspace.list_files();
+        let recent = RecentWorkspaces::load();
+        let palette_open = workspace.palette_open;
+        let sidebar_open = workspace.sidebar_open;
+        let outline_open = workspace.outline_open;
+        let external_change = workspace.pending_external_change.clone();
+        let workspace_entity = self.workspace.clone();
+        let root = workspace.root.clone();
+        let active_doc_path = workspace
+            .active_tab()
+            .and_then(|tab| tab.document.read(cx).path.clone());
+
+        let ws_drop = workspace_entity.clone();
+        let ws_editor_drop = workspace_entity.clone();
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.chrome_bg)
+            .text_color(theme.text)
+            .font_family(theme.font_family.clone())
+            .track_focus(&self.focus_handle)
+            .key_context("MarkRust")
+            .on_action(cx.listener(Self::save))
+            .on_action(cx.listener(Self::open_file))
+            .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::new_document))
+            .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_outline))
+            .on_action(cx.listener(Self::command_palette))
+            .on_action(cx.listener(Self::export_html))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_drop(cx.listener({
+                let ws = ws_drop.clone();
+                move |_, paths: &ExternalPaths, window, cx| {
+                    ws.update(cx, |workspace, cx| {
+                        workspace.handle_window_drop(paths, window, cx);
+                    });
+                }
+            }))
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.bg(theme.drop_zone_bg)
+            })
+            .children(external_change.map(|(index, path)| {
+                let ws = workspace_entity.clone();
+                div()
+                    .px_4()
+                    .py_2()
+                    .bg(theme.accent.opacity(0.85))
+                    .text_color(theme.sidebar_selected_text)
+                    .text_sm()
+                    .child(format!("File changed on disk: {}. Click to reload.", path.display()))
+                    .cursor_pointer()
+                    .id("external-change-banner")
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        ws.update(cx, |workspace, cx| {
+                            let _ = workspace.reload_tab(index, cx);
+                        });
+                    }))
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .py_2()
+                    .gap_1()
+                    .bg(theme.chrome_bg)
+                    .border_b_1()
+                    .border_color(theme.separator)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .mr_4()
+                            .child("MarkRust"),
+                    )
+                    .child(toolbar_button(
+                        "New",
+                        &theme,
+                        "toolbar-new",
+                        cx.listener(|this, _, window, cx| this.new_document(&NewDocument, window, cx)),
+                    ))
+                    .child(toolbar_button(
+                        "Open File",
+                        &theme,
+                        "toolbar-open-file",
+                        cx.listener(|this, _, window, cx| this.open_file(&OpenFile, window, cx)),
+                    ))
+                    .child(toolbar_button(
+                        "Open Folder",
+                        &theme,
+                        "toolbar-open-folder",
+                        cx.listener(|this, _, window, cx| {
+                            this.open_folder(&OpenFolder, window, cx)
+                        }),
+                    ))
+                    .child(toolbar_button(
+                        "Save",
+                        &theme,
+                        "toolbar-save",
+                        cx.listener(|this, _, window, cx| this.save(&Save, window, cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_px()
+                    .px_2()
+                    .bg(theme.tab_inactive)
+                    .border_b_1()
+                    .border_color(theme.separator)
+                    .children((0..tab_count).map(|index| {
+                        let tab = &workspace.tabs[index];
+                        let dirty = tab.document.read(cx).dirty;
+                        let label = if dirty {
+                            format!("{} •", tab.title)
+                        } else {
+                            tab.title.clone()
+                        };
+                        let ws = workspace_entity.clone();
+                        let ws_close = workspace_entity.clone();
+                        document_tab(
+                            label,
+                            &theme,
+                            index == active,
+                            SharedString::from(format!("tab-{index}")),
+                            cx.listener(move |_, _, _, cx| {
+                                ws.update(cx, |workspace, cx| {
+                                    workspace.active_tab = index;
+                                    cx.notify();
+                                });
+                            }),
+                            cx.listener(move |_, _, window, cx| {
+                                ws_close.update(cx, |workspace, cx| {
+                                    workspace.close_tab(index, window, cx);
+                                });
+                            }),
+                        )
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(if sidebar_open {
+                        div()
+                            .w(px(260.))
+                            .h_full()
+                            .id("sidebar")
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .bg(theme.sidebar_bg)
+                            .border_r_1()
+                            .border_color(theme.separator)
+                            .when(root.is_some(), |panel| {
+                                panel
+                                    .child(section_header("Files", &theme))
+                                    .children({
+                                        let root = root.clone().unwrap();
+                                        files
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(file_index, path)| {
+                                                let display = path
+                                                    .strip_prefix(&root)
+                                                    .unwrap_or(path)
+                                                    .display()
+                                                    .to_string();
+                                                let path = path.clone();
+                                                let selected = active_doc_path
+                                                    .as_ref()
+                                                    .is_some_and(|active| active == &path);
+                                                let ws = workspace_entity.clone();
+                                                sidebar_row(
+                                                    display,
+                                                    &theme,
+                                                    selected,
+                                                    SharedString::from(format!(
+                                                        "sidebar-file-{file_index}"
+                                                    )),
+                                                    cx.listener(move |_, _, window, cx| {
+                                                        ws.update(cx, |workspace, cx| {
+                                                            let _ = workspace.open_document(
+                                                                path.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                            })
+                            .when(root.is_none(), |panel| {
+                                panel
+                                    .child(empty_sidebar_state(
+                                        &theme,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.open_folder(&OpenFolder, window, cx)
+                                        }),
+                                        cx.listener(|this, _, window, cx| {
+                                            this.open_file(&OpenFile, window, cx)
+                                        }),
+                                    ))
+                                    .when(!recent.workspaces.is_empty(), |panel| {
+                                        panel
+                                            .child(section_header("Recent", &theme))
+                                            .children(
+                                                recent
+                                                    .workspaces
+                                                    .iter()
+                                                    .enumerate()
+                                                    .map(|(recent_index, path)| {
+                                                        let label = path.display().to_string();
+                                                        let path = path.clone();
+                                                        let ws = workspace_entity.clone();
+                                                        sidebar_row(
+                                                            label,
+                                                            &theme,
+                                                            false,
+                                                            SharedString::from(format!(
+                                                                "recent-workspace-{recent_index}"
+                                                            )),
+                                                            cx.listener(
+                                                                move |_, _, _, cx| {
+                                                                    ws.update(
+                                                                        cx,
+                                                                        |workspace, cx| {
+                                                                            let _ = workspace
+                                                                                .open_workspace(
+                                                                                    path.clone(),
+                                                                                    cx,
+                                                                                );
+                                                                        },
+                                                                    );
+                                                                },
+                                                            ),
+                                                        )
+                                                    })
+                                                    .collect::<Vec<_>>(),
+                                            )
+                                    })
+                            })
+                    } else {
+                        div().w(px(0.)).id("sidebar-closed")
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .id("editor-area")
+                            .overflow_y_scroll()
+                            .bg(theme.editor_bg)
+                            .p(px(24.))
+                            .on_drop(cx.listener({
+                                let ws = ws_editor_drop.clone();
+                                move |_, paths: &ExternalPaths, window, cx| {
+                                    ws.update(cx, |workspace, cx| {
+                                        workspace.handle_editor_drop(paths, window, cx);
+                                    });
+                                }
+                            }))
+                            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                                style.bg(theme.drop_zone_bg)
+                            })
+                            .child(
+                                workspace
+                                    .active_tab()
+                                    .map(|tab| tab.editor_view.clone())
+                                    .unwrap_or_else(|| workspace.tabs[0].editor_view.clone()),
+                            ),
+                    )
+                    .child(if outline_open {
+                        div()
+                            .w(px(240.))
+                            .h_full()
+                            .id("outline-panel")
+                            .overflow_y_scroll()
+                            .bg(theme.sidebar_bg)
+                            .border_l_1()
+                            .border_color(theme.separator)
+                            .child(section_header("Outline", &theme))
+                            .children(outline_items.iter().map(|(offset, level, title)| {
+                                let ws = workspace_entity.clone();
+                                let offset = *offset;
+                                let level = *level;
+                                outline_row(
+                                    title.clone(),
+                                    level,
+                                    &theme,
+                                    SharedString::from(format!("outline-item-{offset}")),
+                                    cx.listener(move |_, _, _, cx| {
+                                        if let Some(editor) = ws
+                                            .read(cx)
+                                            .active_tab()
+                                            .map(|tab| tab.editor.clone())
+                                        {
+                                            editor.update(cx, |editor, cx| {
+                                                editor.jump_to(offset, cx);
+                                            });
+                                        }
+                                    }),
+                                )
+                            }))
+                    } else {
+                        div().w(px(0.)).id("outline-closed")
+                    }),
+            )
+            .child({
+                let tab = workspace.active_tab();
+                let path = tab
+                    .and_then(|t| t.document.read(cx).path.clone())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "Untitled".into());
+                let dirty = tab.map(|t| t.document.read(cx).dirty).unwrap_or(false);
+                let words = tab.map(|t| t.document.read(cx).word_count()).unwrap_or(0);
+                let (line, col) = tab
+                    .map(|t| {
+                        let doc = t.document.read(cx);
+                        let offset = t.editor.read(cx).cursor_offset();
+                        markrust_editor::cursor_line_col(&doc.buffer.content(), offset)
+                    })
+                    .unwrap_or((0, 0));
+                let frontmatter_label = tab
+                    .map(|t| {
+                        let content = t.document.read(cx).buffer.content();
+                        parse_frontmatter(&content)
+                            .and_then(|info| info.title)
+                            .map(|title| format!("  ·  {title}"))
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .px_4()
+                    .py_1()
+                    .h(px(22.))
+                    .bg(theme.status_bar_bg)
+                    .border_t_1()
+                    .border_color(theme.separator)
+                    .text_xs()
+                    .text_color(theme.status_bar_text)
+                    .child(format!(
+                        "{}{}",
+                        path,
+                        if dirty { " — edited" } else { "" }
+                    ))
+                    .child(format!(
+                        "Ln {}, Col {}  ·  {words} words{frontmatter_label}",
+                        line + 1,
+                        col + 1
+                    ))
+            })
+            .child(if palette_open {
+                let query = self.palette_query.clone();
+                let mut commands = Vec::new();
+                if fuzzy_match("Export HTML", &query) {
+                    commands.push("Export HTML".to_string());
+                }
+                commands.extend((0..tab_count).filter_map(|index| {
+                    let title = workspace.tabs[index].title.clone();
+                    fuzzy_match(&title, &query).then_some(title)
+                }));
+                let selected = self.palette_selection.min(commands.len().saturating_sub(1));
+                let ws = workspace_entity.clone();
+                div()
+                    .absolute()
+                    .top(px(96.))
+                    .left(px(240.))
+                    .w(px(440.))
+                    .rounded_lg()
+                    .shadow_lg()
+                    .bg(theme.tab_active)
+                    .border_1()
+                    .border_color(theme.separator)
+                    .p_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.secondary_text)
+                            .child(SharedString::from(format!("> {query}"))),
+                    )
+                    .children(commands.iter().enumerate().map(|(index, title)| {
+                        let ws = ws.clone();
+                        let title = title.clone();
+                        div()
+                            .text_sm()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if index == selected {
+                                theme.sidebar_selected
+                            } else {
+                                theme.tab_active
+                            })
+                            .cursor_pointer()
+                            .child(title.clone())
+                            .id(("palette-item", index))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if title == "Export HTML" {
+                                    if let Ok(path) = ws.read(cx).export_active_html(cx) {
+                                        eprintln!("Exported HTML to {}", path.display());
+                                    }
+                                }
+                                ws.update(cx, |workspace, cx| {
+                                    workspace.palette_open = false;
+                                    cx.notify();
+                                });
+                            }))
+                    }))
+            } else {
+                div().hidden()
+            })
+    }
+}

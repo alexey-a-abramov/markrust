@@ -1,0 +1,145 @@
+---
+interface Props {
+  docs?: boolean;
+}
+
+const { docs = false } = Astro.props;
+const path = Astro.url.pathname;
+---
+
+<header class="site-header">
+  <div class="site-header__inner container">
+    <a href="/" class="wordmark" aria-label="MarkRust home">
+      <span class="wordmark__hash">#</span> Mark<span class="wordmark__rust">Rust</span>
+    </a>
+
+    <nav class="site-nav" aria-label="Primary">
+      {!docs && (
+        <>
+          <a href="/#features">Features</a>
+          <a href="/#download">Download</a>
+        </>
+      )}
+      <a href="/docs" aria-current={path.startsWith('/docs') ? 'page' : undefined}>Docs</a>
+      <a href="https://github.com/alexey-a-abramov/markrust" target="_blank" rel="noopener noreferrer">GitHub</a>
+    </nav>
+
+    <div class="site-header__actions">
+      <button type="button" class="btn btn--ghost btn--small theme-toggle" aria-label="Toggle theme">
+        <span class="theme-toggle__icon" aria-hidden="true">◐</span>
+      </button>
+      {docs && (
+        <button type="button" class="btn btn--ghost btn--small docs-nav-toggle" id="docs-nav-toggle" aria-label="Open documentation menu">
+          Menu
+        </button>
+      )}
+      <a
+        href="https://github.com/alexey-a-abramov/markrust"
+        class="btn btn--ghost btn--small github-link"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        GitHub
+      </a>
+      <a href="/#download" class="btn btn--primary btn--small">Download</a>
+    </div>
+  </div>
+</header>
+
+<style>
+  .site-header {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    height: var(--header-h);
+    background: var(--color-paper);
+    border-bottom: 1px solid var(--color-rule);
+  }
+
+  .site-header__inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 100%;
+    gap: var(--space-4);
+  }
+
+  .wordmark {
+    font-family: var(--font-mono);
+    font-size: 0.9375rem;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    color: var(--color-ink);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  .wordmark__hash {
+    color: var(--color-rust);
+    font-weight: 600;
+  }
+
+  .wordmark__rust {
+    color: var(--color-ink-muted);
+  }
+
+  .site-nav {
+    display: none;
+    gap: var(--space-5);
+  }
+
+  .site-nav a {
+    font-size: 0.875rem;
+    color: var(--color-ink-muted);
+    text-decoration: none;
+  }
+
+  .site-nav a:hover,
+  .site-nav a[aria-current='page'] {
+    color: var(--color-ink);
+  }
+
+  .site-header__actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .github-link {
+    display: none;
+  }
+
+  .docs-nav-toggle {
+    display: none;
+  }
+
+  .theme-toggle {
+    min-width: 2rem;
+    padding-inline: 0.5rem;
+  }
+
+  .theme-toggle__icon {
+    font-size: 0.875rem;
+    line-height: 1;
+  }
+
+  @media (min-width: 768px) {
+    .site-nav {
+      display: flex;
+    }
+
+    .github-link {
+      display: inline-flex;
+    }
+
+    .docs-nav-toggle {
+      display: none !important;
+    }
+  }
+
+  @media (max-width: 767px) {
+    .docs-nav-toggle {
+      display: inline-flex;
+    }
+  }
+</style>
