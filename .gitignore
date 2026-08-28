@@ -32,6 +32,8 @@
 website/node_modules/
 website/dist/
 website/.astro/
+node_modules/
+pnpm-debug.log*
 
 # Editor temp files
 *.tmp

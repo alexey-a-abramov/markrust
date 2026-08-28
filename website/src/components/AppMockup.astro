@@ -30,7 +30,8 @@
         <div class="app-mockup__line"><span class="task done">☑</span> Workspace</div>
         <div class="app-mockup__line"><span class="task">☐</span> World domination</div>
         <div class="app-mockup__line">&nbsp;</div>
-        <div class="app-mockup__line"><span class="code">cargo install markrust</span></div>
+        <div class="app-mockup__line quote">Markdown is the interface.</div>
+        <div class="app-mockup__line"><span class="code">`cargo install markrust`</span></div>
         <div class="app-mockup__cursor" aria-hidden="true"></div>
       </main>
       <aside class="app-mockup__outline">
@@ -60,19 +61,8 @@
 
   .app-mockup__chrome {
     border: 1px solid var(--color-rule-strong);
+    border-left: 2px solid var(--color-rust);
     background: var(--color-surface);
-    box-shadow: 0 1px 0 var(--color-rule), 0 24px 48px rgba(0, 0, 0, 0.06);
-  }
-
-  [data-theme='dark'] .app-mockup__chrome,
-  :root:not([data-theme='light']) .app-mockup__chrome {
-    box-shadow: 0 1px 0 var(--color-rule), 0 24px 48px rgba(0, 0, 0, 0.35);
-  }
-
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme='light']) .app-mockup__chrome {
-      box-shadow: 0 1px 0 var(--color-rule), 0 24px 48px rgba(0, 0, 0, 0.35);
-    }
   }
 
   .app-mockup__titlebar {
@@ -110,8 +100,8 @@
 
   .app-mockup__body {
     display: grid;
-    grid-template-columns: 9rem 1fr 7rem;
-    min-height: 16rem;
+    grid-template-columns: 8.5rem 1fr 7.5rem;
+    min-height: 18.5rem;
   }
 
   .app-mockup__sidebar,
@@ -189,6 +179,13 @@
 
   .app-mockup__line .code {
     color: var(--color-rust);
+  }
+
+  .app-mockup__line.quote {
+    color: var(--color-ink-muted);
+    font-style: italic;
+    border-left: 2px solid var(--color-rust);
+    padding-left: 0.5rem;
   }
 
   .app-mockup__line .task {

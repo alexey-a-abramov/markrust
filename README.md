@@ -126,10 +126,9 @@ CI runs `fmt`, `clippy`, and `tests` on every push/PR. Pushing a `v*` tag trigge
 Product site and documentation live in [`website/`](website/). Built with Astro (static HTML, minimal JS).
 
 ```bash
-cd website
-npm install
-npm run dev      # http://localhost:4321
-npm run build    # output → website/dist/
+pnpm install          # from repo root
+pnpm dev              # http://localhost:4321
+pnpm build            # output → website/dist/
 ```
 
 Site: [markrust.org](https://markrust.org) (when deployed).

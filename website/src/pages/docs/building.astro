@@ -22,5 +22,5 @@ import Callout from '../../components/Callout.astro';
   <CodeBlock code={`cargo test -p markrust-core -p markrust-editor\ncargo clippy --workspace -- -D warnings\ncargo run -p markrust`} terminal />
 
   <h2>Website</h2>
-  <CodeBlock code={`cd website\nnpm install\nnpm run dev    # http://localhost:4321\nnpm run build`} terminal />
+  <CodeBlock code={`pnpm install\npnpm dev      # http://localhost:4321\npnpm build`} terminal />
 </DocsLayout>

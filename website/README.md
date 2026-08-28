@@ -7,17 +7,22 @@ Built with [Astro](https://astro.build) — static HTML, minimal JavaScript, exc
 ## Development
 
 ```bash
-cd website
-npm install
-npm run dev
+pnpm install          # from repo root (installs website deps)
+pnpm dev              # http://localhost:4321
 ```
 
-Open [http://localhost:4321](http://localhost:4321).
+Or from `website/`:
+
+```bash
+cd website
+pnpm install
+pnpm dev
+```
 
 ## Build
 
 ```bash
-npm run build
+pnpm build            # from repo root
 ```
 
 Output goes to `website/dist/`. Deploy to any static host (Cloudflare Pages, GitHub Pages, etc.).

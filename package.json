@@ -1,0 +1,10 @@
+{
+  "name": "markrust",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --dir website dev",
+    "build": "pnpm --dir website build",
+    "preview": "pnpm --dir website preview"
+  },
+  "packageManager": "pnpm@9.0.0"
+}

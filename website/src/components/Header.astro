@@ -21,7 +21,7 @@ const path = Astro.url.pathname;
         </>
       )}
       <a href="/docs" aria-current={path.startsWith('/docs') ? 'page' : undefined}>Docs</a>
-      <a href="https://github.com/alexey-a-abramov/markrust" target="_blank" rel="noopener noreferrer">GitHub</a>
+      <a href="https://github.com/alexey-a-abramov/markrust" class="nav-github" target="_blank" rel="noopener noreferrer">GitHub</a>
     </nav>
 
     <div class="site-header__actions">
@@ -106,6 +106,10 @@ const path = Astro.url.pathname;
   }
 
   .github-link {
+    display: inline-flex;
+  }
+
+  .nav-github {
     display: none;
   }
 
@@ -128,8 +132,12 @@ const path = Astro.url.pathname;
       display: flex;
     }
 
+    .nav-github {
+      display: inline;
+    }
+
     .github-link {
-      display: inline-flex;
+      display: none;
     }
 
     .docs-nav-toggle {
