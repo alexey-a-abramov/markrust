@@ -33,7 +33,7 @@ pnpm test:unit       # docs-nav page resolution
 pnpm test:e2e        # Playwright against production preview
 ```
 
-E2e builds the site, then serves `pnpm preview` on http://127.0.0.1:4321.
+E2e builds the site, then serves `pnpm preview` on http://127.0.0.1:4371 (Playwright starts its own server; it does not reuse port 4321).
 
 ## Structure
 

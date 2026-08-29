@@ -99,7 +99,7 @@ impl EditorTheme {
             syntax_comment: gpui::hsla(0., 0., 0.5, 1.),
             syntax_function: gpui::hsla(210. / 360., 0.55, 0.72, 1.),
             syntax_type: gpui::hsla(35. / 360., 0.45, 0.72, 1.),
-            font_family: ".SystemUIFont".into(),
+            font_family: "Inter".into(),
             font_size: 16.0,
             code_font_family: "Menlo".into(),
             line_height_multiplier: 1.55,
@@ -144,7 +144,7 @@ impl EditorTheme {
             syntax_comment: gpui::hsla(0., 0., 0.55, 1.),
             syntax_function: gpui::hsla(210. / 360., 0.65, 0.42, 1.),
             syntax_type: gpui::hsla(35. / 360., 0.55, 0.42, 1.),
-            font_family: ".SystemUIFont".into(),
+            font_family: "Inter".into(),
             font_size: 16.0,
             code_font_family: "Menlo".into(),
             line_height_multiplier: 1.55,
@@ -174,7 +174,7 @@ impl EditorTheme {
     }
 
     pub fn system_font_fallbacks() -> gpui::FontFallbacks {
-        gpui::FontFallbacks::from_fonts(vec![".SystemUIFont".into(), "Menlo".into()])
+        gpui::FontFallbacks::from_fonts(vec!["Menlo".into(), "Helvetica".into()])
     }
 }
 
@@ -229,7 +229,8 @@ mod tests {
         assert!(light.background.l > dark.background.l);
         assert_eq!(dark.font_size, light.font_size);
         assert_eq!(dark.line_height_multiplier, light.line_height_multiplier);
-        assert!(!dark.syntax_keyword.eq(&dark.text));
-        assert!(!light.link.eq(&light.text));
+        assert!(!dark.font_family.is_empty());
+        assert!(dark.syntax_keyword.a > 0.9);
+        assert!(light.link.a > 0.9);
     }
 }

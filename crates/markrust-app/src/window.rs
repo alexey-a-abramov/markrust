@@ -222,7 +222,7 @@ impl Render for MarkRustWindow {
             .flex_col()
             .bg(theme.chrome_bg)
             .text_color(theme.text)
-            .font_family(".SystemUIFont")
+            .font_family(theme.font_family.clone())
             .text_size(px(14.))
             .track_focus(&self.focus_handle)
             .key_context("MarkRust")

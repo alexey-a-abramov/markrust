@@ -28,7 +28,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::Dark,
-            font_family: ".SystemUIFont".into(),
+            font_family: "Inter".into(),
             font_size: 16.0,
             code_font_family: "Menlo".into(),
             autosave_ms: DEFAULT_AUTOSAVE_MS,
@@ -81,11 +81,14 @@ impl AppConfig {
         theme
     }
 
-    fn resolve_ui_font(family: &str) -> String {
+    /// Maps virtual / broken system names onto the bundled Inter family.
+    ///
+    /// GPUI's `.SystemUIFont` → `.AppleSystemUIFont` lookup often fails on
+    /// recent macOS (glyphs layout but never rasterize), so we never use it.
+    pub fn resolve_ui_font(family: &str) -> String {
         match family {
-            "" | "Inter" | "system-ui" | "Helvetica Neue" | "Helvetica" | ".AppleSystemUIFont" => {
-                ".SystemUIFont".into()
-            }
+            "" | "Inter" | "system-ui" | ".SystemUIFont" | ".AppleSystemUIFont" | "SF Pro"
+            | "SF Pro Text" | "SF Pro Display" => "Inter".into(),
             other => other.to_string(),
         }
     }
@@ -151,5 +154,26 @@ mod tests {
     #[test]
     fn default_config_has_autosave() {
         assert_eq!(AppConfig::default().autosave_ms, DEFAULT_AUTOSAVE_MS);
+        assert_eq!(AppConfig::default().font_family, "Inter");
+    }
+
+    #[test]
+    fn system_ui_font_aliases_resolve_to_bundled_inter() {
+        for alias in [
+            "",
+            "Inter",
+            "system-ui",
+            ".SystemUIFont",
+            ".AppleSystemUIFont",
+            "SF Pro Text",
+        ] {
+            assert_eq!(
+                AppConfig::resolve_ui_font(alias),
+                "Inter",
+                "alias {alias:?}"
+            );
+        }
+        assert_eq!(AppConfig::resolve_ui_font("Menlo"), "Menlo");
+        assert_eq!(AppConfig::resolve_ui_font("Helvetica"), "Helvetica");
     }
 }
