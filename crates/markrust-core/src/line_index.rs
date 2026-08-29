@@ -271,6 +271,7 @@ mod tests {
             "ab\r\ncd\r\n",
             "👋你好\n世界",
             "a\nb\nc",
+            "e\u{0301}\ncafe\u{0301}",
         ] {
             assert_round_trip(text);
         }

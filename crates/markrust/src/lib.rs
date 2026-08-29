@@ -177,9 +177,11 @@ mod tests {
         assert_eq!(parse_args(&["--version".into()]), CliAction::Version);
         assert_eq!(parse_args(&["-V".into()]), CliAction::Version);
         assert_eq!(parse_args(&["--help".into()]), CliAction::Help);
+        assert_eq!(parse_args(&["-h".into()]), CliAction::Help);
         assert!(matches!(
             parse_args(&["export".into(), "n.md".into()]),
             CliAction::Export { .. }
         ));
+        assert!(matches!(parse_args(&["--wat".into()]), CliAction::Unknown(_)));
     }
 }

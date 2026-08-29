@@ -68,3 +68,33 @@ fn cli_export_via_assert_cmd_and_library() {
 fn parse_args_does_not_select_gui_for_version() {
     assert_eq!(parse_args(&["-V".into()]), CliAction::Version);
 }
+
+#[test]
+fn cli_help_via_assert_cmd() {
+    let mut cmd = Command::cargo_bin("markrust").unwrap();
+    let output = cmd.arg("--help").output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage"), "{stdout}");
+    assert!(stdout.contains("export"), "{stdout}");
+    assert!(stdout.contains("--version") || stdout.contains("-V"), "{stdout}");
+}
+
+#[test]
+fn cli_export_missing_file_errors() {
+    let mut cmd = Command::cargo_bin("markrust").unwrap();
+    let output = cmd
+        .args(["export", "/no/such/markrust-missing.md"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("export failed") || stderr.contains("No such"),
+        "{stderr}"
+    );
+
+    let code = run_export(&["/no/such/markrust-missing.md".into()]);
+    assert_eq!(code, 1);
+    assert_eq!(run_export(&[]), 1);
+}

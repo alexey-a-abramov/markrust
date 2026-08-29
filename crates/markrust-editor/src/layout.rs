@@ -9,6 +9,9 @@ use crate::masking::{
     compute_delimiter_entries, delimiter_visibility_for_span, Caret, DelimiterVisibilityEntry,
     Selection, VisibilityState,
 };
+use crate::table::{
+    compute_column_widths, format_data_row, format_delimiter_row, parse_column_alignments,
+};
 use crate::theme::EditorTheme;
 
 /// Styling applied to a contiguous byte range in the source document.
@@ -498,13 +501,6 @@ fn code_block_line_starts(content: &str, spans: &[SyntaxNodeSpan]) -> Vec<usize>
     lines
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnAlign {
-    Left,
-    Center,
-    Right,
-}
-
 fn apply_table_alignment(layout: &mut DisplayLayout, content: &str, spans: &[SyntaxNodeSpan]) {
     for span in spans {
         if span.kind != SyntaxKind::Table || span.table_row.is_some() {
@@ -529,95 +525,6 @@ fn apply_table_alignment(layout: &mut DisplayLayout, content: &str, spans: &[Syn
             })
             .collect();
         replace_block_in_layout(layout, span.start_byte, block, &formatted.join("\n"));
-    }
-}
-
-fn parse_column_alignments(line: &str) -> Vec<ColumnAlign> {
-    split_table_cells(line)
-        .into_iter()
-        .map(|cell| {
-            let left = cell.starts_with(':');
-            let right = cell.ends_with(':');
-            match (left, right) {
-                (true, true) => ColumnAlign::Center,
-                (false, true) => ColumnAlign::Right,
-                _ => ColumnAlign::Left,
-            }
-        })
-        .collect()
-}
-
-fn split_table_cells(line: &str) -> Vec<String> {
-    line.split('|')
-        .map(str::trim)
-        .filter(|cell| !cell.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn compute_column_widths(lines: &[&str]) -> Vec<usize> {
-    let mut widths = Vec::new();
-    for line in lines {
-        for (idx, cell) in split_table_cells(line).into_iter().enumerate() {
-            if idx >= widths.len() {
-                widths.push(cell.chars().count());
-            } else {
-                widths[idx] = widths[idx].max(cell.chars().count());
-            }
-        }
-    }
-    widths.into_iter().map(|w| w.max(1)).collect()
-}
-
-fn format_data_row(line: &str, widths: &[usize], alignments: &[ColumnAlign]) -> String {
-    let cells = split_table_cells(line);
-    if cells.is_empty() {
-        return line.to_string();
-    }
-    let mut parts = vec!["|".to_string()];
-    for (idx, cell) in cells.iter().enumerate() {
-        let width = widths.get(idx).copied().unwrap_or(cell.chars().count());
-        let align = alignments.get(idx).copied().unwrap_or(ColumnAlign::Left);
-        parts.push(format!(" {} ", pad_cell(cell, width, align)));
-        parts.push("|".to_string());
-    }
-    parts.join("")
-}
-
-fn format_delimiter_row(line: &str, widths: &[usize], alignments: &[ColumnAlign]) -> String {
-    let cells = split_table_cells(line);
-    if cells.is_empty() {
-        return line.to_string();
-    }
-    let mut parts = vec!["|".to_string()];
-    for (idx, _cell) in cells.iter().enumerate() {
-        let width = widths.get(idx).copied().unwrap_or(3).max(3);
-        let align = alignments.get(idx).copied().unwrap_or(ColumnAlign::Left);
-        let dashes = "-".repeat(width);
-        let body = match align {
-            ColumnAlign::Left => format!(":{dashes}"),
-            ColumnAlign::Center => format!(":{dashes}:"),
-            ColumnAlign::Right => format!("{dashes}:"),
-        };
-        parts.push(format!(" {body} "));
-        parts.push("|".to_string());
-    }
-    parts.join("")
-}
-
-fn pad_cell(cell: &str, width: usize, align: ColumnAlign) -> String {
-    let len = cell.chars().count();
-    if len >= width {
-        return cell.to_string();
-    }
-    let pad = width - len;
-    match align {
-        ColumnAlign::Left => format!("{cell}{}", " ".repeat(pad)),
-        ColumnAlign::Right => format!("{}{cell}", " ".repeat(pad)),
-        ColumnAlign::Center => {
-            let left = pad / 2;
-            format!("{}{cell}{}", " ".repeat(left), " ".repeat(pad - left))
-        }
     }
 }
 
@@ -788,14 +695,18 @@ mod tests {
             "aligned table display: {:?}",
             layout.display_text
         );
-        let alignments = parse_column_alignments("|:---|:---:|---:|");
+        let alignments = crate::table::parse_column_alignments("|:---|:---:|---:|");
         assert_eq!(
             alignments,
-            vec![ColumnAlign::Left, ColumnAlign::Center, ColumnAlign::Right]
+            vec![
+                crate::table::ColumnAlign::Left,
+                crate::table::ColumnAlign::Center,
+                crate::table::ColumnAlign::Right
+            ]
         );
-        let padded_right = pad_cell("a", 3, ColumnAlign::Right);
+        let padded_right = crate::table::pad_cell("a", 3, crate::table::ColumnAlign::Right);
         assert_eq!(padded_right, "  a");
-        let padded_center = pad_cell("a", 3, ColumnAlign::Center);
+        let padded_center = crate::table::pad_cell("a", 3, crate::table::ColumnAlign::Center);
         assert_eq!(padded_center.chars().count(), 3);
     }
 

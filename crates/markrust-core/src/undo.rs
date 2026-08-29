@@ -223,6 +223,15 @@ mod tests {
     }
 
     #[test]
+    fn record_without_begin_opens_a_transaction() {
+        let mut stack = UndoStack::new();
+        stack.record(insert(0, "a"));
+        stack.commit_transaction();
+        assert_eq!(stack.undo_depth(), 1);
+        assert!(!stack.has_open_transaction());
+    }
+
+    #[test]
     fn grouped_undo_returns_reverse_inverses() {
         let mut stack = UndoStack::new();
         stack.begin_transaction();

@@ -211,4 +211,25 @@ mod tests {
         assert!((dark.code_block_bg.l - dark.editor_bg.l).abs() > 0.02);
         assert!((light.code_block_bg.l - light.editor_bg.l).abs() > 0.02);
     }
+
+    #[test]
+    fn heading_scale_decreases_with_level() {
+        let theme = EditorTheme::dark();
+        assert!(theme.heading_font_size(1) > theme.heading_font_size(2));
+        assert!(theme.heading_font_size(2) > theme.heading_font_size(3));
+        assert!(theme.heading_font_size(5) >= theme.heading_font_size(6));
+        assert_eq!(theme.heading_font_size(9), theme.font_size * 1.05);
+    }
+
+    #[test]
+    fn light_text_is_darker_than_dark_theme_text() {
+        let dark = EditorTheme::dark();
+        let light = EditorTheme::light();
+        assert!(light.text.l < dark.text.l);
+        assert!(light.background.l > dark.background.l);
+        assert_eq!(dark.font_size, light.font_size);
+        assert_eq!(dark.line_height_multiplier, light.line_height_multiplier);
+        assert!(!dark.syntax_keyword.eq(&dark.text));
+        assert!(!light.link.eq(&light.text));
+    }
 }

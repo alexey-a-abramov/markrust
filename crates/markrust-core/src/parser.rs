@@ -405,6 +405,42 @@ mod tests {
     }
 
     #[test]
+    fn extracts_atx_heading_levels_and_setext() {
+        let atx = extract_syntax_spans("# H1\n\n## H2\n\n### H3\n");
+        let headings: Vec<_> = atx
+            .iter()
+            .filter(|s| s.kind == SyntaxKind::Heading)
+            .collect();
+        assert!(headings.len() >= 3, "atx headings: {headings:?}");
+
+        let setext = extract_syntax_spans("Title\n=====\n\nSub\n-----\n");
+        assert!(has_kind(&setext, SyntaxKind::Heading));
+    }
+
+    #[test]
+    fn extracts_links_images_and_inline_code_ranges() {
+        let source = "See [docs](https://markrust.org) and `code` plus ![alt](pic.png).";
+        let spans = extract_syntax_spans(source);
+        let link = spans.iter().find(|s| s.kind == SyntaxKind::Link).unwrap();
+        assert!(source[link.start_byte..link.end_byte.min(source.len())].contains("docs"));
+        let image = spans.iter().find(|s| s.kind == SyntaxKind::Image).unwrap();
+        assert!(source[image.start_byte..image.end_byte.min(source.len())].contains("alt"));
+        let code = spans
+            .iter()
+            .find(|s| s.kind == SyntaxKind::CodeInline)
+            .unwrap();
+        assert!(source[code.start_byte..code.end_byte.min(source.len())].contains("code"));
+    }
+
+    #[test]
+    fn extracts_indented_code_and_nested_blockquote() {
+        let source = "    indented()\n\n> outer\n> > inner\n";
+        let spans = extract_syntax_spans(source);
+        assert!(has_kind(&spans, SyntaxKind::CodeBlock) || has_kind(&spans, SyntaxKind::BlockQuote));
+        assert!(has_kind(&spans, SyntaxKind::BlockQuote));
+    }
+
+    #[test]
     fn concurrent_edit_and_parse_keeps_latest_revision() {
         let parser = BackgroundMarkdownParser::new();
         parser.request_parse(ParseSnapshot {

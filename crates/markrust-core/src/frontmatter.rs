@@ -132,6 +132,20 @@ mod tests {
     }
 
     #[test]
+    fn nested_yaml_title_is_not_extracted_from_indented_key() {
+        let source = "---\nmeta:\n  title: Nested\n---\n\n# Body\n";
+        let info = parse_frontmatter(source).unwrap();
+        assert!(info.title.is_none(), "nested title should not match: {info:?}");
+        assert!(info.end_byte < source.find("# Body").unwrap());
+    }
+
+    #[test]
+    fn empty_title_value_is_none() {
+        let info = parse_frontmatter("---\ntitle:\n---\n").unwrap();
+        assert!(info.title.is_none());
+    }
+
+    #[test]
     fn crlf_frontmatter() {
         let source = "---\r\ntitle: Win\r\n---\r\n\r\n# Body";
         let info = parse_frontmatter(source).unwrap();

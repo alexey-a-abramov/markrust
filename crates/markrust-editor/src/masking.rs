@@ -323,4 +323,47 @@ mod tests {
         assert!(doc.syntax_spans.is_empty());
         assert!(compute_visibility(&[Caret::new(2)], &[], &doc.syntax_spans).is_empty());
     }
+
+    #[test]
+    fn overlapping_spans_reveal_independently() {
+        let source = "**bold *italic* still**";
+        let spans = markrust_core::extract_syntax_spans(source);
+        let italic = spans
+            .iter()
+            .find(|span| span.kind == SyntaxKind::Italic)
+            .expect("italic span");
+        let bold = spans
+            .iter()
+            .find(|span| span.kind == SyntaxKind::Bold)
+            .expect("bold span");
+        let vis = compute_visibility(&[Caret::new(italic.start_byte + 1)], &[], &spans);
+        let bold_visible = delimiter_visibility_for_span(bold, &[Caret::new(italic.start_byte + 1)], &[]);
+        let italic_visible =
+            delimiter_visibility_for_span(italic, &[Caret::new(italic.start_byte + 1)], &[]);
+        assert_eq!(bold_visible, VisibilityState::Visible);
+        assert_eq!(italic_visible, VisibilityState::Visible);
+        assert!(vis.contains(&VisibilityState::Visible));
+    }
+
+    #[test]
+    fn empty_caret_list_masks_without_selection() {
+        let spans = vec![bold_span(0, 8)];
+        assert_eq!(
+            compute_visibility(&[], &[], &spans),
+            vec![VisibilityState::Masked, VisibilityState::Masked]
+        );
+        let vis = compute_visibility(&[], &[Selection::new(0, 8)], &spans);
+        assert_eq!(
+            vis,
+            vec![VisibilityState::Visible, VisibilityState::Visible]
+        );
+    }
+
+    #[test]
+    fn inverted_selection_normalizes_and_overlaps() {
+        let sel = Selection::new(8, 2);
+        assert_eq!(sel, Selection::new(2, 8));
+        assert!(sel.overlaps(0, 4));
+        assert!(!Selection::new(0, 0).overlaps(0, 4));
+    }
 }

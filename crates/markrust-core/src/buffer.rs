@@ -300,4 +300,58 @@ mod tests {
         assert_eq!(buf.content(), "abcd");
         assert_line_index_consistent(&buf);
     }
+
+    #[test]
+    fn insert_and_delete_at_start_middle_end() {
+        let mut buf = DocumentBuffer::with_text("ace");
+        buf.insert(0, "!");
+        assert_eq!(buf.content(), "!ace");
+        buf.insert(2, "b");
+        assert_eq!(buf.content(), "!abce");
+        buf.insert(buf.len_bytes(), "!");
+        assert_eq!(buf.content(), "!abce!");
+        buf.delete(0, 1);
+        buf.delete(buf.len_bytes() - 1, buf.len_bytes());
+        buf.delete(1, 2);
+        assert_eq!(buf.content(), "ace");
+        assert_line_index_consistent(&buf);
+    }
+
+    #[test]
+    fn empty_buffer_slice_and_delete_are_empty() {
+        let mut buf = DocumentBuffer::new();
+        assert_eq!(buf.slice(0, 0), "");
+        assert_eq!(buf.slice(0, 10), "");
+        assert_eq!(buf.delete(0, 4), 0);
+        buf.insert(0, "");
+        assert_eq!(buf.content(), "");
+        assert_eq!(buf.revision(), 1);
+    }
+
+    #[test]
+    fn combining_character_is_two_chars() {
+        let nfd = "e\u{0301}";
+        let mut buf = DocumentBuffer::with_text(nfd);
+        assert_eq!(buf.len_chars(), 2);
+        assert_eq!(buf.len_bytes(), 3);
+        assert_eq!(buf.slice(0, 1), "e");
+        assert_eq!(buf.slice(1, 3), "\u{0301}");
+        buf.insert(1, "x");
+        assert_eq!(buf.content(), "ex\u{0301}");
+        buf.delete(1, 2);
+        assert_eq!(buf.content(), nfd);
+        assert_line_index_consistent(&buf);
+    }
+
+    #[test]
+    fn cjk_insert_middle_and_end() {
+        let mut buf = DocumentBuffer::with_text("你好");
+        buf.insert(3, "，");
+        assert_eq!(buf.content(), "你，好");
+        buf.insert(buf.len_bytes(), "。");
+        assert_eq!(buf.content(), "你，好。");
+        buf.delete(0, 3);
+        assert_eq!(buf.content(), "，好。");
+        assert_line_index_consistent(&buf);
+    }
 }

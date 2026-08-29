@@ -10,6 +10,7 @@ pub mod headless;
 pub mod highlight;
 pub mod layout;
 pub mod masking;
+pub mod table;
 pub mod theme;
 
 pub use editor::MarkdownEditor;
@@ -27,4 +28,5 @@ pub use masking::{
     compute_delimiter_entries, compute_visibility, delimiter_visibility_for_span, ByteRange, Caret,
     DelimiterVisibilityEntry, Selection, VisibilityState,
 };
+pub use table::{parse_column_alignments, ColumnAlign};
 pub use theme::EditorTheme;

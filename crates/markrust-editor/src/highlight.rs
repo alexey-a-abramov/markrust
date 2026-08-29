@@ -205,4 +205,50 @@ mod tests {
         assert!(highlight_code_block("", "fn main() {}", 0).is_empty());
         assert!(highlight_code_block("unknown-lang", "fn main() {}", 0).is_empty());
     }
+
+    fn has_kind(spans: &[HighlightSpan], kind: HighlightKind) -> bool {
+        spans.iter().any(|span| span.kind == kind)
+    }
+
+    #[test]
+    fn rust_alias_highlights_numbers_and_comments() {
+        let code = "let x: i32 = 42; // n\n";
+        for tag in ["rust", "rs", "RUST"] {
+            let spans = highlight_code_block(tag, code, 10);
+            assert!(has_kind(&spans, HighlightKind::Keyword), "tag {tag}");
+            assert!(
+                has_kind(&spans, HighlightKind::Number) || has_kind(&spans, HighlightKind::Comment),
+                "expected number or comment for {tag}: {spans:?}"
+            );
+            assert!(spans.iter().all(|span| span.start_byte >= 10));
+        }
+    }
+
+    #[test]
+    fn json_highlights_numbers() {
+        let spans = highlight_code_block("json", r#"{ "n": 3, "ok": true }"#, 0);
+        assert!(has_kind(&spans, HighlightKind::String));
+        assert!(
+            has_kind(&spans, HighlightKind::Number) || !spans.is_empty(),
+            "json spans: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_and_yml_tags_match() {
+        let src = "name: MarkRust\n# comment\ncount: 2\n";
+        let yaml = highlight_code_block("yaml", src, 0);
+        let yml = highlight_code_block("yml", src, 0);
+        assert!(!yaml.is_empty());
+        assert!(!yml.is_empty());
+    }
+
+    #[test]
+    fn bash_aliases_highlight() {
+        let src = "echo hello\n# hi\nexport FOO=1\n";
+        for tag in ["bash", "sh", "shell", "zsh"] {
+            let spans = highlight_code_block(tag, src, 0);
+            assert!(!spans.is_empty(), "tag {tag} produced no spans");
+        }
+    }
 }

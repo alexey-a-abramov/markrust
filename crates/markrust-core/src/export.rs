@@ -120,6 +120,20 @@ mod tests {
     }
 
     #[test]
+    fn exports_links_and_images() {
+        let html = markdown_to_html_gfm("[MarkRust](https://markrust.org) and ![alt](pic.png)");
+        assert!(
+            html.contains("href=\"https://markrust.org\""),
+            "link html: {html}"
+        );
+        assert!(html.contains("MarkRust"), "link text html: {html}");
+        assert!(
+            html.contains("src=\"pic.png\"") || html.contains("pic.png"),
+            "image html: {html}"
+        );
+    }
+
+    #[test]
     fn write_markdown_creates_parent_dirs() {
         let dir = crate::test_support::TempDir::new("export-write");
         let output = dir.join("deep/nested/out.html");

@@ -446,4 +446,101 @@ mod tests {
         assert_eq!(doc.buffer.content(), "# Reset");
         assert_eq!(doc.word_count(), 2);
     }
+
+    #[test]
+    fn revision_increments_on_document_edits() {
+        let mut doc = Document::new("a");
+        assert_eq!(doc.revision(), 0);
+        doc.insert(1, "b");
+        assert_eq!(doc.revision(), 1);
+        doc.delete(0, 1);
+        assert_eq!(doc.revision(), 2);
+        doc.replace_range(0, 1, "xy");
+        assert!(doc.revision() > 2);
+        doc.undo();
+        assert!(doc.revision() > 0);
+        doc.replace_range(0, 0, "");
+        let after_noop = doc.revision();
+        doc.replace_range(0, 0, "");
+        assert_eq!(doc.revision(), after_noop);
+    }
+
+    #[test]
+    fn interleaved_edits_clear_redo_and_restore() {
+        let mut doc = Document::new("");
+        doc.insert(0, "a");
+        doc.insert(1, "b");
+        doc.insert(2, "c");
+        assert_eq!(doc.buffer.content(), "abc");
+        assert!(doc.undo());
+        assert_eq!(doc.buffer.content(), "ab");
+        assert!(doc.undo());
+        assert_eq!(doc.buffer.content(), "a");
+        assert!(doc.undo_stack().can_redo());
+        doc.insert(1, "X");
+        assert_eq!(doc.buffer.content(), "aX");
+        assert!(!doc.undo_stack().can_redo());
+        assert!(doc.undo());
+        assert_eq!(doc.buffer.content(), "a");
+        assert!(doc.redo());
+        assert_eq!(doc.buffer.content(), "aX");
+        assert!(doc.dirty);
+    }
+
+    #[test]
+    fn save_as_round_trip_and_atomic_temp_is_gone() {
+        let dir = TempDir::new("doc-save-as");
+        let path = dir.join("note.md");
+        let mut doc = Document::new("# Hello");
+        doc.insert(7, " world");
+        doc.save_as(path.clone()).unwrap();
+        assert!(!doc.dirty);
+        assert_eq!(doc.path.as_deref(), Some(path.as_path()));
+        assert!(!path.with_extension("markrust-tmp").exists());
+        let reloaded = Document::from_file(path).unwrap();
+        assert_eq!(reloaded.buffer.content(), "# Hello world");
+        assert!(!reloaded.dirty);
+    }
+
+    #[test]
+    fn save_creates_parent_dirs_and_clears_tmp() {
+        let dir = TempDir::new("doc-atomic");
+        let path = dir.join("nested/out.md");
+        let mut doc = Document::new("body");
+        doc.set_path(Some(path.clone()));
+        doc.save_and_mark_clean().unwrap();
+        assert!(!doc.dirty);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "body");
+        assert!(!path.with_extension("markrust-tmp").exists());
+    }
+
+    #[test]
+    fn word_count_edge_cases() {
+        let cases: &[(&str, usize)] = &[
+            ("hello, world!", 2),
+            ("foo\nbar", 2),
+            ("foo\tbar", 2),
+            ("你好 世界", 2),
+            ("你好世界", 1),
+            ("e\u{0301} acute", 2),
+            ("one two  three\n\nfour", 4),
+            ("a\u{00a0}b", 2),
+        ];
+        for &(text, expected) in cases {
+            assert_eq!(Document::new(text).word_count(), expected, "text {text:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_extension_from_file_is_wysiwyg() {
+        let dir = TempDir::new("doc-md");
+        let path = dir.join("readme.markdown");
+        std::fs::write(&path, "# Title").unwrap();
+        let doc = Document::from_file(path).unwrap();
+        assert_eq!(doc.mode, DocumentProcessingMode::MarkdownWysiwyg);
+        assert!(doc
+            .syntax_spans
+            .iter()
+            .any(|span| span.kind == SyntaxKind::Heading));
+    }
 }
