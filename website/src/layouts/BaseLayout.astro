@@ -67,6 +67,7 @@ const url = canonical ?? new URL(Astro.url.pathname, Astro.site).href;
     </script>
   </head>
   <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
     <slot />
     <script src="/theme.js" defer></script>
   </body>

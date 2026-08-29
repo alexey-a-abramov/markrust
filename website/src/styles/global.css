@@ -90,6 +90,21 @@ samp {
   border: 0;
 }
 
+.skip-link {
+  position: absolute;
+  left: var(--space-3);
+  top: -100%;
+  z-index: 100;
+  padding: 0.5rem 0.75rem;
+  background: var(--color-ink);
+  color: var(--color-paper);
+  text-decoration: none;
+}
+
+.skip-link:focus {
+  top: var(--space-3);
+}
+
 .container {
   width: min(100% - var(--space-6), var(--max-wide));
   margin-inline: auto;
