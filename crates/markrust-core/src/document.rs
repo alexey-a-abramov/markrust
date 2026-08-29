@@ -535,12 +535,16 @@ mod tests {
     fn markdown_extension_from_file_is_wysiwyg() {
         let dir = TempDir::new("doc-md");
         let path = dir.join("readme.markdown");
-        std::fs::write(&path, "# Title").unwrap();
-        let doc = Document::from_file(path).unwrap();
+        std::fs::write(&path, "# Title\n").unwrap();
+        let mut doc = Document::from_file(path).unwrap();
         assert_eq!(doc.mode, DocumentProcessingMode::MarkdownWysiwyg);
-        assert!(doc
-            .syntax_spans
-            .iter()
-            .any(|span| span.kind == SyntaxKind::Heading));
+        assert!(doc.wait_for_parse(PARSE_TIMEOUT));
+        assert!(
+            doc.syntax_spans
+                .iter()
+                .any(|span| span.kind == SyntaxKind::Heading),
+            "spans: {:?}",
+            doc.syntax_spans
+        );
     }
 }

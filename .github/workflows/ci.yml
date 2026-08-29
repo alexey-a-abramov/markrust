@@ -43,6 +43,29 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+  website:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install website dependencies
+        run: pnpm install
+
+      - name: Install Playwright Chromium
+        run: pnpm --dir website exec playwright install --with-deps chromium
+
+      - name: Website unit + e2e tests
+        run: pnpm --dir website test
+
   msrv:
     runs-on: ubuntu-latest
     steps:

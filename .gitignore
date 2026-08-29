@@ -35,6 +35,12 @@ website/.astro/
 node_modules/
 pnpm-debug.log*
 
+# Playwright
+website/test-results/
+website/playwright-report/
+website/blob-report/
+website/playwright/.cache/
+
 # Editor temp files
 *.tmp
 *.bak

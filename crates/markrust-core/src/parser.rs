@@ -436,7 +436,9 @@ mod tests {
     fn extracts_indented_code_and_nested_blockquote() {
         let source = "    indented()\n\n> outer\n> > inner\n";
         let spans = extract_syntax_spans(source);
-        assert!(has_kind(&spans, SyntaxKind::CodeBlock) || has_kind(&spans, SyntaxKind::BlockQuote));
+        assert!(
+            has_kind(&spans, SyntaxKind::CodeBlock) || has_kind(&spans, SyntaxKind::BlockQuote)
+        );
         assert!(has_kind(&spans, SyntaxKind::BlockQuote));
     }
 

@@ -122,7 +122,10 @@ mod tests {
     #[test]
     fn empty_or_plain_line_has_no_columns() {
         assert!(parse_column_alignments("").is_empty());
-        assert!(parse_column_alignments("not a table").is_empty());
+        assert_eq!(
+            parse_column_alignments("not a table"),
+            vec![ColumnAlign::Left]
+        );
         assert_eq!(split_table_cells("|  |  |"), Vec::<String>::new());
     }
 

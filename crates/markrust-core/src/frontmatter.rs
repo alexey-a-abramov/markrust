@@ -57,7 +57,7 @@ fn find_closing_fence(yaml_body: &str) -> Option<std::ops::Range<usize>> {
 
 fn extract_yaml_title(yaml: &str) -> Option<String> {
     for line in yaml.lines() {
-        let line = line.trim();
+        let line = line.trim_end();
         if let Some(value) = line.strip_prefix("title:") {
             return parse_yaml_scalar(value);
         }
@@ -135,7 +135,10 @@ mod tests {
     fn nested_yaml_title_is_not_extracted_from_indented_key() {
         let source = "---\nmeta:\n  title: Nested\n---\n\n# Body\n";
         let info = parse_frontmatter(source).unwrap();
-        assert!(info.title.is_none(), "nested title should not match: {info:?}");
+        assert!(
+            info.title.is_none(),
+            "nested title should not match: {info:?}"
+        );
         assert!(info.end_byte < source.find("# Body").unwrap());
     }
 

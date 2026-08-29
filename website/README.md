@@ -25,7 +25,15 @@ pnpm dev
 pnpm build            # from repo root
 ```
 
-Output goes to `website/dist/`. Deploy to any static host (Cloudflare Pages, GitHub Pages, etc.).
+## Tests
+
+```bash
+pnpm test            # unit + Playwright e2e (from repo root or website/)
+pnpm test:unit       # docs-nav page resolution
+pnpm test:e2e        # Playwright against production preview
+```
+
+E2e builds the site, then serves `pnpm preview` on http://127.0.0.1:4321.
 
 ## Structure
 

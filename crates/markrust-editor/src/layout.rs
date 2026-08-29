@@ -771,4 +771,24 @@ mod tests {
             build_display_layout(content, &spans, &[Caret::new(0)], &[], &EditorTheme::dark());
         assert!(!layout.code_block_lines.is_empty());
     }
+
+    #[test]
+    fn outline_headings_collect_titles() {
+        let content = "# Alpha\n\n## Beta\n";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let outline = outline_headings(&spans, content);
+        assert!(outline
+            .iter()
+            .any(|(_, level, title)| *level == 1 && title.contains("Alpha")));
+        assert!(outline
+            .iter()
+            .any(|(_, level, title)| *level == 2 && title.contains("Beta")));
+    }
+
+    #[test]
+    fn cursor_line_col_handles_lf_and_crlf() {
+        assert_eq!(cursor_line_col("ab\ncd", 3), (1, 0));
+        assert_eq!(cursor_line_col("ab\r\ncd", 4), (1, 0));
+        assert_eq!(cursor_line_col("", 0), (0, 0));
+    }
 }

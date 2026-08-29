@@ -4,7 +4,10 @@
   "scripts": {
     "dev": "pnpm --dir website dev",
     "build": "pnpm --dir website build",
-    "preview": "pnpm --dir website preview"
+    "preview": "pnpm --dir website preview",
+    "test": "pnpm --dir website test",
+    "test:e2e": "pnpm --dir website test:e2e",
+    "test:unit": "pnpm --dir website test:unit"
   },
   "packageManager": "pnpm@9.0.0"
 }

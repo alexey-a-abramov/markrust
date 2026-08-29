@@ -77,7 +77,10 @@ fn cli_help_via_assert_cmd() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage"), "{stdout}");
     assert!(stdout.contains("export"), "{stdout}");
-    assert!(stdout.contains("--version") || stdout.contains("-V"), "{stdout}");
+    assert!(
+        stdout.contains("--version") || stdout.contains("-V"),
+        "{stdout}"
+    );
 }
 
 #[test]

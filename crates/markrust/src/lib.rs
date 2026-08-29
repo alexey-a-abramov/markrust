@@ -182,6 +182,9 @@ mod tests {
             parse_args(&["export".into(), "n.md".into()]),
             CliAction::Export { .. }
         ));
-        assert!(matches!(parse_args(&["--wat".into()]), CliAction::Unknown(_)));
+        assert!(matches!(
+            parse_args(&["--wat".into()]),
+            CliAction::Unknown(_)
+        ));
     }
 }

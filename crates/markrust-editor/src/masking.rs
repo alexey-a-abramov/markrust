@@ -337,7 +337,8 @@ mod tests {
             .find(|span| span.kind == SyntaxKind::Bold)
             .expect("bold span");
         let vis = compute_visibility(&[Caret::new(italic.start_byte + 1)], &[], &spans);
-        let bold_visible = delimiter_visibility_for_span(bold, &[Caret::new(italic.start_byte + 1)], &[]);
+        let bold_visible =
+            delimiter_visibility_for_span(bold, &[Caret::new(italic.start_byte + 1)], &[]);
         let italic_visible =
             delimiter_visibility_for_span(italic, &[Caret::new(italic.start_byte + 1)], &[]);
         assert_eq!(bold_visible, VisibilityState::Visible);
