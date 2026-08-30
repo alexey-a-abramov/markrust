@@ -5,6 +5,7 @@
 //! The WYSIWYG editor view: a virtualized list of rendered blocks kept in
 //! sync with the document through [`RichEngine`].
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,9 @@ use markrust_core::Document;
 
 use super::block_text::{hit_test_leaf, LeafLayout, WidgetImeSink, WysiwygHost};
 use super::blocks::{render_top_block, RenderSnapshot};
+use super::image::{
+    cache_path_for_url, collect_remote_image_urls, default_image_cache_dir, fetch_remote_image,
+};
 use super::ime::{caret_from_element_bounds, widget_caret_rect, ImeLeafHit, ImeOriginState};
 use crate::headless::{CaretMove, EditorCommand, EditorOutcome};
 use crate::theme::EditorTheme;
@@ -79,7 +83,10 @@ pub struct RichEditorView {
     ime: ImeOriginState,
     widget_edit: WidgetEdit,
     widget_preedit: Option<String>,
+    remote_pending: HashSet<String>,
+    remote_failed: HashSet<String>,
     _blink_task: Task<()>,
+    _remote_fetch_tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -116,7 +123,10 @@ impl RichEditorView {
             ime: ImeOriginState::default(),
             widget_edit: WidgetEdit::Idle,
             widget_preedit: None,
+            remote_pending: HashSet::new(),
+            remote_failed: HashSet::new(),
             _blink_task: Task::ready(()),
+            _remote_fetch_tasks: Vec::new(),
             _subscriptions: vec![focus_sub, blur_sub, doc_sub],
         }
     }
@@ -459,21 +469,25 @@ impl RichEditorView {
     }
 
     fn sync_snapshot(&mut self, cx: &mut Context<Self>) -> Arc<RenderSnapshot> {
-        let doc = self.document.read(cx);
-        let revision = doc.revision();
+        let revision = self.document.read(cx).revision();
         if self.synced_revision == Some(revision) {
             if let Some(snapshot) = &self.snapshot {
                 return snapshot.clone();
             }
         }
         let widget_only = self.synced_revision == Some(revision) && self.snapshot.is_none();
-        let base_dir = doc
-            .path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf());
-        let old_count = self.engine.tree().blocks.len();
-        self.engine.sync(doc);
+        let (base_dir, source, old_count) = {
+            let doc = self.document.read(cx);
+            let base_dir = doc
+                .path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf());
+            let source = doc.buffer.content();
+            let old_count = self.engine.tree().blocks.len();
+            self.engine.sync(doc);
+            (base_dir, source, old_count)
+        };
         let new_count = self.engine.tree().blocks.len();
         if !widget_only {
             match self.engine.last_splice() {
@@ -488,9 +502,10 @@ impl RichEditorView {
                 }
             }
         }
+        self.enqueue_remote_images(cx);
         let snapshot = Arc::new(RenderSnapshot {
             tree: self.engine.tree().clone(),
-            source: doc.buffer.content(),
+            source,
             theme: self.theme.clone(),
             base_dir,
             editing_code: match &self.widget_edit {
@@ -506,6 +521,38 @@ impl RichEditorView {
         self.snapshot = Some(snapshot.clone());
         self.synced_revision = Some(revision);
         snapshot
+    }
+
+    fn enqueue_remote_images(&mut self, cx: &mut Context<Self>) {
+        let cache_dir = default_image_cache_dir();
+        for url in collect_remote_image_urls(self.engine.tree()) {
+            if self.remote_pending.contains(&url) || self.remote_failed.contains(&url) {
+                continue;
+            }
+            let dest = cache_path_for_url(&cache_dir, &url);
+            if dest.is_file() {
+                continue;
+            }
+            self.remote_pending.insert(url.clone());
+            let url_fetch = url.clone();
+            let url_status = url;
+            let dest_fetch = dest;
+            let task = cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { fetch_remote_image(&url_fetch, &dest_fetch) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.remote_pending.remove(&url_status);
+                    if result.is_err() {
+                        this.remote_failed.insert(url_status);
+                    }
+                    this.snapshot = None;
+                    cx.notify();
+                });
+            });
+            self._remote_fetch_tasks.push(task);
+        }
     }
 
     fn offset_from_utf16(content: &str, offset: usize) -> usize {

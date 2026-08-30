@@ -5,7 +5,7 @@
 //! Per-kind block renderers for the WYSIWYG surface.
 
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
@@ -18,6 +18,7 @@ use super::block_text::{
     build_code_layout, build_leaf_layout, build_leaf_layout_inlines, BlockTextElement,
     WidgetImeSink, WysiwygHost,
 };
+use super::image::{resolve_image_source, ResolvedImage};
 use super::inline_layout::{
     classify_paragraph, image_role, inline_image_height, inline_segments, ImageRole, InlineSegment,
     ParagraphFlow, BLOCK_IMAGE_MAX_HEIGHT, BLOCK_IMAGE_MAX_WIDTH,
@@ -353,11 +354,12 @@ fn render_table<H: WysiwygHost>(
         .into_any_element()
 }
 
-/// A leaf block's inline content as wrapped rich text, with local images as
-/// GPUI `img()` pixels (filesystem `PathBuf`, decoded on the background
-/// executor). Mixed text+image paragraphs are a wrapping flex row (GPUI cannot
-/// mix Image and glyphs in one `TextRun`); standalone image paragraphs stay
-/// block-sized.
+/// A leaf block's inline content as wrapped rich text, with images as GPUI
+/// `img()` pixels (filesystem `PathBuf`, decoded on the background executor).
+/// Remote `http(s)` images use a URL cache path once fetched; until then (and
+/// on failure) the alt placeholder is shown. Mixed text+image paragraphs are
+/// a wrapping flex row (GPUI cannot mix Image and glyphs in one `TextRun`);
+/// standalone image paragraphs stay block-sized.
 fn paragraph_element<H: WysiwygHost>(
     snap: &Arc<RenderSnapshot>,
     block: &Block,
@@ -562,55 +564,83 @@ fn render_image<H: WysiwygHost>(
     let inline_h = px(inline_image_height(font_size));
     let edit_on_click = role == ImageRole::Inline;
     let click_range = image_range.clone();
-    // GPUI: `img(String)` is an *embedded asset*, not a file. Local Markdown
-    // images must be `PathBuf` so decode runs on the background executor and
-    // the view is notified when pixels are ready.
-    let pixels = match resolve_image_source(snap.base_dir.as_deref(), url) {
-        ResolvedImage::File(path) => img(path),
-        ResolvedImage::Uri(uri) => img(uri),
-    }
-    .id(("md-img", image_range.start as u64))
-    .object_fit(ObjectFit::Contain)
-    .rounded_md()
-    .cursor(CursorStyle::PointingHand);
-    let pixels = match role {
-        ImageRole::Inline => {
-            let fallback_label = fallback_label.clone();
-            pixels
-                .h(inline_h)
-                .max_h(inline_h)
-                .flex_none()
+    // GPUI: `img(String)` is an *embedded asset*, not a file. Markdown images
+    // must be `PathBuf` (local file or a populated URL cache) so decode runs
+    // on the background executor. Do not `img()` a missing cache path: GPUI
+    // would cache the failure and never retry after the fetch writes the file.
+    let resolved = resolve_image_source(snap.base_dir.as_deref(), url);
+    let ready_source = match resolved {
+        ResolvedImage::File(path) if path.is_file() => Some(img(path)),
+        ResolvedImage::Uri(uri) => Some(img(uri)),
+        ResolvedImage::File(_) => None,
+    };
+    let pixels = if let Some(source) = ready_source {
+        let source = source
+            .id(("md-img", image_range.start as u64))
+            .object_fit(ObjectFit::Contain)
+            .rounded_md()
+            .cursor(CursorStyle::PointingHand);
+        let source = match role {
+            ImageRole::Inline => {
+                let fallback_label = fallback_label.clone();
+                source
+                    .h(inline_h)
+                    .max_h(inline_h)
+                    .flex_none()
+                    .with_loading(move || {
+                        div()
+                            .h(inline_h)
+                            .w(inline_h)
+                            .rounded_md()
+                            .bg(code_bg)
+                            .into_any_element()
+                    })
+                    .with_fallback(move || missing_image_fallback(secondary, &fallback_label))
+            }
+            ImageRole::Block => source
+                .max_w(px(BLOCK_IMAGE_MAX_WIDTH))
+                .max_h(px(BLOCK_IMAGE_MAX_HEIGHT))
                 .with_loading(move || {
                     div()
-                        .h(inline_h)
-                        .w(inline_h)
+                        .h(px(72.))
+                        .w_full()
                         .rounded_md()
                         .bg(code_bg)
                         .into_any_element()
                 })
-                .with_fallback(move || missing_image_fallback(secondary, &fallback_label))
-        }
-        ImageRole::Block => pixels
-            .max_w(px(BLOCK_IMAGE_MAX_WIDTH))
-            .max_h(px(BLOCK_IMAGE_MAX_HEIGHT))
-            .with_loading(move || {
-                div()
-                    .h(px(72.))
-                    .w_full()
-                    .rounded_md()
-                    .bg(code_bg)
-                    .into_any_element()
+                .with_fallback(move || missing_image_fallback(secondary, &fallback_label)),
+        };
+        source
+            .on_click(move |_, window, cx| {
+                editor_click.update(cx, |host, cx| {
+                    host.click_source(caret_at, false, window, cx);
+                    if edit_on_click {
+                        host.edit_image_alt(click_range.clone(), &alt_for_edit, cx);
+                    }
+                });
             })
-            .with_fallback(move || missing_image_fallback(secondary, &fallback_label)),
-    }
-    .on_click(move |_, window, cx| {
-        editor_click.update(cx, |host, cx| {
-            host.click_source(caret_at, false, window, cx);
-            if edit_on_click {
-                host.edit_image_alt(click_range.clone(), &alt_for_edit, cx);
-            }
-        });
-    });
+            .into_any_element()
+    } else {
+        let placeholder = match role {
+            ImageRole::Inline => div()
+                .h(inline_h)
+                .flex_none()
+                .child(missing_image_fallback(secondary, &fallback_label)),
+            ImageRole::Block => div().child(missing_image_fallback(secondary, &fallback_label)),
+        };
+        placeholder
+            .id(("md-img", image_range.start as u64))
+            .cursor(CursorStyle::PointingHand)
+            .on_click(move |_, window, cx| {
+                editor_click.update(cx, |host, cx| {
+                    host.click_source(caret_at, false, window, cx);
+                    if edit_on_click {
+                        host.edit_image_alt(click_range.clone(), &alt_for_edit, cx);
+                    }
+                });
+            })
+            .into_any_element()
+    };
     let show_caption = role == ImageRole::Block || editing;
     let caption_el = div()
         .id(("img-alt", image_range.start as u64))
@@ -682,62 +712,6 @@ fn missing_image_fallback(secondary: gpui::Hsla, label: &str) -> AnyElement {
         .italic()
         .child(SharedString::from(format!("🖼 {label}")))
         .into_any_element()
-}
-
-/// How a Markdown image destination is handed to GPUI's `img()`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ResolvedImage {
-    /// Local file; GPUI `From<PathBuf>` → `Resource::Path` (background decode).
-    File(PathBuf),
-    /// `http(s):` / `data:` ; GPUI `From<String>` → `Resource::Uri`.
-    Uri(String),
-}
-
-pub(crate) fn resolve_image_source(base_dir: Option<&Path>, url: &str) -> ResolvedImage {
-    let trimmed = url.trim();
-    if trimmed.starts_with("http://")
-        || trimmed.starts_with("https://")
-        || trimmed.starts_with("data:")
-    {
-        return ResolvedImage::Uri(trimmed.to_string());
-    }
-    let path_url = trimmed
-        .strip_prefix("file://")
-        .map(|rest| rest.strip_prefix("localhost").unwrap_or(rest))
-        .unwrap_or(trimmed);
-    let decoded = percent_decode_path(path_url);
-    let path = match base_dir {
-        Some(dir) if !Path::new(&decoded).is_absolute() => dir.join(&decoded),
-        _ => PathBuf::from(&decoded),
-    };
-    ResolvedImage::File(path)
-}
-
-fn percent_decode_path(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn base_text_style(theme: &EditorTheme, font_size: f32, weight: FontWeight) -> TextStyle {
@@ -820,54 +794,4 @@ fn text_runs_from_highlights(
         runs.push(style.to_run(body.len()));
     }
     runs
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn local_relative_url_is_a_filesystem_path() {
-        let base = Path::new("/docs/notes");
-        assert_eq!(
-            resolve_image_source(Some(base), "assets/icon/icon.png"),
-            ResolvedImage::File(base.join("assets/icon/icon.png"))
-        );
-        assert_eq!(
-            resolve_image_source(Some(base), "photo%20one.png"),
-            ResolvedImage::File(base.join("photo one.png"))
-        );
-    }
-
-    #[test]
-    fn absolute_and_file_urls_stay_paths() {
-        assert_eq!(
-            resolve_image_source(Some(Path::new("/docs")), "/tmp/pic.png"),
-            ResolvedImage::File(PathBuf::from("/tmp/pic.png"))
-        );
-        assert_eq!(
-            resolve_image_source(None, "file:///Users/me/pic.png"),
-            ResolvedImage::File(PathBuf::from("/Users/me/pic.png"))
-        );
-    }
-
-    #[test]
-    fn remote_and_data_urls_stay_uris() {
-        assert_eq!(
-            resolve_image_source(Some(Path::new("/docs")), "https://cdn.example/a.png"),
-            ResolvedImage::Uri("https://cdn.example/a.png".into())
-        );
-        assert_eq!(
-            resolve_image_source(None, "data:image/png;base64,xx"),
-            ResolvedImage::Uri("data:image/png;base64,xx".into())
-        );
-    }
-
-    #[test]
-    fn string_img_source_would_not_be_a_file() {
-        // Regression lock: GPUI treats String as Embedded or Uri, never Path.
-        // Local markdown images must keep going through ResolvedImage::File.
-        let resolved = resolve_image_source(Some(Path::new("/doc")), "img.webp");
-        assert!(matches!(resolved, ResolvedImage::File(_)));
-    }
 }

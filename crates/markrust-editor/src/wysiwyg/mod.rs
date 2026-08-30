@@ -7,6 +7,7 @@
 
 mod block_text;
 mod blocks;
+mod image;
 mod ime;
 mod inline_layout;
 mod view;

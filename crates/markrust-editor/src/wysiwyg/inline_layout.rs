@@ -44,8 +44,13 @@ pub enum ImageRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InlineSegment {
     /// Inclusive-exclusive slice of `block.inlines` (text / breaks / opaque).
-    Text { start: usize, end: usize },
-    Image { index: usize },
+    Text {
+        start: usize,
+        end: usize,
+    },
+    Image {
+        index: usize,
+    },
 }
 
 pub fn classify_paragraph(inlines: &[Inline]) -> ParagraphFlow {
@@ -205,7 +210,10 @@ mod tests {
     fn standalone_image_paragraph_is_block_sized() {
         let inlines = &import("![x](a.png)\n").blocks[0].inlines;
         assert_eq!(classify_paragraph(inlines), ParagraphFlow::Standalone);
-        assert_eq!(image_role(ParagraphFlow::Standalone), Some(ImageRole::Block));
+        assert_eq!(
+            image_role(ParagraphFlow::Standalone),
+            Some(ImageRole::Block)
+        );
         assert_eq!(visual_rows("![x](a.png)\n", 480.0, 16.0), 1);
         assert!(
             BLOCK_IMAGE_MAX_HEIGHT > inline_image_height(16.0) * 4.0,

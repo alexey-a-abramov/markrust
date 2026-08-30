@@ -121,7 +121,8 @@ pub fn build_leaf_layout(
 }
 
 /// Visible text for a slice of inlines. Images are omitted here; the block
-/// renderer paints local files as `img()` elements instead of alt placeholders.
+/// renderer paints files as `img()` elements (local paths and cached remotes)
+/// instead of alt placeholders.
 pub fn build_leaf_layout_inlines(
     inlines: &[Inline],
     block_range: Range<usize>,

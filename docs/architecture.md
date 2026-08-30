@@ -50,10 +50,10 @@ SyntaxNodeSpan map (revision-stamped)  — source-mode masking only
 RichEngine::sync → RichTree              — WYSIWYG + commands
         ↓
 Source: compute_visibility + layout + paint
-WYSIWYG: virtualized block list + BlockTextElement; mixed text+image paragraphs are a wrapping flex line-box (`img(PathBuf)`, 1.5em height cap); standalone image paragraphs stay block-sized (max 720×480); decode on the background executor; IME origin from the focused widget or caret leaf (`wysiwyg/ime.rs`), pushed with `invalidate_character_coordinates` after caret/widget paint
+WYSIWYG: virtualized block list + BlockTextElement; mixed text+image paragraphs are a wrapping flex line-box (`img(PathBuf)`, 1.5em height cap); standalone image paragraphs stay block-sized (max 720×480); local files and cached `http(s)` images decode on the background executor; remote URLs fetch off the UI thread into `cache/markrust/images` (timeout/failure → alt placeholder); IME origin from the focused widget or caret leaf (`wysiwyg/ime.rs`), pushed with `invalidate_character_coordinates` after caret/widget paint
 ```
 
-Parse, the folder watcher `recv`, and GPUI image decode stay off the GPUI UI thread. `Document::new` / `from_file` only *schedule* a parse; the frame drains with `apply_pending_parse`. CI timeout tests (`crates/markrust-core/tests/perf_gates.rs`, `crates/markrust-editor/tests/perf_gates.rs`) fail if load+parse or source layout of a 256 KiB fixture exceeds a budget. Local numbers: `cargo bench -p markrust-core --bench parse` and `cargo bench -p markrust-editor --bench layout`.
+Parse, the folder watcher `recv`, remote image HTTP, and GPUI image decode stay off the GPUI UI thread. `Document::new` / `from_file` only *schedule* a parse; they do not fetch network images. The frame drains parse with `apply_pending_parse`. CI timeout tests (`crates/markrust-core/tests/perf_gates.rs`, `crates/markrust-editor/tests/perf_gates.rs`) fail if load+parse or source layout of a 256 KiB fixture exceeds a budget. Local numbers: `cargo bench -p markrust-core --bench parse` and `cargo bench -p markrust-editor --bench layout`.
 
 ## Document model
 

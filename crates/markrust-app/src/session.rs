@@ -794,6 +794,38 @@ mod tests {
     }
 
     #[test]
+    fn open_file_with_remote_image_does_not_block_on_network() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "markrust-open-remote-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+        std::fs::write(&path, format!("![alt](http://{addr}/hang.png)\n")).unwrap();
+        let started = std::time::Instant::now();
+        let mut workspace = HeadlessWorkspace::new();
+        workspace.apply(WorkspaceCommand::OpenFile(path)).unwrap();
+        let elapsed = started.elapsed();
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "OpenFile blocked on network for {elapsed:?}"
+        );
+        assert!(workspace
+            .active()
+            .unwrap()
+            .editor
+            .content()
+            .contains("hang.png"));
+    }
+
+    #[test]
     fn open_launch_path_opens_file_and_parent_folder() {
         let dir = std::env::temp_dir().join("markrust-open-launch");
         let _ = std::fs::create_dir_all(&dir);
