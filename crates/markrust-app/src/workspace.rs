@@ -774,6 +774,13 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn default_editor_mode_is_wysiwyg_not_split() {
+        assert_eq!(EditorMode::default(), EditorMode::Wysiwyg);
+        assert_ne!(EditorMode::default(), EditorMode::Split);
+        assert_ne!(EditorMode::default(), EditorMode::Source);
+    }
+
+    #[test]
     fn fuzzy_match_finds_subsequence() {
         assert!(fuzzy_match("README.md", "readme"));
         assert!(!fuzzy_match("README.md", "xyz"));

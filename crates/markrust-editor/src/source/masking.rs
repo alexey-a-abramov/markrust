@@ -4,10 +4,10 @@
 
 use markrust_core::{DelimiterSpan, SyntaxNodeSpan};
 
-/// Whether a delimiter is painted normally or masked (zero glyph advance, alpha 0).
+/// Whether a delimiter is painted normally or masked (transparent glyphs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VisibilityState {
-    /// Delimiter glyphs are hidden in the WYSIWYG view.
+    /// Delimiter glyphs are hidden (source-mode Typora masking).
     #[default]
     Masked,
     /// Delimiter glyphs are shown (typically in a muted accent color).
