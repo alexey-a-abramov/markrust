@@ -8,16 +8,6 @@ fn hex(color: u32) -> Hsla {
     Hsla::from(rgb(color))
 }
 
-/// Default UI face on macOS: Menlo is a real Core Text family and rasterizes
-/// reliably. `.SystemUIFont` / Inter-via-add_fonts currently paint empty glyphs.
-pub fn default_ui_font() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Menlo"
-    } else {
-        "DejaVu Sans Mono"
-    }
-}
-
 /// Editor color and typography settings.
 #[derive(Debug, Clone)]
 pub struct EditorTheme {
@@ -114,9 +104,9 @@ impl EditorTheme {
             syntax_comment: hex(0x78716c),
             syntax_function: hex(0x7dd3fc),
             syntax_type: hex(0xfcd34d),
-            font_family: default_ui_font().into(),
+            font_family: "Inter".into(),
             font_size: 16.0,
-            code_font_family: default_ui_font().into(),
+            code_font_family: "Menlo".into(),
             line_height_multiplier: 1.55,
         }
     }
@@ -160,9 +150,9 @@ impl EditorTheme {
             syntax_comment: hex(0x78716c),
             syntax_function: hex(0x1d4ed8),
             syntax_type: hex(0xb45309),
-            font_family: default_ui_font().into(),
+            font_family: "Inter".into(),
             font_size: 16.0,
-            code_font_family: default_ui_font().into(),
+            code_font_family: "Menlo".into(),
             line_height_multiplier: 1.55,
         }
     }
@@ -189,8 +179,8 @@ impl EditorTheme {
         font_size * self.line_height_multiplier
     }
 
-    pub fn system_font_fallbacks() -> Option<gpui::FontFallbacks> {
-        None
+    pub fn system_font_fallbacks() -> gpui::FontFallbacks {
+        gpui::FontFallbacks::from_fonts(vec!["Menlo".into(), "Helvetica".into()])
     }
 }
 

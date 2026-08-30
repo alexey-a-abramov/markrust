@@ -151,7 +151,7 @@ impl HeadlessEditor {
         self.document.buffer.content()
     }
 
-    /// Replace the whole buffer from a UI widget (egui TextEdit). Groups as one undo step.
+    /// Replace the whole buffer from a UI widget. Groups as one undo step.
     pub fn set_content_from_ui(&mut self, text: &str) {
         if self.content() == text {
             return;

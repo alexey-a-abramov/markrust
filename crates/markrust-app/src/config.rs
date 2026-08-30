@@ -28,9 +28,9 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::Dark,
-            font_family: markrust_editor::default_ui_font().into(),
+            font_family: "Inter".into(),
             font_size: 16.0,
-            code_font_family: markrust_editor::default_ui_font().into(),
+            code_font_family: "Menlo".into(),
             autosave_ms: DEFAULT_AUTOSAVE_MS,
         }
     }
@@ -88,14 +88,14 @@ impl AppConfig {
     pub fn resolve_ui_font(family: &str) -> String {
         match family {
             "" | "Inter" | "system-ui" | ".SystemUIFont" | ".AppleSystemUIFont" | "SF Pro"
-            | "SF Pro Text" | "SF Pro Display" => markrust_editor::default_ui_font().into(),
+            | "SF Pro Text" | "SF Pro Display" => "Inter".into(),
             other => other.to_string(),
         }
     }
 
     fn resolve_code_font(family: &str) -> String {
         match family {
-            "" => markrust_editor::default_ui_font().into(),
+            "" => "Menlo".into(),
             other => other.to_string(),
         }
     }
@@ -154,10 +154,7 @@ mod tests {
     #[test]
     fn default_config_has_autosave() {
         assert_eq!(AppConfig::default().autosave_ms, DEFAULT_AUTOSAVE_MS);
-        assert_eq!(
-            AppConfig::default().font_family,
-            markrust_editor::default_ui_font()
-        );
+        assert_eq!(AppConfig::default().font_family, "Inter");
     }
 
     #[test]
@@ -172,7 +169,7 @@ mod tests {
         ] {
             assert_eq!(
                 AppConfig::resolve_ui_font(alias),
-                markrust_editor::default_ui_font(),
+                "Inter",
                 "alias {alias:?}"
             );
         }
