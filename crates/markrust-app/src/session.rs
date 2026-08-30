@@ -46,6 +46,13 @@ pub enum WorkspaceCommand {
     },
     /// Reveal YAML frontmatter in source (hook for the frontmatter panel).
     EditFrontmatter,
+    /// Set a top-level YAML frontmatter key (empty value removes it).
+    SetFrontmatterField {
+        key: String,
+        value: String,
+    },
+    /// Save with an explicit Keep / Normalize / Cancel choice.
+    SaveWithReview(NormalizeReviewChoice),
     /// Advance the fake clock so autosave debounce can fire in tests.
     AdvanceTime {
         millis: u64,
@@ -248,6 +255,10 @@ impl HeadlessWorkspace {
                 self.apply_editor(EditorCommand::JumpTo(offset))
             }
             WorkspaceCommand::EditFrontmatter => self.apply_editor(EditorCommand::JumpTo(0)),
+            WorkspaceCommand::SetFrontmatterField { key, value } => {
+                self.set_frontmatter_field(&key, &value)
+            }
+            WorkspaceCommand::SaveWithReview(choice) => self.save_with_review(choice),
             WorkspaceCommand::AdvanceTime { millis } => {
                 self.now_ms = self.now_ms.saturating_add(millis);
                 self.flush_autosave();
@@ -289,12 +300,57 @@ impl HeadlessWorkspace {
     }
 
     fn save_active(&mut self) -> Result<EditorOutcome, SessionError> {
+        self.save_with_review(NormalizeReviewChoice::KeepOriginal)
+    }
+
+    fn save_with_review(
+        &mut self,
+        choice: NormalizeReviewChoice,
+    ) -> Result<EditorOutcome, SessionError> {
         let tab = self.active_mut().ok_or(SessionError::NoActiveDocument)?;
         if tab.editor.document().path.is_none() {
             return Err(SessionError::UntitledHasNoPath);
         }
+        let mut engine = markrust_core::rich::RichEngine::new();
+        let candidates =
+            markrust_core::rich::save_candidates(tab.editor.document(), &mut engine);
+        if should_offer_normalize_review(&candidates) {
+            let Some(text) = normalize_review_decision(&candidates, choice) else {
+                return Ok(EditorOutcome::Noop);
+            };
+            if text != tab.editor.document().buffer.content() {
+                let len = tab.editor.document().buffer.len_bytes();
+                tab.editor.document_mut().replace_range(0, len, &text);
+            }
+        } else if choice == NormalizeReviewChoice::Cancel {
+            return Ok(EditorOutcome::Noop);
+        }
         tab.editor.document_mut().save_and_mark_clean()?;
         self.autosave.clear();
+        Ok(EditorOutcome::Changed)
+    }
+
+    fn set_frontmatter_field(
+        &mut self,
+        key: &str,
+        value: &str,
+    ) -> Result<EditorOutcome, SessionError> {
+        let tab = self.active_mut().ok_or(SessionError::NoActiveDocument)?;
+        let mut engine = markrust_core::rich::RichEngine::new();
+        let mut caret = markrust_core::rich::CaretState::collapsed(tab.editor.cursor_offset());
+        markrust_core::rich::apply_rich_command(
+            tab.editor.document_mut(),
+            &mut engine,
+            &mut caret,
+            markrust_core::rich::RichCommand::SetFrontmatterField {
+                key: key.to_string(),
+                value: value.to_string(),
+            },
+        )
+        .map_err(|_| SessionError::InvalidRange)?;
+        tab.editor
+            .apply(EditorCommand::JumpTo(caret.cursor()))
+            .ok();
         Ok(EditorOutcome::Changed)
     }
 
@@ -468,7 +524,14 @@ impl HeadlessWorkspace {
             .clone()
             .ok_or(SessionError::UntitledHasNoPath)?;
         let content = std::fs::read_to_string(&path)?;
-        tab.editor.document_mut().replace_content(&content);
+        let caret = tab.editor.cursor_offset();
+        let mapped = tab
+            .editor
+            .document_mut()
+            .apply_external_edit(&content, &[caret]);
+        if let Some(offset) = mapped.first() {
+            let _ = tab.editor.apply(EditorCommand::JumpTo(*offset));
+        }
         self.pending_external_change = None;
         Ok(EditorOutcome::Changed)
     }
@@ -596,6 +659,51 @@ mod tests {
             .unwrap();
         workspace.apply(WorkspaceCommand::EditFrontmatter).unwrap();
         assert_eq!(workspace.active().unwrap().editor.cursor_offset(), 0);
+    }
+
+    #[test]
+    fn save_with_review_normalize_rewrites_then_saves() {
+        let dir = std::env::temp_dir().join(format!(
+            "markrust-normalize-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+        std::fs::write(&path, "Title\n=====\n\npara\n").unwrap();
+        let mut workspace = HeadlessWorkspace::new();
+        workspace
+            .apply(WorkspaceCommand::OpenFile(path.clone()))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::SaveWithReview(
+                NormalizeReviewChoice::Normalize,
+            ))
+            .unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# Title"), "{saved}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_frontmatter_field_from_workspace() {
+        let mut workspace = HeadlessWorkspace::new();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "# Body\n".into(),
+            )))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::SetFrontmatterField {
+                key: "title".into(),
+                value: "Hello".into(),
+            })
+            .unwrap();
+        let content = workspace.active().unwrap().editor.content();
+        assert!(content.contains("title: Hello"), "{content}");
+        assert!(content.contains("# Body"), "{content}");
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod export;
 pub mod frontmatter;
 pub mod line_index;
 pub mod mode;
+pub mod offset_map;
 pub mod parser;
 pub mod rich;
 pub mod spans;
@@ -23,8 +24,9 @@ pub use document::Document;
 pub use export::{
     export_content_to_html, export_file_to_html, markdown_to_html_gfm, write_markdown_to_html_file,
 };
-pub use frontmatter::{parse_frontmatter, FrontmatterInfo};
+pub use frontmatter::{parse_frontmatter, upsert_yaml_key, FrontmatterInfo};
 pub use line_index::LineIndex;
+pub use offset_map::map_offset_across_change;
 pub use mode::DocumentProcessingMode;
 pub use parser::{extract_syntax_spans, BackgroundMarkdownParser, ParseSnapshot, ParseUpdate};
 pub use spans::{DelimiterSpan, SyntaxKind, SyntaxNodeSpan, TableRowKind};

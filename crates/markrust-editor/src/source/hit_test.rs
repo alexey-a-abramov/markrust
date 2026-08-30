@@ -146,6 +146,29 @@ mod tests {
         assert_eq!(offset, 4);
     }
 
+    #[test]
+    fn wrapped_visual_row_uses_that_row_not_the_last() {
+        // One logical line wrapped into two visual rows (display 0..4 and 4..9).
+        let offset = click_byte_offset(
+            8.0,
+            4.0,
+            &[16.0, 16.0],
+            &[0, 4],
+            &[vec![0.0, 8.0, 16.0, 24.0, 32.0], vec![0.0, 8.0, 16.0, 24.0, 32.0]],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        );
+        assert_eq!(offset, 1);
+        let offset = click_byte_offset(
+            8.0,
+            20.0,
+            &[16.0, 16.0],
+            &[0, 4],
+            &[vec![0.0, 8.0, 16.0, 24.0, 32.0], vec![0.0, 8.0, 16.0, 24.0, 32.0]],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        );
+        assert_eq!(offset, 5);
+    }
+
     fn bold_span(start: usize, end: usize) -> markrust_core::SyntaxNodeSpan {
         markrust_core::SyntaxNodeSpan {
             kind: markrust_core::SyntaxKind::Bold,

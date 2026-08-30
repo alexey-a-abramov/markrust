@@ -4,13 +4,15 @@
 
 use gpui::{
     actions, div, prelude::*, px, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, PathPromptOptions, Render, SharedString, Window,
+    FontWeight, PathPromptOptions, PromptButton, PromptLevel, Render, SharedString, Window,
 };
 use markrust_core::parse_frontmatter;
 use markrust_editor::outline_headings;
 use std::path::Path;
 
-use crate::session::{DropTarget, WorkspaceCommand};
+use crate::session::{
+    should_offer_normalize_review, DropTarget, NormalizeReviewChoice, WorkspaceCommand,
+};
 use crate::ui::{
     document_tab, empty_sidebar_state, muted_hint, outline_row, section_header, sidebar_row,
     toolbar_button,
@@ -54,6 +56,42 @@ impl MarkRustWindow {
     }
 
     fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+        let candidates = self.workspace.read(cx).normalize_candidates(cx);
+        let needs_review = candidates
+            .as_ref()
+            .is_some_and(should_offer_normalize_review);
+        if needs_review {
+            let receiver = window.prompt(
+                PromptLevel::Info,
+                "Normalize markdown on save?",
+                Some(
+                    "Keep original writes the buffer as-is. Normalize rewrites to house style. Cancel aborts the save.",
+                ),
+                &[
+                    PromptButton::ok("Keep original"),
+                    PromptButton::new("Normalize"),
+                    PromptButton::cancel("Cancel"),
+                ],
+                cx,
+            );
+            let workspace = self.workspace.clone();
+            cx.spawn_in(window, async move |_, cx| {
+                let choice = match receiver.await {
+                    Ok(0) => NormalizeReviewChoice::KeepOriginal,
+                    Ok(1) => NormalizeReviewChoice::Normalize,
+                    _ => NormalizeReviewChoice::Cancel,
+                };
+                let _ = workspace.update_in(cx, |workspace, window, cx| {
+                    let _ = workspace.dispatch(
+                        WorkspaceCommand::SaveWithReview(choice),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .detach();
+            return;
+        }
         self.workspace.update(cx, |workspace, cx| {
             let _ = workspace.dispatch(WorkspaceCommand::Save, window, cx);
         });
@@ -228,6 +266,15 @@ impl Render for MarkRustWindow {
         let sidebar_open = workspace.sidebar_open;
         let outline_open = workspace.outline_open;
         let external_change = workspace.pending_external_change.clone();
+        let source_mode = matches!(
+            workspace.active_tab().map(|tab| tab.mode),
+            Some(crate::workspace::EditorMode::Source)
+        );
+        let fm_for_window = if source_mode {
+            frontmatter_info.clone()
+        } else {
+            None
+        };
         let workspace_entity = self.workspace.clone();
         let root = workspace.root.clone();
         let active_doc_path = workspace
@@ -540,7 +587,7 @@ impl Render for MarkRustWindow {
                             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                                 style.bg(theme.drop_zone_bg)
                             })
-                            .when_some(frontmatter_info.clone(), |area, info| {
+                            .when_some(fm_for_window, |area, info| {
                                 let ws = workspace_entity.clone();
                                 let title = info
                                     .title

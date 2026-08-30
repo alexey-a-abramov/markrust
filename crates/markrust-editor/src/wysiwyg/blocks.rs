@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    div, img, prelude::*, px, AnyElement, CursorStyle, Entity, FontWeight, SharedString,
-    StyledText, TextStyle,
+    div, img, prelude::*, px, AnyElement, CursorStyle, Entity, FontWeight, MouseButton,
+    SharedString, StyledText, TextStyle,
 };
 use markrust_core::rich::{Block, BlockKind, ColumnAlign, NodeId, RichTree};
 
@@ -27,6 +27,7 @@ pub struct RenderSnapshot {
     pub base_dir: Option<PathBuf>,
     pub editing_code: Option<(NodeId, String)>,
     pub editing_image: Option<(Range<usize>, String)>,
+    pub widget_preedit: Option<String>,
 }
 
 pub fn render_top_block<H: WysiwygHost>(
@@ -86,6 +87,15 @@ fn render_block<H: WysiwygHost>(
                 .editing_code
                 .as_ref()
                 .is_some_and(|(id, _)| *id == block.id);
+            let chip_label = if editing {
+                format!(
+                    "{}{}|",
+                    chip_text,
+                    snap.widget_preedit.as_deref().unwrap_or("")
+                )
+            } else {
+                chip_text
+            };
             let mut code_style = base_text_style(theme, theme.font_size * 0.9, FontWeight::NORMAL);
             code_style.font_family = theme.code_font_family.clone().into();
             let body_start = code_body_source_start(&snap.source, block);
@@ -98,6 +108,7 @@ fn render_block<H: WysiwygHost>(
             let line_height = theme.line_height_for_font_size(theme.font_size * 0.9);
             let chip_id = block.id;
             let editor_chip = editor.clone();
+            let editor_away = editor.clone();
             let chip = div()
                 .id(("code-lang", block.id.0))
                 .text_size(px(11.))
@@ -111,13 +122,14 @@ fn render_block<H: WysiwygHost>(
                     el.bg(theme.code_bg).border_1().border_color(theme.accent)
                 })
                 .when(!editing, |el| el.bg(theme.code_bg.opacity(0.5)))
-                .child(SharedString::from(if editing {
-                    format!("{chip_text}|")
-                } else {
-                    chip_text
-                }))
+                .child(SharedString::from(chip_label))
                 .on_click(move |_, _, cx| {
                     editor_chip.update(cx, |host, cx| host.edit_code_info(chip_id, cx));
+                })
+                .when(editing, |el| {
+                    el.on_mouse_down_out(move |_, _, cx| {
+                        editor_away.update(cx, |host, cx| host.finish_widget(cx));
+                    })
                 });
             div()
                 .my(px(4.))
@@ -275,12 +287,19 @@ fn render_table<H: WysiwygHost>(
                     } else {
                         FontWeight::NORMAL
                     };
+                    let cell_start = cell.source_range.start;
+                    let editor_menu = editor.clone();
                     let mut el = div()
                         .flex_1()
                         .px(px(10.))
                         .py(px(6.))
                         .border_1()
                         .border_color(theme.separator)
+                        .on_mouse_down(MouseButton::Right, move |_, window, cx| {
+                            editor_menu.update(cx, |host, cx| {
+                                host.open_table_menu(cell_start, window, cx);
+                            });
+                        })
                         .child(paragraph_element(
                             snap,
                             cell,
@@ -354,7 +373,7 @@ fn paragraph_element<H: WysiwygHost>(
             .and_then(|(range, draft)| (*range == image_range).then(|| draft.clone()))
             .unwrap_or_else(|| {
                 if alt.is_empty() {
-                    "caption".to_string()
+                    "Add a caption".to_string()
                 } else {
                     alt.clone()
                 }
@@ -364,6 +383,7 @@ fn paragraph_element<H: WysiwygHost>(
             .as_ref()
             .is_some_and(|(range, _)| *range == image_range);
         let editor_cap = editor.clone();
+        let editor_away = editor.clone();
         let alt_for_edit = alt.clone();
         container = container.child(
             div()
@@ -383,7 +403,11 @@ fn paragraph_element<H: WysiwygHost>(
                             el.border_b_1().border_color(snap.theme.accent)
                         })
                         .child(SharedString::from(if editing {
-                            format!("{caption}|")
+                            format!(
+                                "{}{}|",
+                                caption,
+                                snap.widget_preedit.as_deref().unwrap_or("")
+                            )
                         } else {
                             caption
                         }))
@@ -393,6 +417,11 @@ fn paragraph_element<H: WysiwygHost>(
                             editor_cap.update(cx, |host, cx| {
                                 host.edit_image_alt(range, &current, cx);
                             });
+                        })
+                        .when(editing, |el| {
+                            el.on_mouse_down_out(move |_, _, cx| {
+                                editor_away.update(cx, |host, cx| host.finish_widget(cx));
+                            })
                         }),
                 ),
         );

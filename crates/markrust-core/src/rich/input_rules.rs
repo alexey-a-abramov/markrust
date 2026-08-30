@@ -52,7 +52,7 @@ fn match_block_space(source: &str, caret: usize, typed: &str) -> Option<InputRul
     if typed != " " {
         return None;
     }
-    let start = line_start(source, caret);
+    let start = content_start(source, caret);
     let prefix = &source[start..caret];
     if prefix.is_empty() {
         return None;
@@ -90,10 +90,7 @@ fn match_block_space(source: &str, caret: usize, typed: &str) -> Option<InputRul
 }
 
 fn match_fence_or_break(source: &str, caret: usize, typed: &str) -> Option<InputRule> {
-    let start = line_start(source, caret);
-    if !at_line_start(source, start) {
-        return None;
-    }
+    let start = content_start(source, caret);
     if !line_is_only_prefix(source, caret) {
         return None;
     }
@@ -148,15 +145,23 @@ fn match_auto_close(source: &str, caret: usize, typed: &str) -> Option<InputRule
         return None;
     }
     let line0 = line_start(source, caret);
-    let before = &source[line0..caret];
-    let prev = before.as_bytes().last().copied();
 
-    // Completing `**` / `~~` takes precedence over a single-char closer.
-    if ch == b'*' && prev == Some(b'*') {
-        return close_pair(source, line0, caret, "**", "*");
+    // Completing a double delimiter takes precedence, even on the first
+    // closer (`**hello` + `*` should insert a raw `*`).
+    if ch == b'*' {
+        if let Some(rule) = close_pair(source, line0, caret, "**", "*") {
+            return Some(rule);
+        }
     }
-    if ch == b'~' && prev == Some(b'~') {
-        return close_pair(source, line0, caret, "~~", "~");
+    if ch == b'_' {
+        if let Some(rule) = close_pair(source, line0, caret, "__", "_") {
+            return Some(rule);
+        }
+    }
+    if ch == b'~' {
+        if let Some(rule) = close_pair(source, line0, caret, "~~", "~") {
+            return Some(rule);
+        }
     }
     if ch == b'*' || ch == b'_' || ch == b'`' {
         let delim = typed;
@@ -202,13 +207,16 @@ fn match_pending_opener(source: &str, caret: usize, typed: &str) -> Option<Input
         return None;
     }
     let ch = typed.as_bytes()[0];
-    let at_start = at_line_start(source, caret);
+    let at_start = caret == content_start(source, caret);
     let left_flank = at_start || prev_is_ws(source, caret);
+    let continues = continues_opener(source, caret, ch);
 
     match ch {
         b'#' | b'>' | b'+' | b'-' if at_start => Some(InputRule::InsertRaw(typed.to_string())),
-        b'*' | b'_' | b'`' | b'~' if left_flank => Some(InputRule::InsertRaw(typed.to_string())),
-        b'.' | b')' if at_start || follows_line_start_digits(source, caret) => {
+        b'*' | b'_' | b'`' | b'~' if left_flank || continues => {
+            Some(InputRule::InsertRaw(typed.to_string()))
+        }
+        b'.' | b')' if at_start || follows_content_start_digits(source, caret) => {
             Some(InputRule::InsertRaw(typed.to_string()))
         }
         b if b.is_ascii_digit() && at_start => Some(InputRule::InsertRaw(typed.to_string())),
@@ -216,17 +224,20 @@ fn match_pending_opener(source: &str, caret: usize, typed: &str) -> Option<Input
     }
 }
 
-fn unescaped_or_replace(start: usize, prefix: &str, desired: String, caret: usize) -> InputRule {
-    let already = unescape_ascii(prefix);
-    let desired_marker = desired.trim_end();
-    if prefix == desired_marker || already == desired_marker && !prefix.contains('\\') {
-        InputRule::InsertRaw(" ".into())
-    } else {
-        InputRule::Replace {
-            range: start..caret,
-            insert: desired.clone(),
-            caret: start + desired.len(),
-        }
+fn continues_opener(source: &str, caret: usize, ch: u8) -> bool {
+    if caret == 0 || !matches!(ch, b'*' | b'_' | b'~') {
+        return false;
+    }
+    let bytes = source.as_bytes();
+    bytes.get(caret - 1) == Some(&ch) && (caret < 2 || bytes[caret - 2] != b'\\')
+}
+
+fn unescaped_or_replace(start: usize, _prefix: &str, desired: String, caret: usize) -> InputRule {
+    let new_caret = start + desired.len();
+    InputRule::Replace {
+        range: start..caret,
+        insert: desired,
+        caret: new_caret,
     }
 }
 
@@ -237,8 +248,63 @@ fn line_start(source: &str, offset: usize) -> usize {
         .unwrap_or(0)
 }
 
-fn at_line_start(source: &str, offset: usize) -> bool {
-    offset == 0 || source.as_bytes().get(offset.saturating_sub(1)) == Some(&b'\n')
+/// Byte offset where list/quote/indent prefixes end, so `# ` and fences work
+/// inside a list item the same way they do at a physical line start.
+fn content_start(source: &str, caret: usize) -> usize {
+    let line0 = line_start(source, caret);
+    let limit = caret.min(source.len());
+    let bytes = source.as_bytes();
+    let mut i = skip_ws(bytes, line0, limit);
+    while i < limit && bytes[i] == b'>' {
+        i += 1;
+        if i < limit && bytes[i] == b' ' {
+            i += 1;
+        }
+        i = skip_ws(bytes, i, limit);
+    }
+    if i < limit {
+        if matches!(bytes[i], b'-' | b'*' | b'+') && bytes.get(i + 1) == Some(&b' ') && i + 2 <= limit
+        {
+            i += 2;
+            i = skip_task_prefix(source, i, limit);
+        } else if let Some(marker_end) = ordered_marker_end(bytes, i, limit) {
+            i = marker_end;
+            i = skip_task_prefix(source, i, limit);
+        }
+    }
+    i.min(limit)
+}
+
+fn skip_ws(bytes: &[u8], mut i: usize, limit: usize) -> usize {
+    while i < limit && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    i
+}
+
+fn skip_task_prefix(source: &str, i: usize, limit: usize) -> usize {
+    if i + 4 <= limit {
+        let slot = &source[i..i + 4];
+        if slot == "[ ] " || slot == "[x] " || slot == "[X] " {
+            return i + 4;
+        }
+    }
+    i
+}
+
+fn ordered_marker_end(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
+    let mut i = start;
+    if i >= limit || !bytes[i].is_ascii_digit() {
+        return None;
+    }
+    while i < limit && bytes[i].is_ascii_digit() && i - start < 9 {
+        i += 1;
+    }
+    if i < limit && matches!(bytes[i], b'.' | b')') && bytes.get(i + 1) == Some(&b' ') && i + 2 <= limit
+    {
+        return Some(i + 2);
+    }
+    None
 }
 
 fn line_is_only_prefix(source: &str, caret: usize) -> bool {
@@ -261,8 +327,8 @@ fn prev_is_ws(source: &str, caret: usize) -> bool {
         .is_some_and(|c| c.is_whitespace())
 }
 
-fn follows_line_start_digits(source: &str, caret: usize) -> bool {
-    let start = line_start(source, caret);
+fn follows_content_start_digits(source: &str, caret: usize) -> bool {
+    let start = content_start(source, caret);
     let prefix = &source[start..caret];
     !prefix.is_empty() && prefix.len() <= 9 && prefix.bytes().all(|b| b.is_ascii_digit())
 }
@@ -299,6 +365,7 @@ fn unescape_ascii(s: &str) -> String {
 fn last_unescaped_opener(search: &str, opener: &str) -> Option<(usize, usize)> {
     let escaped = match opener {
         "**" => "\\*\\*",
+        "__" => "\\_\\_",
         "~~" => "\\~\\~",
         "*" => "\\*",
         "_" => "\\_",
@@ -327,10 +394,12 @@ fn rfind_bare_opener(search: &str, opener: &str) -> Option<usize> {
     loop {
         if bytes[i..].starts_with(needle) {
             let escaped = i > 0 && bytes[i - 1] == b'\\';
-            let inside_double_star = opener == "*"
-                && ((i > 0 && bytes[i - 1] == b'*' && (i < 2 || bytes[i - 2] != b'\\'))
-                    || bytes.get(i + 1) == Some(&b'*'));
-            if !escaped && !inside_double_star {
+            let inside_double = matches!(opener, "*" | "_")
+                && ((i > 0
+                    && bytes[i - 1] == opener.as_bytes()[0]
+                    && (i < 2 || bytes[i - 2] != b'\\'))
+                    || bytes.get(i + 1) == Some(&opener.as_bytes()[0]));
+            if !escaped && !inside_double {
                 return Some(i);
             }
         }
@@ -453,10 +522,13 @@ mod tests {
     #[test]
     fn space_after_hash_on_a_paragraph_is_a_heading() {
         let rule = match_input_rule("#hello", 1, " ", false);
-        assert!(
-            matches!(rule, Some(InputRule::InsertRaw(ref s)) if s == " "),
-            "{rule:?}"
-        );
+        match rule {
+            Some(InputRule::Replace { insert, range, .. }) => {
+                assert_eq!(insert, "# ");
+                assert_eq!(range, 0..1);
+            }
+            other => panic!("{other:?}"),
+        }
         assert!(match_input_rule("hello", 5, " ", false).is_none());
     }
 
@@ -467,5 +539,59 @@ mod tests {
             Some(InputRule::Replace { insert, .. }) => assert_eq!(insert, "# "),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn underscore_italic_and_bold_auto_close() {
+        assert!(matches!(
+            match_input_rule("_hello", 6, "_", false),
+            Some(InputRule::InsertRaw(s)) if s == "_"
+        ));
+        assert!(matches!(
+            match_input_rule("__hello", 7, "_", false),
+            Some(InputRule::InsertRaw(s)) if s == "_"
+        ));
+        let (out, _) = apply("", 0, "_");
+        assert_eq!(out, "_");
+        let (out, caret) = apply("_", 1, "_");
+        assert_eq!(out, "__");
+        assert_eq!(caret, 2);
+    }
+
+    #[test]
+    fn nested_italic_inside_bold_closes_inner() {
+        let rule = match_input_rule("**hello *world", 14, "*", false);
+        assert!(
+            matches!(rule, Some(InputRule::InsertRaw(ref s)) if s == "*"),
+            "{rule:?}"
+        );
+    }
+
+    #[test]
+    fn heading_and_fence_inside_list_item() {
+        let rule = match_input_rule("- #", 3, " ", false);
+        assert!(
+            matches!(rule, Some(InputRule::InsertRaw(ref s)) if s == " ")
+                || matches!(rule, Some(InputRule::Replace { ref insert, .. }) if insert.ends_with("# ")),
+            "{rule:?}"
+        );
+        let hash = match_input_rule("- ", 2, "#", false);
+        assert!(
+            matches!(hash, Some(InputRule::InsertRaw(ref s)) if s == "#"),
+            "{hash:?}"
+        );
+        let (out, caret) = apply("- ``", 4, "`");
+        assert!(out.contains("```"), "{out:?}");
+        assert!(out.starts_with("- "), "{out:?}");
+        assert!(out[caret..].contains("```"), "{out:?} caret={caret}");
+    }
+
+    #[test]
+    fn heading_inside_blockquote() {
+        let hash = match_input_rule("> ", 2, "#", false);
+        assert!(
+            matches!(hash, Some(InputRule::InsertRaw(ref s)) if s == "#"),
+            "{hash:?}"
+        );
     }
 }

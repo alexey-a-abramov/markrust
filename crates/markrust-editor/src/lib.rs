@@ -26,7 +26,7 @@ pub use source::editor::MarkdownEditor;
 pub use source::editor::{
     Backspace, Delete, Down, End, Enter, Home, Indent, Left, Outdent, PageDown, PageUp, Right,
     SelectAll, SelectDown, SelectEnd, SelectHome, SelectLeft, SelectRight, SelectUp, ToggleBold,
-    ToggleCode, ToggleItalic, ToggleLink, Up,
+    ToggleCode, ToggleItalic, ToggleLink, Up, Escape,
 };
 pub use source::element::{EditorElement, MarkdownEditorView};
 pub use source::layout::{

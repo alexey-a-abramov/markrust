@@ -11,7 +11,7 @@ use gpui::{
     fill, point, px, relative, size, App, Bounds, Context, Element, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    SharedString, Style, TextRun, TextStyle, Window, WrappedLine,
+    SharedString, Style, TextRun, TextStyle, UnderlineStyle, Window, WrappedLine,
 };
 use markrust_core::rich::{Block, BreakStyle, Inline, MarkSet, NodeId};
 
@@ -37,13 +37,17 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     fn toggle_task(&mut self, id: NodeId, cx: &mut Context<Self>);
     fn edit_code_info(&mut self, id: NodeId, cx: &mut Context<Self>);
     fn edit_image_alt(&mut self, source_range: Range<usize>, alt: &str, cx: &mut Context<Self>);
-    fn report_ime(
+    fn edit_frontmatter_field(&mut self, key: &'static str, current: &str, cx: &mut Context<Self>);
+    fn open_table_menu(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>);
+    fn finish_widget(&mut self, cx: &mut Context<Self>);
+    fn preedit(&self) -> Option<&str>;
+    fn report_leaf(
         &mut self,
-        caret_bounds: Bounds<Pixels>,
         layout: Arc<LeafLayout>,
         element_bounds: Bounds<Pixels>,
         font_size: f32,
         line_height: f32,
+        caret_bounds: Option<Bounds<Pixels>>,
     );
 }
 
@@ -411,21 +415,31 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
     ) {
         let focus = self.editor.read(cx).input_focus_handle();
         let caret = self.editor.read(cx).caret_offset();
-        if source_in_leaf(&self.layout, caret) {
+        let preedit = self.editor.read(cx).preedit().map(str::to_string);
+        let layout = self.layout.clone();
+        let font_size = self.font_size;
+        let line_height_px = self.line_height;
+        let caret_in_leaf = source_in_leaf(&self.layout, caret);
+        if caret_in_leaf {
             window.handle_input(
                 &focus,
                 ElementInputHandler::new(bounds, self.editor.clone()),
                 cx,
             );
-            if let Some(caret_bounds) = prepaint.caret_bounds {
-                let layout = self.layout.clone();
-                let font_size = self.font_size;
-                let line_height = self.line_height;
-                self.editor.update(cx, |host, _cx| {
-                    host.report_ime(caret_bounds, layout, bounds, font_size, line_height);
-                });
-            }
         }
+        self.editor.update(cx, |host, _cx| {
+            host.report_leaf(
+                layout,
+                bounds,
+                font_size,
+                line_height_px,
+                if caret_in_leaf {
+                    prepaint.caret_bounds
+                } else {
+                    None
+                },
+            );
+        });
 
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
@@ -444,6 +458,38 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
                 cx,
             );
             y += line.size(line_height).height.max(line_height);
+        }
+
+        if let (Some(preedit), Some(caret_bounds)) = (preedit.as_deref(), prepaint.caret_bounds) {
+            if !preedit.is_empty() && caret_in_leaf {
+                let style = TextStyle {
+                    color: self.theme.text,
+                    font_family: self.theme.font_family.clone().into(),
+                    font_size: px(self.font_size).into(),
+                    line_height: px(self.line_height).into(),
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(self.theme.accent),
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                };
+                let run = style.to_run(preedit.len());
+                let shaped = window.text_system().shape_line(
+                    SharedString::from(preedit.to_string()),
+                    px(self.font_size),
+                    &[run],
+                    None,
+                );
+                let _ = shaped.paint(
+                    caret_bounds.origin,
+                    px(self.line_height),
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
         }
 
         if let Some(cursor) = prepaint.cursor.take() {
@@ -615,7 +661,9 @@ fn visible_index_at(
         let h = line.size(line_height).height.max(line_height);
         let next_y = y + h;
         if position.y < next_y || std::ptr::eq(line, lines.last().unwrap()) {
-            let local = point(position.x - bounds.origin.x, position.y - y);
+            let max_y = (h - px(0.5)).max(px(0.));
+            let local_y = (position.y - y).max(px(0.)).min(max_y);
+            let local = point(position.x - bounds.origin.x, local_y);
             let idx = line
                 .closest_index_for_position(local, line_height)
                 .unwrap_or_else(|e| e);

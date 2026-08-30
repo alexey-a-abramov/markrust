@@ -11,6 +11,7 @@ use crate::buffer::DocumentBuffer;
 use crate::mode::DocumentProcessingMode;
 use crate::parser::{BackgroundMarkdownParser, ParseSnapshot, ParseUpdate};
 use crate::spans::SyntaxNodeSpan;
+use crate::offset_map::map_offset_across_change;
 use crate::undo::{
     is_typing_burst, EditOperation, SelectionSnapshot, Transaction, TransactionKind, UndoStack,
 };
@@ -75,6 +76,66 @@ impl Document {
         let tx = self.undo_tx()?;
         self.undo.discard_redo();
         Some(tx)
+    }
+
+    /// Peel `range` out of the last Typing insert so an input-rule Replace can
+    /// own those bytes. Works when the prefix is a slice of a longer coalesced
+    /// Typing transaction, not only when it *is* that transaction.
+    ///
+    /// On success the buffer no longer contains `range` and the caller should
+    /// insert at `range.start`. Returns the caret to restore if the following
+    /// command is undone.
+    pub fn peel_typing_range(&mut self, range: std::ops::Range<usize>) -> Option<SelectionSnapshot> {
+        let last = self.undo.last()?;
+        if last.kind != TransactionKind::Typing {
+            return None;
+        }
+        let (byte_offset, text_len) = match last.ops.as_slice() {
+            [EditOperation::Insert { byte_offset, text }] => (*byte_offset, text.len()),
+            _ => return None,
+        };
+        let typing_end = byte_offset + text_len;
+        if range.start < byte_offset || range.end > typing_end || range.start > range.end {
+            return None;
+        }
+        if range.start == byte_offset && range.end == typing_end {
+            let tx = self.revert_last_quietly()?;
+            return Some(tx.selection_after);
+        }
+        let last = self.undo.last_mut()?;
+        let EditOperation::Insert { byte_offset, text } = last.ops.first_mut()? else {
+            return None;
+        };
+        let local_s = range.start - *byte_offset;
+        let local_e = range.end - *byte_offset;
+        if local_s > text.len() || local_e > text.len() || local_s > local_e {
+            return None;
+        }
+        text.replace_range(local_s..local_e, "");
+        last.selection_after = SelectionSnapshot::collapsed(range.start);
+        self.buffer.delete(range.start, range.end);
+        self.dirty = true;
+        self.schedule_parse();
+        Some(SelectionSnapshot::collapsed(range.start))
+    }
+
+    /// Replace the buffer with on-disk bytes from an external editor, mapping
+    /// each caret in `offsets` across the change. Clears undo (the old ops
+    /// would not invert against the new text). Parse stays on the worker.
+    pub fn apply_external_edit(&mut self, new_content: &str, offsets: &[usize]) -> Vec<usize> {
+        let old = self.buffer.content();
+        let mapped = offsets
+            .iter()
+            .map(|offset| map_offset_across_change(&old, new_content, *offset))
+            .collect();
+        if old == new_content {
+            return mapped;
+        }
+        self.buffer = DocumentBuffer::with_text(new_content);
+        self.dirty = false;
+        self.undo = UndoStack::new();
+        self.schedule_parse();
+        mapped
     }
 
     pub fn insert(&mut self, byte_offset: usize, text: &str) {
@@ -727,5 +788,52 @@ mod tests {
             heading_count >= 1_000,
             "expected many heading spans, got {heading_count}"
         );
+    }
+
+    #[test]
+    fn peel_typing_range_exact_reverts_the_tx() {
+        let mut doc = Document::new("");
+        doc.replace_range_tx(
+            0,
+            0,
+            "#",
+            TransactionKind::Typing,
+            SelectionSnapshot::collapsed(0),
+            SelectionSnapshot::collapsed(1),
+        );
+        let before = doc.peel_typing_range(0..1).unwrap();
+        assert_eq!(doc.buffer.content(), "");
+        assert_eq!(doc.undo_stack().undo_depth(), 0);
+        assert_eq!(before, SelectionSnapshot::collapsed(0));
+    }
+
+    #[test]
+    fn peel_typing_range_takes_a_prefix_of_coalesced_typing() {
+        let mut doc = Document::new("");
+        doc.replace_range_tx(
+            0,
+            0,
+            "#z",
+            TransactionKind::Typing,
+            SelectionSnapshot::collapsed(0),
+            SelectionSnapshot::collapsed(2),
+        );
+        doc.peel_typing_range(0..1).unwrap();
+        assert_eq!(doc.buffer.content(), "z");
+        assert_eq!(doc.undo_stack().undo_depth(), 1);
+        assert!(doc.undo());
+        assert_eq!(doc.buffer.content(), "");
+    }
+
+    #[test]
+    fn apply_external_edit_maps_caret_and_clears_undo() {
+        let mut doc = Document::new("abcdef");
+        doc.insert(6, "x");
+        assert!(doc.undo_stack().can_undo());
+        let mapped = doc.apply_external_edit("abcXYZdef", &[2, 5]);
+        assert_eq!(mapped, vec![2, 8]);
+        assert_eq!(doc.buffer.content(), "abcXYZdef");
+        assert!(!doc.dirty);
+        assert!(!doc.undo_stack().can_undo());
     }
 }

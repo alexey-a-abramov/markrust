@@ -28,10 +28,10 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 | P2 | `rich/serialize.rs` + `rich/escape.rs` (delimiter-stack serializer), `rich/save.rs` (SaveCandidates + diff hunks), corpus test suite | ✅ done |
 | P3 | `rich/engine.rs` (NodeId stability, splices, caret snap/step, line map, outline) + **read-only WYSIWYG view** (`markrust-editor::wysiwyg`) + per-tab mode toggle (cmd-shift-m / toolbar) | ✅ done |
 | P4 | **Editing core** — `RichCommand` layer, Transaction undo upgrade (typing coalescing + caret restore), WYSIWYG caret/selection/hit-testing/IME | ✅ done |
-| P5 | Lists/tasks UX (Enter/Tab, checkbox clicks); input rules; code language chip; image alt/caption editing; IME caret bounds; stable-width inline delimiter masking | 🚧 in progress (core behaviors in; polish remains) |
-| P6 | Tables: cell editing, Tab nav, insert row/col commands (no context-menu chrome yet) | 🚧 in progress |
-| P7 | Frontmatter panel hook + Normalize review decision fn (dialog UI still open) | 🚧 in progress |
-| P8 | External-edit reconciliation (`map_offset_across_change` port, `apply_external_edit`, watcher/autosave wiring) | ⬜ |
+| P5 | Lists/tasks UX (Enter/Tab, checkbox clicks); input rules; code language chip; image alt/caption editing; IME caret bounds; stable-width inline delimiter masking | 🚧 in progress (core behaviors + polish in; IME candidate window on chips still uses last text caret) |
+| P6 | Tables: cell editing, Tab nav, insert/delete row/col, header constraints, right-click menu | 🚧 in progress |
+| P7 | Frontmatter in-place title/tags; Normalize review dialog on save | 🚧 in progress |
+| P8 | External-edit reconciliation (`map_offset_across_change`, `apply_external_edit`, watcher reload maps caret) | 🚧 in progress |
 | P9 | Side-by-side + polish + migration (delete tree-sitter-md/`parser.rs`/`spans.rs`/masking after source mode re-derives segments from `RichTree`; criterion perf gates; docs rewrite) | ⬜ |
 
 ### Proven invariants (enforced by tests — keep them green)
@@ -45,6 +45,7 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 ### Key modules
 
 - `crates/markrust-core/src/rich/` — `tree` (RichTree/Block/Inline + fidelity), `import` (comrak → tree), `serialize`/`escape` (Preserve/Normalize), `engine` (view contract), `command` (RichCommand → byte splices), `input_rules` (Typora-style `# ` / lists / fences / auto-close), `save` (SaveCandidates).
+- `crates/markrust-core/src/offset_map.rs` — `map_offset_across_change` (nimbalyst port); `Document::apply_external_edit` / `peel_typing_range`.
 - `crates/markrust-editor/src/wysiwyg/` — `view` (RichEditorView over virtualized `list()`), `blocks` (per-kind renderers), `block_text` (caret/hit-testing/IME host).
 - `crates/markrust-editor/src/source/` — the masking source editor (kept as always-working fallback and future source mode).
 - `crates/markrust-app/src/crash.rs` — panic logger (see Crash handling).
@@ -55,9 +56,17 @@ Editing core is in: `rich/command.rs` (`InsertText`, `Backspace`, `Delete`, `Spl
 
 Proven by tests: insert in one block leaves other blocks' bytes untouched; coalesced typing undo restores string + caret; backspace deletes the visible grapheme not `**` wrappers; split paragraph/list; toggle bold; wrap link; empty-item Enter outdents/exits; indent/outdent; task checkbox splice.
 
-## P5–P7 design notes (for the next agent)
+## P5–P8 design notes (for the next agent)
 
-Shipped this pass:
+Shipped this pass (keep previous bullets; this pass added):
+- Input-rule polish: `_`/`__` italic/bold, nested italic inside bold, list-item-local `# ` / fences, `Document::peel_typing_range` so heading conversion is one undo even when the prefix was a slice of a longer Typing tx.
+- Chip/caption: IME composition into the draft; click-away + Escape; empty alt shows “Add a caption”.
+- IME preedit underline in the focused leaf; `character_index_for_point` searches every painted leaf; wrapped-row y is clamped.
+- P6: delete row/col (keep ≥1 of each); first row stays header; insert caret lands in the new cell; right-click table menu.
+- P7: Keep original / Normalize / Cancel on explicit Save when candidates differ (autosave stays verbatim). In-place title/tags in the WYSIWYG frontmatter bar (`SetFrontmatterField`).
+- P8: `map_offset_across_change` + `Document::apply_external_edit`; reload maps source and rich carets. Watcher/parse stay off the UI thread.
+
+Previously shipped:
 - Input rules as pure functions in `rich/input_rules.rs` (`# `, `- `/`* `/`+ `, `1. `/`1) `, `> `, fences, `---`/`***`/`___`, auto-close `*`/`**`/` `/`~~`), disabled in code/raw, heading+space is one undo group.
 - `SetCodeInfo` / `SetImageAlt` / `SetFrontmatter` commands. WYSIWYG: clickable language chip and image caption (click → type → Enter commits).
 - Fenced code bodies are editable `BlockTextElement`s (not inert `StyledText`).
@@ -68,12 +77,12 @@ Shipped this pass:
 - File-open hang fix remains: watcher `recv` on a background task; parse via `apply_pending_parse` off the frame.
 
 Still open (do not shrink the goal):
-- Input-rule polish: `_` italic, nested auto-close, list-item-local `# ` / fences, undo grouping when the prefix was not the last Typing tx.
-- Language chip / caption: IME composition inside the chip, click-away vs Enter, empty-alt placeholder copy.
-- IME: preedit underline in the leaf; `character_index_for_point` for wrapped lines other than the last focused leaf.
-- P6: delete row/col, header-row constraints, context-menu / toolbar for insert; caret after insert-row is approximate.
-- P7: Normalize review dialog UI (Keep original / Normalize / Cancel) wired to save; in-place YAML key editing (title/tags) instead of source-mode hook.
-- P8–P9 unchanged.
+- Chip/caption IME candidate window may still appear at the last text-leaf caret (draft routing works).
+- Table menu is a corner overlay, not a pixel-accurate context menu; no toolbar buttons.
+- Normalize dialog has no hunk preview (choice only).
+- Frontmatter in-place is title/tags only (not a full YAML editor).
+- P8: dirty-tab 3-way merge still skipped (`SkipBecauseDirty`); autosave does not map offsets.
+- P9 unchanged.
 
 Earlier P5 (still in):
 - Checkbox clicks → `SetTaskChecked`; Tab/Shift-Tab → `IndentList`/`OutdentList` outside tables; empty-item Enter outdents or exits.

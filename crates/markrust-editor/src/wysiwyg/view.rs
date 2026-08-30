@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use gpui::{
     div, list, prelude::*, px, App, Bounds, Context, CursorStyle, Entity, EntityInputHandler,
-    FocusHandle, Focusable, ListAlignment, ListState, Pixels, Render, Subscription, Task,
-    UTF16Selection, Window,
+    FocusHandle, Focusable, ListAlignment, ListState, Pixels, Render, SharedString, Subscription,
+    Task, UTF16Selection, Window,
 };
 use markrust_core::rich::{
     apply_rich_command, Bias, CaretState, MarkSet, NodeId, RichCommand, RichEngine, RichOutcome,
@@ -36,8 +36,13 @@ enum WidgetEdit {
         range: Range<usize>,
         draft: String,
     },
+    Frontmatter {
+        key: &'static str,
+        draft: String,
+    },
 }
 
+#[derive(Clone)]
 struct ImeLeaf {
     layout: Arc<LeafLayout>,
     bounds: Bounds<Pixels>,
@@ -61,7 +66,10 @@ pub struct RichEditorView {
     focus_handle: FocusHandle,
     last_ime_bounds: Option<Bounds<Pixels>>,
     ime_leaf: Option<ImeLeaf>,
+    ime_leaves: Vec<ImeLeaf>,
     widget_edit: WidgetEdit,
+    widget_preedit: Option<String>,
+    table_menu: bool,
     _blink_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -78,6 +86,8 @@ impl RichEditorView {
             this.start_blink(cx);
         });
         let blur_sub = cx.on_blur(&focus_handle, window, |this, _window, cx| {
+            this.commit_widget_edit(cx);
+            this.table_menu = false;
             this.stop_blink(cx);
         });
         let doc_sub = cx.observe(&document, |_, _, cx| cx.notify());
@@ -97,7 +107,10 @@ impl RichEditorView {
             focus_handle,
             last_ime_bounds: None,
             ime_leaf: None,
+            ime_leaves: Vec::new(),
             widget_edit: WidgetEdit::Idle,
+            widget_preedit: None,
+            table_menu: false,
             _blink_task: Task::ready(()),
             _subscriptions: vec![focus_sub, blur_sub, doc_sub],
         }
@@ -479,6 +492,7 @@ impl RichEditorView {
                 WidgetEdit::ImageAlt { range, draft } => Some((range.clone(), draft.clone())),
                 _ => None,
             },
+            widget_preedit: self.widget_preedit.clone(),
         });
         self.snapshot = Some(snapshot.clone());
         self.synced_revision = Some(revision);
@@ -514,21 +528,14 @@ impl RichEditorView {
     fn widget_insert(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         match &mut self.widget_edit {
             WidgetEdit::Idle => false,
-            WidgetEdit::CodeInfo { draft, .. } => {
+            WidgetEdit::CodeInfo { draft, .. }
+            | WidgetEdit::ImageAlt { draft, .. }
+            | WidgetEdit::Frontmatter { draft, .. } => {
                 if text.contains('\n') {
                     self.commit_widget_edit(cx);
                     return true;
                 }
-                draft.push_str(text);
-                self.snapshot = None;
-                cx.notify();
-                true
-            }
-            WidgetEdit::ImageAlt { draft, .. } => {
-                if text.contains('\n') {
-                    self.commit_widget_edit(cx);
-                    return true;
-                }
+                self.widget_preedit = None;
                 draft.push_str(text);
                 self.snapshot = None;
                 cx.notify();
@@ -540,7 +547,10 @@ impl RichEditorView {
     fn widget_backspace(&mut self, cx: &mut Context<Self>) -> bool {
         match &mut self.widget_edit {
             WidgetEdit::Idle => false,
-            WidgetEdit::CodeInfo { draft, .. } | WidgetEdit::ImageAlt { draft, .. } => {
+            WidgetEdit::CodeInfo { draft, .. }
+            | WidgetEdit::ImageAlt { draft, .. }
+            | WidgetEdit::Frontmatter { draft, .. } => {
+                self.widget_preedit = None;
                 draft.pop();
                 self.snapshot = None;
                 cx.notify();
@@ -549,7 +559,40 @@ impl RichEditorView {
         }
     }
 
+    fn widget_draft_mut(&mut self) -> Option<&mut String> {
+        match &mut self.widget_edit {
+            WidgetEdit::Idle => None,
+            WidgetEdit::CodeInfo { draft, .. }
+            | WidgetEdit::ImageAlt { draft, .. }
+            | WidgetEdit::Frontmatter { draft, .. } => Some(draft),
+        }
+    }
+
+    fn widget_display(&self) -> Option<(String, Option<String>)> {
+        match &self.widget_edit {
+            WidgetEdit::Idle => None,
+            WidgetEdit::CodeInfo { draft, .. }
+            | WidgetEdit::ImageAlt { draft, .. }
+            | WidgetEdit::Frontmatter { draft, .. } => {
+                Some((draft.clone(), self.widget_preedit.clone()))
+            }
+        }
+    }
+
+    fn cancel_widget_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        if matches!(self.widget_edit, WidgetEdit::Idle) && !self.table_menu {
+            return false;
+        }
+        self.widget_edit = WidgetEdit::Idle;
+        self.widget_preedit = None;
+        self.table_menu = false;
+        self.snapshot = None;
+        cx.notify();
+        true
+    }
+
     fn commit_widget_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        self.widget_preedit = None;
         let edit = std::mem::take(&mut self.widget_edit);
         match edit {
             WidgetEdit::Idle => false,
@@ -562,6 +605,16 @@ impl RichEditorView {
                     RichCommand::SetImageAlt {
                         source_range: range,
                         alt: draft,
+                    },
+                    cx,
+                );
+                true
+            }
+            WidgetEdit::Frontmatter { key, draft } => {
+                self.apply_rich(
+                    RichCommand::SetFrontmatterField {
+                        key: key.to_string(),
+                        value: draft,
                     },
                     cx,
                 );
@@ -580,6 +633,7 @@ impl WysiwygHost for RichEditorView {
         cx: &mut Context<Self>,
     ) {
         self.commit_widget_edit(cx);
+        self.table_menu = false;
         self.is_selecting = true;
         self.focus_handle.focus(window, cx);
         self.move_to(source, extend, cx);
@@ -641,6 +695,7 @@ impl WysiwygHost for RichEditorView {
             })
             .unwrap_or_default();
         self.widget_edit = WidgetEdit::CodeInfo { id, draft };
+        self.widget_preedit = None;
         self.snapshot = None;
         cx.notify();
     }
@@ -651,25 +706,66 @@ impl WysiwygHost for RichEditorView {
             range: source_range,
             draft: alt.to_string(),
         };
+        self.widget_preedit = None;
         self.snapshot = None;
         cx.notify();
     }
 
-    fn report_ime(
+    fn edit_frontmatter_field(&mut self, key: &'static str, current: &str, cx: &mut Context<Self>) {
+        self.commit_widget_edit(cx);
+        self.widget_edit = WidgetEdit::Frontmatter {
+            key,
+            draft: current.to_string(),
+        };
+        self.widget_preedit = None;
+        self.snapshot = None;
+        cx.notify();
+    }
+
+    fn open_table_menu(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_widget_edit(cx);
+        self.focus_handle.focus(window, cx);
+        self.move_to(source, false, cx);
+        self.table_menu = true;
+        cx.notify();
+    }
+
+    fn finish_widget(&mut self, cx: &mut Context<Self>) {
+        self.commit_widget_edit(cx);
+    }
+
+    fn preedit(&self) -> Option<&str> {
+        if matches!(self.widget_edit, WidgetEdit::Idle) {
+            self.preedit.as_deref()
+        } else {
+            None
+        }
+    }
+
+    fn report_leaf(
         &mut self,
-        caret_bounds: Bounds<Pixels>,
         layout: Arc<LeafLayout>,
         element_bounds: Bounds<Pixels>,
         font_size: f32,
         line_height: f32,
+        caret_bounds: Option<Bounds<Pixels>>,
     ) {
-        self.last_ime_bounds = Some(caret_bounds);
-        self.ime_leaf = Some(ImeLeaf {
+        let leaf = ImeLeaf {
             layout,
             bounds: element_bounds,
             font_size,
             line_height,
-        });
+        };
+        if let Some(caret) = caret_bounds {
+            self.last_ime_bounds = Some(caret);
+            self.ime_leaf = Some(ImeLeaf {
+                layout: leaf.layout.clone(),
+                bounds: leaf.bounds,
+                font_size,
+                line_height,
+            });
+        }
+        self.ime_leaves.push(leaf);
     }
 }
 
@@ -687,6 +783,15 @@ impl EntityInputHandler for RichEditorView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
+        if let Some((draft, preedit)) = self.widget_display() {
+            let content = format!("{}{}", draft, preedit.unwrap_or_default());
+            let start = Self::offset_from_utf16(&content, range_utf16.start);
+            let end = Self::offset_from_utf16(&content, range_utf16.end);
+            actual_range.replace(
+                Self::offset_to_utf16(&content, start)..Self::offset_to_utf16(&content, end),
+            );
+            return Some(content.get(start..end).unwrap_or("").to_string());
+        }
         let content = self.document.read(cx).buffer.content();
         let start = Self::offset_from_utf16(&content, range_utf16.start);
         let end = Self::offset_from_utf16(&content, range_utf16.end);
@@ -701,6 +806,14 @@ impl EntityInputHandler for RichEditorView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if let Some((draft, preedit)) = self.widget_display() {
+            let content = format!("{}{}", draft, preedit.unwrap_or_default());
+            let n = Self::offset_to_utf16(&content, content.len());
+            return Some(UTF16Selection {
+                range: n..n,
+                reversed: false,
+            });
+        }
         let content = self.document.read(cx).buffer.content();
         Some(UTF16Selection {
             range: Self::offset_to_utf16(&content, self.selected_range.start)
@@ -720,6 +833,7 @@ impl EntityInputHandler for RichEditorView {
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         self.marked_range = None;
         self.preedit = None;
+        self.widget_preedit = None;
     }
 
     fn replace_text_in_range(
@@ -729,6 +843,24 @@ impl EntityInputHandler for RichEditorView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !matches!(self.widget_edit, WidgetEdit::Idle) {
+            self.widget_preedit = None;
+            if let Some(draft) = self.widget_draft_mut() {
+                if let Some(range_utf16) = range_utf16 {
+                    let content = draft.clone();
+                    let start = Self::offset_from_utf16(&content, range_utf16.start);
+                    let end = Self::offset_from_utf16(&content, range_utf16.end);
+                    let start = start.min(draft.len());
+                    let end = end.min(draft.len()).max(start);
+                    draft.replace_range(start..end, new_text);
+                } else {
+                    draft.push_str(new_text);
+                }
+            }
+            self.snapshot = None;
+            cx.notify();
+            return;
+        }
         if let Some(range_utf16) = range_utf16 {
             let content = self.document.read(cx).buffer.content();
             let start = Self::offset_from_utf16(&content, range_utf16.start);
@@ -751,6 +883,16 @@ impl EntityInputHandler for RichEditorView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !matches!(self.widget_edit, WidgetEdit::Idle) {
+            self.widget_preedit = if new_text.is_empty() {
+                None
+            } else {
+                Some(new_text.to_string())
+            };
+            self.snapshot = None;
+            cx.notify();
+            return;
+        }
         // Preedit is display-only; the model is untouched until commit.
         self.preedit = if new_text.is_empty() {
             None
@@ -784,15 +926,26 @@ impl EntityInputHandler for RichEditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let leaf = self.ime_leaf.as_ref()?;
-        if !leaf.bounds.contains(&point) {
-            return None;
+        if !matches!(self.widget_edit, WidgetEdit::Idle) {
+            if let Some((draft, preedit)) = self.widget_display() {
+                let content = format!("{}{}", draft, preedit.unwrap_or_default());
+                return Some(Self::offset_to_utf16(&content, content.len()));
+            }
         }
+        let theme = self.theme.clone();
+        let leaf = self
+            .ime_leaves
+            .iter()
+            .find(|leaf| leaf.bounds.contains(&point))
+            .or_else(|| {
+                self.ime_leaf
+                    .as_ref()
+                    .filter(|leaf| leaf.bounds.contains(&point))
+            })?;
         let layout = leaf.layout.clone();
         let bounds = leaf.bounds;
         let font_size = leaf.font_size;
         let line_height = leaf.line_height;
-        let theme = self.theme.clone();
         let vis = hit_test_leaf(
             &layout,
             bounds,
@@ -810,12 +963,23 @@ impl EntityInputHandler for RichEditorView {
 
 impl Render for RichEditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ime_leaves.clear();
         let snapshot = self.sync_snapshot(cx);
         let theme = self.theme.clone();
         let editor = cx.entity();
         let focus = self.focus_handle.clone();
+        let fm_info = markrust_core::parse_frontmatter(&snapshot.source);
+        let editing_fm = match &self.widget_edit {
+            WidgetEdit::Frontmatter { key, draft } => Some((*key, draft.clone())),
+            _ => None,
+        };
+        let widget_preedit = self.widget_preedit.clone();
+        let table_menu = self.table_menu;
         div()
             .size_full()
+            .relative()
+            .flex()
+            .flex_col()
             .bg(theme.editor_bg)
             .key_context("RichEditor")
             .track_focus(&focus)
@@ -927,6 +1091,14 @@ impl Render for RichEditorView {
             })
             .on_action({
                 let editor = editor.clone();
+                move |_: &crate::editor::Escape, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        let _ = e.cancel_widget_edit(cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
                 move |_: &crate::editor::ToggleBold, _, cx| {
                     editor.update(cx, |e, cx| {
                         e.apply_rich(RichCommand::ToggleMark(MarkSet::BOLD), cx);
@@ -973,12 +1145,148 @@ impl Render for RichEditorView {
                     });
                 }
             })
+            .children(fm_info.map(|info| {
+                let editor_title = editor.clone();
+                let editor_tags = editor.clone();
+                let theme = theme.clone();
+                let title_value = match &editing_fm {
+                    Some(("title", draft)) => format!(
+                        "{}{}|",
+                        draft,
+                        widget_preedit.as_deref().unwrap_or("")
+                    ),
+                    _ => info.title.clone().unwrap_or_else(|| "Add a title".into()),
+                };
+                let tags_value = match &editing_fm {
+                    Some(("tags", draft)) => format!(
+                        "{}{}|",
+                        draft,
+                        widget_preedit.as_deref().unwrap_or("")
+                    ),
+                    _ => info.tags.clone().unwrap_or_else(|| "Add tags".into()),
+                };
+                let title_editing = matches!(editing_fm, Some(("title", _)));
+                let tags_editing = matches!(editing_fm, Some(("tags", _)));
+                let title_current = info.title.clone().unwrap_or_default();
+                let tags_current = info.tags.clone().unwrap_or_default();
+                div()
+                    .id("wysiwyg-frontmatter")
+                    .px(px(24.))
+                    .pt(px(12.))
+                    .child(
+                        div()
+                            .px(px(12.))
+                            .py(px(8.))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme.separator)
+                            .bg(theme.sidebar_bg)
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.secondary_text)
+                                    .child("Frontmatter"),
+                            )
+                            .child(
+                                div()
+                                    .id("fm-title")
+                                    .text_sm()
+                                    .text_color(theme.frontmatter_text)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .when(title_editing, |el| {
+                                        el.border_b_1().border_color(theme.accent)
+                                    })
+                                    .child(SharedString::from(format!("Title: {title_value}")))
+                                    .on_click(move |_, _, cx| {
+                                        editor_title.update(cx, |host, cx| {
+                                            host.edit_frontmatter_field("title", &title_current, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("fm-tags")
+                                    .text_sm()
+                                    .text_color(theme.secondary_text)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .when(tags_editing, |el| {
+                                        el.border_b_1().border_color(theme.accent)
+                                    })
+                                    .child(SharedString::from(format!("Tags: {tags_value}")))
+                                    .on_click(move |_, _, cx| {
+                                        editor_tags.update(cx, |host, cx| {
+                                            host.edit_frontmatter_field("tags", &tags_current, cx);
+                                        });
+                                    }),
+                            )
+                    )
+            }))
             .child(
                 list(self.list_state.clone(), move |index, _window, _cx| {
                     render_top_block(&snapshot, index, editor.clone())
                 })
+                .flex_1()
                 .size_full()
                 .py(px(16.)),
             )
+            .when(table_menu, |root| {
+                let editor = cx.entity();
+                let theme = theme.clone();
+                root.child(table_menu_overlay(editor, &theme))
+            })
     }
+}
+
+fn table_menu_overlay(
+    editor: gpui::Entity<RichEditorView>,
+    theme: &crate::theme::EditorTheme,
+) -> gpui::AnyElement {
+    let items: [(&str, RichCommand); 6] = [
+        ("Insert row below", RichCommand::InsertTableRow { after: true }),
+        ("Insert row above", RichCommand::InsertTableRow { after: false }),
+        ("Delete row", RichCommand::DeleteTableRow),
+        (
+            "Insert column right",
+            RichCommand::InsertTableColumn { after: true },
+        ),
+        (
+            "Insert column left",
+            RichCommand::InsertTableColumn { after: false },
+        ),
+        ("Delete column", RichCommand::DeleteTableColumn),
+    ];
+    div()
+        .absolute()
+        .top(px(8.))
+        .right(px(8.))
+        .p(px(6.))
+        .rounded_md()
+        .border_1()
+        .border_color(theme.separator)
+        .bg(theme.sidebar_bg)
+        .shadow_lg()
+        .children(items.into_iter().enumerate().map(|(i, (label, cmd))| {
+            let editor = editor.clone();
+            let theme = theme.clone();
+            div()
+                .id(("table-menu", i))
+                .px(px(8.))
+                .py(px(4.))
+                .rounded_md()
+                .text_sm()
+                .text_color(theme.text)
+                .cursor(CursorStyle::PointingHand)
+                .hover(move |s| s.bg(theme.sidebar_hover))
+                .child(SharedString::from(label))
+                .on_click(move |_, _, cx| {
+                    editor.update(cx, |view, cx| {
+                        view.table_menu = false;
+                        view.apply_rich(cmd.clone(), cx);
+                    });
+                })
+        }))
+        .into_any_element()
 }

@@ -42,7 +42,8 @@ actions!(
         ToggleCode,
         ToggleLink,
         Indent,
-        Outdent
+        Outdent,
+        Escape
     ]
 );
 

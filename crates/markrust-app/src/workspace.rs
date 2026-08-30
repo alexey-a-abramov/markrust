@@ -14,7 +14,8 @@ use crate::drop::{
     classify_editor_drop, classify_window_drop, markdown_image_reference, DropIntent,
 };
 use crate::session::{
-    list_markdown_files, reload_decision, DropTarget, ReloadDecision, WorkspaceCommand,
+    list_markdown_files, normalize_review_decision, reload_decision, should_offer_normalize_review,
+    DropTarget, NormalizeReviewChoice, ReloadDecision, WorkspaceCommand,
 };
 use markrust_core::Document;
 use markrust_editor::{EditorCommand, MarkdownEditor, MarkdownEditorView, RichEditorView};
@@ -187,6 +188,23 @@ impl Workspace {
                     cx.notify();
                 }
             }
+            WorkspaceCommand::SetFrontmatterField { key, value } => {
+                if let Some((view, id)) = self
+                    .active_tab()
+                    .map(|tab| (tab.rich_view.clone(), tab.id))
+                {
+                    view.update(cx, |view, cx| {
+                        view.apply_rich(
+                            markrust_core::rich::RichCommand::SetFrontmatterField { key, value },
+                            cx,
+                        );
+                    });
+                    self.schedule_autosave(id, cx);
+                }
+            }
+            WorkspaceCommand::SaveWithReview(choice) => {
+                self.save_with_review(choice, cx);
+            }
             WorkspaceCommand::AdvanceTime { .. } => {}
             WorkspaceCommand::ExternalFileChange(path) => {
                 if let Some(index) = self.tab_index_for_path(&path, cx) {
@@ -333,15 +351,42 @@ impl Workspace {
     }
 
     pub fn save_active(&mut self, cx: &mut Context<Self>) {
+        self.save_with_review(NormalizeReviewChoice::KeepOriginal, cx);
+    }
+
+    pub fn save_with_review(&mut self, choice: NormalizeReviewChoice, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab() else {
             return;
         };
         tab.document.update(cx, |doc, cx| {
+            if doc.path.is_none() {
+                return;
+            }
+            let mut engine = markrust_core::rich::RichEngine::new();
+            let candidates = markrust_core::rich::save_candidates(doc, &mut engine);
+            if should_offer_normalize_review(&candidates) {
+                let Some(text) = normalize_review_decision(&candidates, choice) else {
+                    return;
+                };
+                if text != doc.buffer.content() {
+                    let len = doc.buffer.len_bytes();
+                    doc.replace_range(0, len, &text);
+                }
+            } else if choice == NormalizeReviewChoice::Cancel {
+                return;
+            }
             if doc.save_and_mark_clean().is_ok() {
                 cx.notify();
             }
         });
         cx.notify();
+    }
+
+    pub fn normalize_candidates(&self, cx: &gpui::App) -> Option<markrust_core::rich::SaveCandidates> {
+        let tab = self.active_tab()?;
+        let doc = tab.document.read(cx);
+        let mut engine = markrust_core::rich::RichEngine::new();
+        Some(markrust_core::rich::save_candidates(doc, &mut engine))
     }
 
     #[allow(dead_code)]
@@ -471,10 +516,21 @@ impl Workspace {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("tab has no path"))?;
         let content = std::fs::read_to_string(&path)?;
+        let source_caret = self.tabs[index].editor.read(cx).cursor_offset();
+        let rich_caret = self.tabs[index].rich_view.read(cx).cursor_offset();
         let document = self.tabs[index].document.clone();
-        document.update(cx, |doc, cx| {
-            doc.replace_content(&content);
+        let mapped = document.update(cx, |doc, cx| {
+            let mapped = doc.apply_external_edit(&content, &[source_caret, rich_caret]);
             cx.notify();
+            mapped
+        });
+        let source_mapped = mapped.first().copied().unwrap_or(source_caret);
+        let rich_mapped = mapped.get(1).copied().unwrap_or(rich_caret);
+        self.tabs[index].editor.update(cx, |editor, cx| {
+            editor.apply_command(EditorCommand::JumpTo(source_mapped), cx);
+        });
+        self.tabs[index].rich_view.update(cx, |view, cx| {
+            view.jump_to(rich_mapped, cx);
         });
         spawn_parse_pump(document, cx);
         self.pending_external_change = None;

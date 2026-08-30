@@ -116,6 +116,10 @@ pub enum RichCommand {
     SetFrontmatter {
         raw: String,
     },
+    SetFrontmatterField {
+        key: String,
+        value: String,
+    },
     TableTab {
         reverse: bool,
     },
@@ -125,6 +129,8 @@ pub enum RichCommand {
     InsertTableColumn {
         after: bool,
     },
+    DeleteTableRow,
+    DeleteTableColumn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,9 +174,14 @@ pub fn apply_rich_command(
             set_image_alt(doc, engine, caret, source_range, &alt)
         }
         RichCommand::SetFrontmatter { raw } => set_frontmatter(doc, engine, caret, &raw),
+        RichCommand::SetFrontmatterField { key, value } => {
+            set_frontmatter_field(doc, engine, caret, &key, &value)
+        }
         RichCommand::TableTab { reverse } => table_tab(doc, engine, caret, reverse),
         RichCommand::InsertTableRow { after } => insert_table_row(doc, engine, caret, after),
         RichCommand::InsertTableColumn { after } => insert_table_column(doc, engine, caret, after),
+        RichCommand::DeleteTableRow => delete_table_row(doc, engine, caret),
+        RichCommand::DeleteTableColumn => delete_table_column(doc, engine, caret),
     }
 }
 
@@ -246,7 +257,7 @@ fn apply_input_rule(
             insert,
             caret: new_caret,
         } => {
-            let absorbed = absorb_typing_prefix(doc, &range);
+            let absorbed = doc.peel_typing_range(range.clone());
             let before = absorbed.unwrap_or_else(|| caret.snapshot());
             let (start, end) = if absorbed.is_some() {
                 (range.start, range.start)
@@ -271,27 +282,6 @@ fn apply_input_rule(
             Ok(RichOutcome::Changed)
         }
     }
-}
-
-fn absorb_typing_prefix(
-    doc: &mut Document,
-    range: &Range<usize>,
-) -> Option<crate::undo::SelectionSnapshot> {
-    let last = doc.undo_stack().last()?;
-    if last.kind != TransactionKind::Typing {
-        return None;
-    }
-    let covers = match last.ops.as_slice() {
-        [crate::undo::EditOperation::Insert { byte_offset, text }] => {
-            *byte_offset == range.start && byte_offset + text.len() == range.end
-        }
-        _ => false,
-    };
-    if !covers {
-        return None;
-    }
-    let tx = doc.revert_last_quietly()?;
-    Some(tx.selection_after)
 }
 
 fn is_coalescable_insert(text: &str) -> bool {
@@ -1404,6 +1394,24 @@ fn wrap_frontmatter(raw: &str) -> String {
     }
 }
 
+fn set_frontmatter_field(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    key: &str,
+    value: &str,
+) -> Result<RichOutcome, RichError> {
+    engine.sync(doc);
+    let raw = engine
+        .tree()
+        .frontmatter
+        .as_ref()
+        .map(|fm| fm.raw.clone())
+        .unwrap_or_default();
+    let updated = crate::upsert_yaml_key(&raw, key, value);
+    set_frontmatter(doc, engine, caret, &updated)
+}
+
 fn table_tab(
     doc: &mut Document,
     engine: &mut RichEngine,
@@ -1454,6 +1462,12 @@ fn insert_table_row(
     let Some(pos) = engine.table_pos(caret.cursor()) else {
         return Ok(RichOutcome::Noop);
     };
+    let new_row = if after { pos.row + 1 } else { pos.row };
+    let col = pos.col;
+    let table_start = engine
+        .block(pos.table_id)
+        .map(|t| t.source_range.start)
+        .unwrap_or(caret.cursor());
     rewrite_table(doc, engine, caret, pos, |table, pos| {
         let cols = table
             .children
@@ -1461,22 +1475,13 @@ fn insert_table_row(
             .map(|r| r.children.len())
             .unwrap_or(0)
             .max(1);
-        let mut row = empty_row(false, cols);
-        if table
-            .children
-            .first()
-            .is_some_and(|r| matches!(r.kind, BlockKind::TableRow { header: true }))
-            && pos.row == 0
-            && !after
-        {
-            row.kind = BlockKind::TableRow { header: true };
-            if let Some(first) = table.children.first_mut() {
-                first.kind = BlockKind::TableRow { header: false };
-            }
-        }
+        let row = empty_row(false, cols);
         let idx = if after { pos.row + 1 } else { pos.row };
         table.children.insert(idx.min(table.children.len()), row);
-    })
+        normalize_table_headers(table);
+    })?;
+    place_table_caret(engine, caret, table_start, new_row, col);
+    Ok(RichOutcome::Changed)
 }
 
 fn insert_table_column(
@@ -1488,6 +1493,12 @@ fn insert_table_column(
     let Some(pos) = engine.table_pos(caret.cursor()) else {
         return Ok(RichOutcome::Noop);
     };
+    let new_col = if after { pos.col + 1 } else { pos.col };
+    let row = pos.row;
+    let table_start = engine
+        .block(pos.table_id)
+        .map(|t| t.source_range.start)
+        .unwrap_or(caret.cursor());
     rewrite_table(doc, engine, caret, pos, |table, pos| {
         let idx = if after { pos.col + 1 } else { pos.col };
         if let BlockKind::Table { alignments } = &mut table.kind {
@@ -1498,7 +1509,100 @@ fn insert_table_column(
             let at = idx.min(row.children.len());
             row.children.insert(at, empty_cell());
         }
-    })
+        normalize_table_headers(table);
+    })?;
+    place_table_caret(engine, caret, table_start, row, new_col);
+    Ok(RichOutcome::Changed)
+}
+
+fn delete_table_row(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    let Some(pos) = engine.table_pos(caret.cursor()) else {
+        return Ok(RichOutcome::Noop);
+    };
+    if pos.n_rows <= 1 {
+        return Ok(RichOutcome::Noop);
+    }
+    let next_row = pos.row.min(pos.n_rows.saturating_sub(2));
+    let col = pos.col;
+    let table_start = engine
+        .block(pos.table_id)
+        .map(|t| t.source_range.start)
+        .unwrap_or(caret.cursor());
+    rewrite_table(doc, engine, caret, pos, |table, pos| {
+        if pos.row < table.children.len() {
+            table.children.remove(pos.row);
+        }
+        normalize_table_headers(table);
+    })?;
+    place_table_caret(engine, caret, table_start, next_row, col);
+    Ok(RichOutcome::Changed)
+}
+
+fn delete_table_column(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    let Some(pos) = engine.table_pos(caret.cursor()) else {
+        return Ok(RichOutcome::Noop);
+    };
+    if pos.n_cols <= 1 {
+        return Ok(RichOutcome::Noop);
+    }
+    let next_col = pos.col.min(pos.n_cols.saturating_sub(2));
+    let row = pos.row;
+    let table_start = engine
+        .block(pos.table_id)
+        .map(|t| t.source_range.start)
+        .unwrap_or(caret.cursor());
+    rewrite_table(doc, engine, caret, pos, |table, pos| {
+        if let BlockKind::Table { alignments } = &mut table.kind {
+            if pos.col < alignments.len() {
+                alignments.remove(pos.col);
+            }
+        }
+        for row in &mut table.children {
+            if pos.col < row.children.len() {
+                row.children.remove(pos.col);
+            }
+        }
+        normalize_table_headers(table);
+    })?;
+    place_table_caret(engine, caret, table_start, row, next_col);
+    Ok(RichOutcome::Changed)
+}
+
+fn normalize_table_headers(table: &mut Block) {
+    for (i, row) in table.children.iter_mut().enumerate() {
+        if let BlockKind::TableRow { header } = &mut row.kind {
+            *header = i == 0;
+        }
+    }
+}
+
+fn place_table_caret(
+    engine: &RichEngine,
+    caret: &mut CaretState,
+    table_start: usize,
+    row: usize,
+    col: usize,
+) {
+    let probe = table_start.min(engine.tree().blocks.last().map_or(0, |b| b.source_range.end));
+    let Some(pos) = engine
+        .table_pos(probe)
+        .or_else(|| engine.table_pos(caret.cursor()))
+    else {
+        return;
+    };
+    let row = row.min(pos.n_rows.saturating_sub(1));
+    let col = col.min(pos.n_cols.saturating_sub(1));
+    if let Some(offset) = engine.cell_caret(pos.table_id, row, col) {
+        caret.collapse_to(offset);
+    }
 }
 
 fn rewrite_table(
@@ -2085,5 +2189,218 @@ mod tests {
             "{}",
             doc.buffer.content()
         );
+        let after_insert = caret.cursor();
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteTableRow,
+        );
+        engine.sync(&doc);
+        assert_eq!(
+            engine.tree().blocks[0].children.len(),
+            2,
+            "{}",
+            doc.buffer.content()
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteTableColumn,
+        );
+        engine.sync(&doc);
+        assert_eq!(
+            engine.tree().blocks[0].children[0].children.len(),
+            2,
+            "{}",
+            doc.buffer.content()
+        );
+        let _ = after_insert;
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteTableColumn,
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteTableColumn,
+        );
+        engine.sync(&doc);
+        assert_eq!(
+            engine.tree().blocks[0].children[0].children.len(),
+            1,
+            "last column is kept: {}",
+            doc.buffer.content()
+        );
+    }
+
+    #[test]
+    fn delete_last_row_is_noop() {
+        let source = "| a |\n|---|\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        engine.sync(&doc);
+        caret.collapse_to(engine.tree().blocks[0].children[0].children[0].source_range.start);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::DeleteTableRow);
+        engine.sync(&doc);
+        assert_eq!(engine.tree().blocks[0].children.len(), 1);
+        assert!(matches!(
+            engine.tree().blocks[0].children[0].kind,
+            BlockKind::TableRow { header: true }
+        ));
+    }
+
+    #[test]
+    fn insert_row_keeps_first_row_as_header() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        engine.sync(&doc);
+        caret.collapse_to(engine.tree().blocks[0].children[0].children[0].source_range.start);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertTableRow { after: false },
+        );
+        engine.sync(&doc);
+        let rows = &engine.tree().blocks[0].children;
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0].kind, BlockKind::TableRow { header: true }));
+        assert!(matches!(
+            rows[1].kind,
+            BlockKind::TableRow { header: false }
+        ));
+        assert!(engine.table_pos(caret.cursor()).is_some());
+    }
+
+    #[test]
+    fn underscore_italic_via_input_rule() {
+        let (mut doc, mut engine, mut caret) = setup("");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("_".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("hi".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("_".into()),
+        );
+        let after = doc.buffer.content();
+        assert!(after.contains("_hi_"), "{after:?}");
+        engine.sync(&doc);
+        let italic = engine.tree().blocks[0].inlines.iter().any(|i| match i {
+            Inline::Run { marks, .. } => marks.contains(MarkSet::ITALIC),
+            _ => false,
+        });
+        assert!(italic, "expected italic run in {after:?}");
+    }
+
+    #[test]
+    fn heading_inside_list_item_and_one_undo() {
+        let (mut doc, mut engine, mut caret) = setup("");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("-".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText(" ".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("#".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText(" ".into()),
+        );
+        let after = doc.buffer.content();
+        assert!(after.contains("- #"), "{after:?}");
+        let tx = doc.undo_tx().unwrap();
+        engine.sync(&doc);
+        caret.restore(tx.selection_after);
+        let undone = doc.buffer.content();
+        assert!(
+            undone.contains("- ") && !undone.contains("- # "),
+            "heading conversion is one undo group: {undone:?}"
+        );
+    }
+
+    #[test]
+    fn heading_undo_peels_prefix_out_of_longer_typing() {
+        let (mut doc, mut engine, mut caret) = setup("");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("#".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("z".into()),
+        );
+        caret.collapse_to(1);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText(" ".into()),
+        );
+        let after = doc.buffer.content();
+        assert!(after.starts_with("# z"), "{after:?}");
+        let tx = doc.undo_tx().unwrap();
+        engine.sync(&doc);
+        caret.restore(tx.selection_after);
+        assert_eq!(doc.buffer.content(), "z");
+    }
+
+    #[test]
+    fn set_frontmatter_field_upserts_title() {
+        let (mut doc, mut engine, mut caret) = setup("# Body\n");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetFrontmatterField {
+                key: "title".into(),
+                value: "Hello".into(),
+            },
+        );
+        let after = doc.buffer.content();
+        assert!(after.contains("title: Hello"), "{after:?}");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetFrontmatterField {
+                key: "tags".into(),
+                value: "[a, b]".into(),
+            },
+        );
+        let after = doc.buffer.content();
+        assert!(after.contains("tags: [a, b]"), "{after:?}");
+        assert!(after.contains("title: Hello"), "{after:?}");
     }
 }

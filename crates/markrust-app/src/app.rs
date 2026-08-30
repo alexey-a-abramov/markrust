@@ -83,6 +83,7 @@ pub fn run_gui_with_open(open_path: Option<PathBuf>) {
                 markrust_editor::Outdent,
                 Some("MarkdownEditor"),
             ),
+            KeyBinding::new("escape", markrust_editor::Escape, Some("RichEditor")),
         ]);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
