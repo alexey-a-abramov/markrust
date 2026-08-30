@@ -193,6 +193,11 @@ impl Focusable for MarkRustWindow {
 
 impl Render for MarkRustWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let frontmatter_info = self
+            .workspace
+            .read(cx)
+            .active_tab()
+            .and_then(|tab| parse_frontmatter(&tab.document.read(cx).buffer.content()));
         let outline_items = {
             let mut items = Vec::new();
             if let Some(document) = self
@@ -513,9 +518,10 @@ impl Render for MarkRustWindow {
                             .flex_1()
                             .h_full()
                             .id("editor-area")
+                            .flex()
+                            .flex_col()
                             .overflow_y_scroll()
                             .bg(theme.editor_bg)
-                            .p(px(24.))
                             .on_drop(cx.listener({
                                 let ws = ws_editor_drop.clone();
                                 move |_, paths: &ExternalPaths, window, cx| {
@@ -534,7 +540,54 @@ impl Render for MarkRustWindow {
                             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                                 style.bg(theme.drop_zone_bg)
                             })
-                            .child({
+                            .when_some(frontmatter_info.clone(), |area, info| {
+                                let ws = workspace_entity.clone();
+                                let title = info
+                                    .title
+                                    .clone()
+                                    .unwrap_or_else(|| "YAML frontmatter".into());
+                                area.child(
+                                    div()
+                                        .id("frontmatter-panel")
+                                        .mx(px(24.))
+                                        .mt(px(12.))
+                                        .px(px(12.))
+                                        .py(px(8.))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(theme.separator)
+                                        .bg(theme.sidebar_bg)
+                                        .cursor_pointer()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.secondary_text)
+                                                .child("Frontmatter"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(theme.frontmatter_text)
+                                                .child(SharedString::from(title)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.secondary_text)
+                                                .child("Click to edit in source"),
+                                        )
+                                        .on_click(cx.listener(move |_, _, window, cx| {
+                                            let _ = ws.update(cx, |workspace, cx| {
+                                                workspace.dispatch(
+                                                    WorkspaceCommand::EditFrontmatter,
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        })),
+                                )
+                            })
+                            .child(div().flex_1().p(px(24.)).child({
                                 let tab =
                                     workspace.active_tab().unwrap_or_else(|| &workspace.tabs[0]);
                                 match tab.mode {
@@ -545,7 +598,7 @@ impl Render for MarkRustWindow {
                                         tab.editor_view.clone().into_any_element()
                                     }
                                 }
-                            }),
+                            })),
                     )
                     .child(if outline_open {
                         div()

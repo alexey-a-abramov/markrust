@@ -69,6 +69,14 @@ impl Document {
         &self.undo
     }
 
+    /// Undo the last transaction and drop it from redo, as if it never happened.
+    /// Used to fold a typing prefix into a following input-rule rewrite.
+    pub fn revert_last_quietly(&mut self) -> Option<Transaction> {
+        let tx = self.undo_tx()?;
+        self.undo.discard_redo();
+        Some(tx)
+    }
+
     pub fn insert(&mut self, byte_offset: usize, text: &str) {
         self.replace_range(byte_offset, byte_offset, text);
     }

@@ -35,6 +35,16 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     fn focused(&self, window: &Window) -> bool;
     fn input_focus_handle(&self) -> FocusHandle;
     fn toggle_task(&mut self, id: NodeId, cx: &mut Context<Self>);
+    fn edit_code_info(&mut self, id: NodeId, cx: &mut Context<Self>);
+    fn edit_image_alt(&mut self, source_range: Range<usize>, alt: &str, cx: &mut Context<Self>);
+    fn report_ime(
+        &mut self,
+        caret_bounds: Bounds<Pixels>,
+        layout: Arc<LeafLayout>,
+        element_bounds: Bounds<Pixels>,
+        font_size: f32,
+        line_height: f32,
+    );
 }
 
 /// Visible text of a leaf block plus a map back to source bytes.
@@ -248,6 +258,53 @@ pub fn build_leaf_layout(
     }
 }
 
+/// Layout for a fenced code body: 1:1 map from visible bytes to source.
+pub fn build_code_layout(
+    body: &str,
+    source_start: usize,
+    text_style: &TextStyle,
+    theme: &EditorTheme,
+) -> LeafLayout {
+    let mut runs = vec![text_style.to_run(body.len())];
+    if !body.is_empty() {
+        runs[0].font.family = theme.code_font_family.clone().into();
+    }
+    let mut source_at = Vec::with_capacity(body.len() + 1);
+    for i in 0..=body.len() {
+        source_at.push(source_start + i);
+    }
+    if body.is_empty() {
+        source_at = vec![source_start, source_start];
+        runs = vec![text_style.to_run(1)];
+    }
+    LeafLayout {
+        text: body.to_string(),
+        runs,
+        source_at,
+        block_start: source_start,
+    }
+}
+
+pub fn hit_test_leaf(
+    layout: &LeafLayout,
+    bounds: Bounds<Pixels>,
+    position: gpui::Point<Pixels>,
+    window: &mut Window,
+    font_size: f32,
+    line_height: f32,
+    theme: &EditorTheme,
+) -> usize {
+    let lines = shape_layout(
+        layout,
+        window,
+        bounds.size.width,
+        font_size,
+        line_height,
+        theme,
+    );
+    visible_index_at(&lines, bounds, position, px(line_height))
+}
+
 pub struct BlockTextElement<H: WysiwygHost> {
     pub editor: Entity<H>,
     pub layout: Arc<LeafLayout>,
@@ -259,6 +316,7 @@ pub struct BlockTextElement<H: WysiwygHost> {
 pub struct Prepaint<H: WysiwygHost> {
     lines: Vec<WrappedLine>,
     cursor: Option<PaintQuad>,
+    caret_bounds: Option<Bounds<Pixels>>,
     selection: Option<PaintQuad>,
     _host: std::marker::PhantomData<H>,
 }
@@ -319,7 +377,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
             ..self.layout.visible_for_source(selected.end);
 
         let line_height = px(self.line_height);
-        let (selection, cursor) = paint_carets(
+        let (selection, cursor, caret_bounds) = paint_carets(
             &lines,
             bounds,
             line_height,
@@ -335,6 +393,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
         Prepaint {
             lines,
             cursor,
+            caret_bounds,
             selection,
             _host: std::marker::PhantomData,
         }
@@ -358,6 +417,14 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
                 ElementInputHandler::new(bounds, self.editor.clone()),
                 cx,
             );
+            if let Some(caret_bounds) = prepaint.caret_bounds {
+                let layout = self.layout.clone();
+                let font_size = self.font_size;
+                let line_height = self.line_height;
+                self.editor.update(cx, |host, _cx| {
+                    host.report_ime(caret_bounds, layout, bounds, font_size, line_height);
+                });
+            }
         }
 
         if let Some(selection) = prepaint.selection.take() {
@@ -452,45 +519,14 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
 
 impl<H: WysiwygHost> BlockTextElement<H> {
     fn shape(&self, window: &mut Window, wrap_width: Pixels) -> Vec<WrappedLine> {
-        let display = if self.layout.text.is_empty() {
-            SharedString::from(" ")
-        } else {
-            self.layout.text.clone().into()
-        };
-        let mut runs = self.layout.runs.clone();
-        if display.as_ref() == " " && runs.is_empty() {
-            let style = TextStyle {
-                color: self.theme.text,
-                font_family: self.theme.font_family.clone().into(),
-                font_size: px(self.font_size).into(),
-                line_height: px(self.line_height).into(),
-                ..Default::default()
-            };
-            runs = vec![style.to_run(1)];
-        }
-        let covered: usize = runs.iter().map(|r| r.len).sum();
-        if covered != display.len() {
-            let style = TextStyle {
-                color: self.theme.text,
-                font_family: self.theme.font_family.clone().into(),
-                font_size: px(self.font_size).into(),
-                line_height: px(self.line_height).into(),
-                ..Default::default()
-            };
-            runs = vec![style.to_run(display.len())];
-        }
-        window
-            .text_system()
-            .shape_text(
-                display,
-                px(self.font_size),
-                &runs,
-                Some(wrap_width.max(px(40.))),
-                None,
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .collect()
+        shape_layout(
+            &self.layout,
+            window,
+            wrap_width,
+            self.font_size,
+            self.line_height,
+            &self.theme,
+        )
     }
 
     fn measure_height(&self, window: &mut Window, wrap: Pixels) -> Pixels {
@@ -502,6 +538,57 @@ impl<H: WysiwygHost> BlockTextElement<H> {
             .fold(px(0.), |a, b| a + b)
             .max(lh)
     }
+}
+
+fn shape_layout(
+    layout: &LeafLayout,
+    window: &mut Window,
+    wrap_width: Pixels,
+    font_size: f32,
+    line_height: f32,
+    theme: &EditorTheme,
+) -> Vec<WrappedLine> {
+    let display = if layout.text.is_empty() {
+        SharedString::from(" ")
+    } else {
+        layout.text.clone().into()
+    };
+    let mut runs = layout.runs.clone();
+    if display.as_ref() == " "
+        && (runs.is_empty() || runs.iter().map(|r| r.len).sum::<usize>() != 1)
+    {
+        let style = TextStyle {
+            color: theme.text,
+            font_family: theme.font_family.clone().into(),
+            font_size: px(font_size).into(),
+            line_height: px(line_height).into(),
+            ..Default::default()
+        };
+        runs = vec![style.to_run(1)];
+    }
+    let covered: usize = runs.iter().map(|r| r.len).sum();
+    if covered != display.len() {
+        let style = TextStyle {
+            color: theme.text,
+            font_family: theme.font_family.clone().into(),
+            font_size: px(font_size).into(),
+            line_height: px(line_height).into(),
+            ..Default::default()
+        };
+        runs = vec![style.to_run(display.len())];
+    }
+    window
+        .text_system()
+        .shape_text(
+            display,
+            px(font_size),
+            &runs,
+            Some(wrap_width.max(px(40.))),
+            None,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
 }
 
 fn source_in_leaf(layout: &LeafLayout, src: usize) -> bool {
@@ -552,9 +639,10 @@ fn paint_carets(
     show_sel: bool,
     caret_color: gpui::Hsla,
     sel_color: gpui::Hsla,
-) -> (Option<PaintQuad>, Option<PaintQuad>) {
+) -> (Option<PaintQuad>, Option<PaintQuad>, Option<Bounds<Pixels>>) {
     let _ = text_len;
     let mut cursor = None;
+    let mut caret_bounds = None;
     let mut selection = None;
     let mut y = bounds.origin.y;
     let mut offset = 0usize;
@@ -565,13 +653,12 @@ fn paint_carets(
             if let Some(pos) =
                 line.position_for_index(vis_caret.saturating_sub(offset), line_height)
             {
-                cursor = Some(fill(
-                    Bounds::new(
-                        point(bounds.origin.x + pos.x, y + pos.y),
-                        size(px(2.), line_height),
-                    ),
-                    caret_color,
-                ));
+                let rect = Bounds::new(
+                    point(bounds.origin.x + pos.x, y + pos.y),
+                    size(px(2.), line_height),
+                );
+                caret_bounds = Some(rect);
+                cursor = Some(fill(rect, caret_color));
             }
         }
         if show_sel {
@@ -596,7 +683,7 @@ fn paint_carets(
         offset = line_end;
         y += h;
     }
-    (selection, cursor)
+    (selection, cursor, caret_bounds)
 }
 
 #[cfg(test)]
@@ -635,5 +722,20 @@ mod tests {
             "expected alt placeholder, got {:?}",
             layout.text
         );
+    }
+
+    #[test]
+    fn code_layout_maps_bytes_one_to_one() {
+        let theme = EditorTheme::dark();
+        let style = TextStyle {
+            color: theme.text,
+            font_family: theme.code_font_family.clone().into(),
+            font_size: px(theme.font_size).into(),
+            ..Default::default()
+        };
+        let layout = build_code_layout("fn x() {}", 10, &style, &theme);
+        assert_eq!(layout.text, "fn x() {}");
+        assert_eq!(layout.source_for_visible(0), 10);
+        assert_eq!(layout.source_for_visible(5), 15);
     }
 }

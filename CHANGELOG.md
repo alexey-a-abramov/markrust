@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - WYSIWYG editing core: typing, backspace, bold/italic/code/link wrap, list split/indent/outdent, task-checkbox toggle.
+- Typora-style input rules (`# `, lists, quotes, fences, `---`, auto-close `*`/`**`/` `/`~~`).
+- Editable fenced-code language chip and image alt/caption in WYSIWYG.
+- Table Tab navigation plus insert row/column commands (Tab on last cell adds a row).
+- Frontmatter panel hook (edit in source) and Normalize review decision function.
 - Source-mode Cmd/Ctrl+B/I/E/K wrap that keeps delimiter masking working (caret stays inside the span).
 - Precise source-mode click-to-caret (byte offset from x position, not line-only).
 - Source-mode tables render padded columns until focused, then show raw pipes.

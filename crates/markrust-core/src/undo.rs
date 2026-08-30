@@ -169,8 +169,18 @@ impl UndoStack {
     }
 
     /// The most recently committed undo transaction, if any.
+    pub fn last(&self) -> Option<&Transaction> {
+        self.undo.last()
+    }
+
+    /// The most recently committed undo transaction, if any.
     pub fn last_mut(&mut self) -> Option<&mut Transaction> {
         self.undo.last_mut()
+    }
+
+    /// Drop the redo side after a quiet revert (the edit should not be redoable).
+    pub fn discard_redo(&mut self) {
+        self.redo.clear();
     }
 
     /// Pop an undo step. Returned `ops` are already inverted and ready to apply;

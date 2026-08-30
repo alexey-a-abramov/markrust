@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn masked_bold_click_maps_to_content_bytes() {
+    fn masked_bold_click_maps_display_to_source() {
         let content = "**bold**";
         let spans = vec![bold_span(0, 8)];
         let layout = build_display_layout(
@@ -172,11 +172,11 @@ mod tests {
             &[],
             &EditorTheme::dark(),
         );
-        assert_eq!(layout.display_text, "bold");
+        assert_eq!(layout.display_text, "**bold**");
         let map = invert_doc_to_display(&layout);
-        // Display index 0 is the 'b' of bold, which is source byte 2.
+        // Display index 2 is the 'b' of bold, which is source byte 2.
         assert_eq!(
-            map[0], 2,
+            map[2], 2,
             "display_to_doc={map:?} display={:?}",
             layout.display_text
         );
@@ -185,9 +185,9 @@ mod tests {
             0.0,
             &[20.0],
             &[0],
-            &[vec![0.0, 8.0, 16.0, 24.0, 32.0]],
+            &[vec![0.0, 8.0, 16.0, 24.0, 32.0, 40.0, 48.0, 56.0, 64.0]],
             &map,
         );
-        assert_eq!(offset, 2);
+        assert_eq!(offset, 0);
     }
 }

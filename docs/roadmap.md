@@ -28,10 +28,9 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 | P2 | `rich/serialize.rs` + `rich/escape.rs` (delimiter-stack serializer), `rich/save.rs` (SaveCandidates + diff hunks), corpus test suite | ✅ done |
 | P3 | `rich/engine.rs` (NodeId stability, splices, caret snap/step, line map, outline) + **read-only WYSIWYG view** (`markrust-editor::wysiwyg`) + per-tab mode toggle (cmd-shift-m / toolbar) | ✅ done |
 | P4 | **Editing core** — `RichCommand` layer, Transaction undo upgrade (typing coalescing + caret restore), WYSIWYG caret/selection/hit-testing/IME | ✅ done |
-| P5 | Lists/tasks UX (Enter/Tab, checkbox clicks) **partial**; input rules, code language chip, image alt/caption editing still open | 🚧 in progress |
-| P6 | Tables: cell editing, Tab nav, row/col ops UI (read-only rendered columns exist; source mode shows raw pipes when focused) | ⬜ |
-
-| P7 | Frontmatter panel + Normalize review dialog (decision fn in `session.rs`, headless-tested) | ⬜ |
+| P5 | Lists/tasks UX (Enter/Tab, checkbox clicks); input rules; code language chip; image alt/caption editing; IME caret bounds; stable-width inline delimiter masking | 🚧 in progress (core behaviors in; polish remains) |
+| P6 | Tables: cell editing, Tab nav, insert row/col commands (no context-menu chrome yet) | 🚧 in progress |
+| P7 | Frontmatter panel hook + Normalize review decision fn (dialog UI still open) | 🚧 in progress |
 | P8 | External-edit reconciliation (`map_offset_across_change` port, `apply_external_edit`, watcher/autosave wiring) | ⬜ |
 | P9 | Side-by-side + polish + migration (delete tree-sitter-md/`parser.rs`/`spans.rs`/masking after source mode re-derives segments from `RichTree`; criterion perf gates; docs rewrite) | ⬜ |
 
@@ -45,7 +44,7 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 
 ### Key modules
 
-- `crates/markrust-core/src/rich/` — `tree` (RichTree/Block/Inline + fidelity), `import` (comrak → tree), `serialize`/`escape` (Preserve/Normalize), `engine` (view contract), `command` (RichCommand → byte splices), `save` (SaveCandidates).
+- `crates/markrust-core/src/rich/` — `tree` (RichTree/Block/Inline + fidelity), `import` (comrak → tree), `serialize`/`escape` (Preserve/Normalize), `engine` (view contract), `command` (RichCommand → byte splices), `input_rules` (Typora-style `# ` / lists / fences / auto-close), `save` (SaveCandidates).
 - `crates/markrust-editor/src/wysiwyg/` — `view` (RichEditorView over virtualized `list()`), `blocks` (per-kind renderers), `block_text` (caret/hit-testing/IME host).
 - `crates/markrust-editor/src/source/` — the masking source editor (kept as always-working fallback and future source mode).
 - `crates/markrust-app/src/crash.rs` — panic logger (see Crash handling).
@@ -56,22 +55,30 @@ Editing core is in: `rich/command.rs` (`InsertText`, `Backspace`, `Delete`, `Spl
 
 Proven by tests: insert in one block leaves other blocks' bytes untouched; coalesced typing undo restores string + caret; backspace deletes the visible grapheme not `**` wrappers; split paragraph/list; toggle bold; wrap link; empty-item Enter outdents/exits; indent/outdent; task checkbox splice.
 
-## P5 design notes (for the next agent)
+## P5–P7 design notes (for the next agent)
 
 Shipped this pass:
-- Checkbox clicks → `SetTaskChecked`; Tab/Shift-Tab → `IndentList`/`OutdentList`; empty-item Enter outdents (nested) or exits the list (top-level).
-- Cmd/Ctrl+B/I/E/K wrap in **both** modes. Source wrap is `EditorCommand::Wrap` (byte splice so masking still sees a real span). WYSIWYG uses `ToggleMark` / `ToggleLink`.
-- Source click-to-caret uses glyph x positions (`source/hit_test.rs`), not line-start only.
-- Source tables: padded columns when blurred, raw pipes when the caret is in the table.
-- Images: alt placeholder in the text flow; `img()` below for every image (standalone and mixed). Drag-drop insert already exists (`drop.rs`).
-- File-open hang fix is in: watcher `recv` on a background task; parse via `apply_pending_parse` off the frame.
+- Input rules as pure functions in `rich/input_rules.rs` (`# `, `- `/`* `/`+ `, `1. `/`1) `, `> `, fences, `---`/`***`/`___`, auto-close `*`/`**`/` `/`~~`), disabled in code/raw, heading+space is one undo group.
+- `SetCodeInfo` / `SetImageAlt` / `SetFrontmatter` commands. WYSIWYG: clickable language chip and image caption (click → type → Enter commits).
+- Fenced code bodies are editable `BlockTextElement`s (not inert `StyledText`).
+- IME: `bounds_for_range` uses the painted caret rect; `character_index_for_point` hit-tests the focused leaf.
+- Source-mode inline delimiters keep glyph width when masked (transparent paint) so unmasking does not wrap the line. Block markers (`#`, list bullets) still collapse to visual chrome.
+- P6: `TableTab` (Tab/Shift-Tab in a table), `InsertTableRow` / `InsertTableColumn` (Tab on the last cell inserts a row). Cells were already `BlockTextElement`s.
+- P7: frontmatter panel (title + “edit in source” hook → `WorkspaceCommand::EditFrontmatter`). `normalize_review_decision` / `should_offer_normalize_review` in `session.rs` (headless-tested). No dialog chrome yet.
+- File-open hang fix remains: watcher `recv` on a background task; parse via `apply_pending_parse` off the frame.
 
-Still open:
-- Input rules (`# `, `- `, `1. `, `> `, ` ``` `, `---`, closing `**`/`*`/`` ` ``/`~~`) as pure functions in `input_rules.rs`, each one undo group with the typed text, disabled in code blocks.
-- Code language chip (edit `info` string) and image alt/caption *editing* (display + drop-insert exist).
-- IME domain can tighten from whole-document source offsets to the focused leaf's visible text (`bounds_for_range` / `character_index_for_point` still approximate).
-- Table cell editing / Tab-between-cells / row-col ops (P6).
-- Zero-width delimiter masking so unmasking cannot wrap a source line (today delimiters are omitted from display text, so they change width).
+Still open (do not shrink the goal):
+- Input-rule polish: `_` italic, nested auto-close, list-item-local `# ` / fences, undo grouping when the prefix was not the last Typing tx.
+- Language chip / caption: IME composition inside the chip, click-away vs Enter, empty-alt placeholder copy.
+- IME: preedit underline in the leaf; `character_index_for_point` for wrapped lines other than the last focused leaf.
+- P6: delete row/col, header-row constraints, context-menu / toolbar for insert; caret after insert-row is approximate.
+- P7: Normalize review dialog UI (Keep original / Normalize / Cancel) wired to save; in-place YAML key editing (title/tags) instead of source-mode hook.
+- P8–P9 unchanged.
+
+Earlier P5 (still in):
+- Checkbox clicks → `SetTaskChecked`; Tab/Shift-Tab → `IndentList`/`OutdentList` outside tables; empty-item Enter outdents or exits.
+- Cmd/Ctrl+B/I/E/K wrap in both modes.
+- Source click-to-caret uses glyph x; source tables padded when blurred.
 
 ## Dev workflow — hard-won gotchas
 

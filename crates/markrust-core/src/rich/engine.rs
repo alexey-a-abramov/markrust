@@ -38,6 +38,16 @@ pub struct BlockSplice {
     pub new_count: usize,
 }
 
+/// Location of a table cell containing a source byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TablePos {
+    pub table_id: NodeId,
+    pub row: usize,
+    pub col: usize,
+    pub n_rows: usize,
+    pub n_cols: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct RichEngine {
     tree: RichTree,
@@ -143,6 +153,60 @@ impl RichEngine {
                 _ => false,
             }),
         }
+    }
+
+    /// Cell containing `byte`, if any.
+    pub fn table_pos(&self, byte: usize) -> Option<TablePos> {
+        fn walk(blocks: &[Block], byte: usize) -> Option<TablePos> {
+            for b in blocks {
+                if matches!(b.kind, BlockKind::Table { .. })
+                    && b.source_range.start <= byte
+                    && byte <= b.source_range.end
+                {
+                    let n_rows = b.children.len();
+                    let n_cols = b.children.first().map(|r| r.children.len()).unwrap_or(0);
+                    for (ri, row) in b.children.iter().enumerate() {
+                        for (ci, cell) in row.children.iter().enumerate() {
+                            if cell.source_range.start <= byte && byte <= cell.source_range.end {
+                                return Some(TablePos {
+                                    table_id: b.id,
+                                    row: ri,
+                                    col: ci,
+                                    n_rows,
+                                    n_cols,
+                                });
+                            }
+                        }
+                    }
+                    if n_rows > 0 && n_cols > 0 {
+                        return Some(TablePos {
+                            table_id: b.id,
+                            row: n_rows.saturating_sub(1),
+                            col: n_cols.saturating_sub(1),
+                            n_rows,
+                            n_cols,
+                        });
+                    }
+                }
+                if let Some(found) = walk(&b.children, byte) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(&self.tree.blocks, byte)
+    }
+
+    /// Source caret for the start of cell `(row, col)` in `table_id`.
+    pub fn cell_caret(&self, table_id: NodeId, row: usize, col: usize) -> Option<usize> {
+        let table = self.block(table_id)?;
+        let cell = table.children.get(row)?.children.get(col)?;
+        Some(
+            inline_ranges(cell)
+                .first()
+                .map(|r| r.start)
+                .unwrap_or(cell.source_range.start),
+        )
     }
 
     /// True when `byte` is inside a table cell.

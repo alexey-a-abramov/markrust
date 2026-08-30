@@ -4,6 +4,7 @@
 
 //! Per-kind block renderers for the WYSIWYG surface.
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,18 +12,21 @@ use gpui::{
     div, img, prelude::*, px, AnyElement, CursorStyle, Entity, FontWeight, SharedString,
     StyledText, TextStyle,
 };
-use markrust_core::rich::{Block, BlockKind, ColumnAlign, RichTree};
+use markrust_core::rich::{Block, BlockKind, ColumnAlign, NodeId, RichTree};
 
-use super::block_text::{build_leaf_layout, BlockTextElement, WysiwygHost};
+use super::block_text::{build_code_layout, build_leaf_layout, BlockTextElement, WysiwygHost};
 use crate::highlight::highlight_code_block;
 use crate::theme::EditorTheme;
 
 /// Immutable per-frame snapshot the virtualized list renders from.
 pub struct RenderSnapshot {
     pub tree: RichTree,
+    pub source: String,
     pub theme: EditorTheme,
     /// Directory of the document, for resolving relative image paths.
     pub base_dir: Option<PathBuf>,
+    pub editing_code: Option<(NodeId, String)>,
+    pub editing_image: Option<(Range<usize>, String)>,
 }
 
 pub fn render_top_block<H: WysiwygHost>(
@@ -67,25 +71,68 @@ fn render_block<H: WysiwygHost>(
         BlockKind::CodeBlock { info, literal, .. } => {
             let body = literal.strip_suffix('\n').unwrap_or(literal).to_string();
             let language = info.split_whitespace().next().unwrap_or("").to_string();
-            let runs = code_runs(&body, &language, theme);
-            let text_style = base_text_style(theme, theme.font_size * 0.9, FontWeight::NORMAL);
-            let mut container = div()
+            let chip_text = snap
+                .editing_code
+                .as_ref()
+                .and_then(|(id, draft)| (*id == block.id).then(|| draft.clone()))
+                .unwrap_or_else(|| {
+                    if language.is_empty() {
+                        "plain".to_string()
+                    } else {
+                        language.clone()
+                    }
+                });
+            let editing = snap
+                .editing_code
+                .as_ref()
+                .is_some_and(|(id, _)| *id == block.id);
+            let mut code_style = base_text_style(theme, theme.font_size * 0.9, FontWeight::NORMAL);
+            code_style.font_family = theme.code_font_family.clone().into();
+            let body_start = code_body_source_start(&snap.source, block);
+            let mut layout = build_code_layout(&body, body_start, &code_style, theme);
+            let hl = code_runs(&body, &language, theme);
+            if !hl.is_empty() && !body.is_empty() {
+                layout.runs = text_runs_from_highlights(&body, &hl, &code_style);
+            }
+            let layout = std::sync::Arc::new(layout);
+            let line_height = theme.line_height_for_font_size(theme.font_size * 0.9);
+            let chip_id = block.id;
+            let editor_chip = editor.clone();
+            let chip = div()
+                .id(("code-lang", block.id.0))
+                .text_size(px(11.))
+                .text_color(theme.secondary_text)
+                .px(px(6.))
+                .py(px(2.))
+                .mb(px(4.))
+                .rounded_md()
+                .cursor(CursorStyle::PointingHand)
+                .when(editing, |el| {
+                    el.bg(theme.code_bg).border_1().border_color(theme.accent)
+                })
+                .when(!editing, |el| el.bg(theme.code_bg.opacity(0.5)))
+                .child(SharedString::from(if editing {
+                    format!("{chip_text}|")
+                } else {
+                    chip_text
+                }))
+                .on_click(move |_, _, cx| {
+                    editor_chip.update(cx, |host, cx| host.edit_code_info(chip_id, cx));
+                });
+            div()
                 .my(px(4.))
                 .p(px(12.))
                 .rounded_md()
                 .bg(theme.code_block_bg)
-                .font_family(theme.code_font_family.clone());
-            if !language.is_empty() {
-                container = container.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(theme.secondary_text)
-                        .mb(px(4.))
-                        .child(SharedString::from(language)),
-                );
-            }
-            container
-                .child(StyledText::new(body).with_default_highlights(&text_style, runs))
+                .font_family(theme.code_font_family.clone())
+                .child(chip)
+                .child(BlockTextElement {
+                    editor,
+                    layout,
+                    font_size: theme.font_size * 0.9,
+                    line_height,
+                    theme: theme.clone(),
+                })
                 .into_any_element()
         }
         BlockKind::BlockQuote => {
@@ -277,25 +324,47 @@ fn paragraph_element<H: WysiwygHost>(
 ) -> AnyElement {
     let theme = &snap.theme;
     let text_style = base_text_style(theme, font_size, base_weight);
-    let images: Vec<(String, String)> = block
+    let images: Vec<(String, String, std::ops::Range<usize>)> = block
         .inlines
         .iter()
         .filter_map(|inline| match inline {
-            markrust_core::rich::Inline::Image { alt, url, .. } => Some((alt.clone(), url.clone())),
+            markrust_core::rich::Inline::Image {
+                alt,
+                url,
+                source_range,
+                ..
+            } => Some((alt.clone(), url.clone(), source_range.clone())),
             _ => None,
         })
         .collect();
     let layout = std::sync::Arc::new(build_leaf_layout(block, &text_style, theme, base_weight));
     let line_height = theme.line_height_for_font_size(font_size);
     let mut container = div().flex().flex_col().gap(px(4.)).child(BlockTextElement {
-        editor,
+        editor: editor.clone(),
         layout,
         font_size,
         line_height,
         theme: theme.clone(),
     });
-    for (alt, url) in images {
+    for (alt, url, image_range) in images {
         let source: SharedString = resolve_image_source(snap, &url).into();
+        let caption = snap
+            .editing_image
+            .as_ref()
+            .and_then(|(range, draft)| (*range == image_range).then(|| draft.clone()))
+            .unwrap_or_else(|| {
+                if alt.is_empty() {
+                    "caption".to_string()
+                } else {
+                    alt.clone()
+                }
+            });
+        let editing = snap
+            .editing_image
+            .as_ref()
+            .is_some_and(|(range, _)| *range == image_range);
+        let editor_cap = editor.clone();
+        let alt_for_edit = alt.clone();
         container = container.child(
             div()
                 .my(px(4.))
@@ -305,10 +374,26 @@ fn paragraph_element<H: WysiwygHost>(
                 .child(img(source).max_w_full().rounded_md())
                 .child(
                     div()
+                        .id(("img-alt", image_range.start as u64))
                         .text_size(px(12.))
                         .text_color(snap.theme.secondary_text)
                         .italic()
-                        .child(SharedString::from(alt)),
+                        .cursor(CursorStyle::PointingHand)
+                        .when(editing, |el| {
+                            el.border_b_1().border_color(snap.theme.accent)
+                        })
+                        .child(SharedString::from(if editing {
+                            format!("{caption}|")
+                        } else {
+                            caption
+                        }))
+                        .on_click(move |_, _, cx| {
+                            let range = image_range.clone();
+                            let current = alt_for_edit.clone();
+                            editor_cap.update(cx, |host, cx| {
+                                host.edit_image_alt(range, &current, cx);
+                            });
+                        }),
                 ),
         );
     }
@@ -364,4 +449,45 @@ fn code_runs(
         cursor = end;
     }
     out
+}
+
+fn code_body_source_start(source: &str, block: &Block) -> usize {
+    let slice = source.get(block.source_range.clone()).unwrap_or("");
+    match slice.find('\n') {
+        Some(i) => block.source_range.start + i + 1,
+        None => block.source_range.start,
+    }
+}
+
+fn text_runs_from_highlights(
+    body: &str,
+    highlights: &[(std::ops::Range<usize>, gpui::HighlightStyle)],
+    style: &TextStyle,
+) -> Vec<gpui::TextRun> {
+    let mut runs = Vec::new();
+    let mut cursor = 0usize;
+    for (range, hl) in highlights {
+        let start = range.start.max(cursor).min(body.len());
+        let end = range.end.min(body.len());
+        if start > cursor {
+            let mut run = style.to_run(start - cursor);
+            run.color = style.color;
+            runs.push(run);
+        }
+        if start < end {
+            let mut run = style.to_run(end - start);
+            if let Some(color) = hl.color {
+                run.color = color;
+            }
+            runs.push(run);
+            cursor = end;
+        }
+    }
+    if cursor < body.len() {
+        runs.push(style.to_run(body.len() - cursor));
+    }
+    if runs.is_empty() {
+        runs.push(style.to_run(body.len()));
+    }
+    runs
 }

@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use markrust_core::rich::SaveCandidates;
 use markrust_core::Document;
 use markrust_editor::{EditorCommand, EditorOutcome, HeadlessEditor};
 use thiserror::Error;
@@ -43,6 +44,8 @@ pub enum WorkspaceCommand {
     JumpToHeading {
         offset: usize,
     },
+    /// Reveal YAML frontmatter in source (hook for the frontmatter panel).
+    EditFrontmatter,
     /// Advance the fake clock so autosave debounce can fire in tests.
     AdvanceTime {
         millis: u64,
@@ -87,6 +90,31 @@ pub fn reload_decision(
             }
         }
         _ => ReloadDecision::Ignore,
+    }
+}
+
+/// Choice for the Normalize review dialog (Keep original / Normalize / Cancel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormalizeReviewChoice {
+    KeepOriginal,
+    Normalize,
+    Cancel,
+}
+
+/// Whether save should offer the house-style review dialog.
+pub fn should_offer_normalize_review(candidates: &SaveCandidates) -> bool {
+    candidates.differs()
+}
+
+/// Apply a Normalize review choice. `None` means the save was cancelled.
+pub fn normalize_review_decision(
+    candidates: &SaveCandidates,
+    choice: NormalizeReviewChoice,
+) -> Option<String> {
+    match choice {
+        NormalizeReviewChoice::KeepOriginal => Some(candidates.preserved.clone()),
+        NormalizeReviewChoice::Normalize => Some(candidates.normalized.clone()),
+        NormalizeReviewChoice::Cancel => None,
     }
 }
 
@@ -219,6 +247,7 @@ impl HeadlessWorkspace {
             WorkspaceCommand::JumpToHeading { offset } => {
                 self.apply_editor(EditorCommand::JumpTo(offset))
             }
+            WorkspaceCommand::EditFrontmatter => self.apply_editor(EditorCommand::JumpTo(0)),
             WorkspaceCommand::AdvanceTime { millis } => {
                 self.now_ms = self.now_ms.saturating_add(millis);
                 self.flush_autosave();
@@ -536,6 +565,37 @@ mod tests {
             reload_decision(false, Some(path), Path::new("/tmp/other.md")),
             ReloadDecision::Ignore
         );
+    }
+
+    #[test]
+    fn normalize_review_decision_table() {
+        let doc = Document::new("Title\n=====\n\npara\n");
+        let mut engine = markrust_core::rich::RichEngine::new();
+        let candidates = markrust_core::rich::save_candidates(&doc, &mut engine);
+        assert!(should_offer_normalize_review(&candidates));
+        assert_eq!(
+            normalize_review_decision(&candidates, NormalizeReviewChoice::KeepOriginal).as_deref(),
+            Some(candidates.preserved.as_str())
+        );
+        let normalized =
+            normalize_review_decision(&candidates, NormalizeReviewChoice::Normalize).unwrap();
+        assert!(normalized.contains("# Title"), "{normalized}");
+        assert!(normalize_review_decision(&candidates, NormalizeReviewChoice::Cancel).is_none());
+    }
+
+    #[test]
+    fn edit_frontmatter_jumps_to_start() {
+        let mut workspace = HeadlessWorkspace::new();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "---\ntitle: T\n---\n\n# Body\n".into(),
+            )))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::JumpTo(10)))
+            .unwrap();
+        workspace.apply(WorkspaceCommand::EditFrontmatter).unwrap();
+        assert_eq!(workspace.active().unwrap().editor.cursor_offset(), 0);
     }
 
     #[test]

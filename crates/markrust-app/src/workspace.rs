@@ -178,6 +178,15 @@ impl Workspace {
                     }
                 }
             }
+            WorkspaceCommand::EditFrontmatter => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.mode = EditorMode::Source;
+                    tab.editor.update(cx, |editor, cx| {
+                        editor.apply_command(EditorCommand::JumpTo(0), cx);
+                    });
+                    cx.notify();
+                }
+            }
             WorkspaceCommand::AdvanceTime { .. } => {}
             WorkspaceCommand::ExternalFileChange(path) => {
                 if let Some(index) = self.tab_index_for_path(&path, cx) {

@@ -310,13 +310,26 @@ fn project_display(
                         &display_text[display_pos..],
                         content,
                     );
-                } else {
+                } else if is_block_structure_delimiter(segment, spans) {
                     let display_pos = display_text.len();
                     for byte in segment.doc_start..=segment.doc_end.min(content.len()) {
                         if byte < doc_to_display.len() {
                             doc_to_display[byte] = Some(display_pos);
                         }
                     }
+                } else {
+                    // Inline delimiters keep their glyph width (painted
+                    // transparent) so unmasking cannot wrap the line.
+                    let start_display = display_text.len();
+                    display_text.push_str(slice);
+                    map_display_range(
+                        &mut doc_to_display,
+                        segment.doc_start,
+                        segment.doc_end,
+                        start_display,
+                        slice,
+                        content,
+                    );
                 }
             }
             SegmentStyle::Image if !slice.contains('(') => {
@@ -406,6 +419,22 @@ fn is_masked_unordered_list_marker(
     content[line_start..segment.doc_start]
         .bytes()
         .all(|byte| byte == b' ' || byte == b'\t')
+}
+
+fn is_block_structure_delimiter(segment: &LayoutSegment, spans: &[SyntaxNodeSpan]) -> bool {
+    spans.iter().any(|span| {
+        matches!(
+            span.kind,
+            SyntaxKind::Heading
+                | SyntaxKind::List
+                | SyntaxKind::BlockQuote
+                | SyntaxKind::CodeBlock
+                | SyntaxKind::Frontmatter
+        ) && span
+            .delimiter_spans
+            .iter()
+            .any(|d| d.start_byte == segment.doc_start && d.end_byte == segment.doc_end)
+    })
 }
 
 fn is_masked_list_marker(segment: &LayoutSegment, spans: &[SyntaxNodeSpan]) -> bool {
@@ -655,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn masks_delimiters_from_display_text() {
+    fn masks_inline_delimiters_keep_width() {
         let content = "**bold**";
         let spans = vec![bold_span(0, 8)];
         let layout = build_display_layout(
@@ -665,7 +694,7 @@ mod tests {
             &[],
             &EditorTheme::dark(),
         );
-        assert_eq!(layout.display_text, "bold");
+        assert_eq!(layout.display_text, "**bold**");
     }
 
     #[test]
@@ -760,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn masked_display_is_narrower_than_unmasked() {
+    fn masked_inline_delimiters_keep_stable_width() {
         let content = "**bold**";
         let spans = vec![bold_span(0, 8)];
         let masked = build_display_layout(
@@ -772,9 +801,9 @@ mod tests {
         );
         let unmasked =
             build_display_layout(content, &spans, &[Caret::new(3)], &[], &EditorTheme::dark());
-        assert_eq!(masked.display_text, "bold");
+        assert_eq!(masked.display_text, "**bold**");
         assert_eq!(unmasked.display_text, "**bold**");
-        assert!(masked.display_text.len() < unmasked.display_text.len());
+        assert_eq!(masked.display_text.len(), unmasked.display_text.len());
         assert_eq!(masked.doc_to_display.len(), unmasked.doc_to_display.len());
     }
 

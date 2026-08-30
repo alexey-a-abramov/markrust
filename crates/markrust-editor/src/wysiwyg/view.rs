@@ -19,10 +19,31 @@ use markrust_core::rich::{
 };
 use markrust_core::Document;
 
-use super::block_text::WysiwygHost;
+use super::block_text::{hit_test_leaf, LeafLayout, WysiwygHost};
 use super::blocks::{render_top_block, RenderSnapshot};
 use crate::headless::{CaretMove, EditorCommand, EditorOutcome};
 use crate::theme::EditorTheme;
+
+#[derive(Debug, Clone, Default)]
+enum WidgetEdit {
+    #[default]
+    Idle,
+    CodeInfo {
+        id: NodeId,
+        draft: String,
+    },
+    ImageAlt {
+        range: Range<usize>,
+        draft: String,
+    },
+}
+
+struct ImeLeaf {
+    layout: Arc<LeafLayout>,
+    bounds: Bounds<Pixels>,
+    font_size: f32,
+    line_height: f32,
+}
 
 pub struct RichEditorView {
     document: Entity<Document>,
@@ -39,6 +60,8 @@ pub struct RichEditorView {
     cursor_visible: bool,
     focus_handle: FocusHandle,
     last_ime_bounds: Option<Bounds<Pixels>>,
+    ime_leaf: Option<ImeLeaf>,
+    widget_edit: WidgetEdit,
     _blink_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -73,6 +96,8 @@ impl RichEditorView {
             cursor_visible: true,
             focus_handle,
             last_ime_bounds: None,
+            ime_leaf: None,
+            widget_edit: WidgetEdit::Idle,
             _blink_task: Task::ready(()),
             _subscriptions: vec![focus_sub, blur_sub, doc_sub],
         }
@@ -110,6 +135,13 @@ impl RichEditorView {
     }
 
     pub fn apply_rich(&mut self, command: RichCommand, cx: &mut Context<Self>) -> RichOutcome {
+        if let RichCommand::InsertText(text) = &command {
+            if self.widget_insert(text, cx) {
+                return RichOutcome::Changed;
+            }
+        } else {
+            self.commit_widget_edit(cx);
+        }
         let mut caret = self.caret_state();
         let mut outcome = RichOutcome::Noop;
         self.document.update(cx, |doc, cx| {
@@ -135,11 +167,17 @@ impl RichEditorView {
     ) -> EditorOutcome {
         match command {
             EditorCommand::InsertText(text) => {
-                self.apply_rich(RichCommand::InsertText(text), cx);
-                EditorOutcome::Changed
+                if self.widget_insert(&text, cx) {
+                    EditorOutcome::Changed
+                } else {
+                    self.apply_rich(RichCommand::InsertText(text), cx);
+                    EditorOutcome::Changed
+                }
             }
             EditorCommand::Backspace => {
-                if self.apply_rich(RichCommand::Backspace, cx) == RichOutcome::Noop {
+                if self.widget_backspace(cx) {
+                    EditorOutcome::Changed
+                } else if self.apply_rich(RichCommand::Backspace, cx) == RichOutcome::Noop {
                     EditorOutcome::Noop
                 } else {
                     EditorOutcome::Changed
@@ -194,14 +232,32 @@ impl RichEditorView {
                 }
             }
             EditorCommand::Indent => {
-                if self.apply_rich(RichCommand::IndentList, cx) == RichOutcome::Noop {
+                self.engine.sync(self.document.read(cx));
+                if self.engine.in_table(self.cursor_offset()) {
+                    if self.apply_rich(RichCommand::TableTab { reverse: false }, cx)
+                        == RichOutcome::Noop
+                    {
+                        EditorOutcome::Noop
+                    } else {
+                        EditorOutcome::Changed
+                    }
+                } else if self.apply_rich(RichCommand::IndentList, cx) == RichOutcome::Noop {
                     EditorOutcome::Noop
                 } else {
                     EditorOutcome::Changed
                 }
             }
             EditorCommand::Outdent => {
-                if self.apply_rich(RichCommand::OutdentList, cx) == RichOutcome::Noop {
+                self.engine.sync(self.document.read(cx));
+                if self.engine.in_table(self.cursor_offset()) {
+                    if self.apply_rich(RichCommand::TableTab { reverse: true }, cx)
+                        == RichOutcome::Noop
+                    {
+                        EditorOutcome::Noop
+                    } else {
+                        EditorOutcome::Changed
+                    }
+                } else if self.apply_rich(RichCommand::OutdentList, cx) == RichOutcome::Noop {
                     EditorOutcome::Noop
                 } else {
                     EditorOutcome::Changed
@@ -388,6 +444,7 @@ impl RichEditorView {
                 return snapshot.clone();
             }
         }
+        let widget_only = self.synced_revision == Some(revision) && self.snapshot.is_none();
         let base_dir = doc
             .path
             .as_ref()
@@ -396,21 +453,32 @@ impl RichEditorView {
         let old_count = self.engine.tree().blocks.len();
         self.engine.sync(doc);
         let new_count = self.engine.tree().blocks.len();
-        match self.engine.last_splice() {
-            Some(splice) if self.synced_revision.is_some() => {
-                self.list_state
-                    .splice(splice.range.clone(), splice.new_count);
-            }
-            _ => {
-                self.list_state
-                    .splice(0..old_count.min(new_count.max(old_count)), new_count);
-                self.list_state = ListState::new(new_count, ListAlignment::Top, px(512.));
+        if !widget_only {
+            match self.engine.last_splice() {
+                Some(splice) if self.synced_revision.is_some() => {
+                    self.list_state
+                        .splice(splice.range.clone(), splice.new_count);
+                }
+                _ => {
+                    self.list_state
+                        .splice(0..old_count.min(new_count.max(old_count)), new_count);
+                    self.list_state = ListState::new(new_count, ListAlignment::Top, px(512.));
+                }
             }
         }
         let snapshot = Arc::new(RenderSnapshot {
             tree: self.engine.tree().clone(),
+            source: doc.buffer.content(),
             theme: self.theme.clone(),
             base_dir,
+            editing_code: match &self.widget_edit {
+                WidgetEdit::CodeInfo { id, draft } => Some((*id, draft.clone())),
+                _ => None,
+            },
+            editing_image: match &self.widget_edit {
+                WidgetEdit::ImageAlt { range, draft } => Some((range.clone(), draft.clone())),
+                _ => None,
+            },
         });
         self.snapshot = Some(snapshot.clone());
         self.synced_revision = Some(revision);
@@ -442,6 +510,65 @@ impl RichEditorView {
         }
         utf16_offset
     }
+
+    fn widget_insert(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        match &mut self.widget_edit {
+            WidgetEdit::Idle => false,
+            WidgetEdit::CodeInfo { draft, .. } => {
+                if text.contains('\n') {
+                    self.commit_widget_edit(cx);
+                    return true;
+                }
+                draft.push_str(text);
+                self.snapshot = None;
+                cx.notify();
+                true
+            }
+            WidgetEdit::ImageAlt { draft, .. } => {
+                if text.contains('\n') {
+                    self.commit_widget_edit(cx);
+                    return true;
+                }
+                draft.push_str(text);
+                self.snapshot = None;
+                cx.notify();
+                true
+            }
+        }
+    }
+
+    fn widget_backspace(&mut self, cx: &mut Context<Self>) -> bool {
+        match &mut self.widget_edit {
+            WidgetEdit::Idle => false,
+            WidgetEdit::CodeInfo { draft, .. } | WidgetEdit::ImageAlt { draft, .. } => {
+                draft.pop();
+                self.snapshot = None;
+                cx.notify();
+                true
+            }
+        }
+    }
+
+    fn commit_widget_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        let edit = std::mem::take(&mut self.widget_edit);
+        match edit {
+            WidgetEdit::Idle => false,
+            WidgetEdit::CodeInfo { id, draft } => {
+                self.apply_rich(RichCommand::SetCodeInfo { id, info: draft }, cx);
+                true
+            }
+            WidgetEdit::ImageAlt { range, draft } => {
+                self.apply_rich(
+                    RichCommand::SetImageAlt {
+                        source_range: range,
+                        alt: draft,
+                    },
+                    cx,
+                );
+                true
+            }
+        }
+    }
 }
 
 impl WysiwygHost for RichEditorView {
@@ -452,6 +579,7 @@ impl WysiwygHost for RichEditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.commit_widget_edit(cx);
         self.is_selecting = true;
         self.focus_handle.focus(window, cx);
         self.move_to(source, extend, cx);
@@ -499,6 +627,49 @@ impl WysiwygHost for RichEditorView {
         if let Some(checked) = checked {
             self.apply_rich(RichCommand::SetTaskChecked { id, checked }, cx);
         }
+    }
+
+    fn edit_code_info(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        self.commit_widget_edit(cx);
+        self.engine.sync(self.document.read(cx));
+        let draft = self
+            .engine
+            .block(id)
+            .and_then(|b| match &b.kind {
+                markrust_core::rich::BlockKind::CodeBlock { info, .. } => Some(info.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        self.widget_edit = WidgetEdit::CodeInfo { id, draft };
+        self.snapshot = None;
+        cx.notify();
+    }
+
+    fn edit_image_alt(&mut self, source_range: Range<usize>, alt: &str, cx: &mut Context<Self>) {
+        self.commit_widget_edit(cx);
+        self.widget_edit = WidgetEdit::ImageAlt {
+            range: source_range,
+            draft: alt.to_string(),
+        };
+        self.snapshot = None;
+        cx.notify();
+    }
+
+    fn report_ime(
+        &mut self,
+        caret_bounds: Bounds<Pixels>,
+        layout: Arc<LeafLayout>,
+        element_bounds: Bounds<Pixels>,
+        font_size: f32,
+        line_height: f32,
+    ) {
+        self.last_ime_bounds = Some(caret_bounds);
+        self.ime_leaf = Some(ImeLeaf {
+            layout,
+            bounds: element_bounds,
+            font_size,
+            line_height,
+        });
     }
 }
 
@@ -597,6 +768,9 @@ impl EntityInputHandler for RichEditorView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if let Some(caret) = self.last_ime_bounds {
+            return Some(caret);
+        }
         self.last_ime_bounds = Some(bounds);
         Some(Bounds {
             origin: bounds.origin,
@@ -606,11 +780,31 @@ impl EntityInputHandler for RichEditorView {
 
     fn character_index_for_point(
         &mut self,
-        _point: gpui::Point<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        point: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Option<usize> {
-        None
+        let leaf = self.ime_leaf.as_ref()?;
+        if !leaf.bounds.contains(&point) {
+            return None;
+        }
+        let layout = leaf.layout.clone();
+        let bounds = leaf.bounds;
+        let font_size = leaf.font_size;
+        let line_height = leaf.line_height;
+        let theme = self.theme.clone();
+        let vis = hit_test_leaf(
+            &layout,
+            bounds,
+            point,
+            window,
+            font_size,
+            line_height,
+            &theme,
+        );
+        let src = layout.source_for_visible(vis);
+        let content = self.document.read(cx).buffer.content();
+        Some(Self::offset_to_utf16(&content, src))
     }
 }
 
@@ -725,7 +919,9 @@ impl Render for RichEditorView {
                 let editor = editor.clone();
                 move |_: &crate::editor::Enter, _, cx| {
                     editor.update(cx, |e, cx| {
-                        e.apply_rich(RichCommand::SplitBlock, cx);
+                        if !e.commit_widget_edit(cx) {
+                            e.apply_rich(RichCommand::SplitBlock, cx);
+                        }
                     });
                 }
             })
