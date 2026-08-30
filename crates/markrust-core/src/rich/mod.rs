@@ -204,6 +204,9 @@ mod tests {
             .map(|i| match i {
                 Inline::Run { text, .. } => format!("run:{text}"),
                 Inline::OpaqueInline { raw, .. } => format!("html:{raw}"),
+                Inline::Math {
+                    literal, display, ..
+                } => format!("math:{}:{literal}", if *display { "$$" } else { "$" }),
                 Inline::SoftBreak => "soft".into(),
                 Inline::HardBreak { .. } => "hard".into(),
                 Inline::Image { alt, url, .. } => format!("img:{alt}:{url}"),
@@ -428,6 +431,71 @@ mod tests {
     }
 
     #[test]
+    fn math_dollars_are_first_class_not_opaque() {
+        let source = "see $x^2$ and $$E=mc^2$$ and $5\n";
+        let tree = import(source);
+        let maths: Vec<_> = tree.blocks[0]
+            .inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Math {
+                    literal,
+                    display,
+                    raw,
+                    ..
+                } => Some((literal.as_str(), *display, raw.as_ref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            maths,
+            vec![("x^2", false, "$x^2$"), ("E=mc^2", true, "$$E=mc^2$$")]
+        );
+        assert!(!tree.blocks[0].inlines.iter().any(|i| match i {
+            Inline::Math { .. } => false,
+            Inline::Run { text, .. } => text.contains("$x^2$") || text.contains("$$"),
+            Inline::OpaqueInline { raw, .. } => raw.contains("$x"),
+            _ => false,
+        }));
+        assert!(tree.blocks[0].inlines.iter().any(|i| match i {
+            Inline::Run { text, .. } => text.contains("$5"),
+            _ => false,
+        }));
+        assert_eq!(preserve(source), source);
+        let dirty = std::collections::HashSet::from([tree.blocks[0].id]);
+        let rewritten = serialize_tree(&tree, source, SerializeMode::Preserve, &dirty);
+        assert!(
+            rewritten.contains("$x^2$")
+                && rewritten.contains("$$E=mc^2$$")
+                && rewritten.contains("$5"),
+            "dirty serialize must keep dollar math, got {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn currency_and_code_are_not_math() {
+        for source in [
+            "costs $5\n",
+            "$20,000 and $30,000\n",
+            "$ a^2 $\n",
+            "`$1+2$`\n",
+            "```\n$x$\n```\n",
+        ] {
+            let tree = import(source);
+            let has_math = tree
+                .blocks
+                .iter()
+                .any(|b| b.inlines.iter().any(|i| matches!(i, Inline::Math { .. })));
+            assert!(
+                !has_math,
+                "expected no math in {source:?}, got {:?}",
+                tree.blocks
+            );
+            assert_eq!(preserve(source), source);
+        }
+    }
+
+    #[test]
     fn links_and_images_carry_attrs() {
         let source = "[text](https://e.com \"T\") ![alt](img.png) <https://auto.link>\n";
         let tree = import(source);
@@ -535,6 +603,7 @@ mod tests {
         "==highlight== and <mark>mark</mark>\n",
         "H~2~O and mc^2^ and H<sub>2</sub>O\n",
         "<div>\n**bold** inner\n</div>\n",
+        "see $x^2$ and $$E=mc^2$$ costs $5\n",
     ];
 
     #[test]

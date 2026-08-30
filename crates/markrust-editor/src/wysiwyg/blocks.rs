@@ -18,8 +18,8 @@ use markrust_core::html_visual::{
 use markrust_core::rich::{Block, BlockKind, ColumnAlign, Inline, NodeId, RichTree};
 
 use super::block_text::{
-    build_code_layout, build_html_block_layout, build_leaf_layout, build_leaf_layout_inlines,
-    BlockTextElement, WidgetImeSink, WysiwygHost,
+    build_code_layout, build_html_block_layout, build_leaf_layout_inlines,
+    build_leaf_layout_revealed, BlockTextElement, RevealState, WidgetImeSink, WysiwygHost,
 };
 use super::image::{resolve_image_source, ResolvedImage};
 use super::inline_layout::{
@@ -30,6 +30,7 @@ use crate::highlight::highlight_code_block;
 use crate::theme::EditorTheme;
 
 /// Immutable per-frame snapshot the virtualized list renders from.
+#[derive(Clone)]
 pub struct RenderSnapshot {
     pub tree: RichTree,
     pub source: String,
@@ -39,6 +40,8 @@ pub struct RenderSnapshot {
     pub editing_code: Option<(NodeId, String)>,
     pub editing_image: Option<(Range<usize>, String)>,
     pub widget_preedit: Option<String>,
+    pub caret: usize,
+    pub selected_range: Range<usize>,
 }
 
 pub fn render_top_block<H: WysiwygHost>(
@@ -570,11 +573,16 @@ fn paragraph_element<H: WysiwygHost>(
     let theme = &snap.theme;
     let text_style = base_text_style(theme, font_size, base_weight);
     let line_height = theme.line_height_for_font_size(font_size);
+    let reveal = RevealState {
+        caret: snap.caret,
+        selection: snap.selected_range.clone(),
+    };
     let flow = classify_paragraph(&block.inlines);
     let role = image_role(flow).unwrap_or(ImageRole::Inline);
     match flow {
         ParagraphFlow::TextOnly => {
-            let layout = build_leaf_layout(block, &text_style, theme, base_weight);
+            let layout =
+                build_leaf_layout_revealed(block, &text_style, theme, base_weight, &reveal);
             BlockTextElement {
                 editor,
                 layout: Arc::new(layout),
@@ -601,7 +609,8 @@ fn paragraph_element<H: WysiwygHost>(
                 }
             }
             if children.is_empty() {
-                let layout = build_leaf_layout(block, &text_style, theme, base_weight);
+                let layout =
+                    build_leaf_layout_revealed(block, &text_style, theme, base_weight, &reveal);
                 children.push(
                     BlockTextElement {
                         editor,
@@ -637,6 +646,7 @@ fn paragraph_element<H: WysiwygHost>(
                             line_height,
                             editor.clone(),
                             true,
+                            &reveal,
                         );
                     }
                     InlineSegment::Image { index } => {
@@ -656,7 +666,8 @@ fn paragraph_element<H: WysiwygHost>(
                 }
             }
             if children.is_empty() {
-                let layout = build_leaf_layout(block, &text_style, theme, base_weight);
+                let layout =
+                    build_leaf_layout_revealed(block, &text_style, theme, base_weight, &reveal);
                 children.push(
                     BlockTextElement {
                         editor,
@@ -693,11 +704,13 @@ fn push_text_child<H: WysiwygHost>(
     line_height: f32,
     editor: Entity<H>,
     hug_width: bool,
+    reveal: &RevealState,
 ) {
     if inlines.is_empty() {
         return;
     }
-    let layout = build_leaf_layout_inlines(inlines, block_range, text_style, theme, base_weight);
+    let layout =
+        build_leaf_layout_inlines(inlines, block_range, text_style, theme, base_weight, reveal);
     if layout.text.is_empty() {
         return;
     }

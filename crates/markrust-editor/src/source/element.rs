@@ -439,7 +439,8 @@ fn styled_font(theme: &EditorTheme, style: SegmentStyle) -> gpui::Font {
         SegmentStyle::CodeInline
         | SegmentStyle::CodeBlock
         | SegmentStyle::SyntaxHighlight(_)
-        | SegmentStyle::Table { .. } => theme.code_font_family.clone(),
+        | SegmentStyle::Table { .. }
+        | SegmentStyle::Math => theme.code_font_family.clone(),
         _ => theme.font_family.clone(),
     };
     let weight = match style {
@@ -452,9 +453,10 @@ fn styled_font(theme: &EditorTheme, style: SegmentStyle) -> gpui::Font {
         _ => gpui::FontWeight::NORMAL,
     };
     let font_style = match style {
-        SegmentStyle::Italic | SegmentStyle::BlockQuote | SegmentStyle::Image => {
-            gpui::FontStyle::Italic
-        }
+        SegmentStyle::Italic
+        | SegmentStyle::BlockQuote
+        | SegmentStyle::Image
+        | SegmentStyle::Math => gpui::FontStyle::Italic,
         _ => gpui::FontStyle::Normal,
     };
     gpui::Font {

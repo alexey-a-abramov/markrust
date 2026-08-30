@@ -148,6 +148,7 @@ pub fn pack_runs(widths: &[f32], container: f32) -> Vec<Range<usize>> {
 fn inline_has_visible_text(inline: &Inline) -> bool {
     match inline {
         Inline::Run { text, .. } => !text.trim().is_empty(),
+        Inline::Math { literal, .. } => !literal.trim().is_empty(),
         Inline::OpaqueInline { raw, .. } => {
             if html_visual::html_inline_image(raw).is_some()
                 || html_visual::opaque_inline_is_caret_chrome(raw)
@@ -182,6 +183,7 @@ mod tests {
                     for inline in &inlines[start..end] {
                         match inline {
                             Inline::Run { text, .. } => n += text.chars().count(),
+                            Inline::Math { literal, .. } => n += literal.chars().count(),
                             Inline::OpaqueInline { raw, .. } => n += raw.chars().count(),
                             Inline::SoftBreak | Inline::HardBreak { .. } => n += 1,
                             Inline::Image { .. } => {}

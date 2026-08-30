@@ -59,7 +59,7 @@ pub enum InlineHtmlAction {
     Image { url: String, alt: String },
     /// `[^label]` footnote reference.
     FootnoteRef { label: String },
-    /// Unknown opaque: show the source (math, junk, …).
+    /// Unknown opaque: show the source (leftover junk).
     Raw,
 }
 

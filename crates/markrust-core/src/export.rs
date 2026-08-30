@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use comrak::{markdown_to_html, Options};
 
 /// Render Markdown source to an HTML fragment using GFM extensions plus
-/// Typora extras that the rich tree also parses (footnotes, description lists).
+/// Typora extras that the rich tree also parses (footnotes, description lists,
+/// dollar math).
 pub fn markdown_to_html_gfm(source: &str) -> String {
     let mut options = Options::default();
     options.extension.strikethrough = true;
@@ -20,6 +21,7 @@ pub fn markdown_to_html_gfm(source: &str) -> String {
     options.extension.description_lists = true;
     options.extension.superscript = true;
     options.extension.subscript = true;
+    options.extension.math_dollars = true;
     options.extension.tagfilter = true;
     options.extension.front_matter_delimiter = Some("---".into());
     options.render.unsafe_ = true;
@@ -90,6 +92,23 @@ mod tests {
         assert!(
             html.contains("href=\"https://example.com\""),
             "autolink html: {html}"
+        );
+    }
+
+    #[test]
+    fn exports_dollar_math() {
+        let html = markdown_to_html_gfm("see $x^2$ and $$E=mc^2$$ and $5");
+        assert!(
+            html.contains("data-math-style=\"inline\"") && html.contains("x^2"),
+            "inline math html: {html}"
+        );
+        assert!(
+            html.contains("data-math-style=\"display\"") && html.contains("E=mc^2"),
+            "display math html: {html}"
+        );
+        assert!(
+            html.contains("$5"),
+            "currency must remain text, html: {html}"
         );
     }
 

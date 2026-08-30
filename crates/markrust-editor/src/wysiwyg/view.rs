@@ -470,9 +470,19 @@ impl RichEditorView {
 
     fn sync_snapshot(&mut self, cx: &mut Context<Self>) -> Arc<RenderSnapshot> {
         let revision = self.document.read(cx).revision();
+        let caret = self.cursor_offset();
+        let selected_range = self.selected_range.clone();
         if self.synced_revision == Some(revision) {
             if let Some(snapshot) = &self.snapshot {
-                return snapshot.clone();
+                if snapshot.caret == caret && snapshot.selected_range == selected_range {
+                    return snapshot.clone();
+                }
+                let mut next = (**snapshot).clone();
+                next.caret = caret;
+                next.selected_range = selected_range;
+                let snapshot = Arc::new(next);
+                self.snapshot = Some(snapshot.clone());
+                return snapshot;
             }
         }
         let widget_only = self.synced_revision == Some(revision) && self.snapshot.is_none();
@@ -517,6 +527,8 @@ impl RichEditorView {
                 _ => None,
             },
             widget_preedit: self.widget_preedit.clone(),
+            caret,
+            selected_range,
         });
         self.snapshot = Some(snapshot.clone());
         self.synced_revision = Some(revision);

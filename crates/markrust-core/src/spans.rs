@@ -22,6 +22,8 @@ pub enum SyntaxKind {
     Highlight,
     Superscript,
     Subscript,
+    /// `$…$` / `$$…$$` (comrak `math_dollars`).
+    Math,
     Other,
 }
 

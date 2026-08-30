@@ -151,8 +151,8 @@ pub enum BlockKind {
     },
     DefinitionTerm,
     DefinitionDetails,
-    /// Anything we do not model (HTML blocks, math, ...): inert, serialized
-    /// verbatim from `raw`.
+    /// Anything we do not model (HTML blocks, …): inert, serialized
+    /// verbatim from `raw`. Dollar math is [`Inline::Math`], not opaque.
     Opaque {
         raw: String,
     },
@@ -271,7 +271,21 @@ pub enum Inline {
     HardBreak {
         style: BreakStyle,
     },
-    /// Inline HTML, footnote refs, math, wikilinks, ...: verbatim.
+    /// `$…$` / `$$…$$` TeX (comrak `math_dollars`). Delimiters live in
+    /// `source_range` / `raw`; the visible formula is `literal`.
+    Math {
+        /// Inner TeX (comrak literal; inline math is code-normalized).
+        literal: String,
+        /// `true` for `$$…$$` display math.
+        display: bool,
+        /// Full `$…$` / `$$…$$` source slice (byte-exact for dirty serialize).
+        raw: Box<str>,
+        /// Full span including the dollar delimiters.
+        source_range: Range<usize>,
+        /// Emphasis context the fragment sits inside.
+        marks: MarkSet,
+    },
+    /// Inline HTML, footnote refs, wikilinks, ...: verbatim.
     OpaqueInline {
         raw: Box<str>,
         source_range: Range<usize>,
@@ -287,7 +301,17 @@ impl Inline {
             Inline::Run { text, .. } => text.len(),
             Inline::Image { alt, .. } => alt.len(),
             Inline::SoftBreak | Inline::HardBreak { .. } => 1,
+            Inline::Math { literal, .. } => literal.len(),
             Inline::OpaqueInline { raw, .. } => raw.len(),
         }
+    }
+}
+
+/// `$` vs `$$` delimiter width.
+pub fn math_delim_width(display: bool) -> usize {
+    if display {
+        2
+    } else {
+        1
     }
 }

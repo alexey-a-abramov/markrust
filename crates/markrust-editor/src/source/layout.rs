@@ -32,6 +32,7 @@ pub enum SegmentStyle {
     Frontmatter,
     Strikethrough,
     Highlight,
+    Math,
     SyntaxHighlight(HighlightKind),
 }
 
@@ -235,6 +236,7 @@ fn span_style(span: &SyntaxNodeSpan) -> SegmentStyle {
         SyntaxKind::Frontmatter => SegmentStyle::Frontmatter,
         SyntaxKind::Strikethrough => SegmentStyle::Strikethrough,
         SyntaxKind::Highlight => SegmentStyle::Highlight,
+        SyntaxKind::Math => SegmentStyle::Math,
         _ => SegmentStyle::Plain,
     }
 }
@@ -915,13 +917,8 @@ mod tests {
     fn highlight_eqeq_masks_when_caret_outside() {
         let content = "hello ==mark== world";
         let spans = markrust_core::extract_syntax_spans(content);
-        let layout = build_display_layout(
-            content,
-            &spans,
-            &[Caret::new(0)],
-            &[],
-            &EditorTheme::dark(),
-        );
+        let layout =
+            build_display_layout(content, &spans, &[Caret::new(0)], &[], &EditorTheme::dark());
         let masked: Vec<_> = layout
             .segments
             .iter()
@@ -962,5 +959,67 @@ mod tests {
             .segments
             .iter()
             .any(|s| matches!(s.style, SegmentStyle::Delimiter { visible: false })));
+    }
+
+    #[test]
+    fn math_dollars_mask_when_caret_outside() {
+        let content = "see $x^2$ here";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let layout =
+            build_display_layout(content, &spans, &[Caret::new(0)], &[], &EditorTheme::dark());
+        let masked: Vec<_> = layout
+            .segments
+            .iter()
+            .filter(|s| matches!(s.style, SegmentStyle::Delimiter { visible: false }))
+            .collect();
+        assert!(
+            masked.len() >= 2,
+            "expected masked $, segments={:?}",
+            layout.segments
+        );
+        assert!(layout
+            .segments
+            .iter()
+            .any(|s| matches!(s.style, SegmentStyle::Math)));
+    }
+
+    #[test]
+    fn math_dollars_reveal_when_caret_inside() {
+        let content = "see $x^2$ here";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let inside = content.find('x').unwrap();
+        let layout = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(inside)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        assert!(
+            layout
+                .segments
+                .iter()
+                .any(|s| matches!(s.style, SegmentStyle::Delimiter { visible: true })),
+            "expected visible $, segments={:?}",
+            layout.segments
+        );
+        assert!(!layout
+            .segments
+            .iter()
+            .any(|s| matches!(s.style, SegmentStyle::Delimiter { visible: false })));
+    }
+
+    #[test]
+    fn currency_is_not_math_in_source_layout() {
+        let content = "costs $5";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let layout =
+            build_display_layout(content, &spans, &[Caret::new(0)], &[], &EditorTheme::dark());
+        assert!(!spans.iter().any(|s| s.kind == SyntaxKind::Math));
+        assert!(!layout
+            .segments
+            .iter()
+            .any(|s| matches!(s.style, SegmentStyle::Math)));
+        assert!(layout.display_text.contains("$5"));
     }
 }

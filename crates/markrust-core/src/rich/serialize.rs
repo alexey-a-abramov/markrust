@@ -584,6 +584,24 @@ impl<'a> Ser<'a> {
                     self.out.push(')');
                     at_line_start = false;
                 }
+                Inline::Math {
+                    literal,
+                    display,
+                    raw,
+                    ..
+                } => {
+                    if self.normalize() {
+                        let d = if *display { "$$" } else { "$" };
+                        self.out.push_str(d);
+                        self.out.push_str(literal);
+                        self.out.push_str(d);
+                    } else {
+                        self.out.push_str(raw);
+                    }
+                    if !raw.is_empty() {
+                        at_line_start = false;
+                    }
+                }
                 Inline::OpaqueInline { raw, .. } => {
                     self.out.push_str(raw);
                     if !raw.is_empty() {
@@ -613,7 +631,7 @@ fn inline_keys(inline: &Inline) -> Vec<MarkKey> {
     let (marks, link) = match inline {
         Inline::Run { marks, link, .. } => (*marks, link.clone()),
         Inline::Image { marks, link, .. } => (*marks, link.clone()),
-        Inline::OpaqueInline { marks, .. } => (*marks, None),
+        Inline::OpaqueInline { marks, .. } | Inline::Math { marks, .. } => (*marks, None),
         _ => (MarkSet::empty(), None),
     };
     let fidelity = match inline {

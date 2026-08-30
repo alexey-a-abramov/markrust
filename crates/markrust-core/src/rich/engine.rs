@@ -150,6 +150,9 @@ impl RichEngine {
                 Inline::OpaqueInline { source_range, .. } => {
                     source_range.start <= byte && byte <= source_range.end
                 }
+                Inline::Math { source_range, .. } => {
+                    source_range.start <= byte && byte <= source_range.end
+                }
                 _ => false,
             }),
         }
@@ -448,7 +451,9 @@ fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
         _ => {
             for inline in &block.inlines {
                 match inline {
-                    Inline::Run { source_range, .. } | Inline::Image { source_range, .. } => {
+                    Inline::Run { source_range, .. }
+                    | Inline::Image { source_range, .. }
+                    | Inline::Math { source_range, .. } => {
                         out.push(source_range.clone());
                     }
                     Inline::OpaqueInline {
@@ -618,6 +623,18 @@ mod tests {
         assert_eq!(engine.snap_caret(open + 1, Bias::Right), open + 2);
         let close = source.rfind("==").unwrap();
         assert_eq!(engine.snap_caret(close + 1, Bias::Left), close);
+    }
+
+    #[test]
+    fn snap_caret_sits_on_math_dollars() {
+        let source = "see $x$ tail\n";
+        let (_doc, engine) = engine_for(source);
+        let open = source.find('$').unwrap();
+        assert_eq!(engine.snap_caret(open, Bias::Right), open);
+        let inner = source.find('x').unwrap();
+        assert_eq!(engine.snap_caret(inner, Bias::Right), inner);
+        assert!(engine.in_raw_context(inner));
+        assert!(!engine.in_raw_context(0));
     }
 
     #[test]

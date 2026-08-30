@@ -8,7 +8,8 @@
 //! source mode is a projection of the rich tree's grammar rather than a second
 //! parser (tree-sitter-md). `==highlight==` is not a comrak node; it is paired
 //! with the same rules as [`crate::rich::import`] so source masking matches
-//! WYSIWYG. Parse still runs on a dedicated worker thread.
+//! WYSIWYG. Dollar math (`$` / `$$`) is a comrak node (`math_dollars`). Parse
+//! still runs on a dedicated worker thread.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 use comrak::nodes::{AstNode, NodeValue};
 use comrak::{parse_document, Arena};
 
-use crate::rich::import::{parse_options, LineStarts};
+use crate::rich::import::{math_outer_range, parse_options, LineStarts};
 use crate::spans::{DelimiterSpan, SyntaxKind, SyntaxNodeSpan, TableRowKind};
 
 /// Snapshot sent to the background parser thread.
@@ -126,6 +127,27 @@ fn collect_spans<'a>(
                 SyntaxKind::Subscript,
                 range.clone(),
                 wrap_delims(source, &range, 1),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::Math(math) => {
+            let full = math_outer_range(source, range.clone(), math.display_math);
+            let inner_start = range.start.max(full.start);
+            let inner_end = range.end.min(full.end);
+            let mut delimiter_spans = Vec::new();
+            if full.start < inner_start {
+                delimiter_spans.push(DelimiterSpan::new(full.start, inner_start));
+            }
+            if inner_end < full.end {
+                delimiter_spans.push(DelimiterSpan::new(inner_end, full.end));
+            }
+            spans.push(make_span(
+                SyntaxKind::Math,
+                full,
+                delimiter_spans,
                 None,
                 None,
                 None,
@@ -354,7 +376,7 @@ fn collect_eqeq_skip_ranges<'a>(
     let range = lines.range(node.data.borrow().sourcepos, source.len());
     let skip_here = matches!(
         node.data.borrow().value,
-        NodeValue::Code(_) | NodeValue::HtmlInline(_) | NodeValue::Image(_)
+        NodeValue::Code(_) | NodeValue::HtmlInline(_) | NodeValue::Image(_) | NodeValue::Math(_)
     );
     if skip_here {
         skip.push(range);
@@ -890,6 +912,45 @@ mod tests {
             .find(|s| s.kind == SyntaxKind::Superscript)
             .expect("superscript");
         assert_eq!(delim_text(sup_src, sup_span), vec!["^", "^"]);
+    }
+
+    #[test]
+    fn extracts_inline_and_display_math_delimiters() {
+        let source = "see $x^2$ and $$E=mc^2$$";
+        let spans = extract_syntax_spans(source);
+        let maths: Vec<_> = spans
+            .iter()
+            .filter(|s| s.kind == SyntaxKind::Math)
+            .collect();
+        assert_eq!(maths.len(), 2, "math spans: {spans:?}");
+        assert_eq!(&source[maths[0].start_byte..maths[0].end_byte], "$x^2$");
+        assert_eq!(delim_text(source, maths[0]), vec!["$", "$"]);
+        assert_eq!(
+            &source[maths[1].start_byte..maths[1].end_byte],
+            "$$E=mc^2$$"
+        );
+        assert_eq!(delim_text(source, maths[1]), vec!["$$", "$$"]);
+    }
+
+    #[test]
+    fn currency_and_code_are_not_math_spans() {
+        for source in [
+            "costs $5",
+            "$20,000 and $30,000",
+            "$ a^2 $",
+            "`$1+2$`",
+            "```\n$x$\n```\n",
+        ] {
+            let spans = extract_syntax_spans(source);
+            assert!(
+                !has_kind(&spans, SyntaxKind::Math),
+                "expected no math in {source:?}, got {spans:?}"
+            );
+        }
+        assert!(has_kind(
+            &extract_syntax_spans("`$1+2$`"),
+            SyntaxKind::CodeInline
+        ));
     }
 
     #[test]

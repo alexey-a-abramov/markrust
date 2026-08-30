@@ -437,4 +437,30 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn math_caret_outside_masks_inside_reveals() {
+        let source = "see $x^2$ here";
+        let spans = markrust_core::extract_syntax_spans(source);
+        let math = spans
+            .iter()
+            .find(|span| span.kind == SyntaxKind::Math)
+            .expect("math span");
+        assert_eq!(
+            math.delimiter_spans
+                .iter()
+                .map(|d| &source[d.start_byte..d.end_byte])
+                .collect::<Vec<_>>(),
+            vec!["$", "$"]
+        );
+        assert_eq!(
+            delimiter_visibility_for_span(math, &[Caret::new(0)], &[]),
+            VisibilityState::Masked
+        );
+        let inside = source.find('x').unwrap();
+        assert_eq!(
+            delimiter_visibility_for_span(math, &[Caret::new(inside)], &[]),
+            VisibilityState::Visible
+        );
+    }
 }

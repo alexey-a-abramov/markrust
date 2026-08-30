@@ -105,6 +105,30 @@ impl LeafLayout {
     }
 }
 
+/// Caret/selection used to reveal `$` / `$$` in WYSIWYG (Typora: hide unless
+/// the caret or a non-empty selection intersects the math span).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevealState {
+    pub caret: usize,
+    pub selection: Range<usize>,
+}
+
+impl RevealState {
+    pub const HIDDEN: Self = Self {
+        caret: usize::MAX,
+        selection: Range { start: 0, end: 0 },
+    };
+
+    pub fn intersects(&self, range: &Range<usize>) -> bool {
+        if self.caret >= range.start && self.caret <= range.end {
+            return true;
+        }
+        !self.selection.is_empty()
+            && self.selection.start < range.end
+            && self.selection.end > range.start
+    }
+}
+
 fn visible_for_html(s: &str, paint: &markrust_core::html_visual::HtmlPaint) -> String {
     use markrust_core::html_visual::{map_subscript, map_superscript};
     if paint.sup && !paint.sub {
@@ -186,6 +210,33 @@ fn style_run(
     run
 }
 
+fn math_style_run(
+    text_style: &TextStyle,
+    theme: &EditorTheme,
+    base_weight: gpui::FontWeight,
+    marks: MarkSet,
+    paint: &markrust_core::html_visual::HtmlPaint,
+) -> TextRun {
+    let mut run = style_run(text_style, theme, base_weight, marks, false, paint);
+    run.font.family = theme.code_font_family.clone().into();
+    run.font.style = gpui::FontStyle::Italic;
+    if !(paint.mark
+        || marks.contains(MarkSet::HIGHLIGHT)
+        || paint.code
+        || marks.contains(MarkSet::CODE))
+    {
+        run.background_color = None;
+    }
+    run
+}
+
+fn math_delim_run(text_style: &TextStyle, theme: &EditorTheme) -> TextRun {
+    let mut run = text_style.to_run(0);
+    run.font.family = theme.code_font_family.clone().into();
+    run.color = theme.delimiter;
+    run
+}
+
 /// Layout for a projected HTML block (tags stripped). `source_at` is relative
 /// to the HTML literal; `block_start` is the document offset of that literal.
 /// Inner Markdown (`**bold**`, links, code) is parsed so it does not paint as
@@ -208,6 +259,7 @@ pub fn build_html_block_layout(
             text_style,
             theme,
             gpui::FontWeight::NORMAL,
+            &RevealState::HIDDEN,
         );
         !probe.text.trim().is_empty()
     };
@@ -228,6 +280,7 @@ pub fn build_html_block_layout(
         text_style,
         theme,
         gpui::FontWeight::NORMAL,
+        &RevealState::HIDDEN,
     );
     if layout.text.is_empty() && !text.is_empty() {
         return html_flow_layout(text, source_at, paints, block_start, text_style, theme);
@@ -448,11 +501,12 @@ fn remap_html_sources(
     layout.block_start = block_start;
 }
 
-pub fn build_leaf_layout(
+pub fn build_leaf_layout_revealed(
     block: &Block,
     text_style: &TextStyle,
     theme: &EditorTheme,
     base_weight: gpui::FontWeight,
+    reveal: &RevealState,
 ) -> LeafLayout {
     build_leaf_layout_inlines(
         &block.inlines,
@@ -460,6 +514,7 @@ pub fn build_leaf_layout(
         text_style,
         theme,
         base_weight,
+        reveal,
     )
 }
 
@@ -472,6 +527,7 @@ pub fn build_leaf_layout_inlines(
     text_style: &TextStyle,
     theme: &EditorTheme,
     base_weight: gpui::FontWeight,
+    reveal: &RevealState,
 ) -> LeafLayout {
     let mut text = String::new();
     let mut runs: Vec<TextRun> = Vec::new();
@@ -576,6 +632,72 @@ pub fn build_leaf_layout_inlines(
                     run,
                 );
             }
+            Inline::Math {
+                literal,
+                display,
+                raw,
+                source_range,
+                marks,
+            } => {
+                if html.hidden() {
+                    continue;
+                }
+                let paint = merge_html_paint(*marks, &html.paint());
+                let width = markrust_core::rich::tree::math_delim_width(*display);
+                if reveal.intersects(source_range) {
+                    let raw_s = raw.as_ref();
+                    if raw_s.len() >= width * 2 {
+                        let open = &raw_s[..width];
+                        let inner = &raw_s[width..raw_s.len() - width];
+                        let close = &raw_s[raw_s.len() - width..];
+                        let delim = math_delim_run(text_style, theme);
+                        push(
+                            &mut text,
+                            &mut runs,
+                            &mut source_at,
+                            open,
+                            source_range.start..source_range.start + width,
+                            delim.clone(),
+                        );
+                        push(
+                            &mut text,
+                            &mut runs,
+                            &mut source_at,
+                            inner,
+                            source_range.start + width..source_range.end.saturating_sub(width),
+                            math_style_run(text_style, theme, base_weight, *marks, &paint),
+                        );
+                        push(
+                            &mut text,
+                            &mut runs,
+                            &mut source_at,
+                            close,
+                            source_range.end.saturating_sub(width)..source_range.end,
+                            delim,
+                        );
+                    } else {
+                        push(
+                            &mut text,
+                            &mut runs,
+                            &mut source_at,
+                            raw_s,
+                            source_range.clone(),
+                            math_style_run(text_style, theme, base_weight, *marks, &paint),
+                        );
+                    }
+                } else {
+                    let inner_start = source_range.start.saturating_add(width);
+                    let inner_end = source_range.end.saturating_sub(width).max(inner_start);
+                    push(
+                        &mut text,
+                        &mut runs,
+                        &mut source_at,
+                        literal,
+                        inner_start..inner_end,
+                        math_style_run(text_style, theme, base_weight, *marks, &paint),
+                    );
+                }
+            }
             Inline::OpaqueInline {
                 raw, source_range, ..
             } => match markrust_core::html_visual::classify_opaque_inline(raw, &mut html) {
@@ -641,6 +763,7 @@ pub fn build_leaf_layout_inlines(
                 .find_map(|i| match i {
                     Inline::Run { source_range, .. }
                     | Inline::Image { source_range, .. }
+                    | Inline::Math { source_range, .. }
                     | Inline::OpaqueInline { source_range, .. } => Some(source_range.end),
                     _ => None,
                 })
@@ -1256,7 +1379,7 @@ mod tests {
             font_size: px(theme.font_size).into(),
             ..Default::default()
         };
-        build_leaf_layout(block, &style, &theme, gpui::FontWeight::NORMAL)
+        build_leaf_layout_revealed(block, &style, &theme, gpui::FontWeight::NORMAL, &RevealState::HIDDEN)
     }
 
     fn first_paragraph(block: &Block) -> Option<&Block> {
@@ -1516,6 +1639,107 @@ mod tests {
             layout.runs.iter().any(|run| run.background_color.is_some()),
             "expected highlight background, runs={:?}",
             layout.runs
+        );
+    }
+
+    fn layout_for_caret(source: &str, caret: usize) -> LeafLayout {
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let block = &tree.blocks[0];
+        let theme = EditorTheme::dark();
+        let style = TextStyle {
+            color: theme.text,
+            font_family: theme.font_family.clone().into(),
+            font_size: px(theme.font_size).into(),
+            ..Default::default()
+        };
+        build_leaf_layout_revealed(
+            block,
+            &style,
+            &theme,
+            gpui::FontWeight::NORMAL,
+            &RevealState {
+                caret,
+                selection: 0..0,
+            },
+        )
+    }
+
+    fn math_run_is_styled(run: &gpui::TextRun, theme: &EditorTheme) -> bool {
+        run.font.style == gpui::FontStyle::Italic
+            && run.font.family.as_ref() == theme.code_font_family.as_str()
+    }
+
+    #[test]
+    fn math_hides_dollars_and_paints_formula_style() {
+        let layout = layout_for("see $x^2$ here\n");
+        assert_eq!(layout.text, "see x^2 here");
+        assert!(
+            !layout.text.contains('$'),
+            "math delimiters must not paint when caret is outside, got {:?}",
+            layout.text
+        );
+        let theme = EditorTheme::dark();
+        assert!(
+            layout
+                .runs
+                .iter()
+                .any(|run| math_run_is_styled(run, &theme)),
+            "expected italic monospace math, runs={:?}",
+            layout.runs
+        );
+    }
+
+    #[test]
+    fn math_reveals_dollars_when_caret_intersects() {
+        let source = "see $x^2$ here\n";
+        let inside = source.find('x').unwrap();
+        let layout = layout_for_caret(source, inside);
+        assert!(
+            layout.text.contains("$x^2$"),
+            "expected revealed $…$, got {:?}",
+            layout.text
+        );
+        assert_eq!(layout.text, "see $x^2$ here");
+    }
+
+    #[test]
+    fn display_math_hides_double_dollars() {
+        let layout = layout_for("$$E=mc^2$$\n");
+        assert!(
+            !layout.text.contains("$$"),
+            "display delimiters must not paint, got {:?}",
+            layout.text
+        );
+        assert!(
+            layout.text.contains("E=mc^2"),
+            "expected formula body, got {:?}",
+            layout.text
+        );
+        let revealed = layout_for_caret("$$E=mc^2$$\n", 2);
+        assert!(
+            revealed.text.contains("$$"),
+            "caret inside display math must reveal $$, got {:?}",
+            revealed.text
+        );
+    }
+
+    #[test]
+    fn currency_and_code_are_not_math_layout() {
+        let five = layout_for("costs $5\n");
+        assert_eq!(five.text, "costs $5");
+        let theme = EditorTheme::dark();
+        assert!(
+            !five.runs.iter().any(|run| math_run_is_styled(run, &theme)),
+            "currency must not use math style, runs={:?}",
+            five.runs
+        );
+        let code = layout_for("`$x$`\n");
+        assert_eq!(code.text, "$x$");
+        assert!(
+            code.runs.iter().any(|run| run.background_color.is_some()),
+            "expected inline code, runs={:?}",
+            code.runs
         );
     }
 

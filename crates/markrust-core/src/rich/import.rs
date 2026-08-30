@@ -36,6 +36,7 @@ pub(crate) fn parse_options() -> Options<'static> {
     // `apply_eqeq_highlight`. Do not enable `underline` — it would steal GFM `__bold__`.
     options.extension.superscript = true;
     options.extension.subscript = true;
+    options.extension.math_dollars = true;
     options.extension.front_matter_delimiter = Some("---".into());
     options.render.sourcepos = true;
     options
@@ -433,7 +434,20 @@ impl<'s> Importer<'s> {
                 };
                 out.push(Inline::HardBreak { style });
             }
-            // Inline HTML, footnote refs, math, wikilinks, superscript, ...
+            NodeValue::Math(math) => {
+                let display = math.display_math;
+                let literal = math.literal.clone();
+                let source_range = math_outer_range(self.source, range, display);
+                let raw = Box::<str>::from(self.slice(&source_range));
+                out.push(Inline::Math {
+                    literal,
+                    display,
+                    raw,
+                    source_range,
+                    marks: ctx.marks,
+                });
+            }
+            // Inline HTML, footnote refs, wikilinks, ...
             _ => {
                 let slice = self.slice(&range);
                 out.push(Inline::OpaqueInline {
@@ -443,6 +457,23 @@ impl<'s> Importer<'s> {
                 });
             }
         }
+    }
+}
+
+/// Expand comrak's inner math sourcepos to include `$` / `$$`.
+pub(crate) fn math_outer_range(
+    source: &str,
+    inner: std::ops::Range<usize>,
+    display: bool,
+) -> std::ops::Range<usize> {
+    let width = super::tree::math_delim_width(display);
+    let delim = if display { "$$" } else { "$" };
+    let start = inner.start.saturating_sub(width);
+    let end = inner.end.saturating_add(width).min(source.len());
+    if source.get(start..inner.start) == Some(delim) && source.get(inner.end..end) == Some(delim) {
+        start..end
+    } else {
+        inner
     }
 }
 
@@ -652,6 +683,25 @@ fn rebuild_with_highlight(inlines: &[Inline], pairs: &[(EqDelim, EqDelim, u64)])
                     m = m.with(MarkSet::HIGHLIGHT);
                 }
                 out.push(Inline::OpaqueInline {
+                    raw: raw.clone(),
+                    source_range: source_range.clone(),
+                    marks: m,
+                });
+            }
+            Inline::Math {
+                literal,
+                display,
+                raw,
+                source_range,
+                marks,
+            } => {
+                let mut m = *marks;
+                if highlight_group_for_inline(pairs, inline_i).is_some() {
+                    m = m.with(MarkSet::HIGHLIGHT);
+                }
+                out.push(Inline::Math {
+                    literal: literal.clone(),
+                    display: *display,
                     raw: raw.clone(),
                     source_range: source_range.clone(),
                     marks: m,
