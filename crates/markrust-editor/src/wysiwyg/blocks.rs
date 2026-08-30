@@ -190,6 +190,7 @@ fn render_block<H: WysiwygHost>(
                 .children(children)
                 .into_any_element()
         }
+        BlockKind::Alert { .. } => render_alert(snap, block, editor),
         BlockKind::BulletList { .. } | BlockKind::OrderedList { .. } => {
             render_list(snap, block, editor).into_any_element()
         }
@@ -223,6 +224,84 @@ fn render_block<H: WysiwygHost>(
         }
         BlockKind::Opaque { raw } => render_opaque(snap, block, raw, editor),
     }
+}
+
+fn render_alert<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    block: &Block,
+    editor: Entity<H>,
+) -> AnyElement {
+    let BlockKind::Alert {
+        kind,
+        title,
+        tag_range,
+        chrome_range,
+    } = &block.kind
+    else {
+        return div().into_any_element();
+    };
+    let theme = &snap.theme;
+    let accent = theme.alert_accent(*kind);
+    let reveal = RevealState {
+        caret: snap.caret,
+        selection: snap.selected_range.clone(),
+    };
+    let show_chrome = !chrome_range.is_empty() && reveal.intersects(chrome_range);
+    let header = if show_chrome {
+        let slice = snap.source.get(chrome_range.clone()).unwrap_or("");
+        let mut text_style = base_text_style(theme, theme.font_size * 0.85, FontWeight::SEMIBOLD);
+        text_style.color = accent;
+        let layout = std::sync::Arc::new(build_code_layout(
+            slice,
+            chrome_range.start,
+            &text_style,
+            theme,
+        ));
+        let line_height = theme.line_height_for_font_size(theme.font_size * 0.85);
+        BlockTextElement {
+            editor: editor.clone(),
+            layout,
+            font_size: theme.font_size * 0.85,
+            line_height,
+            theme: theme.clone(),
+            hug_width: false,
+        }
+        .into_any_element()
+    } else {
+        let caret_at = if tag_range.start < tag_range.end {
+            tag_range.start
+        } else {
+            block.source_range.start
+        };
+        let editor_click = editor.clone();
+        let label = kind.callout_label(title.as_deref());
+        div()
+            .id(("alert-label", block.id.0))
+            .text_size(px(12.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(accent)
+            .cursor(CursorStyle::PointingHand)
+            .child(SharedString::from(label))
+            .on_click(move |_, window, cx| {
+                editor_click.update(cx, |host, cx| {
+                    host.click_source(caret_at, false, window, cx);
+                });
+            })
+            .into_any_element()
+    };
+    let children: Vec<AnyElement> = block
+        .children
+        .iter()
+        .map(|child| render_block(snap, child, editor.clone()))
+        .collect();
+    div()
+        .my(px(4.))
+        .pl(px(12.))
+        .border_l_3()
+        .border_color(accent)
+        .child(header)
+        .children(children)
+        .into_any_element()
 }
 
 fn thematic_rule(theme: &EditorTheme) -> AnyElement {

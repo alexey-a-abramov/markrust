@@ -9,12 +9,14 @@
 //! Block source positions come from comrak sourcepos; inline positions are
 //! advisory and verified against the raw slice before use.
 
-use comrak::nodes::{AstNode, ListDelimType, ListType, NodeValue, Sourcepos, TableAlignment};
+use comrak::nodes::{
+    AlertType, AstNode, ListDelimType, ListType, NodeValue, Sourcepos, TableAlignment,
+};
 use comrak::{parse_document, Arena, Options};
 
 use super::tree::{
-    Block, BlockKind, BreakStyle, ColumnAlign, FenceFidelity, Frontmatter, HeadingStyle, IdGen,
-    Inline, LinkAttrs, MarkFidelity, MarkSet, RichTree,
+    find_alert_chrome, AlertKind, Block, BlockKind, BreakStyle, ColumnAlign, FenceFidelity,
+    Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs, MarkFidelity, MarkSet, RichTree,
 };
 
 /// Parse options shared with `export::markdown_to_html_gfm` (parse-relevant
@@ -34,9 +36,11 @@ pub(crate) fn parse_options() -> Options<'static> {
     options.extension.description_lists = true;
     // Typora extras (not GFM). `==highlight==` is not a comrak node; see
     // `apply_eqeq_highlight`. Do not enable `underline` — it would steal GFM `__bold__`.
+    // GitHub alerts (`> [!NOTE]`, …) are enabled so WYSIWYG can paint callouts.
     options.extension.superscript = true;
     options.extension.subscript = true;
     options.extension.math_dollars = true;
+    options.extension.alerts = true;
     options.extension.front_matter_delimiter = Some("---".into());
     options.render.sourcepos = true;
     options
@@ -151,6 +155,32 @@ impl<'s> Importer<'s> {
                 false,
             ),
             NodeValue::BlockQuote => (BlockKind::BlockQuote, true),
+            NodeValue::Alert(alert) => {
+                let kind = match alert.alert_type {
+                    AlertType::Note => AlertKind::Note,
+                    AlertType::Tip => AlertKind::Tip,
+                    AlertType::Important => AlertKind::Important,
+                    AlertType::Warning => AlertKind::Warning,
+                    AlertType::Caution => AlertKind::Caution,
+                };
+                let (tag_range, chrome_range) =
+                    match find_alert_chrome(self.source, source_range.clone()) {
+                        Some(c) => (c.tag_range, c.chrome_range),
+                        None => (
+                            source_range.start..source_range.start,
+                            source_range.start..source_range.start,
+                        ),
+                    };
+                (
+                    BlockKind::Alert {
+                        kind,
+                        title: alert.title.clone(),
+                        tag_range,
+                        chrome_range,
+                    },
+                    true,
+                )
+            }
             NodeValue::List(l) => (
                 match l.list_type {
                     ListType::Bullet => BlockKind::BulletList {

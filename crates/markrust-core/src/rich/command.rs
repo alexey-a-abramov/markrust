@@ -578,7 +578,7 @@ fn ancestor_list_item(engine: &RichEngine, leaf_id: NodeId) -> Option<&Block> {
 fn ancestor_is_quote(engine: &RichEngine, leaf_id: NodeId) -> bool {
     fn walk(blocks: &[Block], leaf_id: NodeId, in_quote: bool) -> Option<bool> {
         for b in blocks {
-            let q = in_quote || matches!(b.kind, BlockKind::BlockQuote);
+            let q = in_quote || matches!(b.kind, BlockKind::BlockQuote | BlockKind::Alert { .. });
             if b.id == leaf_id {
                 return Some(q);
             }
@@ -761,7 +761,7 @@ fn set_block_type(
     let Some(top) = engine.top_level_at(caret.cursor()).cloned() else {
         return Ok(RichOutcome::Noop);
     };
-    if top.is_container() && !matches!(top.kind, BlockKind::BlockQuote) {
+    if top.is_container() && !matches!(top.kind, BlockKind::BlockQuote | BlockKind::Alert { .. }) {
         return Ok(RichOutcome::Noop);
     }
     let mut rewritten = top.clone();
@@ -787,7 +787,7 @@ fn toggle_blockquote(
     let Some(top) = engine.top_level_at(caret.cursor()).cloned() else {
         return Ok(RichOutcome::Noop);
     };
-    if matches!(top.kind, BlockKind::BlockQuote) {
+    if matches!(top.kind, BlockKind::BlockQuote | BlockKind::Alert { .. }) {
         let inner = if top.children.len() == 1 {
             top.children[0].clone()
         } else {

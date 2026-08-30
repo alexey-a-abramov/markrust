@@ -8,8 +8,9 @@
 //! source mode is a projection of the rich tree's grammar rather than a second
 //! parser (tree-sitter-md). `==highlight==` is not a comrak node; it is paired
 //! with the same rules as [`crate::rich::import`] so source masking matches
-//! WYSIWYG. Dollar math (`$` / `$$`) is a comrak node (`math_dollars`). Parse
-//! still runs on a dedicated worker thread.
+//! WYSIWYG. Dollar math (`$` / `$$`) is a comrak node (`math_dollars`). GitHub
+//! alerts (`> [!NOTE]`, …) are comrak `alerts`. Parse still runs on a dedicated
+//! worker thread.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -216,6 +217,31 @@ fn collect_spans<'a>(
                 None,
                 None,
             ));
+        }
+        NodeValue::Alert(_) => {
+            spans.push(make_span(
+                SyntaxKind::Alert,
+                range.clone(),
+                line_prefix_delims(source, &range, b'>'),
+                None,
+                None,
+                None,
+                None,
+            ));
+            if let Some(chrome) = crate::rich::find_alert_chrome(source, range.clone()) {
+                spans.push(make_span(
+                    SyntaxKind::Alert,
+                    chrome.chrome_range,
+                    vec![DelimiterSpan::new(
+                        chrome.tag_range.start,
+                        chrome.tag_range.end,
+                    )],
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
+            }
         }
         NodeValue::List(_) => {
             spans.push(make_span(
@@ -808,6 +834,25 @@ mod tests {
         assert!(tasks.iter().any(|t| t.task_checked == Some(true)));
         assert!(has_kind(&spans, SyntaxKind::Link));
         assert!(has_kind(&spans, SyntaxKind::Image));
+    }
+
+    #[test]
+    fn extracts_github_alerts() {
+        for tag in ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"] {
+            let source = format!("> [!{tag}]\n> body\n");
+            let spans = extract_syntax_spans(&source);
+            assert!(
+                has_kind(&spans, SyntaxKind::Alert),
+                "missing Alert span for {tag}, spans={spans:?}"
+            );
+            let tagged = spans.iter().any(|s| {
+                s.kind == SyntaxKind::Alert
+                    && s.delimiter_spans.iter().any(|d| {
+                        source.get(d.start_byte..d.end_byte) == Some(format!("[!{tag}]").as_str())
+                    })
+            });
+            assert!(tagged, "expected [!{tag}] delimiter, spans={spans:?}");
+        }
     }
 
     #[test]

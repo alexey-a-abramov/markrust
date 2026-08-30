@@ -50,7 +50,7 @@ SyntaxNodeSpan map (revision-stamped)  — source-mode masking only
 RichEngine::sync → RichTree              — WYSIWYG + commands
         ↓
 Source: compute_visibility + layout + paint
-WYSIWYG: virtualized block list + BlockTextElement; mixed text+image paragraphs are a wrapping flex line-box (`img(PathBuf)`, 1.5em height cap); standalone image paragraphs stay block-sized (max 720×480); local files and cached `http(s)` images decode on the background executor; remote URLs fetch off the UI thread into `cache/markrust/images` (timeout/failure → alt placeholder); safe inline/block HTML is painted (tags hidden, phrasing marks applied; script/iframe/`javascript:` dropped); HTML-block inner Markdown (`**bold**`, links, code) is a nested parse, not raw chrome; `==highlight==` / `<mark>` paint a background; `<sub>`/`<sup>` and `~sub~`/`^sup^` map to Unicode (GPUI has no per-run baseline); footnote refs paint as superscripts; footnote definition and definition-list bodies are nested rich trees (`**bold**`, links, code); `$…$` / `$$…$$` hide the dollars unless the caret intersects, and paint the TeX in italic monospace (no TeX-to-glyphs); IME origin from the focused widget or caret leaf (`wysiwyg/ime.rs`), pushed with `invalidate_character_coordinates` after caret/widget paint
+WYSIWYG: virtualized block list + BlockTextElement; mixed text+image paragraphs are a wrapping flex line-box (`img(PathBuf)`, 1.5em height cap); standalone image paragraphs stay block-sized (max 720×480); local files and cached `http(s)` images decode on the background executor; remote URLs fetch off the UI thread into `cache/markrust/images` (timeout/failure → alt placeholder); safe inline/block HTML is painted (tags hidden, phrasing marks applied; script/iframe/`javascript:` dropped); HTML-block inner Markdown (`**bold**`, links, code) is a nested parse, not raw chrome; `==highlight==` / `<mark>` paint a background; `<sub>`/`<sup>` and `~sub~`/`^sup^` map to Unicode (GPUI has no per-run baseline); footnote refs paint as superscripts; footnote definition and definition-list bodies are nested rich trees (`**bold**`, links, code); `$…$` / `$$…$$` hide the dollars unless the caret intersects, and paint the TeX in italic monospace (no TeX-to-glyphs); GitHub `> [!NOTE]` / TIP / IMPORTANT / WARNING / CAUTION alerts paint as labeled callouts (left rule + label; `[!NOTE]` chrome hidden unless the caret intersects); IME origin from the focused widget or caret leaf (`wysiwyg/ime.rs`), pushed with `invalidate_character_coordinates` after caret/widget paint
 ```
 
 Parse, the folder watcher `recv`, remote image HTTP, and GPUI image decode stay off the GPUI UI thread. `Document::new` / `from_file` only *schedule* a parse; they do not fetch network images. The frame drains parse with `apply_pending_parse`. CI timeout tests (`crates/markrust-core/tests/perf_gates.rs`, `crates/markrust-editor/tests/perf_gates.rs`) fail if load+parse or source layout of a 256 KiB fixture exceeds a budget. Local numbers: `cargo bench -p markrust-core --bench parse` and `cargo bench -p markrust-editor --bench layout`.
@@ -66,11 +66,11 @@ Parse, the folder watcher `recv`, remote image HTTP, and GPUI image decode stay 
 
 | Layer | Engine | When |
 |---|---|---|
-| Document structure + source spans | comrak (same options as HTML export: GFM + footnotes + description lists + math_dollars) | Every edit, background thread |
+| Document structure + source spans | comrak (same options as HTML export: GFM + footnotes + description lists + math_dollars + alerts) | Every edit, background thread |
 | WYSIWYG tree | `rich::import` (comrak → `RichTree`) | On `RichEngine::sync` |
 | Fenced-code highlighting | tree-sitter rust/json/yaml/bash | Viewport paint of a code body |
 
-tree-sitter-md is not used. Source-mode `SyntaxNodeSpan`s are extracted from the comrak AST so masking cannot disagree with the rich tree's grammar. `==highlight==` is paired in that same pass (comrak has no highlight node). `$…$` / `$$…$$` are comrak `math_dollars` nodes.
+tree-sitter-md is not used. Source-mode `SyntaxNodeSpan`s are extracted from the comrak AST so masking cannot disagree with the rich tree's grammar. `==highlight==` is paired in that same pass (comrak has no highlight node). `$…$` / `$$…$$` are comrak `math_dollars` nodes. GitHub alerts (`> [!NOTE]`, …) are comrak `alerts` nodes.
 
 ## Editing surfaces
 

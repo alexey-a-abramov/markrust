@@ -48,6 +48,8 @@ One `VisibilityState` is returned per delimiter in document order (flattened acr
 | `$` / `$$` math, caret outside | Masked (formula body stays, italic monospace) |
 | `$` / `$$` math, caret or selection inside | Visible |
 | `$5`, `$ a $`, `` `$1+2$` `` | Not a math span |
+| `[!NOTE]` / TIP / IMPORTANT / WARNING / CAUTION in a GitHub alert, caret outside the tag line | Masked (callout body stays) |
+| `[!NOTE]` (etc.), caret or selection on the tag line | Visible |
 
 ## Example
 

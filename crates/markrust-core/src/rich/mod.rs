@@ -22,8 +22,9 @@ pub use input_rules::{match_input_rule, InputRule};
 pub use save::{save_candidates, DiffHunk, SaveCandidates};
 pub use serialize::{serialize_block, serialize_tree, SerializeMode};
 pub use tree::{
-    Block, BlockKind, BreakStyle, ColumnAlign, FenceFidelity, Frontmatter, HeadingStyle, IdGen,
-    Inline, LinkAttrs, MarkFidelity, MarkSet, NodeId, RichTree,
+    find_alert_chrome, AlertChrome, AlertKind, Block, BlockKind, BreakStyle, ColumnAlign,
+    FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs, MarkFidelity, MarkSet,
+    NodeId, RichTree,
 };
 
 #[cfg(test)]
@@ -473,6 +474,121 @@ mod tests {
     }
 
     #[test]
+    fn github_alerts_import_each_kind_and_roundtrip() {
+        for kind in AlertKind::ALL {
+            let source = format!("> [!{}]\n> body {}\n", kind.tag(), kind.tag());
+            let tree = import(&source);
+            match &tree.blocks[0].kind {
+                BlockKind::Alert {
+                    kind: got,
+                    title,
+                    tag_range,
+                    chrome_range,
+                } => {
+                    assert_eq!(*got, kind, "{}", kind.tag());
+                    assert!(title.is_none(), "{}", kind.tag());
+                    assert_eq!(
+                        &source[tag_range.clone()],
+                        format!("[!{}]", kind.tag()),
+                        "{}",
+                        kind.tag()
+                    );
+                    assert_eq!(
+                        &source[chrome_range.clone()],
+                        format!("[!{}]", kind.tag()),
+                        "{}",
+                        kind.tag()
+                    );
+                }
+                other => panic!("expected Alert {}, got {other:?}", kind.tag()),
+            }
+            let body = tree.blocks[0]
+                .children
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Paragraph))
+                .expect("alert body paragraph");
+            let has_tag = body.inlines.iter().any(|i| match i {
+                Inline::Run { text, .. } => text.contains("[!"),
+                Inline::OpaqueInline { raw, .. } => raw.contains("[!"),
+                _ => false,
+            });
+            assert!(
+                !has_tag,
+                "[!{}] must not be body text, inlines={:?}",
+                kind.tag(),
+                body.inlines
+            );
+            assert_eq!(preserve(&source), source, "{}", kind.tag());
+            let dirty = std::collections::HashSet::from([tree.blocks[0].id]);
+            let rewritten = serialize_tree(&tree, &source, SerializeMode::Preserve, &dirty);
+            assert!(
+                rewritten.contains(&format!("[!{}]", kind.tag())) && rewritten.contains("body"),
+                "dirty serialize must keep [!{}], got {rewritten:?}",
+                kind.tag()
+            );
+            let html = crate::export::markdown_to_html_gfm(&source);
+            let class = format!("markdown-alert-{}", kind.tag().to_ascii_lowercase());
+            assert!(
+                html.contains(&class) && html.contains("markdown-alert-title"),
+                "html for {}: {html}",
+                kind.tag()
+            );
+            assert!(
+                !html.contains(&format!("[!{}]", kind.tag())),
+                "exported html must not show raw [!{}]: {html}",
+                kind.tag()
+            );
+        }
+    }
+
+    #[test]
+    fn github_alert_custom_title_and_lowercase_tag() {
+        let titled = "> [!NOTE] Pay attention\n> body\n";
+        let tree = import(titled);
+        match &tree.blocks[0].kind {
+            BlockKind::Alert {
+                kind,
+                title,
+                chrome_range,
+                ..
+            } => {
+                assert_eq!(*kind, AlertKind::Note);
+                assert_eq!(title.as_deref(), Some("Pay attention"));
+                assert_eq!(&titled[chrome_range.clone()], "[!NOTE] Pay attention");
+                assert_eq!(kind.callout_label(title.as_deref()), "Pay attention");
+            }
+            other => panic!("expected titled Note alert, got {other:?}"),
+        }
+        assert_eq!(preserve(titled), titled);
+
+        let lower = "> [!warning]\n> watch out\n";
+        let tree = import(lower);
+        match &tree.blocks[0].kind {
+            BlockKind::Alert { kind, .. } => assert_eq!(*kind, AlertKind::Warning),
+            other => panic!("expected Warning, got {other:?}"),
+        }
+        assert_eq!(preserve(lower), lower);
+        let dirty = std::collections::HashSet::from([tree.blocks[0].id]);
+        let rewritten = serialize_tree(&tree, lower, SerializeMode::Preserve, &dirty);
+        assert!(
+            rewritten.contains("[!WARNING]"),
+            "dirty serialize uppercases the tag, got {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_blockquote_is_not_an_alert() {
+        let source = "> just a quote\n";
+        let tree = import(source);
+        assert!(
+            matches!(tree.blocks[0].kind, BlockKind::BlockQuote),
+            "got {:?}",
+            tree.blocks[0].kind
+        );
+        assert_eq!(preserve(source), source);
+    }
+
+    #[test]
     fn currency_and_code_are_not_math() {
         for source in [
             "costs $5\n",
@@ -604,6 +720,11 @@ mod tests {
         "H~2~O and mc^2^ and H<sub>2</sub>O\n",
         "<div>\n**bold** inner\n</div>\n",
         "see $x^2$ and $$E=mc^2$$ costs $5\n",
+        "> [!NOTE]\n> alert body\n",
+        "> [!TIP]\n> tip body\n",
+        "> [!IMPORTANT]\n> important body\n",
+        "> [!WARNING]\n> warning body\n",
+        "> [!CAUTION]\n> caution body\n",
     ];
 
     #[test]

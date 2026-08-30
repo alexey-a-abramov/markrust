@@ -10,7 +10,7 @@ use comrak::{markdown_to_html, Options};
 
 /// Render Markdown source to an HTML fragment using GFM extensions plus
 /// Typora extras that the rich tree also parses (footnotes, description lists,
-/// dollar math).
+/// dollar math, GitHub alerts).
 pub fn markdown_to_html_gfm(source: &str) -> String {
     let mut options = Options::default();
     options.extension.strikethrough = true;
@@ -22,6 +22,7 @@ pub fn markdown_to_html_gfm(source: &str) -> String {
     options.extension.superscript = true;
     options.extension.subscript = true;
     options.extension.math_dollars = true;
+    options.extension.alerts = true;
     options.extension.tagfilter = true;
     options.extension.front_matter_delimiter = Some("---".into());
     options.render.unsafe_ = true;
@@ -110,6 +111,28 @@ mod tests {
             html.contains("$5"),
             "currency must remain text, html: {html}"
         );
+    }
+
+    #[test]
+    fn exports_github_alerts() {
+        for (tag, class) in [
+            ("NOTE", "markdown-alert-note"),
+            ("TIP", "markdown-alert-tip"),
+            ("IMPORTANT", "markdown-alert-important"),
+            ("WARNING", "markdown-alert-warning"),
+            ("CAUTION", "markdown-alert-caution"),
+        ] {
+            let md = format!("> [!{tag}]\n> body\n");
+            let html = markdown_to_html_gfm(&md);
+            assert!(
+                html.contains("markdown-alert") && html.contains(class),
+                "{tag} html: {html}"
+            );
+            assert!(
+                !html.contains(&format!("[!{tag}]")),
+                "raw tag must not appear in html for {tag}: {html}"
+            );
+        }
     }
 
     #[test]

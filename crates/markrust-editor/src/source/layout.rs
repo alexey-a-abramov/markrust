@@ -237,6 +237,7 @@ fn span_style(span: &SyntaxNodeSpan) -> SegmentStyle {
         SyntaxKind::Strikethrough => SegmentStyle::Strikethrough,
         SyntaxKind::Highlight => SegmentStyle::Highlight,
         SyntaxKind::Math => SegmentStyle::Math,
+        SyntaxKind::Alert => SegmentStyle::BlockQuote,
         _ => SegmentStyle::Plain,
     }
 }
@@ -434,6 +435,7 @@ fn is_block_structure_delimiter(segment: &LayoutSegment, spans: &[SyntaxNodeSpan
             SyntaxKind::Heading
                 | SyntaxKind::List
                 | SyntaxKind::BlockQuote
+                | SyntaxKind::Alert
                 | SyntaxKind::CodeBlock
                 | SyntaxKind::Frontmatter
         ) && span
@@ -489,7 +491,7 @@ fn task_checkbox_for_marker(marker: &str) -> char {
 fn blockquote_line_starts(content: &str, spans: &[SyntaxNodeSpan]) -> Vec<usize> {
     let mut lines = Vec::new();
     for span in spans {
-        if span.kind != SyntaxKind::BlockQuote {
+        if span.kind != SyntaxKind::BlockQuote && span.kind != SyntaxKind::Alert {
             continue;
         }
         let block = &content[span.start_byte..span.end_byte.min(content.len())];
@@ -1021,5 +1023,57 @@ mod tests {
             .iter()
             .any(|s| matches!(s.style, SegmentStyle::Math)));
         assert!(layout.display_text.contains("$5"));
+    }
+
+    #[test]
+    fn github_alert_masks_tag_when_caret_in_body() {
+        for tag in ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"] {
+            let content = format!("> [!{tag}]\n> body");
+            let spans = markrust_core::extract_syntax_spans(&content);
+            let body = content.find("body").unwrap();
+            let layout = build_display_layout(
+                &content,
+                &spans,
+                &[Caret::new(body)],
+                &[],
+                &EditorTheme::dark(),
+            );
+            let tag_start = content.find(&format!("[!{tag}]")).unwrap();
+            let tag_end = tag_start + tag.len() + 3;
+            let masked_tag = layout.segments.iter().any(|s| {
+                matches!(s.style, SegmentStyle::Delimiter { visible: false })
+                    && s.doc_start <= tag_start
+                    && s.doc_end >= tag_end
+            });
+            assert!(
+                masked_tag,
+                "expected masked [!{tag}] with caret in body, segments={:?}",
+                layout.segments
+            );
+            assert!(
+                !layout.display_text.contains(&format!("[!{tag}]")),
+                "masked [!{tag}] must not take display width, got {:?}",
+                layout.display_text
+            );
+        }
+    }
+
+    #[test]
+    fn github_alert_reveals_tag_when_caret_on_chrome() {
+        let content = "> [!NOTE]\n> body";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let tag = content.find("[!NOTE]").unwrap();
+        let layout = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(tag + 2)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        assert!(
+            layout.display_text.contains("[!NOTE]"),
+            "caret on chrome must reveal [!NOTE], got {:?}",
+            layout.display_text
+        );
     }
 }

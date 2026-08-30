@@ -218,6 +218,25 @@ impl<'a> Ser<'a> {
                 self.emit_children(&block.children, false);
                 self.delim.truncate(saved);
             }
+            BlockKind::Alert { kind, title, .. } => {
+                self.out.push_str("> [!");
+                self.out.push_str(kind.tag());
+                self.out.push(']');
+                if let Some(title) = title {
+                    let t = title.trim();
+                    if !t.is_empty() {
+                        self.out.push(' ');
+                        self.out.push_str(t);
+                    }
+                }
+                let saved = self.delim.len();
+                self.delim.push_str("> ");
+                if !block.children.is_empty() {
+                    self.line_break();
+                    self.emit_children(&block.children, false);
+                }
+                self.delim.truncate(saved);
+            }
             BlockKind::BulletList { tight, marker } => {
                 // The author's marker survives normalize too: rewriting all
                 // bullets to one char would merge adjacent sibling lists.

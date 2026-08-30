@@ -64,6 +64,7 @@ impl Block {
         matches!(
             self.kind,
             BlockKind::BlockQuote
+                | BlockKind::Alert { .. }
                 | BlockKind::BulletList { .. }
                 | BlockKind::OrderedList { .. }
                 | BlockKind::ListItem { .. }
@@ -117,6 +118,17 @@ pub enum BlockKind {
         literal: String,
     },
     BlockQuote,
+    /// GitHub `> [!NOTE]` / TIP / IMPORTANT / WARNING / CAUTION.
+    /// Children are the body; `[!NOTE]` lives in `tag_range` / `chrome_range`.
+    Alert {
+        kind: AlertKind,
+        /// Custom title after `[!NOTE]`, if any.
+        title: Option<String>,
+        /// Byte range of `[!NOTE]` (or `[!TIP]`, …) in source.
+        tag_range: Range<usize>,
+        /// `[!NOTE]` plus an optional custom title on that first line.
+        chrome_range: Range<usize>,
+    },
     BulletList {
         tight: bool,
         /// `b'-'`, `b'*'`, or `b'+'`.
@@ -314,4 +326,98 @@ pub fn math_delim_width(display: bool) -> usize {
     } else {
         1
     }
+}
+
+/// GitHub Flavored Markdown alert kinds (`> [!NOTE]`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl AlertKind {
+    pub const ALL: [AlertKind; 5] = [
+        AlertKind::Note,
+        AlertKind::Tip,
+        AlertKind::Important,
+        AlertKind::Warning,
+        AlertKind::Caution,
+    ];
+
+    /// Uppercase tag written in source (`NOTE`, `TIP`, …).
+    pub fn tag(self) -> &'static str {
+        match self {
+            AlertKind::Note => "NOTE",
+            AlertKind::Tip => "TIP",
+            AlertKind::Important => "IMPORTANT",
+            AlertKind::Warning => "WARNING",
+            AlertKind::Caution => "CAUTION",
+        }
+    }
+
+    /// GitHub callout title (`Note`, `Tip`, …).
+    pub fn label(self) -> &'static str {
+        match self {
+            AlertKind::Note => "Note",
+            AlertKind::Tip => "Tip",
+            AlertKind::Important => "Important",
+            AlertKind::Warning => "Warning",
+            AlertKind::Caution => "Caution",
+        }
+    }
+
+    pub fn from_tag(s: &str) -> Option<Self> {
+        if s.eq_ignore_ascii_case("NOTE") {
+            Some(AlertKind::Note)
+        } else if s.eq_ignore_ascii_case("TIP") {
+            Some(AlertKind::Tip)
+        } else if s.eq_ignore_ascii_case("IMPORTANT") {
+            Some(AlertKind::Important)
+        } else if s.eq_ignore_ascii_case("WARNING") {
+            Some(AlertKind::Warning)
+        } else if s.eq_ignore_ascii_case("CAUTION") {
+            Some(AlertKind::Caution)
+        } else {
+            None
+        }
+    }
+
+    /// Painted label: custom title if present, otherwise the kind name.
+    pub fn callout_label(self, title: Option<&str>) -> String {
+        title
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.label().to_string())
+    }
+}
+
+/// `[!NOTE]` (etc.) inside an alert block, plus the rest of that first-line chrome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertChrome {
+    pub kind: AlertKind,
+    pub tag_range: Range<usize>,
+    pub chrome_range: Range<usize>,
+}
+
+/// Locate `[!NOTE]` / `[!TIP]` / … on the first line of `block_range`.
+pub fn find_alert_chrome(source: &str, block_range: Range<usize>) -> Option<AlertChrome> {
+    let slice = source.get(block_range.clone())?;
+    let line = slice.split('\n').next()?;
+    let rel = line.find("[!")?;
+    let after = &line[rel + 2..];
+    let close = after.find(']')?;
+    let kind = AlertKind::from_tag(&after[..close])?;
+    let tag_start = block_range.start + rel;
+    let tag_end = tag_start + 2 + close + 1;
+    let trimmed = line.trim_end();
+    let line_end = block_range.start + trimmed.len();
+    Some(AlertChrome {
+        kind,
+        tag_range: tag_start..tag_end,
+        chrome_range: tag_start..line_end.max(tag_end),
+    })
 }

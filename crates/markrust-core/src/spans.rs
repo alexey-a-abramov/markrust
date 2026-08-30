@@ -24,6 +24,8 @@ pub enum SyntaxKind {
     Subscript,
     /// `$…$` / `$$…$$` (comrak `math_dollars`).
     Math,
+    /// GitHub `> [!NOTE]` / TIP / IMPORTANT / WARNING / CAUTION.
+    Alert,
     Other,
 }
 

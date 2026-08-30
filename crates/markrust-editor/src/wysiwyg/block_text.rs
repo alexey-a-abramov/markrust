@@ -1362,7 +1362,7 @@ impl<H: WysiwygHost> Element for WidgetImeSink<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use markrust_core::rich::{import_markdown, Block, BlockKind, IdGen};
+    use markrust_core::rich::{import_markdown, AlertKind, Block, BlockKind, IdGen};
 
     fn layout_for(source: &str) -> LeafLayout {
         let mut ids = IdGen::default();
@@ -1379,7 +1379,13 @@ mod tests {
             font_size: px(theme.font_size).into(),
             ..Default::default()
         };
-        build_leaf_layout_revealed(block, &style, &theme, gpui::FontWeight::NORMAL, &RevealState::HIDDEN)
+        build_leaf_layout_revealed(
+            block,
+            &style,
+            &theme,
+            gpui::FontWeight::NORMAL,
+            &RevealState::HIDDEN,
+        )
     }
 
     fn first_paragraph(block: &Block) -> Option<&Block> {
@@ -1824,5 +1830,79 @@ mod tests {
             "expected nested bold in HTML block, runs={:?}",
             layout.runs
         );
+    }
+
+    fn alert_body_layout(source: &str, caret: usize) -> LeafLayout {
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let alert =
+            first_kind(&tree.blocks, |k| matches!(k, BlockKind::Alert { .. })).expect("alert");
+        let para = first_paragraph(alert).expect("alert body");
+        let theme = EditorTheme::dark();
+        let style = TextStyle {
+            color: theme.text,
+            font_family: theme.font_family.clone().into(),
+            font_size: px(theme.font_size).into(),
+            ..Default::default()
+        };
+        build_leaf_layout_revealed(
+            para,
+            &style,
+            &theme,
+            gpui::FontWeight::NORMAL,
+            &RevealState {
+                caret,
+                selection: 0..0,
+            },
+        )
+    }
+
+    #[test]
+    fn github_alert_body_hides_tag_for_each_kind() {
+        for kind in AlertKind::ALL {
+            let source = format!("> [!{}]\n> hello {}\n", kind.tag(), kind.label());
+            let layout = alert_body_layout(&source, usize::MAX);
+            assert!(
+                !layout.text.contains("[!"),
+                "[!{}] must not paint in the body, got {:?}",
+                kind.tag(),
+                layout.text
+            );
+            assert!(
+                layout.text.contains("hello"),
+                "expected body text, got {:?}",
+                layout.text
+            );
+            assert_eq!(kind.callout_label(None), kind.label(), "{}", kind.tag());
+        }
+    }
+
+    #[test]
+    fn github_alert_reveals_chrome_when_caret_intersects() {
+        let source = "> [!NOTE]\n> hello\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let BlockKind::Alert {
+            chrome_range,
+            tag_range,
+            kind,
+            title,
+        } = &tree.blocks[0].kind
+        else {
+            panic!("expected alert, got {:?}", tree.blocks[0].kind);
+        };
+        assert_eq!(*kind, AlertKind::Note);
+        assert_eq!(kind.callout_label(title.as_deref()), "Note");
+        assert_eq!(&source[tag_range.clone()], "[!NOTE]");
+        let outside = RevealState::HIDDEN;
+        assert!(!outside.intersects(chrome_range));
+        let on_tag = RevealState {
+            caret: tag_range.start,
+            selection: 0..0,
+        };
+        assert!(on_tag.intersects(chrome_range));
+        let body = alert_body_layout(source, source.find("hello").unwrap());
+        assert_eq!(body.text, "hello");
+        assert!(!body.text.contains("[!NOTE]"));
     }
 }

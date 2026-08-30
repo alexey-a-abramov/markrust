@@ -136,7 +136,9 @@ impl RichEngine {
             return false;
         };
         match &block.kind {
-            BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. } => true,
+            BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. } | BlockKind::Alert { .. } => {
+                true
+            }
             _ => block.inlines.iter().any(|inline| match inline {
                 Inline::Run {
                     source_range,
@@ -448,6 +450,13 @@ fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
         BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. } => {
             out.push(block.source_range.clone());
         }
+        BlockKind::Alert { chrome_range, .. } => {
+            if chrome_range.start < chrome_range.end {
+                out.push(chrome_range.clone());
+            } else {
+                out.push(block.source_range.clone());
+            }
+        }
         _ => {
             for inline in &block.inlines {
                 match inline {
@@ -635,6 +644,19 @@ mod tests {
         assert_eq!(engine.snap_caret(inner, Bias::Right), inner);
         assert!(engine.in_raw_context(inner));
         assert!(!engine.in_raw_context(0));
+    }
+
+    #[test]
+    fn snap_caret_sits_on_alert_tag() {
+        let source = "> [!NOTE]\n> body\n";
+        let (_doc, engine) = engine_for(source);
+        let tag = source.find("[!NOTE]").unwrap();
+        assert_eq!(engine.snap_caret(tag, Bias::Right), tag);
+        assert_eq!(engine.snap_caret(tag + 3, Bias::Left), tag + 3);
+        assert!(engine.in_raw_context(tag));
+        let body = source.find("body").unwrap();
+        assert_eq!(engine.snap_caret(body, Bias::Right), body);
+        assert!(!engine.in_raw_context(body));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use gpui::{rgb, Hsla};
+use markrust_core::rich::AlertKind;
 
 fn hex(color: u32) -> Hsla {
     Hsla::from(rgb(color))
@@ -179,6 +180,23 @@ impl EditorTheme {
         font_size * self.line_height_multiplier
     }
 
+    /// Left-rule / label color for a GitHub alert kind.
+    pub fn alert_accent(&self, kind: AlertKind) -> Hsla {
+        let dark = self.background.l < 0.5;
+        match (kind, dark) {
+            (AlertKind::Note, true) => hex(0x4493f8),
+            (AlertKind::Note, false) => hex(0x0969da),
+            (AlertKind::Tip, true) => hex(0x3fb950),
+            (AlertKind::Tip, false) => hex(0x1a7f37),
+            (AlertKind::Important, true) => hex(0xab7df8),
+            (AlertKind::Important, false) => hex(0x8250df),
+            (AlertKind::Warning, true) => hex(0xd29922),
+            (AlertKind::Warning, false) => hex(0x9a6700),
+            (AlertKind::Caution, true) => hex(0xf85149),
+            (AlertKind::Caution, false) => hex(0xcf222e),
+        }
+    }
+
     pub fn system_font_fallbacks() -> gpui::FontFallbacks {
         gpui::FontFallbacks::from_fonts(vec!["Menlo".into(), "Helvetica".into()])
     }
@@ -238,5 +256,13 @@ mod tests {
         assert!(!dark.font_family.is_empty());
         assert!(dark.syntax_keyword.a > 0.9);
         assert!(light.link.a > 0.9);
+        assert_ne!(
+            dark.alert_accent(AlertKind::Note),
+            dark.alert_accent(AlertKind::Caution)
+        );
+        assert_ne!(
+            light.alert_accent(AlertKind::Tip),
+            light.alert_accent(AlertKind::Warning)
+        );
     }
 }
