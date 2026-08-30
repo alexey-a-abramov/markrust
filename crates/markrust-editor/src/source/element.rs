@@ -11,9 +11,12 @@ use gpui::{
     SharedString, Style, TextAlign, TextRun, Window,
 };
 
+use super::hit_test::{click_byte_offset, invert_doc_to_display};
 use crate::editor::MarkdownEditor;
 use crate::highlight::HighlightKind;
-use crate::layout::{build_display_layout, line_byte_ranges, DisplayLayout, SegmentStyle};
+use crate::layout::{
+    build_display_layout, line_byte_ranges, source_line_font_size, DisplayLayout, SegmentStyle,
+};
 use crate::theme::EditorTheme;
 use markrust_core::TableRowKind;
 
@@ -41,6 +44,7 @@ pub struct EditorPrepaint {
     cursor: Option<PaintQuad>,
     blockquote_borders: Vec<PaintQuad>,
     code_block_backgrounds: Vec<PaintQuad>,
+    display_to_doc: Vec<usize>,
 }
 
 impl EditorElement {
@@ -156,6 +160,7 @@ impl Element for EditorElement {
             cursor,
             blockquote_borders,
             code_block_backgrounds,
+            display_to_doc: invert_doc_to_display(&display_layout),
         }
     }
 
@@ -221,6 +226,12 @@ impl Element for EditorElement {
                 .iter()
                 .map(|line| f32::from(line.height))
                 .collect();
+            editor.layout_cache.line_x_at = prepaint
+                .lines
+                .iter()
+                .map(|line| x_positions_for_shaped(&line.shaped))
+                .collect();
+            editor.layout_cache.display_to_doc = prepaint.display_to_doc.clone();
         });
     }
 }
@@ -235,31 +246,23 @@ fn total_layout_height(layout: &DisplayLayout, theme: &EditorTheme, content: &st
             .get(index)
             .copied()
             .unwrap_or((0, content.len()));
-        let font_size = font_size_for_line(layout, theme, doc_start, doc_end);
+        let font_size = source_line_font_size(layout, theme, content, doc_start, doc_end);
         total += theme.line_height_for_font_size(font_size);
     }
     total
 }
 
-fn font_size_for_line(
-    layout: &DisplayLayout,
-    theme: &EditorTheme,
-    doc_start: usize,
-    doc_end: usize,
-) -> f32 {
-    let heading = layout.segments.iter().find_map(|segment| {
-        if segment.doc_end <= doc_start || segment.doc_start >= doc_end {
-            return None;
+fn x_positions_for_shaped(shaped: &ShapedLine) -> Vec<f32> {
+    let n = shaped.text.len();
+    let mut xs = vec![0.0f32; n + 1];
+    for i in 0..=n {
+        if i == n || shaped.text.is_char_boundary(i) {
+            xs[i] = f32::from(shaped.x_for_index(i));
+        } else if i > 0 {
+            xs[i] = xs[i - 1];
         }
-        match segment.style {
-            SegmentStyle::Heading { level } => Some(level),
-            _ => None,
-        }
-    });
-    match heading {
-        Some(level) => theme.heading_font_size(level),
-        None => theme.font_size,
     }
+    xs
 }
 
 fn line_is_style(
@@ -292,7 +295,7 @@ fn shape_lines(
             .get(line_idx)
             .copied()
             .unwrap_or((0, content.len()));
-        let font_size = font_size_for_line(layout, theme, doc_start, doc_end);
+        let font_size = source_line_font_size(layout, theme, content, doc_start, doc_end);
         let height = px(theme.line_height_for_font_size(font_size));
         let runs = build_runs_for_line(layout, theme, *display_start, *display_end, &line_text);
 
@@ -644,7 +647,18 @@ impl MarkdownEditor {
         position: Point<Pixels>,
         bounds: Bounds<Pixels>,
     ) -> usize {
+        let relative_x = f32::from(position.x - bounds.left()) - EDITOR_GUTTER;
         let relative_y = f32::from(position.y - bounds.top());
+        if !self.layout_cache.line_x_at.is_empty() {
+            return click_byte_offset(
+                relative_x,
+                relative_y,
+                &self.layout_cache.line_heights,
+                &self.layout_cache.display_line_starts,
+                &self.layout_cache.line_x_at,
+                &self.layout_cache.display_to_doc,
+            );
+        }
         if !self.layout_cache.line_heights.is_empty() {
             let mut y = 0.0;
             for (line_idx, height) in self.layout_cache.line_heights.iter().enumerate() {
@@ -822,6 +836,42 @@ impl Render for MarkdownEditorView {
                 let editor = editor.clone();
                 move |action: &crate::editor::Delete, window, cx| {
                     editor.update(cx, |e, cx| e.delete(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::ToggleBold, window, cx| {
+                    editor.update(cx, |e, cx| e.toggle_bold(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::ToggleItalic, window, cx| {
+                    editor.update(cx, |e, cx| e.toggle_italic(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::ToggleCode, window, cx| {
+                    editor.update(cx, |e, cx| e.toggle_code(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::ToggleLink, window, cx| {
+                    editor.update(cx, |e, cx| e.toggle_link(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::Indent, window, cx| {
+                    editor.update(cx, |e, cx| e.indent(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::Outdent, window, cx| {
+                    editor.update(cx, |e, cx| e.outdent(action, window, cx))
                 }
             })
             .child(EditorElement::new(editor))

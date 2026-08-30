@@ -11,6 +11,7 @@ pub mod highlight;
 pub mod source;
 pub mod table;
 pub mod theme;
+pub mod wrap;
 pub mod wysiwyg;
 
 // Compatibility aliases for the pre-`source` module paths.
@@ -22,6 +23,11 @@ pub use headless::{
 };
 pub use highlight::{highlight_code_block, HighlightKind, HighlightSpan};
 pub use source::editor::MarkdownEditor;
+pub use source::editor::{
+    Backspace, Delete, Down, End, Enter, Home, Indent, Left, Outdent, PageDown, PageUp, Right,
+    SelectAll, SelectDown, SelectEnd, SelectHome, SelectLeft, SelectRight, SelectUp, ToggleBold,
+    ToggleCode, ToggleItalic, ToggleLink, Up,
+};
 pub use source::element::{EditorElement, MarkdownEditorView};
 pub use source::layout::{
     build_display_layout, cursor_line_col, outline_headings, DisplayLayout, LayoutSegment,
@@ -33,4 +39,5 @@ pub use source::masking::{
 };
 pub use table::{parse_column_alignments, ColumnAlign};
 pub use theme::EditorTheme;
+pub use wrap::WrapKind;
 pub use wysiwyg::RichEditorView;

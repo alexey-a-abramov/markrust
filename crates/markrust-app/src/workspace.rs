@@ -4,11 +4,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use gpui::{AppContext, Context, Entity, ExternalPaths, Task, Window};
 
-use crate::config::AppConfig;
+use crate::config::{is_markdown, AppConfig, RecentWorkspaces};
 use crate::drop::{
     classify_editor_drop, classify_window_drop, markdown_image_reference, DropIntent,
 };
@@ -22,11 +23,11 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 /// Which editing surface a tab shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorMode {
-    /// Raw markdown with delimiter masking (currently the editable surface).
+    /// Rendered rich document (editable).
     #[default]
-    Source,
-    /// Rendered rich document (read-only until the command layer lands).
     Wysiwyg,
+    /// Raw markdown with delimiter masking.
+    Source,
 }
 
 #[allow(dead_code)]
@@ -50,8 +51,11 @@ pub struct Workspace {
     pub palette_open: bool,
     pub config: AppConfig,
     pub pending_external_change: Option<(usize, PathBuf)>,
+    pub recent: RecentWorkspaces,
+    cached_files: Vec<PathBuf>,
     _watcher: Option<RecommendedWatcher>,
     _watcher_task: Task<()>,
+    _file_list_task: Task<()>,
     _autosave_tasks: HashMap<usize, Task<()>>,
 }
 
@@ -68,8 +72,11 @@ impl Workspace {
             palette_open: false,
             config,
             pending_external_change: None,
+            recent: RecentWorkspaces::load(),
+            cached_files: Vec::new(),
             _watcher: None,
             _watcher_task: Task::ready(()),
+            _file_list_task: Task::ready(()),
             _autosave_tasks: HashMap::new(),
         };
         workspace.new_document(window, cx);
@@ -85,13 +92,26 @@ impl Workspace {
     ) -> anyhow::Result<()> {
         match command {
             WorkspaceCommand::Editor(editor_command) => {
-                if let Some(tab) = self.active_tab() {
-                    tab.editor.update(cx, |editor, cx| {
-                        editor.apply_command(editor_command, cx);
-                    });
-                    if let Some(tab) = self.active_tab() {
-                        self.schedule_autosave(tab.id, cx);
+                let mode = self.active_tab().map(|t| t.mode);
+                let tab_id = self.active_tab().map(|t| t.id);
+                match mode {
+                    Some(EditorMode::Wysiwyg) => {
+                        if let Some(tab) = self.tabs.get(self.active_tab) {
+                            tab.rich_view.update(cx, |view, cx| {
+                                view.apply_editor_command(editor_command.clone(), cx);
+                            });
+                        }
                     }
+                    _ => {
+                        if let Some(tab) = self.active_tab() {
+                            tab.editor.update(cx, |editor, cx| {
+                                editor.apply_command(editor_command, cx);
+                            });
+                        }
+                    }
+                }
+                if let Some(id) = tab_id {
+                    self.schedule_autosave(id, cx);
                 }
             }
             WorkspaceCommand::Save => self.save_active(cx),
@@ -143,10 +163,19 @@ impl Workspace {
                 }
             }
             WorkspaceCommand::JumpToHeading { offset } => {
-                if let Some(tab) = self.active_tab() {
-                    tab.editor.update(cx, |editor, cx| {
-                        editor.apply_command(EditorCommand::JumpTo(offset), cx);
-                    });
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    match tab.mode {
+                        EditorMode::Wysiwyg => {
+                            tab.rich_view.update(cx, |view, cx| {
+                                view.jump_to(offset, cx);
+                            });
+                        }
+                        EditorMode::Source => {
+                            tab.editor.update(cx, |editor, cx| {
+                                editor.apply_command(EditorCommand::JumpTo(offset), cx);
+                            });
+                        }
+                    }
                 }
             }
             WorkspaceCommand::AdvanceTime { .. } => {}
@@ -204,10 +233,7 @@ impl Workspace {
                 let _ = self.open_workspace(parent.to_path_buf(), cx);
             }
         }
-        let content = std::fs::read_to_string(&path)?;
-        let mut document = Document::new(&content);
-        document.path = Some(path.clone());
-        document.dirty = false;
+        let document = Document::from_file(path.clone())?;
         let doc = cx.new(|_| document);
         self.push_tab(doc, Some(path), window, cx);
         self.dismiss_placeholder_untitled(window, cx);
@@ -256,13 +282,14 @@ impl Workspace {
         let theme = self.config.editor_theme();
         let editor = cx.new(|cx| MarkdownEditor::new(document.clone(), theme, window, cx));
         let editor_view = cx.new(|_| MarkdownEditorView::new(editor.clone()));
-        let rich_view =
-            cx.new(|cx| RichEditorView::new(document.clone(), self.config.editor_theme(), cx));
+        let rich_view = cx.new(|cx| {
+            RichEditorView::new(document.clone(), self.config.editor_theme(), window, cx)
+        });
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.tabs.push(DocumentTab {
             id,
-            document,
+            document: document.clone(),
             editor,
             editor_view,
             rich_view,
@@ -270,6 +297,7 @@ impl Workspace {
             title,
         });
         self.active_tab = self.tabs.len() - 1;
+        spawn_parse_pump(document, cx);
         cx.notify();
     }
 
@@ -336,10 +364,10 @@ impl Workspace {
 
     pub fn open_workspace(&mut self, root: PathBuf, cx: &mut Context<Self>) -> anyhow::Result<()> {
         self.root = Some(root.clone());
-        let mut recent = crate::config::RecentWorkspaces::load();
-        recent.push(root);
-        let _ = recent.save();
+        self.recent.push(root);
+        let _ = self.recent.save();
         self.start_watcher(cx);
+        self.schedule_file_list_scan(cx);
         cx.notify();
         Ok(())
     }
@@ -348,7 +376,7 @@ impl Workspace {
         let Some(root) = self.root.clone() else {
             return;
         };
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |res| {
             let _ = tx.send(res);
         })
@@ -356,17 +384,38 @@ impl Workspace {
         if let Some(watcher) = watcher.as_mut() {
             let _ = watcher.watch(&root, RecursiveMode::Recursive);
         }
-        let workspace = cx.entity();
         self._watcher = watcher;
+
+        // `cx.spawn` runs on GPUI's foreground executor (the UI thread).
+        // Blocking `recv` there freezes the window for as long as the disk is
+        // quiet — which is exactly "open a markdown file and the app hangs",
+        // because open also starts a watcher on the parent folder.
+        let rx = Arc::new(Mutex::new(rx));
+        let workspace = cx.entity();
         self._watcher_task = cx.spawn(async move |_, cx| loop {
-            if let Ok(Ok(event)) = rx.recv() {
-                workspace.update(cx, |workspace, cx| workspace.handle_fs_event(event, cx));
+            let rx = rx.clone();
+            let received = cx
+                .background_executor()
+                .spawn(async move { recv_notify_blocking(&rx) })
+                .await;
+            match received {
+                Ok(Ok(event)) => {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.handle_fs_event(event, cx);
+                    });
+                }
+                Ok(Err(_notify_error)) => continue,
+                Err(_disconnected) => break,
             }
         });
     }
 
     fn handle_fs_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        let mut refresh_sidebar = false;
         for path in event.paths {
+            if is_markdown(&path) || path.is_dir() {
+                refresh_sidebar = true;
+            }
             if let Some(index) = self.tab_index_for_path(&path, cx) {
                 let dirty = self.tabs[index].document.read(cx).dirty;
                 let tab_path = self.tabs[index].document.read(cx).path.clone();
@@ -379,6 +428,30 @@ impl Workspace {
                 }
             }
         }
+        if refresh_sidebar {
+            self.schedule_file_list_scan(cx);
+        }
+    }
+
+    fn schedule_file_list_scan(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            self.cached_files.clear();
+            return;
+        };
+        let workspace = cx.entity();
+        self._file_list_task = cx.spawn(async move |_, cx| {
+            let scanned = root.clone();
+            let files = cx
+                .background_executor()
+                .spawn(async move { list_markdown_files(&scanned) })
+                .await;
+            workspace.update(cx, |workspace, cx| {
+                if workspace.root.as_ref() == Some(&root) {
+                    workspace.cached_files = files;
+                    cx.notify();
+                }
+            });
+        });
     }
 
     pub fn reload_tab(&mut self, index: usize, cx: &mut Context<Self>) -> anyhow::Result<()> {
@@ -389,20 +462,19 @@ impl Workspace {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("tab has no path"))?;
         let content = std::fs::read_to_string(&path)?;
-        self.tabs[index].document.update(cx, |doc, cx| {
+        let document = self.tabs[index].document.clone();
+        document.update(cx, |doc, cx| {
             doc.replace_content(&content);
             cx.notify();
         });
+        spawn_parse_pump(document, cx);
         self.pending_external_change = None;
         cx.notify();
         Ok(())
     }
 
     pub fn list_files(&self) -> Vec<PathBuf> {
-        let Some(root) = &self.root else {
-            return Vec::new();
-        };
-        list_markdown_files(root)
+        self.cached_files.clone()
     }
 
     pub fn toggle_theme(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -503,6 +575,41 @@ impl Workspace {
     }
 }
 
+/// Blocking notify receive. Must run on a background worker, never on GPUI's
+/// foreground executor — that is the hang that made opening a file freeze the UI.
+fn recv_notify_blocking(
+    rx: &Mutex<mpsc::Receiver<notify::Result<Event>>>,
+) -> Result<notify::Result<Event>, mpsc::RecvError> {
+    rx.lock().unwrap_or_else(|e| e.into_inner()).recv()
+}
+
+/// Drain background parse results without blocking a GPUI frame.
+fn spawn_parse_pump(document: Entity<Document>, cx: &mut Context<Workspace>) {
+    cx.spawn(async move |_, cx| loop {
+        cx.background_executor()
+            .timer(Duration::from_millis(32))
+            .await;
+        let done = document.update(cx, |doc, cx| {
+            if !doc.mode.parses_markdown() {
+                cx.notify();
+                return true;
+            }
+            let updated = doc.apply_pending_parse();
+            let done = updated
+                .as_ref()
+                .is_some_and(|update| update.revision >= doc.revision());
+            if updated.is_some() || done {
+                cx.notify();
+            }
+            done
+        });
+        if done {
+            break;
+        }
+    })
+    .detach();
+}
+
 pub fn fuzzy_match(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -523,6 +630,7 @@ pub fn fuzzy_match(haystack: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn fuzzy_match_finds_subsequence() {
@@ -536,5 +644,34 @@ mod tests {
         assert!(crate::session::should_skip_dir(Path::new(".git")));
         assert!(crate::session::should_skip_dir(Path::new("target")));
         assert!(!crate::session::should_skip_dir(Path::new("docs")));
+    }
+
+    #[test]
+    fn idle_notify_channel_try_recv_does_not_block() {
+        let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+        let started = Instant::now();
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "try_recv blocked for {:?}",
+            started.elapsed()
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn notify_disconnect_unblocks_background_recv() {
+        let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+        let rx = Mutex::new(rx);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = recv_notify_blocking(&rx);
+            let _ = done_tx.send(result.is_err());
+        });
+        drop(tx);
+        let disconnected = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("watcher recv deadlocked after sender drop");
+        assert!(disconnected);
     }
 }

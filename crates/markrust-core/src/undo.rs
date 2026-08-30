@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::ops::Range;
+
 /// A single reversible buffer edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditOperation {
@@ -25,12 +27,56 @@ impl EditOperation {
     }
 }
 
+/// Why a transaction was recorded — drives typing/backspace coalescing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionKind {
+    Typing,
+    DeleteBack,
+    Command,
+    External,
+}
+
+/// Caret/selection at a point in history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SelectionSnapshot {
+    pub start: usize,
+    pub end: usize,
+    pub reversed: bool,
+}
+
+impl SelectionSnapshot {
+    pub fn collapsed(offset: usize) -> Self {
+        Self {
+            start: offset,
+            end: offset,
+            reversed: false,
+        }
+    }
+
+    pub fn range(self) -> Range<usize> {
+        if self.start <= self.end {
+            self.start..self.end
+        } else {
+            self.end..self.start
+        }
+    }
+}
+
+/// One undo step: buffer ops plus the caret on either side of the edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transaction {
+    pub ops: Vec<EditOperation>,
+    pub selection_before: SelectionSnapshot,
+    pub selection_after: SelectionSnapshot,
+    pub kind: TransactionKind,
+}
+
 /// Undo/redo stack storing grouped edit transactions.
 #[derive(Debug, Default)]
 pub struct UndoStack {
-    undo: Vec<Vec<EditOperation>>,
-    redo: Vec<Vec<EditOperation>>,
-    open: Option<Vec<EditOperation>>,
+    undo: Vec<Transaction>,
+    redo: Vec<Transaction>,
+    open: Option<Transaction>,
 }
 
 impl UndoStack {
@@ -39,21 +85,57 @@ impl UndoStack {
     }
 
     pub fn begin_transaction(&mut self) {
-        self.open = Some(Vec::new());
+        self.begin_transaction_ex(
+            SelectionSnapshot::default(),
+            SelectionSnapshot::default(),
+            TransactionKind::Command,
+        );
+    }
+
+    pub fn begin_transaction_ex(
+        &mut self,
+        selection_before: SelectionSnapshot,
+        selection_after: SelectionSnapshot,
+        kind: TransactionKind,
+    ) {
+        self.open = Some(Transaction {
+            ops: Vec::new(),
+            selection_before,
+            selection_after,
+            kind,
+        });
     }
 
     pub fn record(&mut self, edit: EditOperation) {
         match &mut self.open {
-            Some(group) => group.push(edit),
+            Some(group) => group.ops.push(edit),
             None => {
-                self.open = Some(vec![edit]);
+                self.open = Some(Transaction {
+                    ops: vec![edit],
+                    selection_before: SelectionSnapshot::default(),
+                    selection_after: SelectionSnapshot::default(),
+                    kind: TransactionKind::Command,
+                });
             }
+        }
+    }
+
+    pub fn set_open_meta(
+        &mut self,
+        selection_before: SelectionSnapshot,
+        selection_after: SelectionSnapshot,
+        kind: TransactionKind,
+    ) {
+        if let Some(open) = &mut self.open {
+            open.selection_before = selection_before;
+            open.selection_after = selection_after;
+            open.kind = kind;
         }
     }
 
     pub fn commit_transaction(&mut self) {
         if let Some(group) = self.open.take() {
-            if !group.is_empty() {
+            if !group.ops.is_empty() {
                 self.redo.clear();
                 self.undo.push(group);
             }
@@ -86,19 +168,38 @@ impl UndoStack {
         self.open.is_some()
     }
 
-    pub fn undo(&mut self) -> Option<Vec<EditOperation>> {
-        let group = self.undo.pop()?;
-        let inverse: Vec<_> = group.iter().rev().map(EditOperation::inverse).collect();
-        self.redo.push(group);
-        Some(inverse)
+    /// The most recently committed undo transaction, if any.
+    pub fn last_mut(&mut self) -> Option<&mut Transaction> {
+        self.undo.last_mut()
     }
 
-    pub fn redo(&mut self) -> Option<Vec<EditOperation>> {
-        let group = self.redo.pop()?;
-        let forward = group.to_vec();
-        self.undo.push(group);
-        Some(forward)
+    /// Pop an undo step. Returned `ops` are already inverted and ready to apply;
+    /// `selection_after` is the caret to restore (the original before-state).
+    pub fn undo(&mut self) -> Option<Transaction> {
+        let group = self.undo.pop()?;
+        let applied = Transaction {
+            ops: group.ops.iter().rev().map(EditOperation::inverse).collect(),
+            selection_before: group.selection_after,
+            selection_after: group.selection_before,
+            kind: group.kind,
+        };
+        self.redo.push(group);
+        Some(applied)
     }
+
+    /// Pop a redo step. Returned `ops` are the original forwards edits;
+    /// `selection_after` is the caret after the original edit.
+    pub fn redo(&mut self) -> Option<Transaction> {
+        let group = self.redo.pop()?;
+        let applied = group.clone();
+        self.undo.push(group);
+        Some(applied)
+    }
+}
+
+/// True when `text` is a typing burst that should join the previous Typing tx.
+pub fn is_typing_burst(text: &str) -> bool {
+    !text.is_empty() && !text.contains('\n')
 }
 
 #[cfg(test)]
@@ -113,10 +214,10 @@ mod tests {
             text: "hi".into(),
         });
         let undo_ops = stack.undo().unwrap();
-        assert_eq!(undo_ops.len(), 1);
-        assert!(matches!(undo_ops[0], EditOperation::Delete { .. }));
+        assert_eq!(undo_ops.ops.len(), 1);
+        assert!(matches!(undo_ops.ops[0], EditOperation::Delete { .. }));
         let redo_ops = stack.redo().unwrap();
-        assert!(matches!(redo_ops[0], EditOperation::Insert { .. }));
+        assert!(matches!(redo_ops.ops[0], EditOperation::Insert { .. }));
     }
 
     #[test]
@@ -133,7 +234,7 @@ mod tests {
         });
         stack.commit_transaction();
         let undo_ops = stack.undo().unwrap();
-        assert_eq!(undo_ops.len(), 2);
+        assert_eq!(undo_ops.ops.len(), 2);
     }
 
     fn insert(offset: usize, text: &str) -> EditOperation {
@@ -177,19 +278,19 @@ mod tests {
 
         let first = stack.undo().unwrap();
         assert_eq!(
-            first[0],
+            first.ops[0],
             EditOperation::Delete {
                 byte_offset: 2,
                 text: "c".into(),
             }
         );
         let second = stack.undo().unwrap();
-        assert_eq!(second[0], insert(1, "b").inverse());
+        assert_eq!(second.ops[0], insert(1, "b").inverse());
         assert_eq!(stack.undo_depth(), 1);
         assert_eq!(stack.redo_depth(), 2);
 
         let redo = stack.redo().unwrap();
-        assert_eq!(redo[0], insert(1, "b"));
+        assert_eq!(redo.ops[0], insert(1, "b"));
         assert_eq!(stack.undo_depth(), 2);
         assert_eq!(stack.redo_depth(), 1);
     }
@@ -242,7 +343,7 @@ mod tests {
 
         let undo_ops = stack.undo().unwrap();
         assert_eq!(
-            undo_ops,
+            undo_ops.ops,
             vec![
                 EditOperation::Delete {
                     byte_offset: 1,
@@ -256,5 +357,21 @@ mod tests {
         );
         assert!(!stack.can_undo());
         assert!(stack.can_redo());
+    }
+
+    #[test]
+    fn undo_restores_selection_before() {
+        let mut stack = UndoStack::new();
+        stack.begin_transaction_ex(
+            SelectionSnapshot::collapsed(0),
+            SelectionSnapshot::collapsed(3),
+            TransactionKind::Typing,
+        );
+        stack.record(insert(0, "abc"));
+        stack.commit_transaction();
+        let undone = stack.undo().unwrap();
+        assert_eq!(undone.selection_after, SelectionSnapshot::collapsed(0));
+        let redone = stack.redo().unwrap();
+        assert_eq!(redone.selection_after, SelectionSnapshot::collapsed(3));
     }
 }

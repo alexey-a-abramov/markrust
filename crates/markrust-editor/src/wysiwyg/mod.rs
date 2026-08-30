@@ -2,9 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! WYSIWYG editor surface: renders the rich document tree as styled blocks.
-//! Read-only in this milestone; editing lands with the command layer.
+//! WYSIWYG editor surface: renders the rich document tree as styled blocks
+//! and applies [`markrust_core::rich::RichCommand`]s for editing.
 
+mod block_text;
 mod blocks;
 mod view;
 

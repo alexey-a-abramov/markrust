@@ -10,7 +10,6 @@ use markrust_core::parse_frontmatter;
 use markrust_editor::outline_headings;
 use std::path::Path;
 
-use crate::config::RecentWorkspaces;
 use crate::session::{DropTarget, WorkspaceCommand};
 use crate::ui::{
     document_tab, empty_sidebar_state, muted_hint, outline_row, section_header, sidebar_row,
@@ -219,7 +218,7 @@ impl Render for MarkRustWindow {
         let active = workspace.active_tab;
         let tab_count = workspace.tabs.len();
         let files = workspace.list_files();
-        let recent = RecentWorkspaces::load();
+        let recent = workspace.recent.clone();
         let palette_open = workspace.palette_open;
         let sidebar_open = workspace.sidebar_open;
         let outline_open = workspace.outline_open;

@@ -6,5 +6,6 @@
 
 pub mod editor;
 pub mod element;
+pub mod hit_test;
 pub mod layout;
 pub mod masking;

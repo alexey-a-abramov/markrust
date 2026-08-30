@@ -28,4 +28,4 @@ pub use line_index::LineIndex;
 pub use mode::DocumentProcessingMode;
 pub use parser::{extract_syntax_spans, BackgroundMarkdownParser, ParseSnapshot, ParseUpdate};
 pub use spans::{DelimiterSpan, SyntaxKind, SyntaxNodeSpan, TableRowKind};
-pub use undo::{EditOperation, UndoStack};
+pub use undo::{EditOperation, SelectionSnapshot, Transaction, TransactionKind, UndoStack};

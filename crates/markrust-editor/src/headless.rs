@@ -5,11 +5,13 @@
 use std::ops::Range;
 
 use markrust_core::Document;
+use markrust_core::{SelectionSnapshot, TransactionKind};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::layout::{build_display_layout, cursor_line_col, outline_headings, DisplayLayout};
 use crate::masking::{compute_visibility, Caret, Selection, VisibilityState};
 use crate::theme::EditorTheme;
+use crate::wrap::{indent_selection, outdent_selection, wrap_selection, WrapKind};
 
 /// Caret / selection movement relative to the current cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +41,9 @@ pub enum EditorCommand {
     Undo,
     Redo,
     JumpTo(usize),
+    Wrap(WrapKind),
+    Indent,
+    Outdent,
 }
 
 /// Outcome of applying an [`EditorCommand`].
@@ -260,9 +265,11 @@ pub fn apply_editor_command(
         }
         EditorCommand::Undo => {
             document.apply_pending_parse();
-            if document.undo() {
+            if let Some(tx) = document.undo_tx() {
                 document.apply_pending_parse();
-                collapse_and_clamp(state, document.buffer.len_bytes());
+                state.selected_range = tx.selection_after.range();
+                state.selection_reversed = tx.selection_after.reversed;
+                state.clamp_to(document.buffer.len_bytes());
                 Ok(EditorOutcome::Changed)
             } else {
                 Ok(EditorOutcome::Noop)
@@ -270,9 +277,11 @@ pub fn apply_editor_command(
         }
         EditorCommand::Redo => {
             document.apply_pending_parse();
-            if document.redo() {
+            if let Some(tx) = document.redo_tx() {
                 document.apply_pending_parse();
-                collapse_and_clamp(state, document.buffer.len_bytes());
+                state.selected_range = tx.selection_after.range();
+                state.selection_reversed = tx.selection_after.reversed;
+                state.clamp_to(document.buffer.len_bytes());
                 Ok(EditorOutcome::Changed)
             } else {
                 Ok(EditorOutcome::Noop)
@@ -285,21 +294,104 @@ pub fn apply_editor_command(
             state.selection_reversed = false;
             Ok(EditorOutcome::CaretMoved)
         }
+        EditorCommand::Wrap(kind) => Ok(apply_wrap(document, state, kind)),
+        EditorCommand::Indent => Ok(apply_indent(document, state)),
+        EditorCommand::Outdent => Ok(apply_outdent(document, state)),
     }
 }
 
-fn collapse_and_clamp(state: &mut EditorState, len: usize) {
-    let cursor = state.cursor_offset().min(len);
-    state.selected_range = cursor..cursor;
+fn apply_wrap(document: &mut Document, state: &mut EditorState, kind: WrapKind) -> EditorOutcome {
+    document.apply_pending_parse();
+    let content = document.buffer.content();
+    let edit = wrap_selection(&content, state.selected_range.clone(), kind);
+    let before = SelectionSnapshot {
+        start: state.selected_range.start,
+        end: state.selected_range.end,
+        reversed: state.selection_reversed,
+    };
+    let after = SelectionSnapshot {
+        start: edit.selection.start,
+        end: edit.selection.end,
+        reversed: false,
+    };
+    document.replace_range_tx(
+        edit.range.start,
+        edit.range.end,
+        &edit.text,
+        TransactionKind::Command,
+        before,
+        after,
+    );
+    document.apply_pending_parse();
+    state.selected_range = edit.selection;
     state.selection_reversed = false;
+    EditorOutcome::Changed
+}
+
+fn apply_indent(document: &mut Document, state: &mut EditorState) -> EditorOutcome {
+    document.apply_pending_parse();
+    let content = document.buffer.content();
+    let edit = indent_selection(&content, state.selected_range.clone());
+    apply_wrap_edit(document, state, edit)
+}
+
+fn apply_outdent(document: &mut Document, state: &mut EditorState) -> EditorOutcome {
+    document.apply_pending_parse();
+    let content = document.buffer.content();
+    match outdent_selection(&content, state.selected_range.clone()) {
+        Some(edit) => apply_wrap_edit(document, state, edit),
+        None => EditorOutcome::Noop,
+    }
+}
+
+fn apply_wrap_edit(
+    document: &mut Document,
+    state: &mut EditorState,
+    edit: crate::wrap::WrapEdit,
+) -> EditorOutcome {
+    let before = SelectionSnapshot {
+        start: state.selected_range.start,
+        end: state.selected_range.end,
+        reversed: state.selection_reversed,
+    };
+    let after = SelectionSnapshot {
+        start: edit.selection.start,
+        end: edit.selection.end,
+        reversed: false,
+    };
+    document.replace_range_tx(
+        edit.range.start,
+        edit.range.end,
+        &edit.text,
+        TransactionKind::Command,
+        before,
+        after,
+    );
+    document.apply_pending_parse();
+    state.selected_range = edit.selection;
+    state.selection_reversed = false;
+    EditorOutcome::Changed
 }
 
 fn replace_selection(document: &mut Document, state: &mut EditorState, text: &str) {
     document.apply_pending_parse();
     let range = state.selected_range.clone();
-    document.replace_range(range.start, range.end, text);
-    document.apply_pending_parse();
+    let before = SelectionSnapshot {
+        start: range.start,
+        end: range.end,
+        reversed: state.selection_reversed,
+    };
     let new_cursor = range.start + text.len();
+    let after = SelectionSnapshot::collapsed(new_cursor);
+    let kind = if text.is_empty() {
+        TransactionKind::DeleteBack
+    } else if range.is_empty() && markrust_core::undo::is_typing_burst(text) {
+        TransactionKind::Typing
+    } else {
+        TransactionKind::Command
+    };
+    document.replace_range_tx(range.start, range.end, text, kind, before, after);
+    document.apply_pending_parse();
     state.selected_range = new_cursor..new_cursor;
     state.selection_reversed = false;
 }
@@ -532,5 +624,55 @@ mod tests {
         assert!(editor.cursor_offset() <= editor.content().len());
         editor.set_content_from_ui("# Title\n\nbody");
         assert_eq!(editor.content(), "# Title\n\nbody");
+    }
+
+    #[test]
+    fn wrap_bold_selection_unmasks_then_masks_when_caret_leaves() {
+        let mut editor = HeadlessEditor::new("hello world");
+        editor
+            .apply(EditorCommand::SetSelection { start: 0, end: 5 })
+            .unwrap();
+        editor.apply(EditorCommand::Wrap(WrapKind::Bold)).unwrap();
+        assert_eq!(editor.content(), "**hello** world");
+        let vis_inside = editor.visibility();
+        assert!(
+            vis_inside.contains(&VisibilityState::Visible),
+            "{vis_inside:?}"
+        );
+        editor
+            .apply(EditorCommand::JumpTo(editor.content().len()))
+            .unwrap();
+        let vis_outside = editor.visibility();
+        assert!(vis_outside.contains(&VisibilityState::Masked));
+        assert!(!vis_outside.contains(&VisibilityState::Visible));
+    }
+
+    #[test]
+    fn wrap_link_places_caret_in_url() {
+        let mut editor = HeadlessEditor::new("hello world");
+        editor
+            .apply(EditorCommand::SetSelection { start: 0, end: 5 })
+            .unwrap();
+        editor.apply(EditorCommand::Wrap(WrapKind::Link)).unwrap();
+        assert_eq!(editor.content(), "[hello]() world");
+        assert_eq!(editor.cursor_offset(), "[hello](".len());
+        let vis = editor.visibility();
+        assert!(
+            vis.contains(&VisibilityState::Visible),
+            "link delimiters visible while caret is in the URL: {vis:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_italic_and_code() {
+        let mut editor = HeadlessEditor::new("hello");
+        editor
+            .apply(EditorCommand::SetSelection { start: 0, end: 5 })
+            .unwrap();
+        editor.apply(EditorCommand::Wrap(WrapKind::Italic)).unwrap();
+        assert_eq!(editor.content(), "*hello*");
+        editor.apply(EditorCommand::SelectAll).unwrap();
+        editor.apply(EditorCommand::Wrap(WrapKind::Code)).unwrap();
+        assert!(editor.content().contains('`'), "{}", editor.content());
     }
 }

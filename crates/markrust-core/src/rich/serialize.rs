@@ -28,6 +28,21 @@ pub enum SerializeMode {
     Normalize,
 }
 
+/// Re-serialize a single block from the tree (fidelity honored). Used when a
+/// rich command rewrites one top-level block and splices it back into source.
+pub fn serialize_block(block: &Block, source: &str) -> String {
+    let dirty = HashSet::from([block.id]);
+    let mut ser = Ser {
+        source,
+        mode: SerializeMode::Preserve,
+        dirty: &dirty,
+        out: String::new(),
+        delim: String::new(),
+    };
+    ser.emit_block(block, true);
+    ser.out
+}
+
 /// Serialize the whole tree. `dirty` marks blocks (by id) whose content no
 /// longer matches their `source_range` slice and must come from the tree.
 pub fn serialize_tree(

@@ -8,11 +8,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    div, img, prelude::*, px, AnyElement, FontStyle, FontWeight, SharedString, StrikethroughStyle,
-    StyledText, TextRun, TextStyle, UnderlineStyle,
+    div, img, prelude::*, px, AnyElement, CursorStyle, Entity, FontWeight, SharedString,
+    StyledText, TextStyle,
 };
-use markrust_core::rich::{Block, BlockKind, BreakStyle, ColumnAlign, Inline, MarkSet, RichTree};
+use markrust_core::rich::{Block, BlockKind, ColumnAlign, RichTree};
 
+use super::block_text::{build_leaf_layout, BlockTextElement, WysiwygHost};
 use crate::highlight::highlight_code_block;
 use crate::theme::EditorTheme;
 
@@ -24,27 +25,43 @@ pub struct RenderSnapshot {
     pub base_dir: Option<PathBuf>,
 }
 
-pub fn render_top_block(snap: &Arc<RenderSnapshot>, index: usize) -> AnyElement {
+pub fn render_top_block<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    index: usize,
+    editor: Entity<H>,
+) -> AnyElement {
     let Some(block) = snap.tree.blocks.get(index) else {
         return div().into_any_element();
     };
     div()
         .px(px(24.))
         .py(px(4.))
-        .child(render_block(snap, block))
+        .child(render_block(snap, block, editor))
         .into_any_element()
 }
 
-fn render_block(snap: &Arc<RenderSnapshot>, block: &Block) -> AnyElement {
+fn render_block<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    block: &Block,
+    editor: Entity<H>,
+) -> AnyElement {
     let theme = &snap.theme;
     match &block.kind {
-        BlockKind::Paragraph => paragraph_element(snap, block, theme.font_size, FontWeight::NORMAL),
+        BlockKind::Paragraph => {
+            paragraph_element(snap, block, theme.font_size, FontWeight::NORMAL, editor)
+        }
         BlockKind::Heading { level, .. } => {
             let size = theme.heading_font_size(*level);
             div()
                 .pt(px(8.))
                 .pb(px(2.))
-                .child(paragraph_element(snap, block, size, FontWeight::BOLD))
+                .child(paragraph_element(
+                    snap,
+                    block,
+                    size,
+                    FontWeight::BOLD,
+                    editor,
+                ))
                 .into_any_element()
         }
         BlockKind::CodeBlock { info, literal, .. } => {
@@ -75,7 +92,7 @@ fn render_block(snap: &Arc<RenderSnapshot>, block: &Block) -> AnyElement {
             let children: Vec<AnyElement> = block
                 .children
                 .iter()
-                .map(|child| render_block(snap, child))
+                .map(|child| render_block(snap, child, editor.clone()))
                 .collect();
             div()
                 .my(px(2.))
@@ -87,18 +104,17 @@ fn render_block(snap: &Arc<RenderSnapshot>, block: &Block) -> AnyElement {
                 .into_any_element()
         }
         BlockKind::BulletList { .. } | BlockKind::OrderedList { .. } => {
-            render_list(snap, block).into_any_element()
+            render_list(snap, block, editor).into_any_element()
         }
         BlockKind::ListItem { .. } => {
-            // Rendered by render_list; standalone fallback:
             let children: Vec<AnyElement> = block
                 .children
                 .iter()
-                .map(|child| render_block(snap, child))
+                .map(|child| render_block(snap, child, editor.clone()))
                 .collect();
             div().children(children).into_any_element()
         }
-        BlockKind::Table { alignments } => render_table(snap, block, alignments),
+        BlockKind::Table { alignments } => render_table(snap, block, alignments, editor),
         BlockKind::TableRow { .. } | BlockKind::TableCell => div().into_any_element(),
         BlockKind::ThematicBreak => div()
             .my(px(12.))
@@ -121,7 +137,11 @@ fn render_block(snap: &Arc<RenderSnapshot>, block: &Block) -> AnyElement {
     }
 }
 
-fn render_list(snap: &Arc<RenderSnapshot>, list: &Block) -> impl IntoElement {
+fn render_list<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    list: &Block,
+    editor: Entity<H>,
+) -> impl IntoElement {
     let theme = snap.theme.clone();
     let (ordered, start) = match &list.kind {
         BlockKind::OrderedList { start, .. } => (true, *start),
@@ -147,27 +167,37 @@ fn render_list(snap: &Arc<RenderSnapshot>, list: &Block) -> impl IntoElement {
             } else {
                 "•".into()
             };
+            let item_id = item.id;
+            let is_task = task.is_some();
             let children: Vec<AnyElement> = item
                 .children
                 .iter()
-                .map(|child| render_block(snap, child))
+                .map(|child| render_block(snap, child, editor.clone()))
                 .collect();
+            let mut marker = div()
+                .id(("task", item_id.0))
+                .min_w(px(20.))
+                .text_color(if is_task {
+                    theme.accent
+                } else {
+                    theme.secondary_text
+                })
+                .text_size(px(theme.font_size))
+                .child(glyph);
+            if is_task {
+                let editor = editor.clone();
+                marker = marker
+                    .cursor(CursorStyle::PointingHand)
+                    .on_click(move |_, _, cx| {
+                        editor.update(cx, |host, cx| host.toggle_task(item_id, cx));
+                    });
+            }
             div()
                 .flex()
                 .flex_row()
                 .items_start()
                 .gap(px(8.))
-                .child(
-                    div()
-                        .min_w(px(20.))
-                        .text_color(if task.is_some() {
-                            theme.accent
-                        } else {
-                            theme.secondary_text
-                        })
-                        .text_size(px(theme.font_size))
-                        .child(glyph),
-                )
+                .child(marker)
                 .child(div().flex_1().children(children))
                 .into_any_element()
         })
@@ -175,10 +205,11 @@ fn render_list(snap: &Arc<RenderSnapshot>, list: &Block) -> impl IntoElement {
     div().flex().flex_col().gap(px(2.)).children(rows)
 }
 
-fn render_table(
+fn render_table<H: WysiwygHost>(
     snap: &Arc<RenderSnapshot>,
     table: &Block,
     alignments: &[ColumnAlign],
+    editor: Entity<H>,
 ) -> AnyElement {
     let theme = snap.theme.clone();
     let rows: Vec<AnyElement> = table
@@ -208,6 +239,7 @@ fn render_table(
                             cell,
                             theme.font_size * 0.95,
                             weight,
+                            editor.clone(),
                         ));
                     el = match align {
                         ColumnAlign::Center => el.text_center(),
@@ -236,95 +268,32 @@ fn render_table(
 
 /// A leaf block's inline content as wrapped rich text (plus trailing image
 /// elements for standalone images).
-fn paragraph_element(
+fn paragraph_element<H: WysiwygHost>(
     snap: &Arc<RenderSnapshot>,
     block: &Block,
     font_size: f32,
     base_weight: FontWeight,
+    editor: Entity<H>,
 ) -> AnyElement {
     let theme = &snap.theme;
-    let mut text = String::new();
-    let mut runs: Vec<TextRun> = Vec::new();
-    let mut images: Vec<(String, String)> = Vec::new(); // (alt, url)
     let text_style = base_text_style(theme, font_size, base_weight);
-
-    let push_run = |text: &mut String, runs: &mut Vec<TextRun>, s: &str, run: TextRun| {
-        if s.is_empty() {
-            return;
-        }
-        text.push_str(s);
-        let mut run = run;
-        run.len = s.len();
-        runs.push(run);
-    };
-
-    for inline in &block.inlines {
-        match inline {
-            Inline::Run {
-                text: t,
-                marks,
-                link,
-                ..
-            } => {
-                let mut run = text_style.to_run(0);
-                if marks.contains(MarkSet::BOLD) {
-                    run.font.weight = FontWeight::BOLD;
-                }
-                if marks.contains(MarkSet::ITALIC) {
-                    run.font.style = FontStyle::Italic;
-                }
-                if marks.contains(MarkSet::STRIKE) {
-                    run.strikethrough = Some(StrikethroughStyle {
-                        thickness: px(1.),
-                        color: Some(theme.secondary_text),
-                    });
-                }
-                if marks.contains(MarkSet::CODE) {
-                    run.font.family = theme.code_font_family.clone().into();
-                    run.background_color = Some(theme.code_bg);
-                }
-                if link.is_some() {
-                    run.color = theme.link;
-                    run.underline = Some(UnderlineStyle {
-                        thickness: px(1.),
-                        color: Some(theme.link),
-                        wavy: false,
-                    });
-                }
-                push_run(&mut text, &mut runs, t, run);
-            }
-            Inline::Image { alt, url, .. } => {
-                if block.inlines.len() == 1 {
-                    images.push((alt.clone(), url.clone()));
-                } else {
-                    let mut run = text_style.to_run(0);
-                    run.color = theme.image_text;
-                    run.font.style = FontStyle::Italic;
-                    let label = format!("🖼 {alt}");
-                    push_run(&mut text, &mut runs, &label, run);
-                }
-            }
-            Inline::SoftBreak => {
-                push_run(&mut text, &mut runs, " ", text_style.to_run(0));
-            }
-            Inline::HardBreak {
-                style: BreakStyle::TwoSpaces | BreakStyle::Backslash,
-            } => {
-                push_run(&mut text, &mut runs, "\n", text_style.to_run(0));
-            }
-            Inline::OpaqueInline { raw, .. } => {
-                let mut run = text_style.to_run(0);
-                run.color = theme.secondary_text;
-                run.font.family = theme.code_font_family.clone().into();
-                push_run(&mut text, &mut runs, raw, run);
-            }
-        }
-    }
-
-    let mut container = div().flex().flex_col().gap(px(4.));
-    if !text.is_empty() {
-        container = container.child(StyledText::new(text).with_runs(runs));
-    }
+    let images: Vec<(String, String)> = block
+        .inlines
+        .iter()
+        .filter_map(|inline| match inline {
+            markrust_core::rich::Inline::Image { alt, url, .. } => Some((alt.clone(), url.clone())),
+            _ => None,
+        })
+        .collect();
+    let layout = std::sync::Arc::new(build_leaf_layout(block, &text_style, theme, base_weight));
+    let line_height = theme.line_height_for_font_size(font_size);
+    let mut container = div().flex().flex_col().gap(px(4.)).child(BlockTextElement {
+        editor,
+        layout,
+        font_size,
+        line_height,
+        theme: theme.clone(),
+    });
     for (alt, url) in images {
         let source: SharedString = resolve_image_source(snap, &url).into();
         container = container.child(

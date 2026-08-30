@@ -97,7 +97,7 @@ pub fn build_display_layout(
     layout.highlight_spans = highlight_spans;
     layout.blockquote_lines = blockquote_line_starts(content, spans);
     layout.code_block_lines = code_block_line_starts(content, spans);
-    apply_table_alignment(&mut layout, content, spans);
+    apply_table_alignment(&mut layout, content, spans, carets, selections);
     layout
 }
 
@@ -501,9 +501,49 @@ fn code_block_line_starts(content: &str, spans: &[SyntaxNodeSpan]) -> Vec<usize>
     lines
 }
 
-fn apply_table_alignment(layout: &mut DisplayLayout, content: &str, spans: &[SyntaxNodeSpan]) {
+/// Font size for a source line, derived from heading spans — independent of
+/// delimiter mask state, so toggling `**` / `#` never changes line height.
+pub fn source_line_font_size(
+    layout: &DisplayLayout,
+    theme: &EditorTheme,
+    _content: &str,
+    doc_start: usize,
+    doc_end: usize,
+) -> f32 {
+    let heading = layout.segments.iter().find_map(|segment| {
+        if segment.doc_end <= doc_start || segment.doc_start >= doc_end {
+            return None;
+        }
+        match segment.style {
+            SegmentStyle::Heading { level } => Some(level),
+            _ => None,
+        }
+    });
+    match heading {
+        Some(level) => theme.heading_font_size(level),
+        None => theme.font_size,
+    }
+}
+
+fn apply_table_alignment(
+    layout: &mut DisplayLayout,
+    content: &str,
+    spans: &[SyntaxNodeSpan],
+    carets: &[Caret],
+    selections: &[Selection],
+) {
     for span in spans {
         if span.kind != SyntaxKind::Table || span.table_row.is_some() {
+            continue;
+        }
+        let focused = carets
+            .iter()
+            .any(|c| c.offset >= span.start_byte && c.offset <= span.end_byte)
+            || selections
+                .iter()
+                .any(|s| !s.is_empty() && s.overlaps(span.start_byte, span.end_byte));
+        if focused {
+            // Raw pipes while the table is focused (Typora-style).
             continue;
         }
         let block = &content[span.start_byte..span.end_byte.min(content.len())];
@@ -790,5 +830,50 @@ mod tests {
         assert_eq!(cursor_line_col("ab\ncd", 3), (1, 0));
         assert_eq!(cursor_line_col("ab\r\ncd", 4), (1, 0));
         assert_eq!(cursor_line_col("", 0), (0, 0));
+    }
+
+    #[test]
+    fn focused_table_keeps_raw_pipes() {
+        let content = "| a | bb |\n|---|---|\n| c | d |";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let focused =
+            build_display_layout(content, &spans, &[Caret::new(0)], &[], &EditorTheme::dark());
+        let blurred = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(999)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        assert!(
+            focused.display_text.contains("| a | bb |"),
+            "focused should keep raw pipes: {:?}",
+            focused.display_text
+        );
+        assert!(
+            blurred.display_text.contains("| a  | bb |")
+                || blurred.display_text.contains("| a | bb |")
+                || blurred
+                    .segments
+                    .iter()
+                    .any(|segment| matches!(segment.style, SegmentStyle::Table { .. })),
+            "blurred table display: {:?}",
+            blurred.display_text
+        );
+    }
+
+    #[test]
+    fn heading_font_size_does_not_depend_on_mask() {
+        let content = "# Title\nplain\n";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let theme = EditorTheme::dark();
+        let masked = build_display_layout(content, &spans, &[Caret::new(99)], &[], &theme);
+        let shown = build_display_layout(content, &spans, &[Caret::new(0)], &[], &theme);
+        let h_masked = source_line_font_size(&masked, &theme, content, 0, 8);
+        let h_shown = source_line_font_size(&shown, &theme, content, 0, 8);
+        assert_eq!(h_masked, h_shown);
+        assert_eq!(h_masked, theme.heading_font_size(1));
+        let body = source_line_font_size(&masked, &theme, content, 8, content.len());
+        assert_eq!(body, theme.font_size);
     }
 }

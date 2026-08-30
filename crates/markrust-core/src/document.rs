@@ -9,9 +9,11 @@ use std::time::Duration;
 
 use crate::buffer::DocumentBuffer;
 use crate::mode::DocumentProcessingMode;
-use crate::parser::{extract_syntax_spans, BackgroundMarkdownParser, ParseSnapshot, ParseUpdate};
+use crate::parser::{BackgroundMarkdownParser, ParseSnapshot, ParseUpdate};
 use crate::spans::SyntaxNodeSpan;
-use crate::undo::{EditOperation, UndoStack};
+use crate::undo::{
+    is_typing_burst, EditOperation, SelectionSnapshot, Transaction, TransactionKind, UndoStack,
+};
 
 /// A document with buffer, processing mode, syntax spans, and undo history.
 #[derive(Debug)]
@@ -52,13 +54,10 @@ impl Document {
             undo: UndoStack::new(),
             parser: BackgroundMarkdownParser::new(),
         };
-        if mode.parses_markdown() && !doc.buffer.is_empty() {
-            let content = doc.buffer.content();
-            doc.syntax_spans = extract_syntax_spans(&content);
-            doc.parsed_revision = doc.revision();
-        }
+        // Parse on the background worker only. Callers on the GPUI UI thread
+        // must never wait here — drain with `apply_pending_parse` (non-blocking)
+        // or `wait_for_parse` from tests.
         doc.schedule_parse();
-        doc.apply_pending_parse();
         doc
     }
 
@@ -80,6 +79,28 @@ impl Document {
 
     /// Delete `[start, end)` and insert `text` as a single undo transaction.
     pub fn replace_range(&mut self, start: usize, end: usize, text: &str) {
+        let before = SelectionSnapshot {
+            start,
+            end,
+            reversed: false,
+        };
+        let after = SelectionSnapshot::collapsed(start.min(end) + text.len());
+        self.replace_range_tx(start, end, text, TransactionKind::Command, before, after);
+    }
+
+    /// Like [`replace_range`] with explicit undo kind and caret snapshots.
+    /// Consecutive [`TransactionKind::Typing`] inserts at the growing caret
+    /// coalesce into one undo step; consecutive [`TransactionKind::DeleteBack`]
+    /// deletes do the same.
+    pub fn replace_range_tx(
+        &mut self,
+        start: usize,
+        end: usize,
+        text: &str,
+        kind: TransactionKind,
+        selection_before: SelectionSnapshot,
+        selection_after: SelectionSnapshot,
+    ) {
         let len = self.buffer.len_bytes();
         let start = start.min(len);
         let end = end.min(len);
@@ -91,7 +112,21 @@ impl Document {
         if start == end && text.is_empty() {
             return;
         }
-        self.undo.begin_transaction();
+
+        if self.try_coalesce(start, end, text, kind, selection_after) {
+            if start < end {
+                self.buffer.delete(start, end);
+            }
+            if !text.is_empty() {
+                self.buffer.insert(start, text);
+            }
+            self.dirty = true;
+            self.schedule_parse();
+            return;
+        }
+
+        self.undo
+            .begin_transaction_ex(selection_before, selection_after, kind);
         if start < end {
             let deleted = self.buffer.slice(start, end);
             if !deleted.is_empty() {
@@ -114,20 +149,79 @@ impl Document {
         self.schedule_parse();
     }
 
-    pub fn undo(&mut self) -> bool {
-        let Some(ops) = self.undo.undo() else {
+    fn try_coalesce(
+        &mut self,
+        start: usize,
+        end: usize,
+        text: &str,
+        kind: TransactionKind,
+        selection_after: SelectionSnapshot,
+    ) -> bool {
+        if self.undo.has_open_transaction() {
+            return false;
+        }
+        let Some(last) = self.undo.last_mut() else {
             return false;
         };
-        self.apply_ops(&ops);
-        true
+        if last.kind != kind {
+            return false;
+        }
+        match kind {
+            TransactionKind::Typing if end == start && is_typing_burst(text) => {
+                match last.ops.last_mut() {
+                    Some(EditOperation::Insert {
+                        byte_offset,
+                        text: prev,
+                    }) if *byte_offset + prev.len() == start && is_typing_burst(prev) => {
+                        prev.push_str(text);
+                        last.selection_after = selection_after;
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            TransactionKind::DeleteBack if text.is_empty() && start < end => {
+                match last.ops.last_mut() {
+                    Some(EditOperation::Delete {
+                        byte_offset,
+                        text: prev,
+                    }) if end == *byte_offset => {
+                        let deleted = self.buffer.slice(start, end);
+                        let mut combined = deleted;
+                        combined.push_str(prev);
+                        *byte_offset = start;
+                        *prev = combined;
+                        last.selection_after = selection_after;
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    pub fn undo(&mut self) -> bool {
+        self.undo_tx().is_some()
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(ops) = self.undo.redo() else {
-            return false;
-        };
-        self.apply_ops(&ops);
-        true
+        self.redo_tx().is_some()
+    }
+
+    /// Undo and return the transaction (ops already inverted; restore
+    /// `selection_after`).
+    pub fn undo_tx(&mut self) -> Option<Transaction> {
+        let tx = self.undo.undo()?;
+        self.apply_ops(&tx.ops);
+        Some(tx)
+    }
+
+    /// Redo and return the original transaction (restore `selection_after`).
+    pub fn redo_tx(&mut self) -> Option<Transaction> {
+        let tx = self.undo.redo()?;
+        self.apply_ops(&tx.ops);
+        Some(tx)
     }
 
     fn apply_ops(&mut self, ops: &[EditOperation]) {
@@ -253,7 +347,6 @@ impl Document {
         self.dirty = false;
         self.undo = UndoStack::new();
         self.schedule_parse();
-        self.apply_pending_parse();
     }
 
     pub fn word_count(&self) -> usize {
@@ -331,8 +424,19 @@ mod tests {
     }
 
     #[test]
-    fn new_parses_markdown_immediately() {
+    fn new_does_not_parse_on_the_calling_thread() {
         let doc = Document::new("# Hello\n\n**bold**");
+        assert!(
+            doc.syntax_spans.is_empty(),
+            "Document::new must not run tree-sitter on the caller (got {} spans)",
+            doc.syntax_spans.len()
+        );
+    }
+
+    #[test]
+    fn new_parses_markdown_on_background_worker() {
+        let mut doc = Document::new("# Hello\n\n**bold**");
+        assert!(doc.wait_for_parse(PARSE_TIMEOUT));
         assert!(doc
             .syntax_spans
             .iter()
@@ -346,6 +450,7 @@ mod tests {
     #[test]
     fn configure_mode_from_path_switches() {
         let mut doc = Document::new("# Hello\n\n**bold**");
+        assert!(doc.wait_for_parse(PARSE_TIMEOUT));
         assert!(
             !doc.syntax_spans.is_empty(),
             "expected markdown spans for a heading"
@@ -545,6 +650,74 @@ mod tests {
                 .any(|span| span.kind == SyntaxKind::Heading),
             "spans: {:?}",
             doc.syntax_spans
+        );
+    }
+
+    #[test]
+    fn typing_coalesces_and_undo_restores_caret() {
+        let mut doc = Document::new("ab");
+        let before = SelectionSnapshot::collapsed(2);
+        doc.replace_range_tx(
+            2,
+            2,
+            "c",
+            TransactionKind::Typing,
+            before,
+            SelectionSnapshot::collapsed(3),
+        );
+        doc.replace_range_tx(
+            3,
+            3,
+            "d",
+            TransactionKind::Typing,
+            SelectionSnapshot::collapsed(3),
+            SelectionSnapshot::collapsed(4),
+        );
+        assert_eq!(doc.buffer.content(), "abcd");
+        assert_eq!(doc.undo_stack().undo_depth(), 1);
+        let tx = doc.undo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), "ab");
+        assert_eq!(tx.selection_after, before);
+    }
+
+    #[test]
+    fn load_and_parse_large_markdown_does_not_hang() {
+        let dir = TempDir::new("large-md");
+        let path = dir.join("large.md");
+        let mut body = String::with_capacity(256 * 1024);
+        for i in 0..2_000 {
+            body.push_str("# Heading ");
+            body.push_str(&i.to_string());
+            body.push_str("\n\nParagraph with **bold**, *italic*, and `code`.\n\n- item\n\n");
+        }
+        std::fs::write(&path, &body).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut doc = Document::from_file(path).expect("from_file");
+            let construct = started.elapsed();
+            let parsed = doc.wait_for_parse(Duration::from_secs(5));
+            let heading_count = doc
+                .syntax_spans
+                .iter()
+                .filter(|span| span.kind == SyntaxKind::Heading)
+                .count();
+            let _ = tx.send((construct, parsed, heading_count, doc.buffer.len_bytes()));
+        });
+
+        let (construct, parsed, heading_count, len) = rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("Document::from_file + parse hung (timed out)");
+        assert!(
+            construct < Duration::from_millis(500),
+            "from_file blocked the caller for {construct:?}; parse must stay off this thread"
+        );
+        assert!(parsed, "background parse did not finish");
+        assert!(len > 100_000, "fixture too small: {len} bytes");
+        assert!(
+            heading_count >= 1_000,
+            "expected many heading spans, got {heading_count}"
         );
     }
 }

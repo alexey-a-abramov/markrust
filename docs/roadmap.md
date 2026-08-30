@@ -27,9 +27,10 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 | P1 | `rich/tree.rs` + `rich/import.rs` (comrak, sourcepos byte-columns pinned by test, fidelity capture, Opaque totality) | ✅ done |
 | P2 | `rich/serialize.rs` + `rich/escape.rs` (delimiter-stack serializer), `rich/save.rs` (SaveCandidates + diff hunks), corpus test suite | ✅ done |
 | P3 | `rich/engine.rs` (NodeId stability, splices, caret snap/step, line map, outline) + **read-only WYSIWYG view** (`markrust-editor::wysiwyg`) + per-tab mode toggle (cmd-shift-m / toolbar) | ✅ done |
-| P4 | **Editing core** — `RichCommand` layer, Transaction undo upgrade (typing coalescing + caret restore), WYSIWYG caret/selection/hit-testing/IME | ⬜ next |
-| P5 | Lists/tasks UX (Enter/Tab semantics, checkbox clicks), input rules (autoformat), code language chip, image alt/caption editing | ⬜ |
-| P6 | Tables: cell editing, Tab nav, row/col ops UI | ⬜ |
+| P4 | **Editing core** — `RichCommand` layer, Transaction undo upgrade (typing coalescing + caret restore), WYSIWYG caret/selection/hit-testing/IME | ✅ done |
+| P5 | Lists/tasks UX (Enter/Tab, checkbox clicks) **partial**; input rules, code language chip, image alt/caption editing still open | 🚧 in progress |
+| P6 | Tables: cell editing, Tab nav, row/col ops UI (read-only rendered columns exist; source mode shows raw pipes when focused) | ⬜ |
+
 | P7 | Frontmatter panel + Normalize review dialog (decision fn in `session.rs`, headless-tested) | ⬜ |
 | P8 | External-edit reconciliation (`map_offset_across_change` port, `apply_external_edit`, watcher/autosave wiring) | ⬜ |
 | P9 | Side-by-side + polish + migration (delete tree-sitter-md/`parser.rs`/`spans.rs`/masking after source mode re-derives segments from `RichTree`; criterion perf gates; docs rewrite) | ⬜ |
@@ -44,23 +45,33 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 
 ### Key modules
 
-- `crates/markrust-core/src/rich/` — `tree` (RichTree/Block/Inline + fidelity), `import` (comrak → tree), `serialize`/`escape` (Preserve/Normalize), `engine` (view contract), `save` (SaveCandidates).
-- `crates/markrust-editor/src/wysiwyg/` — `view` (RichEditorView over virtualized `list()`), `blocks` (per-kind renderers).
+- `crates/markrust-core/src/rich/` — `tree` (RichTree/Block/Inline + fidelity), `import` (comrak → tree), `serialize`/`escape` (Preserve/Normalize), `engine` (view contract), `command` (RichCommand → byte splices), `save` (SaveCandidates).
+- `crates/markrust-editor/src/wysiwyg/` — `view` (RichEditorView over virtualized `list()`), `blocks` (per-kind renderers), `block_text` (caret/hit-testing/IME host).
 - `crates/markrust-editor/src/source/` — the masking source editor (kept as always-working fallback and future source mode).
 - `crates/markrust-app/src/crash.rs` — panic logger (see Crash handling).
 
-## P4 design notes (for the next agent)
+## P4 shipped
 
-The editing pipeline per command: `engine.sync` → locate leaf/top-level block via selection bytes → transform → re-serialize that top-level block with `serialize_tree` (dirty set = its id) → `document.replace_range` in one undo transaction → `engine.sync` (NodeId stability keeps other blocks). Because the source is primary:
+Editing core is in: `rich/command.rs` (`InsertText`, `Backspace`, `Delete`, `SplitBlock`, `InsertLineBreak`, `ToggleMark`, `ToggleLink`, `SetBlockType`, `ToggleBlockquote`, `ToggleList`, `SetTaskChecked`, `IndentList`, `OutdentList`), `UndoStack` `Transaction` with typing coalescing and caret restore, WYSIWYG caret/selection/hit-testing via `block_text.rs`, IME (`EntityInputHandler`, preedit does not touch the model). Default tab mode is WYSIWYG. Source mode remains the fallback (`cmd-shift-m`).
 
-- `InsertText` = escape typed text per context (`rich/escape.rs`; raw in code/opaque blocks) + byte splice at caret. No tree mutation needed.
-- `SplitBlock` (Enter) = kind-dependent source insertion: paragraph `\n\n`; list item `\n` + marker (+ task box); empty item → outdent; code block `\n`; quote `\n>\n> `. The markdown IS the model.
-- `Backspace` crossing a run boundary must extend deletion over now-empty mark delimiters (compute enclosing delimiter span from mark diff with neighbor runs) — the one genuinely fiddly case.
-- `ToggleMark`/`SetBlockType`/table ops = tree-rewrite of a copied block + reserialize.
-- Input rules (view side) must bundle typed-text + transform into ONE undo step — `UndoStack` transactions already exist; add typing coalescing + caret restore (`Transaction { ops, selection_before/after, kind }`).
-- IME: `EntityInputHandler` domain = focused node's text only; implement `bounds_for_range` (see gpui `examples/input.rs:365`); preedit never touches the model.
+Proven by tests: insert in one block leaves other blocks' bytes untouched; coalesced typing undo restores string + caret; backspace deletes the visible grapheme not `**` wrappers; split paragraph/list; toggle bold; wrap link; empty-item Enter outdents/exits; indent/outdent; task checkbox splice.
 
-The full design (view architecture, hit-testing via `WrappedLine::closest_index_for_position`, modes, tables UX, dialogs) is in the approved plan: `~/.claude/plans/now-it-works-as-moonlit-wirth.md` (machine-local; the substance is mirrored in this file and in module docs).
+## P5 design notes (for the next agent)
+
+Shipped this pass:
+- Checkbox clicks → `SetTaskChecked`; Tab/Shift-Tab → `IndentList`/`OutdentList`; empty-item Enter outdents (nested) or exits the list (top-level).
+- Cmd/Ctrl+B/I/E/K wrap in **both** modes. Source wrap is `EditorCommand::Wrap` (byte splice so masking still sees a real span). WYSIWYG uses `ToggleMark` / `ToggleLink`.
+- Source click-to-caret uses glyph x positions (`source/hit_test.rs`), not line-start only.
+- Source tables: padded columns when blurred, raw pipes when the caret is in the table.
+- Images: alt placeholder in the text flow; `img()` below for every image (standalone and mixed). Drag-drop insert already exists (`drop.rs`).
+- File-open hang fix is in: watcher `recv` on a background task; parse via `apply_pending_parse` off the frame.
+
+Still open:
+- Input rules (`# `, `- `, `1. `, `> `, ` ``` `, `---`, closing `**`/`*`/`` ` ``/`~~`) as pure functions in `input_rules.rs`, each one undo group with the typed text, disabled in code blocks.
+- Code language chip (edit `info` string) and image alt/caption *editing* (display + drop-insert exist).
+- IME domain can tighten from whole-document source offsets to the focused leaf's visible text (`bounds_for_range` / `character_index_for_point` still approximate).
+- Table cell editing / Tab-between-cells / row-col ops (P6).
+- Zero-width delimiter masking so unmasking cannot wrap a source line (today delimiters are omitted from display text, so they change width).
 
 ## Dev workflow — hard-won gotchas
 

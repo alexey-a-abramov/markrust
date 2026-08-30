@@ -12,7 +12,7 @@ use markrust_app::{
     DropIntent, DropTarget, HeadlessWorkspace, ReloadDecision, SessionError, WorkspaceCommand,
 };
 use markrust_core::markdown_to_html_gfm;
-use markrust_editor::{EditorCommand, VisibilityState};
+use markrust_editor::{EditorCommand, VisibilityState, WrapKind};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -71,6 +71,40 @@ fn bold_wrap_masks_when_caret_is_outside() {
     assert!(inside.contains(&VisibilityState::Visible));
     workspace
         .apply(WorkspaceCommand::Editor(EditorCommand::JumpTo(0)))
+        .unwrap();
+    let outside = workspace.active_mut().unwrap().editor.visibility();
+    assert!(outside.contains(&VisibilityState::Masked));
+    assert!(!outside.contains(&VisibilityState::Visible));
+}
+
+#[test]
+fn wrap_bold_command_then_mask_outside() {
+    let mut workspace = HeadlessWorkspace::new();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+            "hello world".into(),
+        )))
+        .unwrap();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::SetSelection {
+            start: 0,
+            end: 5,
+        }))
+        .unwrap();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::Wrap(
+            WrapKind::Bold,
+        )))
+        .unwrap();
+    assert_eq!(
+        workspace.active().unwrap().editor.content(),
+        "**hello** world"
+    );
+    let inside = workspace.active_mut().unwrap().editor.visibility();
+    assert!(inside.contains(&VisibilityState::Visible));
+    let end = workspace.active().unwrap().editor.content().len();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::JumpTo(end)))
         .unwrap();
     let outside = workspace.active_mut().unwrap().editor.visibility();
     assert!(outside.contains(&VisibilityState::Masked));
@@ -292,5 +326,39 @@ fn should_skip_dir_ignores_target() {
     std::fs::write(dir.join("ok.md"), "x").unwrap();
     let files = markrust_app::list_markdown_files(&dir);
     assert_eq!(files, vec![dir.join("ok.md")]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_large_markdown_file_does_not_hang() {
+    let dir = unique_temp("open-large");
+    let path = dir.join("large.md");
+    let mut body = String::with_capacity(128 * 1024);
+    for i in 0..1_500 {
+        body.push_str("# H");
+        body.push_str(&i.to_string());
+        body.push_str("\n\npara **x**\n\n");
+    }
+    std::fs::write(&path, &body).unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let mut workspace = HeadlessWorkspace::new();
+        workspace
+            .apply(WorkspaceCommand::OpenFile(path))
+            .expect("open");
+        let elapsed = started.elapsed();
+        let content = workspace.active().unwrap().editor.content();
+        let _ = tx.send((elapsed, content.len()));
+    });
+    let (elapsed, len) = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("opening a markdown file hung");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "OpenFile blocked for {elapsed:?}"
+    );
+    assert!(len > 10_000, "fixture too small: {len}");
     let _ = std::fs::remove_dir_all(&dir);
 }

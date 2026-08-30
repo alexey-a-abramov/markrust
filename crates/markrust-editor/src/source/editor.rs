@@ -14,6 +14,7 @@ use markrust_core::Document;
 use crate::headless::{apply_editor_command, CaretMove, EditorCommand, EditorOutcome, EditorState};
 use crate::masking::{Caret, Selection};
 use crate::theme::EditorTheme;
+use crate::wrap::WrapKind;
 
 actions!(
     markrust_editor,
@@ -34,7 +35,14 @@ actions!(
         SelectEnd,
         PageUp,
         PageDown,
-        SelectAll
+        SelectAll,
+        Enter,
+        ToggleBold,
+        ToggleItalic,
+        ToggleCode,
+        ToggleLink,
+        Indent,
+        Outdent
     ]
 );
 
@@ -44,6 +52,8 @@ pub struct LineLayoutCache {
     pub line_starts: Vec<usize>,
     pub display_line_starts: Vec<usize>,
     pub line_heights: Vec<f32>,
+    pub line_x_at: Vec<Vec<f32>>,
+    pub display_to_doc: Vec<usize>,
 }
 
 /// GPUI editor state: caret, selection, and document binding.
@@ -291,6 +301,30 @@ impl MarkdownEditor {
         if self.apply_command(EditorCommand::Delete, cx) == EditorOutcome::Noop {
             window.play_system_bell();
         }
+    }
+
+    pub fn toggle_bold(&mut self, _: &ToggleBold, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Wrap(WrapKind::Bold), cx);
+    }
+
+    pub fn toggle_italic(&mut self, _: &ToggleItalic, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Wrap(WrapKind::Italic), cx);
+    }
+
+    pub fn toggle_code(&mut self, _: &ToggleCode, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Wrap(WrapKind::Code), cx);
+    }
+
+    pub fn toggle_link(&mut self, _: &ToggleLink, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Wrap(WrapKind::Link), cx);
+    }
+
+    pub fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Indent, cx);
+    }
+
+    pub fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Outdent, cx);
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {

@@ -240,6 +240,9 @@ impl HeadlessWorkspace {
                 | EditorCommand::Delete
                 | EditorCommand::Undo
                 | EditorCommand::Redo
+                | EditorCommand::Wrap(_)
+                | EditorCommand::Indent
+                | EditorCommand::Outdent
         );
         let tab_id = self.active().ok_or(SessionError::NoActiveDocument)?.id;
         let outcome = self
@@ -462,24 +465,33 @@ impl HeadlessWorkspace {
     }
 }
 
+const MAX_LISTED_MARKDOWN_FILES: usize = 2_000;
+const MAX_LIST_DEPTH: usize = 8;
+
 pub fn list_markdown_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    collect_files(root, &mut files);
+    collect_files(root, &mut files, 0);
     files.sort();
     files
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > MAX_LIST_DEPTH || out.len() >= MAX_LISTED_MARKDOWN_FILES {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if out.len() >= MAX_LISTED_MARKDOWN_FILES {
+            return;
+        }
         let path = entry.path();
         if path.is_dir() {
             if should_skip_dir(&path) {
                 continue;
             }
-            collect_files(&path, out);
+            collect_files(&path, out, depth + 1);
         } else if is_markdown(&path) {
             out.push(path);
         }
@@ -559,11 +571,35 @@ mod tests {
                 .and_then(|tab| tab.editor.document().path.clone()),
             Some(canonical.clone())
         );
-        assert_eq!(
-            workspace.root.as_ref().map(|p| p.as_path()),
-            canonical.parent()
-        );
+        assert_eq!(workspace.root.as_deref(), canonical.parent());
         assert_eq!(workspace.tabs().len(), 1);
         assert_eq!(workspace.active().unwrap().editor.content(), "# Hello\n");
+    }
+
+    #[test]
+    fn list_markdown_files_is_bounded_and_timely() {
+        let dir = std::env::temp_dir().join(format!("markrust-list-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cur = dir.clone();
+        for i in 0..20 {
+            cur = cur.join(format!("d{i}"));
+            std::fs::create_dir_all(&cur).unwrap();
+            std::fs::write(cur.join("n.md"), "x").unwrap();
+        }
+        let started = std::time::Instant::now();
+        let files = list_markdown_files(&dir);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "sidebar walk hung: {:?}",
+            started.elapsed()
+        );
+        assert!(!files.is_empty());
+        assert!(
+            files.len() <= MAX_LIST_DEPTH + 1,
+            "depth cap failed: {} files",
+            files.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -12,7 +12,7 @@ use std::ops::Range;
 use crate::document::Document;
 
 use super::import::import_markdown;
-use super::tree::{Block, BlockKind, IdGen, Inline, NodeId, RichTree};
+use super::tree::{Block, BlockKind, IdGen, Inline, MarkSet, NodeId, RichTree};
 
 /// Caret snapping direction when a byte falls on delimiter bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +95,72 @@ impl RichEngine {
             None
         }
         find(&self.tree.blocks, id)
+    }
+
+    /// Top-level block containing `byte`.
+    pub fn top_level_at(&self, byte: usize) -> Option<&Block> {
+        let mut best = None;
+        for b in &self.tree.blocks {
+            if b.source_range.start <= byte && byte <= b.source_range.end {
+                best = Some(b);
+            } else if b.source_range.start > byte {
+                break;
+            }
+        }
+        best.or_else(|| {
+            self.tree
+                .blocks
+                .iter()
+                .rev()
+                .find(|b| b.source_range.start <= byte)
+                .or_else(|| self.tree.blocks.first())
+        })
+    }
+
+    /// True when `byte` sits in a code block, opaque block, or inline code run.
+    pub fn in_raw_context(&self, byte: usize) -> bool {
+        let Some(id) = self.block_at(byte) else {
+            return false;
+        };
+        let Some(block) = self.block(id) else {
+            return false;
+        };
+        match &block.kind {
+            BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. } => true,
+            _ => block.inlines.iter().any(|inline| match inline {
+                Inline::Run {
+                    source_range,
+                    marks,
+                    ..
+                } => {
+                    source_range.start <= byte
+                        && byte <= source_range.end
+                        && marks.contains(MarkSet::CODE)
+                }
+                Inline::OpaqueInline { source_range, .. } => {
+                    source_range.start <= byte && byte <= source_range.end
+                }
+                _ => false,
+            }),
+        }
+    }
+
+    /// True when `byte` is inside a table cell.
+    pub fn in_table(&self, byte: usize) -> bool {
+        fn walk(blocks: &[Block], byte: usize) -> bool {
+            for b in blocks {
+                if b.source_range.start <= byte && byte <= b.source_range.end {
+                    if matches!(b.kind, BlockKind::TableCell | BlockKind::Table { .. }) {
+                        return true;
+                    }
+                    if walk(&b.children, byte) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        walk(&self.tree.blocks, byte)
     }
 
     /// Deepest leaf block containing `byte` (falls back to the nearest block).
@@ -380,6 +446,36 @@ pub(crate) fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+/// Step one grapheme-ish unit left within [start, byte); backslash escapes
+/// ("\\X") are atomic.
+fn step_left_in_slice(source: &str, start: usize, byte: usize) -> usize {
+    let slice = &source[start..byte];
+    let Some(last) = slice.char_indices().last() else {
+        return start;
+    };
+    let mut pos = start + last.0;
+    if pos > start && source.as_bytes().get(pos - 1) == Some(&b'\\') {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Step one grapheme-ish unit right within (byte, end].
+fn step_right_in_slice(source: &str, byte: usize, end: usize) -> usize {
+    let slice = &source[byte..end];
+    let mut it = slice.char_indices();
+    let Some((_, first)) = it.next() else {
+        return end;
+    };
+    let mut adv = first.len_utf8();
+    if first == '\\' {
+        if let Some((_, c2)) = it.next() {
+            adv += c2.len_utf8();
+        }
+    }
+    (byte + adv).min(end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,34 +553,4 @@ mod tests {
         assert_eq!(outline[2].1, 3);
         assert_eq!(&outline[2].2, "Quoted");
     }
-}
-
-/// Step one grapheme-ish unit left within [start, byte); backslash escapes
-/// ("\\X") are atomic.
-fn step_left_in_slice(source: &str, start: usize, byte: usize) -> usize {
-    let slice = &source[start..byte];
-    let Some(last) = slice.char_indices().last() else {
-        return start;
-    };
-    let mut pos = start + last.0;
-    if pos > start && source.as_bytes().get(pos - 1) == Some(&b'\\') {
-        pos -= 1;
-    }
-    pos
-}
-
-/// Step one grapheme-ish unit right within (byte, end].
-fn step_right_in_slice(source: &str, byte: usize, end: usize) -> usize {
-    let slice = &source[byte..end];
-    let mut it = slice.char_indices();
-    let Some((_, first)) = it.next() else {
-        return end;
-    };
-    let mut adv = first.len_utf8();
-    if first == '\\' {
-        if let Some((_, c2)) = it.next() {
-            adv += c2.len_utf8();
-        }
-    }
-    (byte + adv).min(end)
 }
