@@ -4,11 +4,21 @@
 
 //! IME candidate origin for the WYSIWYG surface.
 //!
-//! GPUI asks [`EntityInputHandler::bounds_for_range`] for the rectangle the OS
-//! should pin the IME candidate window to. Leaves and chip/caption/frontmatter
-//! widgets report geometry as they paint; this module resolves that noise into
-//! **one** caret rect from the focused widget or the leaf that owns the
-//! document caret — not whichever text leaf happened to paint last.
+//! Two platform paths must agree on the same rectangle:
+//!
+//! - **Pull:** GPUI asks [`EntityInputHandler::bounds_for_range`] (macOS
+//!   `firstRectForCharacterRange:`) for the OS candidate window.
+//! - **Push:** after a caret move or widget focus, the view calls
+//!   `Window::invalidate_character_coordinates` (GPUI's equivalent of
+//!   `set_ime_cursor_position`) so the OS re-queries that origin instead of
+//!   keeping a stale candidate window. Call it only after this frame's leaves
+//!   and widgets have reported — `ImeOriginState` is last-paint geometry, not
+//!   a live layout snapshot.
+//!
+//! Leaves and chip/caption/frontmatter widgets report geometry as they paint;
+//! this module resolves that noise into **one** caret rect from the focused
+//! widget or the leaf that owns the document caret — not whichever text leaf
+//! happened to paint last.
 
 use std::sync::Arc;
 
@@ -41,10 +51,18 @@ pub struct ImeOriginState {
     widget_bounds: Option<Bounds<Pixels>>,
     caret_source: usize,
     leaves: Vec<ImeLeafHit>,
+    /// Bumps when the caret source or widget-focus flag changes so a caret
+    /// move still pushes even if two surfaces happen to share a rectangle.
+    caret_generation: u64,
+    last_pushed_generation: Option<u64>,
+    last_platform_origin: Option<Bounds<Pixels>>,
 }
 
 impl ImeOriginState {
     pub fn begin_frame(&mut self, widget_focused: bool, caret_source: usize) {
+        if self.widget_focused != widget_focused || self.caret_source != caret_source {
+            self.caret_generation = self.caret_generation.wrapping_add(1);
+        }
         self.widget_focused = widget_focused;
         self.caret_source = caret_source;
         self.widget_bounds = None;
@@ -80,6 +98,24 @@ impl ImeOriginState {
             return self.widget_bounds.map(widget_caret_rect);
         }
         self.focused_leaf().map(leaf_caret_or_fallback)
+    }
+
+    /// Resolved origin to push to the platform IME cursor API.
+    ///
+    /// Returns `Some` when the origin changed since the last push (caret
+    /// move, widget focus, or a new painted rect). The view must call
+    /// [`gpui::Window::invalidate_character_coordinates`] with this — not only
+    /// wait for `bounds_for_range`.
+    pub fn take_platform_push(&mut self) -> Option<Bounds<Pixels>> {
+        let rect = self.caret_rect()?;
+        let same_generation = self.last_pushed_generation == Some(self.caret_generation);
+        let same_rect = self.last_platform_origin == Some(rect);
+        if same_generation && same_rect {
+            return None;
+        }
+        self.last_pushed_generation = Some(self.caret_generation);
+        self.last_platform_origin = Some(rect);
+        Some(rect)
     }
 
     pub fn focused_leaf(&self) -> Option<&ImeLeafHit> {
@@ -158,6 +194,7 @@ fn focused_leaf_index(leaves: &[ImeLeafHit], caret: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use markrust_core::rich::{apply_rich_command, RichCommand};
 
     fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
         Bounds {
@@ -376,5 +413,194 @@ mod tests {
             .leaf_at_point(point(px(20.0), px(48.0)))
             .expect("second leaf");
         assert_eq!(leaf.layout.text, "world");
+    }
+
+    fn hit_for_range(
+        start: usize,
+        end: usize,
+        bounds: Bounds<Pixels>,
+        caret: Option<Bounds<Pixels>>,
+    ) -> ImeLeafHit {
+        let n = end.saturating_sub(start).max(1);
+        hit(&"x".repeat(n), start, bounds, caret)
+    }
+
+    fn caret_on(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        rect(
+            f32::from(bounds.origin.x) + 2.0,
+            f32::from(bounds.origin.y),
+            2.0,
+            20.0,
+        )
+    }
+
+    fn report_tree_leaves(
+        ime: &mut ImeOriginState,
+        blocks: &[markrust_core::rich::Block],
+        caret: usize,
+        y: &mut f32,
+    ) {
+        for block in blocks {
+            if block.children.is_empty() {
+                let bounds = rect(8.0, *y, 200.0, 22.0);
+                *y += 24.0;
+                let caret_bounds =
+                    if block.source_range.start <= caret && caret <= block.source_range.end {
+                        Some(caret_on(bounds))
+                    } else {
+                        None
+                    };
+                ime.report_leaf(hit_for_range(
+                    block.source_range.start,
+                    block.source_range.end,
+                    bounds,
+                    caret_bounds,
+                ));
+            } else {
+                report_tree_leaves(ime, &block.children, caret, y);
+            }
+        }
+    }
+
+    /// View protocol: `begin_frame` with the document caret, then report the
+    /// leaves (and optional widget) that would paint this frame.
+    fn paint_engine_frame(
+        ime: &mut ImeOriginState,
+        engine: &markrust_core::rich::RichEngine,
+        caret: usize,
+        widget: Option<Bounds<Pixels>>,
+    ) {
+        ime.begin_frame(widget.is_some(), caret);
+        if let Some(bounds) = widget {
+            ime.report_widget(bounds);
+        }
+        let mut y = 10.0;
+        report_tree_leaves(ime, &engine.tree().blocks, caret, &mut y);
+    }
+
+    #[test]
+    fn platform_push_fires_once_per_origin_change() {
+        let mut ime = ImeOriginState::default();
+        let body = rect(10.0, 40.0, 2.0, 22.0);
+        ime.begin_frame(false, 3);
+        ime.report_leaf(hit("hello", 0, rect(8.0, 40.0, 200.0, 22.0), Some(body)));
+        assert_eq!(ime.take_platform_push(), Some(body));
+        assert_eq!(
+            ime.take_platform_push(),
+            None,
+            "same origin must not re-push"
+        );
+    }
+
+    #[test]
+    fn ime_origin_after_insert_then_caret_into_table_cell_is_not_stale() {
+        let source = "hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let mut doc = markrust_core::Document::new(source);
+        let mut engine = markrust_core::rich::RichEngine::new();
+        engine.sync(&doc);
+        let mut caret = markrust_core::rich::CaretState::collapsed(5);
+        apply_rich_command(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("!".into()),
+        )
+        .expect("insert in paragraph");
+        engine.sync(&doc);
+        let body_caret = caret.cursor();
+        assert!(
+            !engine.in_table(body_caret),
+            "edit must land in the paragraph, not the table"
+        );
+
+        let mut ime = ImeOriginState::default();
+        paint_engine_frame(&mut ime, &engine, body_caret, None);
+        let origin_body = ime.caret_rect().expect("body origin after edit");
+        assert_eq!(ime.take_platform_push(), Some(origin_body));
+        assert_eq!(ime.owner(), Some(ImeOwner::Leaf));
+
+        let table = engine
+            .tree()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, markrust_core::rich::BlockKind::Table { .. }))
+            .expect("table after edit");
+        let cell_a = engine
+            .cell_caret(table.id, 0, 0)
+            .expect("header cell a after edit");
+        caret.collapse_to(cell_a);
+        apply_rich_command(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::TableTab { reverse: false },
+        )
+        .expect("tab into next cell");
+        engine.sync(&doc);
+        let cell_caret = caret.cursor();
+        let pos = engine
+            .table_pos(cell_caret)
+            .expect("caret must sit in a table cell after tab");
+        assert_eq!(pos.col, 1, "TableTab should land in column b");
+
+        paint_engine_frame(&mut ime, &engine, cell_caret, None);
+        let origin_cell = ime.caret_rect().expect("cell origin after caret move");
+        assert_ne!(
+            origin_cell, origin_body,
+            "IME origin must follow the caret into the table cell after the edit, not keep the paragraph rect"
+        );
+        let leaf = ime.focused_leaf().expect("cell leaf");
+        assert!(
+            leaf.layout.contains_source(cell_caret),
+            "origin leaf must own the post-edit cell caret {cell_caret}"
+        );
+        assert!(
+            !leaf.layout.contains_source(body_caret),
+            "cell origin must not still be the pre-tab paragraph caret {body_caret}"
+        );
+        assert_eq!(
+            ime.take_platform_push(),
+            Some(origin_cell),
+            "caret move into a cell must push the new origin to the platform"
+        );
+        assert_eq!(ime.take_platform_push(), None);
+    }
+
+    #[test]
+    fn ime_origin_after_insert_then_caption_focus_is_not_stale() {
+        let source = "hello\n\n![cat](img.png)\n";
+        let mut doc = markrust_core::Document::new(source);
+        let mut engine = markrust_core::rich::RichEngine::new();
+        engine.sync(&doc);
+        let mut caret = markrust_core::rich::CaretState::collapsed(5);
+        apply_rich_command(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("!".into()),
+        )
+        .expect("insert in paragraph");
+        engine.sync(&doc);
+        let body_caret = caret.cursor();
+
+        let mut ime = ImeOriginState::default();
+        paint_engine_frame(&mut ime, &engine, body_caret, None);
+        let origin_body = ime.caret_rect().expect("body origin after edit");
+        assert_eq!(ime.take_platform_push(), Some(origin_body));
+
+        let caption = rect(24.0, 260.0, 160.0, 16.0);
+        paint_engine_frame(&mut ime, &engine, body_caret, Some(caption));
+        let origin_caption = ime.caret_rect().expect("caption origin");
+        assert_eq!(ime.owner(), Some(ImeOwner::Widget));
+        assert_eq!(origin_caption, widget_caret_rect(caption));
+        assert_ne!(
+            origin_caption, origin_body,
+            "IME origin must move to the caption overlay after the edit, not keep the body caret"
+        );
+        assert_eq!(
+            ime.take_platform_push(),
+            Some(origin_caption),
+            "widget focus after an edit must push the caption origin"
+        );
     }
 }

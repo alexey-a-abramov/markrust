@@ -777,6 +777,12 @@ impl WysiwygHost for RichEditorView {
             caret_bounds,
         });
     }
+
+    fn sync_ime_cursor(&mut self, window: &mut Window) {
+        if self.ime.take_platform_push().is_some() {
+            window.invalidate_character_coordinates();
+        }
+    }
 }
 
 impl Focusable for RichEditorView {

@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Side-by-side editor mode: `cmd-shift-m` cycles Rich → Source → Split.
 - Dirty-tab 3-way merge when a file changes on disk; carets are mapped across the merge.
 - Normalize-on-save dialog shows a line hunk preview.
-- Chip/caption/frontmatter IME origin uses the widget bounds, not the last text-leaf caret. Body/wrapped/table IME origin is the focused leaf's caret rect (not last-painted). The OS IME candidate window is still unverified.
+- Chip/caption/frontmatter IME origin uses the widget bounds, not the last text-leaf caret. Body/wrapped/table IME origin is the focused leaf's caret rect (not last-painted). Caret moves and widget focus push that origin via GPUI `invalidate_character_coordinates`. The OS IME candidate window is still unverified.
 
 ### Changed
 

@@ -42,6 +42,7 @@ pub struct EditorPrepaint {
     lines: Vec<LinePaintData>,
     selection: Option<PaintQuad>,
     cursor: Option<PaintQuad>,
+    caret_bounds: Bounds<Pixels>,
     blockquote_borders: Vec<PaintQuad>,
     code_block_backgrounds: Vec<PaintQuad>,
     display_to_doc: Vec<usize>,
@@ -132,6 +133,7 @@ impl Element for EditorElement {
         let lines = shape_lines(window, &display_layout, &theme, &content);
 
         let cursor_display = display_layout.display_offset_for_doc(cursor_doc);
+        let caret_bounds = caret_bounds_for_display(&lines, cursor_display, bounds);
         let selection = if selected_range.is_empty() {
             None
         } else {
@@ -158,6 +160,7 @@ impl Element for EditorElement {
             lines,
             selection,
             cursor,
+            caret_bounds,
             blockquote_borders,
             code_block_backgrounds,
             display_to_doc: invert_doc_to_display(&display_layout),
@@ -180,6 +183,11 @@ impl Element for EditorElement {
             ElementInputHandler::new(bounds, self.editor.clone()),
             cx,
         );
+
+        self.editor.update(cx, |editor, _| {
+            editor.report_caret_bounds(prepaint.caret_bounds);
+            editor.sync_ime_cursor(window);
+        });
 
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
@@ -570,18 +578,26 @@ fn code_block_background_quads(
         .collect()
 }
 
+fn caret_bounds_for_display(
+    lines: &[LinePaintData],
+    display_offset: usize,
+    bounds: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let (x, y, height) = position_for_display_offset(lines, display_offset);
+    Bounds::new(
+        point(bounds.left() + px(EDITOR_GUTTER) + x, bounds.top() + y),
+        size(px(2.), height),
+    )
+}
+
 fn cursor_quad(
     lines: &[LinePaintData],
     display_offset: usize,
     bounds: Bounds<Pixels>,
     color: gpui::Hsla,
 ) -> PaintQuad {
-    let (x, y, height) = position_for_display_offset(lines, display_offset);
     fill(
-        Bounds::new(
-            point(bounds.left() + px(EDITOR_GUTTER) + x, bounds.top() + y),
-            size(px(2.), height),
-        ),
+        caret_bounds_for_display(lines, display_offset, bounds),
         color,
     )
 }

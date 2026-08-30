@@ -52,6 +52,8 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
         line_height: f32,
         caret_bounds: Option<Bounds<Pixels>>,
     );
+    /// Push the resolved IME origin to the platform (not only `bounds_for_range`).
+    fn sync_ime_cursor(&mut self, window: &mut Window);
 }
 
 /// Visible text of a leaf block plus a map back to source bytes.
@@ -455,6 +457,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
                     None
                 },
             );
+            host.sync_ime_cursor(window);
         });
 
         if let Some(selection) = prepaint.selection.take() {
@@ -817,6 +820,9 @@ impl<H: WysiwygHost> Element for WidgetImeSink<H> {
             ElementInputHandler::new(bounds, self.editor.clone()),
             cx,
         );
+        self.editor.update(cx, |host, _cx| {
+            host.sync_ime_cursor(window);
+        });
     }
 }
 

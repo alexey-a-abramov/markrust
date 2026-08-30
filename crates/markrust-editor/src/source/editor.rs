@@ -6,8 +6,8 @@ use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{
-    actions, App, Context, Entity, EntityInputHandler, FocusHandle, Focusable, Subscription, Task,
-    UTF16Selection, Window,
+    actions, App, Bounds, Context, Entity, EntityInputHandler, FocusHandle, Focusable, Pixels,
+    Subscription, Task, UTF16Selection, Window,
 };
 use markrust_core::Document;
 
@@ -69,6 +69,8 @@ pub struct MarkdownEditor {
     pub cursor_visible: bool,
     pub layout_cache: LineLayoutCache,
     pub last_bounds_line_height: f32,
+    last_caret_bounds: Option<Bounds<Pixels>>,
+    last_ime_origin: Option<Bounds<Pixels>>,
     _blink_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -100,6 +102,8 @@ impl MarkdownEditor {
             cursor_visible: false,
             layout_cache: LineLayoutCache::default(),
             last_bounds_line_height: 0.0,
+            last_caret_bounds: None,
+            last_ime_origin: None,
             _blink_task: Task::ready(()),
             _subscriptions: vec![focus_sub, blur_sub, doc_sub],
         }
@@ -370,6 +374,21 @@ impl MarkdownEditor {
         self.offset_from_utf16(content, range_utf16.start)
             ..self.offset_from_utf16(content, range_utf16.end)
     }
+
+    pub fn report_caret_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.last_caret_bounds = Some(bounds);
+    }
+
+    pub fn sync_ime_cursor(&mut self, window: &mut Window) {
+        let Some(origin) = self.last_caret_bounds else {
+            return;
+        };
+        if self.last_ime_origin == Some(origin) {
+            return;
+        }
+        self.last_ime_origin = Some(origin);
+        window.invalidate_character_coordinates();
+    }
 }
 
 impl Focusable for MarkdownEditor {
@@ -469,11 +488,16 @@ impl EntityInputHandler for MarkdownEditor {
     fn bounds_for_range(
         &mut self,
         _range_utf16: Range<usize>,
-        _bounds: gpui::Bounds<gpui::Pixels>,
+        bounds: gpui::Bounds<gpui::Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<gpui::Bounds<gpui::Pixels>> {
-        None
+        self.last_caret_bounds.or_else(|| {
+            Some(Bounds {
+                origin: bounds.origin,
+                size: gpui::size(gpui::px(2.), bounds.size.height.min(gpui::px(24.))),
+            })
+        })
     }
 
     fn character_index_for_point(
