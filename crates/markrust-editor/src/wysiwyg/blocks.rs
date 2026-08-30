@@ -248,7 +248,7 @@ fn paragraph_element(
     let mut images: Vec<(String, String)> = Vec::new(); // (alt, url)
     let text_style = base_text_style(theme, font_size, base_weight);
 
-    let mut push_run = |text: &mut String, runs: &mut Vec<TextRun>, s: &str, run: TextRun| {
+    let push_run = |text: &mut String, runs: &mut Vec<TextRun>, s: &str, run: TextRun| {
         if s.is_empty() {
             return;
         }
@@ -276,18 +276,18 @@ fn paragraph_element(
                 if marks.contains(MarkSet::STRIKE) {
                     run.strikethrough = Some(StrikethroughStyle {
                         thickness: px(1.),
-                        color: Some(theme.secondary_text.into()),
+                        color: Some(theme.secondary_text),
                     });
                 }
                 if marks.contains(MarkSet::CODE) {
                     run.font.family = theme.code_font_family.clone().into();
-                    run.background_color = Some(theme.code_bg.into());
+                    run.background_color = Some(theme.code_bg);
                 }
                 if link.is_some() {
-                    run.color = theme.link.into();
+                    run.color = theme.link;
                     run.underline = Some(UnderlineStyle {
                         thickness: px(1.),
-                        color: Some(theme.link.into()),
+                        color: Some(theme.link),
                         wavy: false,
                     });
                 }
@@ -298,7 +298,7 @@ fn paragraph_element(
                     images.push((alt.clone(), url.clone()));
                 } else {
                     let mut run = text_style.to_run(0);
-                    run.color = theme.image_text.into();
+                    run.color = theme.image_text;
                     run.font.style = FontStyle::Italic;
                     let label = format!("🖼 {alt}");
                     push_run(&mut text, &mut runs, &label, run);
@@ -314,7 +314,7 @@ fn paragraph_element(
             }
             Inline::OpaqueInline { raw, .. } => {
                 let mut run = text_style.to_run(0);
-                run.color = theme.secondary_text.into();
+                run.color = theme.secondary_text;
                 run.font.family = theme.code_font_family.clone().into();
                 push_run(&mut text, &mut runs, raw, run);
             }
@@ -357,13 +357,14 @@ fn resolve_image_source(snap: &Arc<RenderSnapshot>, url: &str) -> String {
 }
 
 fn base_text_style(theme: &EditorTheme, font_size: f32, weight: FontWeight) -> TextStyle {
-    let mut style = TextStyle::default();
-    style.color = theme.text.into();
-    style.font_family = theme.font_family.clone().into();
-    style.font_size = px(font_size).into();
-    style.font_weight = weight;
-    style.line_height = px(theme.line_height_for_font_size(font_size)).into();
-    style
+    TextStyle {
+        color: theme.text,
+        font_family: theme.font_family.clone().into(),
+        font_size: px(font_size).into(),
+        font_weight: weight,
+        line_height: px(theme.line_height_for_font_size(font_size)).into(),
+        ..Default::default()
+    }
 }
 
 fn code_runs(
