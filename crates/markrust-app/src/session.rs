@@ -28,6 +28,7 @@ pub enum WorkspaceCommand {
     SaveAs(PathBuf),
     OpenFile(PathBuf),
     OpenFolder(PathBuf),
+    OpenLaunchPath(PathBuf),
     ExportHtml {
         output: Option<PathBuf>,
     },
@@ -193,6 +194,7 @@ impl HeadlessWorkspace {
                 self.root = Some(path);
                 Ok(EditorOutcome::Noop)
             }
+            WorkspaceCommand::OpenLaunchPath(path) => self.open_launch_path(path),
             WorkspaceCommand::ExportHtml { output } => self.export_html(output),
             WorkspaceCommand::DropFiles { paths, target } => self.drop_files(paths, target),
             WorkspaceCommand::ToggleTheme => {
@@ -283,7 +285,42 @@ impl HeadlessWorkspace {
         let mut document = Document::from_file(path.clone())?;
         document.dirty = false;
         self.push_tab(HeadlessEditor::from_document(document), Some(&path));
+        self.dismiss_placeholder_untitled();
         Ok(EditorOutcome::Changed)
+    }
+
+    fn open_launch_path(&mut self, path: PathBuf) -> Result<EditorOutcome, SessionError> {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        if path.is_dir() {
+            self.root = Some(path);
+            return Ok(EditorOutcome::Changed);
+        }
+        if self.root.is_none() {
+            if let Some(parent) = path.parent() {
+                self.root = Some(parent.to_path_buf());
+            }
+        }
+        self.open_file(path)
+    }
+
+    fn dismiss_placeholder_untitled(&mut self) {
+        let placeholder = self.tabs.iter().position(|tab| {
+            tab.title == "Untitled"
+                && tab.editor.document().path.is_none()
+                && !tab.editor.document().dirty
+                && tab.editor.content().is_empty()
+        });
+        if let Some(index) = placeholder {
+            if self.tabs.len() > 1 {
+                let active_was = self.active_tab;
+                self.tabs.remove(index);
+                if active_was > index {
+                    self.active_tab = active_was - 1;
+                } else {
+                    self.active_tab = active_was.min(self.tabs.len() - 1);
+                }
+            }
+        }
     }
 
     fn export_html(&mut self, output: Option<PathBuf>) -> Result<EditorOutcome, SessionError> {
@@ -503,5 +540,30 @@ mod tests {
         assert_eq!(workspace.theme, ThemeChoice::Dark);
         workspace.apply(WorkspaceCommand::ToggleTheme).unwrap();
         assert_eq!(workspace.theme, ThemeChoice::Light);
+    }
+
+    #[test]
+    fn open_launch_path_opens_file_and_parent_folder() {
+        let dir = std::env::temp_dir().join("markrust-open-launch");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("note.md");
+        std::fs::write(&path, "# Hello\n").unwrap();
+        let mut workspace = HeadlessWorkspace::new();
+        workspace
+            .apply(WorkspaceCommand::OpenLaunchPath(path.clone()))
+            .unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        assert_eq!(
+            workspace
+                .active()
+                .and_then(|tab| tab.editor.document().path.clone()),
+            Some(canonical.clone())
+        );
+        assert_eq!(
+            workspace.root.as_ref().map(|p| p.as_path()),
+            canonical.parent()
+        );
+        assert_eq!(workspace.tabs().len(), 1);
+        assert_eq!(workspace.active().unwrap().editor.content(), "# Hello\n");
     }
 }

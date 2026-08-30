@@ -246,17 +246,18 @@ fn multi_tab_switch_dirty_and_close() {
     let mut workspace = HeadlessWorkspace::new();
     workspace.apply(WorkspaceCommand::OpenFile(a)).unwrap();
     workspace.apply(WorkspaceCommand::OpenFile(b)).unwrap();
-    assert_eq!(workspace.tabs().len(), 3);
-    workspace.apply(WorkspaceCommand::SwitchTab(1)).unwrap();
+    // Opening a real file dismisses the pristine Untitled placeholder tab.
+    assert_eq!(workspace.tabs().len(), 2);
+    workspace.apply(WorkspaceCommand::SwitchTab(0)).unwrap();
     workspace
         .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
             "x".into(),
         )))
         .unwrap();
-    assert!(workspace.tabs()[1].editor.document().dirty);
-    assert!(!workspace.tabs()[2].editor.document().dirty);
+    assert!(workspace.tabs()[0].editor.document().dirty);
+    assert!(!workspace.tabs()[1].editor.document().dirty);
     workspace.apply(WorkspaceCommand::CloseTab).unwrap();
-    assert_eq!(workspace.tabs().len(), 2);
+    assert_eq!(workspace.tabs().len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

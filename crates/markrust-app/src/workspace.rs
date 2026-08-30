@@ -97,6 +97,9 @@ impl Workspace {
             WorkspaceCommand::OpenFolder(path) => {
                 self.open_workspace(path, cx)?;
             }
+            WorkspaceCommand::OpenLaunchPath(path) => {
+                self.open_launch_path(path, window, cx)?;
+            }
             WorkspaceCommand::ExportHtml { output } => {
                 let tab = self
                     .active_tab()
