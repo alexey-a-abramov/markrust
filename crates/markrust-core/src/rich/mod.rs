@@ -237,34 +237,125 @@ mod tests {
         );
     }
 
-    #[test]
-    fn footnote_ref_is_opaque_inline_and_def_is_opaque_block() {
-        let tree = import("Hello[^1]\n\n[^1]: the note\n");
-        assert_eq!(tree.blocks.len(), 2);
-        assert_eq!(
-            inline_debug(&tree),
-            vec!["run:Hello", "html:[^1]"]
-        );
-        match &tree.blocks[1].kind {
-            BlockKind::Opaque { raw } => assert_eq!(raw, "[^1]: the note"),
-            other => panic!("expected opaque footnote def, got {other:?}"),
+    fn walk_blocks<'a>(blocks: &'a [Block], out: &mut Vec<&'a Block>) {
+        for b in blocks {
+            out.push(b);
+            walk_blocks(&b.children, out);
         }
-        assert_eq!(preserve("Hello[^1]\n\n[^1]: the note\n"), "Hello[^1]\n\n[^1]: the note\n");
+    }
+
+    fn inlines_have_bold(inlines: &[Inline]) -> bool {
+        inlines.iter().any(|i| match i {
+            Inline::Run { marks, .. } => marks.contains(MarkSet::BOLD),
+            _ => false,
+        })
     }
 
     #[test]
-    fn definition_list_is_one_opaque_block() {
+    fn footnote_ref_is_opaque_inline_and_def_is_nested_rich() {
+        let tree = import("Hello[^1]\n\n[^1]: the note\n");
+        assert_eq!(tree.blocks.len(), 2);
+        assert_eq!(inline_debug(&tree), vec!["run:Hello", "html:[^1]"]);
+        match &tree.blocks[1].kind {
+            BlockKind::FootnoteDefinition { label } => assert_eq!(label, "1"),
+            other => panic!("expected footnote def, got {other:?}"),
+        }
+        assert!(
+            !tree.blocks[1].children.is_empty(),
+            "footnote body is nested"
+        );
+        assert_eq!(
+            preserve("Hello[^1]\n\n[^1]: the note\n"),
+            "Hello[^1]\n\n[^1]: the note\n"
+        );
+    }
+
+    #[test]
+    fn footnote_def_body_parses_bold_link_and_code() {
+        let source = "See[^1]\n\n[^1]: **bold** and `code` and [a](https://e.com)\n";
+        let tree = import(source);
+        let def = tree
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::FootnoteDefinition { .. }))
+            .expect("footnote def");
+        let mut all = Vec::new();
+        walk_blocks(&def.children, &mut all);
+        let body = all
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Paragraph))
+            .expect("footnote body paragraph");
+        assert!(
+            inlines_have_bold(&body.inlines),
+            "expected nested bold, got {:?}",
+            body.inlines
+        );
+        let has_code = body.inlines.iter().any(|i| match i {
+            Inline::Run { marks, text, .. } => marks.contains(MarkSet::CODE) && text == "code",
+            _ => false,
+        });
+        assert!(has_code, "expected nested code, got {:?}", body.inlines);
+        let has_link = body.inlines.iter().any(|i| match i {
+            Inline::Run {
+                link: Some(l),
+                text,
+                ..
+            } => text == "a" && l.url == "https://e.com",
+            _ => false,
+        });
+        assert!(has_link, "expected nested link, got {:?}", body.inlines);
+        assert_eq!(preserve(source), source);
+    }
+
+    #[test]
+    fn definition_list_is_nested_rich() {
         let blank = import("Term\n\n: Definition\n");
         match &blank.blocks[0].kind {
-            BlockKind::Opaque { raw } => {
-                assert!(raw.contains("Term"), "{raw}");
-                assert!(raw.contains("Definition"), "{raw}");
-            }
-            other => panic!("expected opaque deflist, got {other:?}"),
+            BlockKind::DefinitionList => {}
+            other => panic!("expected definition list, got {other:?}"),
         }
         let tight = import("Term\n: Definition\n");
-        assert!(matches!(tight.blocks[0].kind, BlockKind::Opaque { .. }));
+        assert!(matches!(tight.blocks[0].kind, BlockKind::DefinitionList));
         assert_eq!(preserve("Term\n\n: Definition\n"), "Term\n\n: Definition\n");
+        assert_eq!(preserve("Term\n: Definition\n"), "Term\n: Definition\n");
+    }
+
+    #[test]
+    fn definition_details_parse_bold_link_and_code() {
+        let source = "Term\n\n: **bold** and `code` and [a](https://e.com)\n";
+        let tree = import(source);
+        let mut all = Vec::new();
+        walk_blocks(&tree.blocks, &mut all);
+        let details = all
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::DefinitionDetails))
+            .expect("definition details");
+        let mut nested = Vec::new();
+        walk_blocks(&details.children, &mut nested);
+        let body = nested
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Paragraph))
+            .expect("details paragraph");
+        assert!(
+            inlines_have_bold(&body.inlines),
+            "expected nested bold in details, got {:?}",
+            body.inlines
+        );
+        let has_code = body.inlines.iter().any(|i| match i {
+            Inline::Run { marks, text, .. } => marks.contains(MarkSet::CODE) && text == "code",
+            _ => false,
+        });
+        assert!(has_code, "expected nested code, got {:?}", body.inlines);
+        let has_link = body.inlines.iter().any(|i| match i {
+            Inline::Run {
+                link: Some(l),
+                text,
+                ..
+            } => text == "a" && l.url == "https://e.com",
+            _ => false,
+        });
+        assert!(has_link, "expected nested link, got {:?}", body.inlines);
+        assert_eq!(preserve(source), source);
     }
 
     #[test]
@@ -370,9 +461,8 @@ mod tests {
         "Hello[^1]\n\n[^1]: the note\n",
         "Term\n\n: Definition\n",
         "a <b>bold</b> and <br>break\n",
-        "Hello[^1]\n\n[^1]: the note\n",
-        "Term\n\n: Definition\n",
-        "a <b>bold</b> and <br>break\n",
+        "See[^1]\n\n[^1]: **bold** inside\n",
+        "Term\n\n: **bold** details\n",
     ];
 
     #[test]

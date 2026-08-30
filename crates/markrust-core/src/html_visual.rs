@@ -2,12 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Safe visual projection of raw HTML and Typora extras that import as opaque.
-//!
-//! Does not execute script, apply CSS, or follow `javascript:` URLs. Simple
-//! phrasing tags become marks; everything else is either hidden chrome or
-//! inner text. The rope / [`crate::rich::RichTree`] stay unchanged so Preserve
-//! identity is untouched.
+//! Safe visual projection of raw HTML and Typora extras (footnote refs,
+//! leftover opaque blocks). Does not execute script, apply CSS, or follow
+//! `javascript:` URLs. Simple phrasing tags become marks; everything else is
+//! either hidden chrome or inner text. Footnote definitions and definition
+//! lists import as nested [`crate::rich::RichTree`] nodes; this module still
+//! classifies `[^label]` refs and can project a leftover opaque blob.
 
 use std::ops::Range;
 
@@ -139,7 +139,12 @@ impl HtmlStack {
         bump(&mut self.italic, name, &["i", "em", "cite", "dfn"], true);
         bump(&mut self.strike, name, &["s", "del", "strike"], true);
         bump(&mut self.underline, name, &["u", "ins"], true);
-        bump(&mut self.code, name, &["code", "kbd", "samp", "tt", "var"], true);
+        bump(
+            &mut self.code,
+            name,
+            &["code", "kbd", "samp", "tt", "var"],
+            true,
+        );
         bump(&mut self.mark, name, &["mark"], true);
         bump(&mut self.sup, name, &["sup"], true);
         bump(&mut self.sub, name, &["sub", "small"], true);
@@ -160,7 +165,12 @@ impl HtmlStack {
         bump(&mut self.italic, name, &["i", "em", "cite", "dfn"], false);
         bump(&mut self.strike, name, &["s", "del", "strike"], false);
         bump(&mut self.underline, name, &["u", "ins"], false);
-        bump(&mut self.code, name, &["code", "kbd", "samp", "tt", "var"], false);
+        bump(
+            &mut self.code,
+            name,
+            &["code", "kbd", "samp", "tt", "var"],
+            false,
+        );
         bump(&mut self.mark, name, &["mark"], false);
         bump(&mut self.sup, name, &["sup"], false);
         bump(&mut self.sub, name, &["sub", "small"], false);
@@ -638,7 +648,10 @@ fn parse_attr(s: &str, start: usize) -> Option<(String, String, usize)> {
         }
         _ => {
             let vs = i;
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' && bytes[i] != b'/'
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && bytes[i] != b'>'
+                && bytes[i] != b'/'
             {
                 i += 1;
             }
@@ -794,7 +807,9 @@ mod tests {
         assert!(opaque_inline_is_caret_chrome("</b>"));
         assert!(opaque_inline_is_caret_chrome("<!-- x -->"));
         assert!(opaque_inline_is_caret_chrome("<br>"));
-        assert!(!opaque_inline_is_caret_chrome("<img src=\"a.png\" alt=\"x\">"));
+        assert!(!opaque_inline_is_caret_chrome(
+            "<img src=\"a.png\" alt=\"x\">"
+        ));
         assert!(!opaque_inline_is_caret_chrome("[^1]"));
         assert!(!opaque_inline_is_caret_chrome("not html"));
     }

@@ -21,8 +21,9 @@ use super::tree::{
 /// subset) plus sourcepos tracking. Also used by the background span extractor
 /// so source-mode masking and the rich tree share one grammar.
 ///
-/// Footnotes and description lists are Typora extras (not GFM). They import as
-/// opaque nodes so Preserve identity stays byte-exact; WYSIWYG paints them.
+/// Footnotes and description lists are Typora extras (not GFM). They import
+/// as nested containers so body Markdown is a rich tree; Preserve identity
+/// still uses the top-level source slice.
 pub(crate) fn parse_options() -> Options<'static> {
     let mut options = Options::default();
     options.extension.strikethrough = true;
@@ -187,6 +188,16 @@ impl<'s> Importer<'s> {
             NodeValue::TableRow(header) => (BlockKind::TableRow { header: *header }, true),
             NodeValue::TableCell => (BlockKind::TableCell, false),
             NodeValue::ThematicBreak => (BlockKind::ThematicBreak, false),
+            NodeValue::FootnoteDefinition(f) => (
+                BlockKind::FootnoteDefinition {
+                    label: f.name.clone(),
+                },
+                true,
+            ),
+            NodeValue::DescriptionList => (BlockKind::DefinitionList, true),
+            NodeValue::DescriptionItem(di) => (BlockKind::DefinitionItem { tight: di.tight }, true),
+            NodeValue::DescriptionTerm => (BlockKind::DefinitionTerm, true),
+            NodeValue::DescriptionDetails => (BlockKind::DefinitionDetails, true),
             // Everything else is inert and round-trips verbatim. comrak's
             // sourcepos for HTML blocks is unreliable, so prefer the literal.
             NodeValue::HtmlBlock(h) => (
@@ -237,6 +248,17 @@ impl<'s> Importer<'s> {
         if container {
             for child in node.children() {
                 block.children.push(self.import_block(child, ids));
+            }
+            // comrak sourcepos for DescriptionTerm/Details/Item is known-bad;
+            // expand to the children's real ranges so caret descent works.
+            if matches!(
+                block.kind,
+                BlockKind::DefinitionTerm
+                    | BlockKind::DefinitionDetails
+                    | BlockKind::DefinitionItem { .. }
+            ) {
+                cover_children(&mut block);
+                block.content_hash = super::engine::hash_str(self.slice(&block.source_range));
             }
         } else {
             let mut ctx = InlineCtx {
@@ -403,6 +425,17 @@ struct InlineCtx {
     marks: MarkSet,
     link: Option<LinkAttrs>,
     fidelity: MarkFidelity,
+}
+
+fn cover_children(block: &mut Block) {
+    for child in &block.children {
+        if child.source_range.start < block.source_range.start {
+            block.source_range.start = child.source_range.start;
+        }
+        if child.source_range.end > block.source_range.end {
+            block.source_range.end = child.source_range.end;
+        }
+    }
 }
 
 fn collect_text<'a>(node: &'a AstNode<'a>, out: &mut String) {

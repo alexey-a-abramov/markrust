@@ -261,6 +261,35 @@ impl<'a> Ser<'a> {
                     });
                 }
             }
+            BlockKind::FootnoteDefinition { label } => {
+                self.out.push_str("[^");
+                self.out.push_str(label);
+                self.out.push_str("]: ");
+                let marker_width = 5 + label.len(); // `[^{label}]: `
+                let saved = self.delim.len();
+                self.delim.push_str(&" ".repeat(marker_width));
+                self.emit_children(&block.children, false);
+                self.delim.truncate(saved);
+            }
+            BlockKind::DefinitionList => {
+                for (i, item) in block.children.iter().enumerate() {
+                    if i > 0 {
+                        self.blank_sep();
+                    }
+                    self.emit_definition_item(item);
+                }
+            }
+            BlockKind::DefinitionItem { .. } => self.emit_definition_item(block),
+            BlockKind::DefinitionTerm => {
+                self.emit_children(&block.children, true);
+            }
+            BlockKind::DefinitionDetails => {
+                self.out.push_str(": ");
+                let saved = self.delim.len();
+                self.delim.push_str("  ");
+                self.emit_children(&block.children, false);
+                self.delim.truncate(saved);
+            }
             BlockKind::Opaque { raw } => {
                 // Inert content; each continuation line re-prefixed so it
                 // stays inside the current container (quote, list item).
@@ -284,6 +313,50 @@ impl<'a> Ser<'a> {
                 }
             }
             self.emit_block(child, true);
+        }
+    }
+
+    fn emit_definition_item(&mut self, item: &Block) {
+        let tight = match &item.kind {
+            BlockKind::DefinitionItem { tight } => *tight,
+            _ => false,
+        };
+        let mut last_was_term = false;
+        let mut saw_any = false;
+        for child in &item.children {
+            match &child.kind {
+                BlockKind::DefinitionTerm => {
+                    if saw_any {
+                        self.line_break();
+                    }
+                    self.emit_block(child, true);
+                    last_was_term = true;
+                    saw_any = true;
+                }
+                BlockKind::DefinitionDetails => {
+                    if saw_any {
+                        if last_was_term && !tight {
+                            self.blank_sep();
+                        } else {
+                            self.line_break();
+                        }
+                    }
+                    self.out.push_str(": ");
+                    let saved = self.delim.len();
+                    self.delim.push_str("  ");
+                    self.emit_children(&child.children, tight);
+                    self.delim.truncate(saved);
+                    last_was_term = false;
+                    saw_any = true;
+                }
+                _ => {
+                    if saw_any {
+                        self.line_break();
+                    }
+                    self.emit_block(child, true);
+                    saw_any = true;
+                }
+            }
         }
     }
 

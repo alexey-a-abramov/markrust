@@ -72,10 +72,9 @@ pub fn visual_image(inline: &Inline) -> Option<(String, String, Range<usize>)> {
             source_range,
             ..
         } => Some((alt.clone(), url.clone(), source_range.clone())),
-        Inline::OpaqueInline { raw, source_range, .. } => {
-            html_visual::html_inline_image(raw)
-                .map(|(url, alt)| (alt, url, source_range.clone()))
-        }
+        Inline::OpaqueInline {
+            raw, source_range, ..
+        } => html_visual::html_inline_image(raw).map(|(url, alt)| (alt, url, source_range.clone())),
         _ => None,
     }
 }
@@ -203,11 +202,9 @@ mod tests {
         let inlines = &tree.blocks[0].inlines;
         match classify_paragraph(inlines) {
             ParagraphFlow::TextOnly => 1,
-            ParagraphFlow::Standalone => inlines
-                .iter()
-                .filter(|i| is_visual_image(i))
-                .count()
-                .max(1),
+            ParagraphFlow::Standalone => {
+                inlines.iter().filter(|i| is_visual_image(i)).count().max(1)
+            }
             ParagraphFlow::Mixed => {
                 let widths = estimate_mixed_widths(inlines, font_size);
                 pack_runs(&widths, container).len()

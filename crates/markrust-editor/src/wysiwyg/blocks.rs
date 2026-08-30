@@ -201,6 +201,23 @@ fn render_block<H: WysiwygHost>(
         BlockKind::Table { alignments } => render_table(snap, block, alignments, editor),
         BlockKind::TableRow { .. } | BlockKind::TableCell => div().into_any_element(),
         BlockKind::ThematicBreak => thematic_rule(theme),
+        BlockKind::FootnoteDefinition { label } => {
+            render_footnote_def_nested(snap, block, label, editor)
+        }
+        BlockKind::DefinitionList => render_definition_list_nested(snap, block, editor),
+        BlockKind::DefinitionItem { .. } => render_definition_item(snap, block, editor),
+        BlockKind::DefinitionTerm => {
+            render_nested_inlines(snap, block, theme.font_size, FontWeight::SEMIBOLD, editor)
+        }
+        BlockKind::DefinitionDetails => {
+            let inner =
+                render_nested_inlines(snap, block, theme.font_size, FontWeight::NORMAL, editor);
+            div()
+                .pl(px(16.))
+                .text_color(theme.secondary_text)
+                .child(inner)
+                .into_any_element()
+        }
         BlockKind::Opaque { raw } => render_opaque(snap, block, raw, editor),
     }
 }
@@ -267,6 +284,98 @@ fn render_opaque<H: WysiwygHost>(
     }
 }
 
+fn render_footnote_def_nested<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    block: &Block,
+    label: &str,
+    editor: Entity<H>,
+) -> AnyElement {
+    let theme = &snap.theme;
+    let mark = to_superscript(label).unwrap_or_else(|| label.to_string());
+    let body: Vec<AnyElement> = block
+        .children
+        .iter()
+        .map(|child| {
+            render_nested_inlines(
+                snap,
+                child,
+                theme.font_size * 0.95,
+                FontWeight::NORMAL,
+                editor.clone(),
+            )
+        })
+        .collect();
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(8.))
+        .my(px(4.))
+        .pt(px(8.))
+        .border_t_1()
+        .border_color(theme.separator)
+        .child(div().text_color(theme.link).child(SharedString::from(mark)))
+        .child(
+            div()
+                .flex_1()
+                .text_color(theme.secondary_text)
+                .children(body),
+        )
+        .into_any_element()
+}
+
+fn render_definition_list_nested<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    block: &Block,
+    editor: Entity<H>,
+) -> AnyElement {
+    let rows: Vec<AnyElement> = block
+        .children
+        .iter()
+        .map(|item| render_definition_item(snap, item, editor.clone()))
+        .collect();
+    div().my(px(4.)).children(rows).into_any_element()
+}
+
+fn render_definition_item<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    item: &Block,
+    editor: Entity<H>,
+) -> AnyElement {
+    let children: Vec<AnyElement> = item
+        .children
+        .iter()
+        .map(|child| render_block(snap, child, editor.clone()))
+        .collect();
+    div()
+        .flex()
+        .flex_col()
+        .mb(px(8.))
+        .children(children)
+        .into_any_element()
+}
+
+fn render_nested_inlines<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    block: &Block,
+    font_size: f32,
+    weight: FontWeight,
+    editor: Entity<H>,
+) -> AnyElement {
+    if matches!(block.kind, BlockKind::Paragraph) || !block.inlines.is_empty() {
+        return paragraph_element(snap, block, font_size, weight, editor);
+    }
+    if block.children.is_empty() {
+        return div().into_any_element();
+    }
+    let children: Vec<AnyElement> = block
+        .children
+        .iter()
+        .map(|child| render_nested_inlines(snap, child, font_size, weight, editor.clone()))
+        .collect();
+    div().children(children).into_any_element()
+}
+
 fn render_footnote_def(theme: &EditorTheme, label: &str, body: &str) -> AnyElement {
     let mark = to_superscript(label).unwrap_or_else(|| label.to_string());
     let text_style = base_text_style(theme, theme.font_size * 0.95, FontWeight::NORMAL);
@@ -279,16 +388,11 @@ fn render_footnote_def(theme: &EditorTheme, label: &str, body: &str) -> AnyEleme
         .pt(px(8.))
         .border_t_1()
         .border_color(theme.separator)
+        .child(div().text_color(theme.link).child(SharedString::from(mark)))
         .child(
-            div()
-                .text_color(theme.link)
-                .child(SharedString::from(mark)),
-        )
-        .child(
-            div()
-                .flex_1()
-                .text_color(theme.secondary_text)
-                .child(StyledText::new(body.to_string()).with_default_highlights(&text_style, vec![])),
+            div().flex_1().text_color(theme.secondary_text).child(
+                StyledText::new(body.to_string()).with_default_highlights(&text_style, vec![]),
+            ),
         )
         .into_any_element()
 }
@@ -296,27 +400,21 @@ fn render_footnote_def(theme: &EditorTheme, label: &str, body: &str) -> AnyEleme
 fn render_definition_list(theme: &EditorTheme, items: Vec<(String, String)>) -> AnyElement {
     let term_style = base_text_style(theme, theme.font_size, FontWeight::SEMIBOLD);
     let detail_style = base_text_style(theme, theme.font_size, FontWeight::NORMAL);
-    let rows: Vec<AnyElement> = items
-        .into_iter()
-        .map(|(term, details)| {
-            div()
-                .flex()
-                .flex_col()
-                .mb(px(8.))
-                .child(
-                    StyledText::new(term).with_default_highlights(&term_style, vec![]),
-                )
-                .child(
-                    div()
-                        .pl(px(16.))
-                        .text_color(theme.secondary_text)
-                        .child(
-                            StyledText::new(details).with_default_highlights(&detail_style, vec![]),
-                        ),
-                )
-                .into_any_element()
-        })
-        .collect();
+    let rows: Vec<AnyElement> =
+        items
+            .into_iter()
+            .map(|(term, details)| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .mb(px(8.))
+                    .child(StyledText::new(term).with_default_highlights(&term_style, vec![]))
+                    .child(div().pl(px(16.)).text_color(theme.secondary_text).child(
+                        StyledText::new(details).with_default_highlights(&detail_style, vec![]),
+                    ))
+                    .into_any_element()
+            })
+            .collect();
     div().my(px(4.)).children(rows).into_any_element()
 }
 
@@ -542,8 +640,7 @@ fn paragraph_element<H: WysiwygHost>(
                         );
                     }
                     InlineSegment::Image { index } => {
-                        if let Some((alt, url, source_range)) =
-                            visual_image(&block.inlines[index])
+                        if let Some((alt, url, source_range)) = visual_image(&block.inlines[index])
                         {
                             children.push(render_image(
                                 snap,

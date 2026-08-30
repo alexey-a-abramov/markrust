@@ -451,7 +451,9 @@ fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
                     Inline::Run { source_range, .. } | Inline::Image { source_range, .. } => {
                         out.push(source_range.clone());
                     }
-                    Inline::OpaqueInline { source_range, raw, .. } => {
+                    Inline::OpaqueInline {
+                        source_range, raw, ..
+                    } => {
                         if !crate::html_visual::opaque_inline_is_caret_chrome(raw) {
                             out.push(source_range.clone());
                         }

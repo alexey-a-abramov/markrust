@@ -69,6 +69,11 @@ impl Block {
                 | BlockKind::ListItem { .. }
                 | BlockKind::Table { .. }
                 | BlockKind::TableRow { .. }
+                | BlockKind::FootnoteDefinition { .. }
+                | BlockKind::DefinitionList
+                | BlockKind::DefinitionItem { .. }
+                | BlockKind::DefinitionTerm
+                | BlockKind::DefinitionDetails
         )
     }
 }
@@ -135,8 +140,19 @@ pub enum BlockKind {
     },
     TableCell,
     ThematicBreak,
-    /// Anything we do not model (HTML blocks, footnote definitions, math,
-    /// ...): inert, serialized verbatim from `raw`.
+    /// `[^label]:` footnote definition; children are the body blocks.
+    FootnoteDefinition {
+        label: String,
+    },
+    /// PHP-Extra / Typora definition list (`term` / `: details`).
+    DefinitionList,
+    DefinitionItem {
+        tight: bool,
+    },
+    DefinitionTerm,
+    DefinitionDetails,
+    /// Anything we do not model (HTML blocks, math, ...): inert, serialized
+    /// verbatim from `raw`.
     Opaque {
         raw: String,
     },

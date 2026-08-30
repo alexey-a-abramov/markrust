@@ -196,7 +196,10 @@ pub fn build_html_block_layout(
         run.len = pr.len;
         runs.push(run);
     }
-    let mut mapped: Vec<usize> = source_at.iter().map(|o| block_start.saturating_add(*o)).collect();
+    let mut mapped: Vec<usize> = source_at
+        .iter()
+        .map(|o| block_start.saturating_add(*o))
+        .collect();
     if text.is_empty() {
         mapped = vec![block_start, block_start];
         runs = vec![text_style.to_run(1)];
@@ -367,8 +370,8 @@ pub fn build_leaf_layout_inlines(
                 }
                 markrust_core::html_visual::InlineHtmlAction::FootnoteRef { label } => {
                     let paint = html.paint();
-                    let visible = markrust_core::html_visual::to_superscript(&label)
-                        .unwrap_or(label);
+                    let visible =
+                        markrust_core::html_visual::to_superscript(&label).unwrap_or(label);
                     let mut run = style_run(
                         text_style,
                         theme,
@@ -1012,12 +1015,16 @@ impl<H: WysiwygHost> Element for WidgetImeSink<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use markrust_core::rich::{import_markdown, IdGen};
+    use markrust_core::rich::{import_markdown, Block, BlockKind, IdGen};
 
     fn layout_for(source: &str) -> LeafLayout {
         let mut ids = IdGen::default();
         let tree = import_markdown(source, &mut ids);
         let block = &tree.blocks[0];
+        layout_of(block)
+    }
+
+    fn layout_of(block: &Block) -> LeafLayout {
         let theme = EditorTheme::dark();
         let style = TextStyle {
             color: theme.text,
@@ -1026,6 +1033,30 @@ mod tests {
             ..Default::default()
         };
         build_leaf_layout(block, &style, &theme, gpui::FontWeight::NORMAL)
+    }
+
+    fn first_paragraph(block: &Block) -> Option<&Block> {
+        if matches!(block.kind, BlockKind::Paragraph) {
+            return Some(block);
+        }
+        for child in &block.children {
+            if let Some(p) = first_paragraph(child) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    fn first_kind(blocks: &[Block], pred: impl Fn(&BlockKind) -> bool + Copy) -> Option<&Block> {
+        for b in blocks {
+            if pred(&b.kind) {
+                return Some(b);
+            }
+            if let Some(found) = first_kind(&b.children, pred) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     #[test]
@@ -1102,7 +1133,10 @@ mod tests {
             layout.text
         );
         assert!(
-            layout.runs.iter().any(|run| run.font.weight == gpui::FontWeight::BOLD),
+            layout
+                .runs
+                .iter()
+                .any(|run| run.font.weight == gpui::FontWeight::BOLD),
             "expected bold paint on inner HTML text, runs={:?}",
             layout.runs
         );
@@ -1133,6 +1167,59 @@ mod tests {
             !layout.text.contains("[^"),
             "footnote syntax must not paint, got {:?}",
             layout.text
+        );
+    }
+
+    #[test]
+    fn footnote_def_body_paints_nested_bold() {
+        let source = "See[^1]\n\n[^1]: **bold** note\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let def = tree
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::FootnoteDefinition { .. }))
+            .expect("footnote def");
+        let body = first_paragraph(def).expect("footnote body");
+        let layout = layout_of(body);
+        assert_eq!(layout.text, "bold note");
+        assert!(
+            !layout.text.contains('*'),
+            "markers must not paint, got {:?}",
+            layout.text
+        );
+        assert!(
+            layout
+                .runs
+                .iter()
+                .any(|run| run.font.weight == gpui::FontWeight::BOLD),
+            "expected bold paint inside footnote, runs={:?}",
+            layout.runs
+        );
+    }
+
+    #[test]
+    fn definition_details_paint_nested_bold() {
+        let source = "Term\n\n: **bold** details\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let details = first_kind(&tree.blocks, |k| matches!(k, BlockKind::DefinitionDetails))
+            .expect("definition details");
+        let body = first_paragraph(details).expect("details body");
+        let layout = layout_of(body);
+        assert_eq!(layout.text, "bold details");
+        assert!(
+            !layout.text.contains('*'),
+            "markers must not paint, got {:?}",
+            layout.text
+        );
+        assert!(
+            layout
+                .runs
+                .iter()
+                .any(|run| run.font.weight == gpui::FontWeight::BOLD),
+            "expected bold paint inside definition details, runs={:?}",
+            layout.runs
         );
     }
 
