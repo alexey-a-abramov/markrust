@@ -33,6 +33,7 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     fn caret_visible(&self) -> bool;
     fn is_selecting(&self) -> bool;
     fn focused(&self, window: &Window) -> bool;
+    fn widget_editing(&self) -> bool;
     fn input_focus_handle(&self) -> FocusHandle;
     fn toggle_task(&mut self, id: NodeId, cx: &mut Context<Self>);
     fn edit_code_info(&mut self, id: NodeId, cx: &mut Context<Self>);
@@ -87,6 +88,18 @@ impl LeafLayout {
             }
         }
         best.min(self.text.len())
+    }
+
+    pub fn contains_source(&self, src: usize) -> bool {
+        let start = *self.source_at.first().unwrap_or(&self.block_start);
+        let end = *self.source_at.last().unwrap_or(&self.block_start);
+        src >= start && src <= end
+    }
+
+    pub fn source_span_len(&self) -> usize {
+        let start = *self.source_at.first().unwrap_or(&self.block_start);
+        let end = *self.source_at.last().unwrap_or(&self.block_start);
+        end.saturating_sub(start)
     }
 }
 
@@ -422,7 +435,8 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
         let font_size = self.font_size;
         let line_height_px = self.line_height;
         let caret_in_leaf = source_in_leaf(&self.layout, caret);
-        if caret_in_leaf {
+        let widget_editing = self.editor.read(cx).widget_editing();
+        if caret_in_leaf && !widget_editing {
             window.handle_input(
                 &focus,
                 ElementInputHandler::new(bounds, self.editor.clone()),
@@ -640,9 +654,7 @@ fn shape_layout(
 }
 
 fn source_in_leaf(layout: &LeafLayout, src: usize) -> bool {
-    let start = *layout.source_at.first().unwrap_or(&layout.block_start);
-    let end = *layout.source_at.last().unwrap_or(&layout.block_start);
-    src >= start && src <= end
+    layout.contains_source(src)
 }
 
 fn ranges_touch_leaf(layout: &LeafLayout, sel: &Range<usize>) -> bool {
@@ -793,12 +805,18 @@ impl<H: WysiwygHost> Element for WidgetImeSink<H> {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
-        _window: &mut Window,
-        _cx: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) {
+        let focus = self.editor.read(cx).input_focus_handle();
+        window.handle_input(
+            &focus,
+            ElementInputHandler::new(bounds, self.editor.clone()),
+            cx,
+        );
     }
 }
 
@@ -853,5 +871,9 @@ mod tests {
         assert_eq!(layout.text, "fn x() {}");
         assert_eq!(layout.source_for_visible(0), 10);
         assert_eq!(layout.source_for_visible(5), 15);
+        assert!(layout.contains_source(10));
+        assert!(layout.contains_source(19));
+        assert!(!layout.contains_source(9));
+        assert!(!layout.contains_source(20));
     }
 }

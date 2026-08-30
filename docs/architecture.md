@@ -50,7 +50,7 @@ SyntaxNodeSpan map (revision-stamped)  — source-mode masking only
 RichEngine::sync → RichTree              — WYSIWYG + commands
         ↓
 Source: compute_visibility + layout + paint
-WYSIWYG: virtualized block list + BlockTextElement
+WYSIWYG: virtualized block list + BlockTextElement; IME origin from the focused widget or caret leaf (`wysiwyg/ime.rs`)
 ```
 
 Parse and the folder watcher `recv` stay off the GPUI UI thread. `Document::new` / `from_file` only *schedule* a parse; the frame drains with `apply_pending_parse`. CI timeout tests (`crates/markrust-core/tests/perf_gates.rs`, `crates/markrust-editor/tests/perf_gates.rs`) fail if load+parse or source layout of a 256 KiB fixture exceeds a budget. Local numbers: `cargo bench -p markrust-core --bench parse` and `cargo bench -p markrust-editor --bench layout`.

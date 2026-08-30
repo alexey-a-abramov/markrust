@@ -7,6 +7,7 @@
 
 mod block_text;
 mod blocks;
+mod ime;
 mod view;
 
 pub use view::RichEditorView;

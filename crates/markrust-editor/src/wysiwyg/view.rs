@@ -21,6 +21,7 @@ use markrust_core::Document;
 
 use super::block_text::{hit_test_leaf, LeafLayout, WidgetImeSink, WysiwygHost};
 use super::blocks::{render_top_block, RenderSnapshot};
+use super::ime::{caret_from_element_bounds, widget_caret_rect, ImeLeafHit, ImeOriginState};
 use crate::headless::{CaretMove, EditorCommand, EditorOutcome};
 use crate::theme::EditorTheme;
 
@@ -61,14 +62,6 @@ impl WidgetEdit {
     }
 }
 
-#[derive(Clone)]
-struct ImeLeaf {
-    layout: Arc<LeafLayout>,
-    bounds: Bounds<Pixels>,
-    font_size: f32,
-    line_height: f32,
-}
-
 pub struct RichEditorView {
     document: Entity<Document>,
     pub theme: EditorTheme,
@@ -83,10 +76,7 @@ pub struct RichEditorView {
     is_selecting: bool,
     cursor_visible: bool,
     focus_handle: FocusHandle,
-    last_ime_bounds: Option<Bounds<Pixels>>,
-    widget_ime_bounds: Option<Bounds<Pixels>>,
-    ime_leaf: Option<ImeLeaf>,
-    ime_leaves: Vec<ImeLeaf>,
+    ime: ImeOriginState,
     widget_edit: WidgetEdit,
     widget_preedit: Option<String>,
     _blink_task: Task<()>,
@@ -123,10 +113,7 @@ impl RichEditorView {
             is_selecting: false,
             cursor_visible: true,
             focus_handle,
-            last_ime_bounds: None,
-            widget_ime_bounds: None,
-            ime_leaf: None,
-            ime_leaves: Vec::new(),
+            ime: ImeOriginState::default(),
             widget_edit: WidgetEdit::Idle,
             widget_preedit: None,
             _blink_task: Task::ready(()),
@@ -605,7 +592,6 @@ impl RichEditorView {
 
     fn commit_widget_edit(&mut self, cx: &mut Context<Self>) -> bool {
         self.widget_preedit = None;
-        self.widget_ime_bounds = None;
         let edit = std::mem::take(&mut self.widget_edit);
         match edit {
             WidgetEdit::Idle => false,
@@ -685,6 +671,10 @@ impl WysiwygHost for RichEditorView {
         self.focus_handle.is_focused(window)
     }
 
+    fn widget_editing(&self) -> bool {
+        !matches!(self.widget_edit, WidgetEdit::Idle)
+    }
+
     fn input_focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
     }
@@ -760,11 +750,7 @@ impl WysiwygHost for RichEditorView {
     }
 
     fn report_widget_bounds(&mut self, bounds: Bounds<Pixels>) {
-        self.widget_ime_bounds = Some(bounds);
-        self.last_ime_bounds = Some(Bounds {
-            origin: gpui::point(bounds.origin.x + bounds.size.width, bounds.origin.y),
-            size: gpui::size(px(2.), bounds.size.height.min(px(22.))),
-        });
+        self.ime.report_widget(bounds);
     }
 
     fn preedit(&self) -> Option<&str> {
@@ -783,24 +769,13 @@ impl WysiwygHost for RichEditorView {
         line_height: f32,
         caret_bounds: Option<Bounds<Pixels>>,
     ) {
-        let leaf = ImeLeaf {
+        self.ime.report_leaf(ImeLeafHit {
             layout,
             bounds: element_bounds,
             font_size,
             line_height,
-        };
-        if matches!(self.widget_edit, WidgetEdit::Idle) {
-            if let Some(caret) = caret_bounds {
-                self.last_ime_bounds = Some(caret);
-                self.ime_leaf = Some(ImeLeaf {
-                    layout: leaf.layout.clone(),
-                    bounds: leaf.bounds,
-                    font_size,
-                    line_height,
-                });
-            }
-        }
-        self.ime_leaves.push(leaf);
+            caret_bounds,
+        });
     }
 }
 
@@ -945,25 +920,13 @@ impl EntityInputHandler for RichEditorView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        if !matches!(self.widget_edit, WidgetEdit::Idle) {
-            if let Some(caret) = self.last_ime_bounds {
-                return Some(caret);
-            }
-            if let Some(widget) = self.widget_ime_bounds {
-                return Some(Bounds {
-                    origin: gpui::point(widget.origin.x + widget.size.width, widget.origin.y),
-                    size: gpui::size(px(2.), widget.size.height.min(px(22.))),
-                });
-            }
-        }
-        if let Some(caret) = self.last_ime_bounds {
+        if let Some(caret) = self.ime.caret_rect() {
             return Some(caret);
         }
-        self.last_ime_bounds = Some(bounds);
-        Some(Bounds {
-            origin: bounds.origin,
-            size: gpui::size(px(2.), bounds.size.height.min(px(24.))),
-        })
+        if self.ime.widget_focused() {
+            return Some(widget_caret_rect(bounds));
+        }
+        Some(caret_from_element_bounds(bounds))
     }
 
     fn character_index_for_point(
@@ -972,22 +935,14 @@ impl EntityInputHandler for RichEditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
-        if !matches!(self.widget_edit, WidgetEdit::Idle) {
+        if self.ime.widget_focused() {
             if let Some((draft, preedit)) = self.widget_display() {
                 let content = format!("{}{}", draft, preedit.unwrap_or_default());
                 return Some(Self::offset_to_utf16(&content, content.len()));
             }
         }
         let theme = self.theme.clone();
-        let leaf = self
-            .ime_leaves
-            .iter()
-            .find(|leaf| leaf.bounds.contains(&point))
-            .or_else(|| {
-                self.ime_leaf
-                    .as_ref()
-                    .filter(|leaf| leaf.bounds.contains(&point))
-            })?;
+        let leaf = self.ime.leaf_at_point(point)?;
         let layout = leaf.layout.clone();
         let bounds = leaf.bounds;
         let font_size = leaf.font_size;
@@ -1009,7 +964,10 @@ impl EntityInputHandler for RichEditorView {
 
 impl Render for RichEditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ime_leaves.clear();
+        self.ime.begin_frame(
+            !matches!(self.widget_edit, WidgetEdit::Idle),
+            self.cursor_offset(),
+        );
         let snapshot = self.sync_snapshot(cx);
         let theme = self.theme.clone();
         let editor = cx.entity();

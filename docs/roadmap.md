@@ -29,13 +29,13 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 | P2 | `rich/serialize.rs` + `rich/escape.rs` (delimiter-stack serializer), `rich/save.rs` (SaveCandidates + diff hunks), corpus test suite | ✅ done |
 | P3 | `rich/engine.rs` (NodeId stability, splices, caret snap/step, line map, outline) + **read-only WYSIWYG view** (`markrust-editor::wysiwyg`) + per-tab mode toggle (cmd-shift-m / toolbar) | ✅ done |
 | P4 | **Editing core** — `RichCommand` layer, Transaction undo upgrade (typing coalescing + caret restore), WYSIWYG caret/selection/hit-testing/IME | ✅ done |
-| P5 | Lists/tasks UX (Enter/Tab, checkbox clicks); input rules; code language chip; image alt/caption editing; IME caret bounds; stable-width inline delimiter masking | 🚧 in progress (widget IME now reports chip/caption/frontmatter bounds; not proven with a real IME candidate window) |
+| P5 | Lists/tasks UX (Enter/Tab, checkbox clicks); input rules; code language chip; image alt/caption editing; IME caret bounds; stable-width inline delimiter masking | 🚧 in progress (IME origin is derived from the focused widget/leaf in unit tests; OS candidate window not proven) |
 | P6 | Tables: cell editing, Tab nav, insert/delete row/col, header constraints, right-click menu | ✅ done (contextual table toolbar when the caret is in a table; right-click focuses the cell; GPUI has no OS-native pixel-accurate context menu) |
 | P7 | Frontmatter in-place title/tags; Normalize review dialog on save | ✅ done (title, description, tags, and a YAML body field; hunk preview in the save prompt) |
 | P8 | External-edit reconciliation (`map_offset_across_change`, `apply_external_edit` / `apply_merged_edit`, 3-way dirty-tab merge) | ✅ done (proven by `three_way_merge` + headless dirty-tab merge e2e; overlapping edits still prompt) |
 | P9 | Side-by-side + polish + migration (source spans from comrak; delete tree-sitter-md; docs rewrite; criterion perf gates; optionally retire masking) | ✅ done (masking/`spans.rs` kept on purpose for source mode — the retire item was optional) |
 
-**The Typora WYSIWYG GOAL is not complete.** P0–P4 and P6–P9 have test evidence. P5 still lacks a real-OS IME candidate-window proof (bounds are reported; no automated IME session).
+**The Typora WYSIWYG GOAL is not complete.** P0–P4 and P6–P9 have test evidence. P5 still lacks a real-OS IME candidate-window proof (origin rectangles are unit-tested; no automated IME session).
 
 ### Proven invariants (enforced by tests — keep them green)
 
@@ -55,7 +55,7 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 - `crates/markrust-core/src/offset_map.rs` — `map_offset_across_change` (nimbalyst port).
 - `crates/markrust-core/src/merge.rs` — `three_way_merge` for dirty-tab disk reconciliation.
 - `crates/markrust-core/src/document.rs` — `saved_content`, `apply_external_edit`, `apply_merged_edit`, `peel_typing_range`.
-- `crates/markrust-editor/src/wysiwyg/` — `view` (RichEditorView over virtualized `list()`), `blocks` (per-kind renderers), `block_text` (caret/hit-testing/IME host).
+- `crates/markrust-editor/src/wysiwyg/` — `view` (RichEditorView over virtualized `list()`), `blocks` (per-kind renderers), `block_text` (caret/hit-testing/IME host), `ime` (IME origin from the focused widget/leaf).
 - `crates/markrust-editor/src/source/` — the masking source editor (fallback and source/split panes).
 - `crates/markrust-core/src/perf_fixture.rs` — 256 KiB mixed GFM used by parse/layout budget tests and criterion benches.
 - `crates/markrust-app/src/crash.rs` — panic logger (see Crash handling).
@@ -72,7 +72,8 @@ Shipped this pass (keep previous bullets; this pass added):
 - **P9:** tree-sitter-md removed from `markrust-core`. `extract_syntax_spans` walks the comrak AST (shared `parse_options` / `LineStarts` with `rich::import`). Background parser still off the UI thread. Source mode remains masking, now grammar-aligned with WYSIWYG. Split mode in the window (source | rich). Criterion benches plus CI timeout tests gate load+parse (`extract_syntax_spans` / `import_markdown`) and source-mode `build_display_layout` on a 256 KiB fixture.
 - P8: dirty tabs 3-way merge (`three_way_merge` + `Document::apply_merged_edit`); own-save watcher events ignored (`ours == theirs`); conflict still prompts. Autosave no longer spuriously prompts reload after it writes.
 - P7: Normalize save prompt includes a hunk preview (`SaveCandidates::hunk_preview`). Frontmatter panel edits title, description, tags, and the inner YAML body.
-- Chip/caption/frontmatter IME: `WidgetImeSink` reports widget bounds; text-leaf caret is not used as the IME origin while a widget is focused.
+- Chip/caption/frontmatter IME: `WidgetImeSink` reports widget bounds and takes `handle_input` while focused so body leaves cannot steal the IME handler. Origin is the widget overlay's trailing caret, not the last painted text leaf.
+- IME origin (`wysiwyg/ime.rs`): `bounds_for_range` uses `ImeOriginState` — focused widget, else the leaf whose source range contains the document caret (wrapped-line caret rect, table cell, body). Unit tests assert a later decoy leaf cannot steal the rect. **Does not prove the OS candidate window follows.**
 - Input-rule polish: `_`/`__` italic/bold, nested italic inside bold, list-item-local `# ` / fences, `Document::peel_typing_range` so heading conversion is one undo even when the prefix was a slice of a longer Typing tx. `[` / `]` / `<` type as raw (task lists, links, HTML); fences/thematic breaks do not insert newlines inside table cells.
 - P6: delete row/col (keep ≥1 of each); first row stays header; insert caret lands in the new cell; contextual table toolbar when the caret is in a table; right-click focuses the cell (toolbar follows).
 
@@ -80,13 +81,13 @@ Previously shipped:
 - Input rules as pure functions in `rich/input_rules.rs` (`# `, `- `/`* `/`+ `, `1. `/`1) `, `> `, fences, `---`/`***`/`___`, auto-close `*`/`**`/`_`/`__`/` `/`~~`), disabled in code/raw, heading+space is one undo group.
 - `SetCodeInfo` / `SetImageAlt` / `SetFrontmatter` commands. WYSIWYG: clickable language chip and image caption (click → type → Enter commits).
 - Fenced code bodies are editable `BlockTextElement`s (not inert `StyledText`).
-- IME: `bounds_for_range` uses the painted caret rect; `character_index_for_point` hit-tests the focused leaf.
+- IME: `bounds_for_range` / `character_index_for_point` go through `ImeOriginState` (superseded by the origin resolver above).
 - Source-mode inline delimiters keep glyph width when masked (transparent paint) so unmasking does not wrap the line. Block markers (`#`, list bullets) still collapse to visual chrome.
 - P6: `TableTab` (Tab/Shift-Tab in a table), `InsertTableRow` / `InsertTableColumn` (Tab on the last cell inserts a row). Cells were already `BlockTextElement`s.
 - File-open hang fix remains: watcher `recv` on a background task; parse via `apply_pending_parse` off the frame.
 
 Still open (do not shrink the goal):
-- Chip/caption/frontmatter IME candidate window: bounds are reported from the widget overlay; needs a real IME session to prove the OS candidate window follows. **This is the remaining P5 gap; the GOAL is not complete.**
+- IME candidate window: origin rectangles are unit-tested for body caret, wrapped lines, table cells, language chip, image caption, and frontmatter fields. A human must still enable a CJK IME in the GUI (Hiragana / Pinyin / etc.) and confirm the OS candidate window follows the caret in each of those surfaces. **This is the remaining P5 gap; the GOAL is not complete.**
 - Masking/`parser.rs`/`spans.rs` are not deleted (source mode still uses them; they project comrak, not tree-sitter-md). Fenced-code highlighting still uses tree-sitter rust/json/yaml/bash — that stays.
 
 Earlier P5 (still in):
