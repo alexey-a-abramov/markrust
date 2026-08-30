@@ -105,6 +105,122 @@ impl LeafLayout {
     }
 }
 
+fn visible_for_html(s: &str, paint: &markrust_core::html_visual::HtmlPaint) -> String {
+    use markrust_core::html_visual::{to_subscript, to_superscript};
+    if paint.sup && !paint.sub {
+        if let Some(t) = to_superscript(s) {
+            return t;
+        }
+    }
+    if paint.sub && !paint.sup {
+        if let Some(t) = to_subscript(s) {
+            return t;
+        }
+    }
+    s.to_string()
+}
+
+fn style_run(
+    text_style: &TextStyle,
+    theme: &EditorTheme,
+    base_weight: gpui::FontWeight,
+    marks: MarkSet,
+    md_link: bool,
+    paint: &markrust_core::html_visual::HtmlPaint,
+) -> TextRun {
+    let mut run = text_style.to_run(0);
+    let bold = paint.bold || marks.contains(MarkSet::BOLD);
+    let italic = paint.italic || marks.contains(MarkSet::ITALIC);
+    let strike = paint.strike || marks.contains(MarkSet::STRIKE);
+    let code = paint.code || marks.contains(MarkSet::CODE);
+    run.font.weight = if bold {
+        gpui::FontWeight::BOLD
+    } else {
+        base_weight
+    };
+    if italic {
+        run.font.style = gpui::FontStyle::Italic;
+    }
+    if strike {
+        // Inherit the run color so strike-through stays on the
+        // glyph (Typora-style), including links and emphasis.
+        run.strikethrough = Some(gpui::StrikethroughStyle {
+            thickness: px(1.),
+            color: None,
+        });
+    }
+    if code {
+        run.font.family = theme.code_font_family.clone().into();
+        run.background_color = Some(theme.code_bg);
+    } else if paint.mark {
+        run.background_color = Some(theme.accent.opacity(0.22));
+    }
+    if paint.underline {
+        run.underline = Some(gpui::UnderlineStyle {
+            thickness: px(1.),
+            color: Some(theme.text),
+            wavy: false,
+        });
+    }
+    if md_link || paint.href.is_some() {
+        run.color = theme.link;
+        run.underline = Some(gpui::UnderlineStyle {
+            thickness: px(1.),
+            color: Some(theme.link),
+            wavy: false,
+        });
+    }
+    run
+}
+
+/// Layout for a projected HTML block (tags stripped). `source_at` is relative
+/// to the HTML literal; `block_start` is the document offset of that literal.
+pub fn build_html_block_layout(
+    text: &str,
+    source_at: &[usize],
+    paints: &[markrust_core::html_visual::HtmlPaintRun],
+    block_start: usize,
+    text_style: &TextStyle,
+    theme: &EditorTheme,
+) -> LeafLayout {
+    let mut runs = Vec::new();
+    for pr in paints {
+        let mut run = style_run(
+            text_style,
+            theme,
+            gpui::FontWeight::NORMAL,
+            MarkSet::empty(),
+            false,
+            &pr.paint,
+        );
+        run.len = pr.len;
+        runs.push(run);
+    }
+    let mut mapped: Vec<usize> = source_at.iter().map(|o| block_start.saturating_add(*o)).collect();
+    if text.is_empty() {
+        mapped = vec![block_start, block_start];
+        runs = vec![text_style.to_run(1)];
+    } else if mapped.len() < text.len() + 1 {
+        while mapped.len() < text.len() + 1 {
+            mapped.push(*mapped.last().unwrap_or(&block_start));
+        }
+    }
+    mapped.truncate(text.len() + 1);
+    let covered: usize = runs.iter().map(|r| r.len).sum();
+    if covered != text.len() && !text.is_empty() {
+        runs = vec![text_style.to_run(text.len())];
+    }
+    if runs.is_empty() {
+        runs.push(text_style.to_run(text.len().max(1)));
+    }
+    LeafLayout {
+        text: text.to_string(),
+        runs,
+        source_at: mapped,
+        block_start,
+    }
+}
+
 pub fn build_leaf_layout(
     block: &Block,
     text_style: &TextStyle,
@@ -164,6 +280,8 @@ pub fn build_leaf_layout_inlines(
         runs.push(run);
     };
 
+    let mut html = markrust_core::html_visual::HtmlStack::default();
+
     for inline in inlines {
         match inline {
             Inline::Run {
@@ -173,40 +291,24 @@ pub fn build_leaf_layout_inlines(
                 source_range,
                 ..
             } => {
-                let mut run = text_style.to_run(0);
-                run.font.weight = if marks.contains(MarkSet::BOLD) {
-                    gpui::FontWeight::BOLD
-                } else {
-                    base_weight
-                };
-                if marks.contains(MarkSet::ITALIC) {
-                    run.font.style = gpui::FontStyle::Italic;
+                if html.hidden() {
+                    continue;
                 }
-                if marks.contains(MarkSet::STRIKE) {
-                    // Inherit the run color so strike-through stays on the
-                    // glyph (Typora-style), including links and emphasis.
-                    run.strikethrough = Some(gpui::StrikethroughStyle {
-                        thickness: px(1.),
-                        color: None,
-                    });
-                }
-                if marks.contains(MarkSet::CODE) {
-                    run.font.family = theme.code_font_family.clone().into();
-                    run.background_color = Some(theme.code_bg);
-                }
-                if link.is_some() {
-                    run.color = theme.link;
-                    run.underline = Some(gpui::UnderlineStyle {
-                        thickness: px(1.),
-                        color: Some(theme.link),
-                        wavy: false,
-                    });
-                }
+                let paint = html.paint();
+                let visible = visible_for_html(t, &paint);
+                let run = style_run(
+                    text_style,
+                    theme,
+                    base_weight,
+                    *marks,
+                    link.is_some(),
+                    &paint,
+                );
                 push(
                     &mut text,
                     &mut runs,
                     &mut source_at,
-                    t,
+                    &visible,
                     source_range.clone(),
                     run,
                 );
@@ -216,13 +318,26 @@ pub fn build_leaf_layout_inlines(
                 // surrounding visible text only.
             }
             Inline::SoftBreak => {
-                let run = text_style.to_run(0);
+                if html.hidden() {
+                    continue;
+                }
+                let run = style_run(
+                    text_style,
+                    theme,
+                    base_weight,
+                    MarkSet::empty(),
+                    false,
+                    &html.paint(),
+                );
                 let src = block_range.start;
                 push(&mut text, &mut runs, &mut source_at, " ", src..src + 1, run);
             }
             Inline::HardBreak {
                 style: BreakStyle::TwoSpaces | BreakStyle::Backslash,
             } => {
+                if html.hidden() {
+                    continue;
+                }
                 let run = text_style.to_run(0);
                 let src = block_range.start;
                 push(
@@ -236,19 +351,56 @@ pub fn build_leaf_layout_inlines(
             }
             Inline::OpaqueInline {
                 raw, source_range, ..
-            } => {
-                let mut run = text_style.to_run(0);
-                run.color = theme.secondary_text;
-                run.font.family = theme.code_font_family.clone().into();
-                push(
-                    &mut text,
-                    &mut runs,
-                    &mut source_at,
-                    raw,
-                    source_range.clone(),
-                    run,
-                );
-            }
+            } => match markrust_core::html_visual::classify_opaque_inline(raw, &mut html) {
+                markrust_core::html_visual::InlineHtmlAction::Hide
+                | markrust_core::html_visual::InlineHtmlAction::Image { .. } => {}
+                markrust_core::html_visual::InlineHtmlAction::Break => {
+                    let run = text_style.to_run(0);
+                    push(
+                        &mut text,
+                        &mut runs,
+                        &mut source_at,
+                        "\n",
+                        source_range.clone(),
+                        run,
+                    );
+                }
+                markrust_core::html_visual::InlineHtmlAction::FootnoteRef { label } => {
+                    let paint = html.paint();
+                    let visible = markrust_core::html_visual::to_superscript(&label)
+                        .unwrap_or(label);
+                    let mut run = style_run(
+                        text_style,
+                        theme,
+                        base_weight,
+                        MarkSet::empty(),
+                        true,
+                        &paint,
+                    );
+                    run.underline = None;
+                    push(
+                        &mut text,
+                        &mut runs,
+                        &mut source_at,
+                        &visible,
+                        source_range.clone(),
+                        run,
+                    );
+                }
+                markrust_core::html_visual::InlineHtmlAction::Raw => {
+                    let mut run = text_style.to_run(0);
+                    run.color = theme.secondary_text;
+                    run.font.family = theme.code_font_family.clone().into();
+                    push(
+                        &mut text,
+                        &mut runs,
+                        &mut source_at,
+                        raw,
+                        source_range.clone(),
+                        run,
+                    );
+                }
+            },
         }
     }
 
@@ -938,6 +1090,50 @@ mod tests {
         assert_eq!(two_spaces.text, "a\nb", "two-space hard break");
         let backslash = layout_for("a\\\nb\n");
         assert_eq!(backslash.text, "a\nb", "backslash hard break");
+    }
+
+    #[test]
+    fn inline_html_tags_are_hidden_and_inner_text_is_styled() {
+        let layout = layout_for("hello <b>bold</b> world\n");
+        assert_eq!(layout.text, "hello bold world");
+        assert!(
+            !layout.text.contains('<'),
+            "tags must not paint, got {:?}",
+            layout.text
+        );
+        assert!(
+            layout.runs.iter().any(|run| run.font.weight == gpui::FontWeight::BOLD),
+            "expected bold paint on inner HTML text, runs={:?}",
+            layout.runs
+        );
+    }
+
+    #[test]
+    fn inline_html_br_is_a_visible_newline() {
+        let layout = layout_for("a<br>b\n");
+        assert_eq!(layout.text, "a\nb");
+    }
+
+    #[test]
+    fn inline_html_comment_is_hidden() {
+        let layout = layout_for("a<!-- secret -->b\n");
+        assert_eq!(layout.text, "ab");
+        assert!(!layout.text.contains("secret"));
+    }
+
+    #[test]
+    fn footnote_ref_paints_as_superscript() {
+        let layout = layout_for("Hello[^1]\n\n[^1]: the note\n");
+        assert!(
+            layout.text.contains('¹') || layout.text.contains('1'),
+            "expected a footnote marker, got {:?}",
+            layout.text
+        );
+        assert!(
+            !layout.text.contains("[^"),
+            "footnote syntax must not paint, got {:?}",
+            layout.text
+        );
     }
 
     #[test]

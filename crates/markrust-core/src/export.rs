@@ -8,13 +8,16 @@ use std::path::{Path, PathBuf};
 
 use comrak::{markdown_to_html, Options};
 
-/// Render Markdown source to an HTML fragment using GFM extensions.
+/// Render Markdown source to an HTML fragment using GFM extensions plus
+/// Typora extras that the rich tree also parses (footnotes, description lists).
 pub fn markdown_to_html_gfm(source: &str) -> String {
     let mut options = Options::default();
     options.extension.strikethrough = true;
     options.extension.table = true;
     options.extension.autolink = true;
     options.extension.tasklist = true;
+    options.extension.footnotes = true;
+    options.extension.description_lists = true;
     options.extension.tagfilter = true;
     options.extension.front_matter_delimiter = Some("---".into());
     options.render.unsafe_ = true;

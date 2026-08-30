@@ -448,10 +448,13 @@ fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
         _ => {
             for inline in &block.inlines {
                 match inline {
-                    Inline::Run { source_range, .. }
-                    | Inline::Image { source_range, .. }
-                    | Inline::OpaqueInline { source_range, .. } => {
+                    Inline::Run { source_range, .. } | Inline::Image { source_range, .. } => {
                         out.push(source_range.clone());
+                    }
+                    Inline::OpaqueInline { source_range, raw, .. } => {
+                        if !crate::html_visual::opaque_inline_is_caret_chrome(raw) {
+                            out.push(source_range.clone());
+                        }
                     }
                     Inline::SoftBreak | Inline::HardBreak { .. } => {}
                 }
@@ -593,6 +596,16 @@ mod tests {
         let close = source.find("**ated").unwrap_or(6);
         let snapped_left = engine.snap_caret(close + 1, Bias::Left);
         assert_eq!(snapped_left, 6);
+    }
+
+    #[test]
+    fn snap_caret_skips_inline_html_tags() {
+        let source = "hello <b>bold</b>!\n";
+        let (_doc, engine) = engine_for(source);
+        let tag = source.find("<b>").unwrap();
+        assert_eq!(engine.snap_caret(tag + 1, Bias::Right), tag + 3);
+        let close = source.find("</b>").unwrap();
+        assert_eq!(engine.snap_caret(close + 1, Bias::Left), close);
     }
 
     #[test]

@@ -197,6 +197,76 @@ mod tests {
         assert!(matches!(tree.blocks[1].kind, BlockKind::Paragraph));
     }
 
+    fn inline_debug(tree: &RichTree) -> Vec<String> {
+        tree.blocks[0]
+            .inlines
+            .iter()
+            .map(|i| match i {
+                Inline::Run { text, .. } => format!("run:{text}"),
+                Inline::OpaqueInline { raw, .. } => format!("html:{raw}"),
+                Inline::SoftBreak => "soft".into(),
+                Inline::HardBreak { .. } => "hard".into(),
+                Inline::Image { alt, url, .. } => format!("img:{alt}:{url}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inline_html_tags_are_opaque_around_inner_text() {
+        let tree = import("hello <b>bold</b> world\n");
+        assert_eq!(
+            inline_debug(&tree),
+            vec![
+                "run:hello ",
+                "html:<b>",
+                "run:bold",
+                "html:</b>",
+                "run: world",
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_html_br_and_comment_are_opaque() {
+        let br = import("a<br>b\n");
+        assert_eq!(inline_debug(&br), vec!["run:a", "html:<br>", "run:b"]);
+        let comment = import("a<!-- x -->b\n");
+        assert_eq!(
+            inline_debug(&comment),
+            vec!["run:a", "html:<!-- x -->", "run:b"]
+        );
+    }
+
+    #[test]
+    fn footnote_ref_is_opaque_inline_and_def_is_opaque_block() {
+        let tree = import("Hello[^1]\n\n[^1]: the note\n");
+        assert_eq!(tree.blocks.len(), 2);
+        assert_eq!(
+            inline_debug(&tree),
+            vec!["run:Hello", "html:[^1]"]
+        );
+        match &tree.blocks[1].kind {
+            BlockKind::Opaque { raw } => assert_eq!(raw, "[^1]: the note"),
+            other => panic!("expected opaque footnote def, got {other:?}"),
+        }
+        assert_eq!(preserve("Hello[^1]\n\n[^1]: the note\n"), "Hello[^1]\n\n[^1]: the note\n");
+    }
+
+    #[test]
+    fn definition_list_is_one_opaque_block() {
+        let blank = import("Term\n\n: Definition\n");
+        match &blank.blocks[0].kind {
+            BlockKind::Opaque { raw } => {
+                assert!(raw.contains("Term"), "{raw}");
+                assert!(raw.contains("Definition"), "{raw}");
+            }
+            other => panic!("expected opaque deflist, got {other:?}"),
+        }
+        let tight = import("Term\n: Definition\n");
+        assert!(matches!(tight.blocks[0].kind, BlockKind::Opaque { .. }));
+        assert_eq!(preserve("Term\n\n: Definition\n"), "Term\n\n: Definition\n");
+    }
+
     #[test]
     fn links_and_images_carry_attrs() {
         let source = "[text](https://e.com \"T\") ![alt](img.png) <https://auto.link>\n";
@@ -297,6 +367,12 @@ mod tests {
         "task:\n\n- [x] done\n- [ ] todo\n",
         "text with `code` and ~~strike~~ and [link](https://e.com)\n",
         "<div>\nhtml\n</div>\n\npara\n",
+        "Hello[^1]\n\n[^1]: the note\n",
+        "Term\n\n: Definition\n",
+        "a <b>bold</b> and <br>break\n",
+        "Hello[^1]\n\n[^1]: the note\n",
+        "Term\n\n: Definition\n",
+        "a <b>bold</b> and <br>break\n",
     ];
 
     #[test]

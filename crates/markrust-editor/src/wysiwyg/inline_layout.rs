@@ -8,10 +8,10 @@
 //! are a horizontal stack of runs (hug-width text + height-capped image) that
 //! wrap as units. Standalone image paragraphs stay block-sized.
 
-use markrust_core::rich::Inline;
-
-#[cfg(test)]
 use std::ops::Range;
+
+use markrust_core::html_visual;
+use markrust_core::rich::Inline;
 
 /// Display height of an inline image, in ems of the surrounding font.
 pub const INLINE_IMAGE_EM: f32 = 1.5;
@@ -54,13 +54,34 @@ pub enum InlineSegment {
 }
 
 pub fn classify_paragraph(inlines: &[Inline]) -> ParagraphFlow {
-    let has_image = inlines.iter().any(|i| matches!(i, Inline::Image { .. }));
+    let has_image = inlines.iter().any(is_visual_image);
     let has_text = inlines.iter().any(inline_has_visible_text);
     match (has_image, has_text) {
         (false, _) => ParagraphFlow::TextOnly,
         (true, false) => ParagraphFlow::Standalone,
         (true, true) => ParagraphFlow::Mixed,
     }
+}
+
+/// Markdown `![alt](url)` or a safe inline HTML `<img>`.
+pub fn visual_image(inline: &Inline) -> Option<(String, String, Range<usize>)> {
+    match inline {
+        Inline::Image {
+            alt,
+            url,
+            source_range,
+            ..
+        } => Some((alt.clone(), url.clone(), source_range.clone())),
+        Inline::OpaqueInline { raw, source_range, .. } => {
+            html_visual::html_inline_image(raw)
+                .map(|(url, alt)| (alt, url, source_range.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn is_visual_image(inline: &Inline) -> bool {
+    visual_image(inline).is_some()
 }
 
 pub fn image_role(flow: ParagraphFlow) -> Option<ImageRole> {
@@ -80,7 +101,7 @@ pub fn inline_segments(inlines: &[Inline]) -> Vec<InlineSegment> {
     let mut out = Vec::new();
     let mut text_start = 0usize;
     for (i, inline) in inlines.iter().enumerate() {
-        if matches!(inline, Inline::Image { .. }) {
+        if is_visual_image(inline) {
             if text_start < i {
                 out.push(InlineSegment::Text {
                     start: text_start,
@@ -128,7 +149,15 @@ pub fn pack_runs(widths: &[f32], container: f32) -> Vec<Range<usize>> {
 fn inline_has_visible_text(inline: &Inline) -> bool {
     match inline {
         Inline::Run { text, .. } => !text.trim().is_empty(),
-        Inline::OpaqueInline { raw, .. } => !raw.trim().is_empty(),
+        Inline::OpaqueInline { raw, .. } => {
+            if html_visual::html_inline_image(raw).is_some()
+                || html_visual::opaque_inline_is_caret_chrome(raw)
+            {
+                false
+            } else {
+                !raw.trim().is_empty()
+            }
+        }
         Inline::Image { .. } | Inline::SoftBreak | Inline::HardBreak { .. } => false,
     }
 }
@@ -176,7 +205,7 @@ mod tests {
             ParagraphFlow::TextOnly => 1,
             ParagraphFlow::Standalone => inlines
                 .iter()
-                .filter(|i| matches!(i, Inline::Image { .. }))
+                .filter(|i| is_visual_image(i))
                 .count()
                 .max(1),
             ParagraphFlow::Mixed => {

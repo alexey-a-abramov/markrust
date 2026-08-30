@@ -12,16 +12,19 @@ use gpui::{
     div, img, prelude::*, px, AnyElement, CursorStyle, Entity, FontWeight, MouseButton, ObjectFit,
     SharedString, StyledText, TextStyle,
 };
+use markrust_core::html_visual::{
+    definition_list_items, footnote_definition, project_html_block, to_superscript, HtmlBlockVisual,
+};
 use markrust_core::rich::{Block, BlockKind, ColumnAlign, Inline, NodeId, RichTree};
 
 use super::block_text::{
-    build_code_layout, build_leaf_layout, build_leaf_layout_inlines, BlockTextElement,
-    WidgetImeSink, WysiwygHost,
+    build_code_layout, build_html_block_layout, build_leaf_layout, build_leaf_layout_inlines,
+    BlockTextElement, WidgetImeSink, WysiwygHost,
 };
 use super::image::{resolve_image_source, ResolvedImage};
 use super::inline_layout::{
-    classify_paragraph, image_role, inline_image_height, inline_segments, ImageRole, InlineSegment,
-    ParagraphFlow, BLOCK_IMAGE_MAX_HEIGHT, BLOCK_IMAGE_MAX_WIDTH,
+    classify_paragraph, image_role, inline_image_height, inline_segments, visual_image, ImageRole,
+    InlineSegment, ParagraphFlow, BLOCK_IMAGE_MAX_HEIGHT, BLOCK_IMAGE_MAX_WIDTH,
 };
 use crate::highlight::highlight_code_block;
 use crate::theme::EditorTheme;
@@ -197,25 +200,124 @@ fn render_block<H: WysiwygHost>(
         }
         BlockKind::Table { alignments } => render_table(snap, block, alignments, editor),
         BlockKind::TableRow { .. } | BlockKind::TableCell => div().into_any_element(),
-        BlockKind::ThematicBreak => div()
-            .w_full()
-            .my(px(16.))
-            .h(px(1.))
-            .bg(theme.table_delimiter)
-            .into_any_element(),
-        BlockKind::Opaque { raw } => {
-            let text_style = base_text_style(theme, theme.font_size * 0.9, FontWeight::NORMAL);
-            div()
-                .my(px(2.))
-                .p(px(8.))
-                .rounded_md()
-                .bg(theme.code_bg)
-                .font_family(theme.code_font_family.clone())
-                .text_color(theme.secondary_text)
-                .child(StyledText::new(raw.clone()).with_default_highlights(&text_style, vec![]))
-                .into_any_element()
+        BlockKind::ThematicBreak => thematic_rule(theme),
+        BlockKind::Opaque { raw } => render_opaque(snap, block, raw, editor),
+    }
+}
+
+fn thematic_rule(theme: &EditorTheme) -> AnyElement {
+    div()
+        .w_full()
+        .my(px(16.))
+        .h(px(1.))
+        .bg(theme.table_delimiter)
+        .into_any_element()
+}
+
+fn render_opaque<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    block: &Block,
+    raw: &str,
+    editor: Entity<H>,
+) -> AnyElement {
+    let theme = &snap.theme;
+    if let Some((label, body)) = footnote_definition(raw) {
+        return render_footnote_def(theme, label, body);
+    }
+    if let Some(items) = definition_list_items(raw) {
+        return render_definition_list(theme, items);
+    }
+    match project_html_block(raw) {
+        HtmlBlockVisual::Hidden => div().into_any_element(),
+        HtmlBlockVisual::ThematicBreak => thematic_rule(theme),
+        HtmlBlockVisual::Image { url, alt } => render_image(
+            snap,
+            &alt,
+            &url,
+            block.source_range.clone(),
+            editor,
+            ImageRole::Block,
+            theme.font_size,
+        ),
+        HtmlBlockVisual::Flow {
+            text,
+            source_at,
+            runs,
+        } => {
+            let text_style = base_text_style(theme, theme.font_size, FontWeight::NORMAL);
+            let layout = build_html_block_layout(
+                &text,
+                &source_at,
+                &runs,
+                block.source_range.start,
+                &text_style,
+                theme,
+            );
+            let line_height = theme.line_height_for_font_size(theme.font_size);
+            BlockTextElement {
+                editor,
+                layout: Arc::new(layout),
+                font_size: theme.font_size,
+                line_height,
+                theme: theme.clone(),
+                hug_width: false,
+            }
+            .into_any_element()
         }
     }
+}
+
+fn render_footnote_def(theme: &EditorTheme, label: &str, body: &str) -> AnyElement {
+    let mark = to_superscript(label).unwrap_or_else(|| label.to_string());
+    let text_style = base_text_style(theme, theme.font_size * 0.95, FontWeight::NORMAL);
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(8.))
+        .my(px(4.))
+        .pt(px(8.))
+        .border_t_1()
+        .border_color(theme.separator)
+        .child(
+            div()
+                .text_color(theme.link)
+                .child(SharedString::from(mark)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_color(theme.secondary_text)
+                .child(StyledText::new(body.to_string()).with_default_highlights(&text_style, vec![])),
+        )
+        .into_any_element()
+}
+
+fn render_definition_list(theme: &EditorTheme, items: Vec<(String, String)>) -> AnyElement {
+    let term_style = base_text_style(theme, theme.font_size, FontWeight::SEMIBOLD);
+    let detail_style = base_text_style(theme, theme.font_size, FontWeight::NORMAL);
+    let rows: Vec<AnyElement> = items
+        .into_iter()
+        .map(|(term, details)| {
+            div()
+                .flex()
+                .flex_col()
+                .mb(px(8.))
+                .child(
+                    StyledText::new(term).with_default_highlights(&term_style, vec![]),
+                )
+                .child(
+                    div()
+                        .pl(px(16.))
+                        .text_color(theme.secondary_text)
+                        .child(
+                            StyledText::new(details).with_default_highlights(&detail_style, vec![]),
+                        ),
+                )
+                .into_any_element()
+        })
+        .collect();
+    div().my(px(4.)).children(rows).into_any_element()
 }
 
 fn render_list<H: WysiwygHost>(
@@ -388,18 +490,12 @@ fn paragraph_element<H: WysiwygHost>(
         ParagraphFlow::Standalone => {
             let mut children: Vec<AnyElement> = Vec::new();
             for inline in &block.inlines {
-                if let Inline::Image {
-                    alt,
-                    url,
-                    source_range,
-                    ..
-                } = inline
-                {
+                if let Some((alt, url, source_range)) = visual_image(inline) {
                     children.push(render_image(
                         snap,
-                        alt,
-                        url,
-                        source_range.clone(),
+                        &alt,
+                        &url,
+                        source_range,
                         editor.clone(),
                         ImageRole::Block,
                         font_size,
@@ -446,18 +542,14 @@ fn paragraph_element<H: WysiwygHost>(
                         );
                     }
                     InlineSegment::Image { index } => {
-                        if let Inline::Image {
-                            alt,
-                            url,
-                            source_range,
-                            ..
-                        } = &block.inlines[index]
+                        if let Some((alt, url, source_range)) =
+                            visual_image(&block.inlines[index])
                         {
                             children.push(render_image(
                                 snap,
-                                alt,
-                                url,
-                                source_range.clone(),
+                                &alt,
+                                &url,
+                                source_range,
                                 editor.clone(),
                                 role,
                                 font_size,

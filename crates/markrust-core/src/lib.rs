@@ -8,6 +8,7 @@ pub mod buffer;
 pub mod document;
 pub mod export;
 pub mod frontmatter;
+pub mod html_visual;
 pub mod line_index;
 pub mod merge;
 pub mod mode;

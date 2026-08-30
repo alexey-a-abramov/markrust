@@ -20,12 +20,17 @@ use super::tree::{
 /// Parse options shared with `export::markdown_to_html_gfm` (parse-relevant
 /// subset) plus sourcepos tracking. Also used by the background span extractor
 /// so source-mode masking and the rich tree share one grammar.
+///
+/// Footnotes and description lists are Typora extras (not GFM). They import as
+/// opaque nodes so Preserve identity stays byte-exact; WYSIWYG paints them.
 pub(crate) fn parse_options() -> Options<'static> {
     let mut options = Options::default();
     options.extension.strikethrough = true;
     options.extension.table = true;
     options.extension.autolink = true;
     options.extension.tasklist = true;
+    options.extension.footnotes = true;
+    options.extension.description_lists = true;
     options.extension.front_matter_delimiter = Some("---".into());
     options.render.sourcepos = true;
     options

@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Normalize-on-save dialog shows a line hunk preview.
 - Chip/caption/frontmatter IME origin uses the widget bounds, not the last text-leaf caret. Body/wrapped/table IME origin is the focused leaf's caret rect (not last-painted). Caret moves and widget focus push that origin via GPUI `invalidate_character_coordinates`. The OS IME candidate window is still unverified.
 - WYSIWYG local images render as pixels (filesystem path, background decode) with alt/caption still editable. Mixed text+image paragraphs lay out as a wrapping horizontal line-box (inline images capped at 1.5em); a standalone image paragraph stays block-sized. Remote `http(s)` images fetch off the UI thread into a URL-keyed cache, then use the same `PathBuf` pipeline; timeouts and failures keep the alt placeholder. Thematic breaks, autolink paint, strikethrough, and hard-break newlines match the rendered document instead of source chrome.
+- WYSIWYG paints safe inline and block HTML instead of raw tags (phrasing marks, `<br>`, comments hidden, script/iframe/`javascript:` dropped). Footnote references paint as superscripts; footnote definitions and definition lists paint as structured blocks. Parse still uses the background worker; the folder watcher still `recv`s off the UI thread. Mermaid fences stay code blocks (no small in-process SVG renderer without a large layout crate).
 
 ### Changed
 
