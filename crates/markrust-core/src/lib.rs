@@ -1,4 +1,4 @@
-//! MarkRust core: rope-backed document buffer, undo/redo, Markdown parsing, syntax spans.
+//! MarkRust core: rope-backed document buffer, undo/redo, Markdown parsing via comrak, syntax spans.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -9,6 +9,7 @@ pub mod document;
 pub mod export;
 pub mod frontmatter;
 pub mod line_index;
+pub mod merge;
 pub mod mode;
 pub mod offset_map;
 pub mod parser;
@@ -26,8 +27,9 @@ pub use export::{
 };
 pub use frontmatter::{parse_frontmatter, upsert_yaml_key, FrontmatterInfo};
 pub use line_index::LineIndex;
-pub use offset_map::map_offset_across_change;
+pub use merge::{three_way_merge, MergeOutcome};
 pub use mode::DocumentProcessingMode;
+pub use offset_map::map_offset_across_change;
 pub use parser::{extract_syntax_spans, BackgroundMarkdownParser, ParseSnapshot, ParseUpdate};
 pub use spans::{DelimiterSpan, SyntaxKind, SyntaxNodeSpan, TableRowKind};
 pub use undo::{EditOperation, SelectionSnapshot, Transaction, TransactionKind, UndoStack};

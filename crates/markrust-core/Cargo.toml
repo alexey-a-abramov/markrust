@@ -9,14 +9,12 @@ repository.workspace = true
 homepage.workspace = true
 description = "Document buffer, Markdown parsing, and syntax spans for MarkRust"
 readme = "../../README.md"
-keywords = ["markdown", "rope", "tree-sitter", "document", "parser"]
+keywords = ["markdown", "rope", "document", "parser"]
 categories = ["text-processing", "parser-implementations"]
 exclude = ["../../target", "../../.github", "../../packaging", "../../scripts"]
 
 [dependencies]
 ropey = { workspace = true }
-tree-sitter = { workspace = true }
-tree-sitter-md = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 comrak = "0.36"

@@ -66,6 +66,7 @@ mod tests {
             language: None,
             task_checked: None,
             table_row: None,
+            heading_level: None,
         }
     }
 
@@ -114,6 +115,8 @@ pub struct SyntaxNodeSpan {
     pub task_checked: Option<bool>,
     /// Table row role when `kind == Table`.
     pub table_row: Option<TableRowKind>,
+    /// ATX/setext heading level when `kind == Heading`.
+    pub heading_level: Option<u8>,
 }
 
 impl SyntaxNodeSpan {

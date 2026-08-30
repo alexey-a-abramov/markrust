@@ -45,6 +45,50 @@ impl SaveCandidates {
     pub fn differs(&self) -> bool {
         self.preserved != self.normalized
     }
+
+    /// Line-oriented preview of Normalize changes for the save dialog.
+    pub fn hunk_preview(&self, max_lines: usize) -> String {
+        if !self.differs() {
+            return String::new();
+        }
+        let old_lines: Vec<&str> = self.preserved.lines().collect();
+        let new_lines: Vec<&str> = self.normalized.lines().collect();
+        let mut out = String::new();
+        let mut shown = 0usize;
+        for hunk in &self.hunks {
+            if shown >= max_lines {
+                out.push('…');
+                out.push('\n');
+                break;
+            }
+            let DiffHunk::Replace { old, new } = hunk else {
+                continue;
+            };
+            for i in old.clone() {
+                if shown >= max_lines {
+                    break;
+                }
+                if let Some(line) = old_lines.get(i) {
+                    out.push_str("- ");
+                    out.push_str(line);
+                    out.push('\n');
+                    shown += 1;
+                }
+            }
+            for i in new.clone() {
+                if shown >= max_lines {
+                    break;
+                }
+                if let Some(line) = new_lines.get(i) {
+                    out.push_str("+ ");
+                    out.push_str(line);
+                    out.push('\n');
+                    shown += 1;
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Compute both save candidates for the document.
@@ -135,5 +179,19 @@ mod tests {
         let candidates = save_candidates(&doc, &mut engine);
         assert_eq!(candidates.preserved, candidates.normalized);
         assert!(!candidates.differs());
+    }
+
+    #[test]
+    fn hunk_preview_lists_replaced_lines() {
+        let source = "Title\n=====\n\npara\n";
+        let doc = Document::new(source);
+        let mut engine = RichEngine::new();
+        let candidates = save_candidates(&doc, &mut engine);
+        let preview = candidates.hunk_preview(16);
+        assert!(
+            preview.contains("- Title") || preview.contains("- ====="),
+            "{preview}"
+        );
+        assert!(preview.contains('+'), "{preview}");
     }
 }

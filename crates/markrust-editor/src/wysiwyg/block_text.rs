@@ -41,6 +41,7 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     fn open_table_menu(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>);
     fn finish_widget(&mut self, cx: &mut Context<Self>);
     fn preedit(&self) -> Option<&str>;
+    fn report_widget_bounds(&mut self, bounds: Bounds<Pixels>);
     fn report_leaf(
         &mut self,
         layout: Arc<LeafLayout>,
@@ -732,6 +733,72 @@ fn paint_carets(
         y += h;
     }
     (selection, cursor, caret_bounds)
+}
+
+/// Invisible overlay that reports its layout bounds for IME candidate placement
+/// while a chip / caption / frontmatter field is being edited.
+pub struct WidgetImeSink<H: WysiwygHost> {
+    pub editor: Entity<H>,
+}
+
+impl<H: WysiwygHost> IntoElement for WidgetImeSink<H> {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl<H: WysiwygHost> Element for WidgetImeSink<H> {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, Vec::new(), cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.editor.update(cx, |host, _cx| {
+            host.report_widget_bounds(bounds);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
 }
 
 #[cfg(test)]

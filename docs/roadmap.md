@@ -18,6 +18,7 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 - Undo stays byte-based (`UndoStack`/`EditOperation` keep working for both modes).
 - Caret/selection stay source byte offsets; `RichEngine` provides delimiter-skipping snap/step and source↔visible mapping.
 - Fidelity layering: untouched blocks byte-exact automatically; touched blocks keep delimiter fidelity via captured attrs (`*` vs `_`, list markers, ATX/setext, fence char/len, break style) and `raw` slices on inline runs; explicit Normalize ignores fidelity.
+- Source-mode masking is a **projection of the same comrak AST**, not a second Markdown parser. tree-sitter-md is gone. Masking + `spans.rs` stay as the source-mode renderer; they are not the WYSIWYG primary.
 
 ## Status
 
@@ -28,11 +29,13 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 | P2 | `rich/serialize.rs` + `rich/escape.rs` (delimiter-stack serializer), `rich/save.rs` (SaveCandidates + diff hunks), corpus test suite | ✅ done |
 | P3 | `rich/engine.rs` (NodeId stability, splices, caret snap/step, line map, outline) + **read-only WYSIWYG view** (`markrust-editor::wysiwyg`) + per-tab mode toggle (cmd-shift-m / toolbar) | ✅ done |
 | P4 | **Editing core** — `RichCommand` layer, Transaction undo upgrade (typing coalescing + caret restore), WYSIWYG caret/selection/hit-testing/IME | ✅ done |
-| P5 | Lists/tasks UX (Enter/Tab, checkbox clicks); input rules; code language chip; image alt/caption editing; IME caret bounds; stable-width inline delimiter masking | 🚧 in progress (core behaviors + polish in; IME candidate window on chips still uses last text caret) |
+| P5 | Lists/tasks UX (Enter/Tab, checkbox clicks); input rules; code language chip; image alt/caption editing; IME caret bounds; stable-width inline delimiter masking | 🚧 in progress (widget IME now reports chip/caption/frontmatter bounds; not proven with a real IME candidate window) |
 | P6 | Tables: cell editing, Tab nav, insert/delete row/col, header constraints, right-click menu | 🚧 in progress |
-| P7 | Frontmatter in-place title/tags; Normalize review dialog on save | 🚧 in progress |
-| P8 | External-edit reconciliation (`map_offset_across_change`, `apply_external_edit`, watcher reload maps caret) | 🚧 in progress |
-| P9 | Side-by-side + polish + migration (delete tree-sitter-md/`parser.rs`/`spans.rs`/masking after source mode re-derives segments from `RichTree`; criterion perf gates; docs rewrite) | ⬜ |
+| P7 | Frontmatter in-place title/tags; Normalize review dialog on save | 🚧 in progress (hunk preview in the save prompt; still title/tags only) |
+| P8 | External-edit reconciliation (`map_offset_across_change`, `apply_external_edit` / `apply_merged_edit`, 3-way dirty-tab merge) | ✅ done (proven by `three_way_merge` + headless dirty-tab merge e2e; overlapping edits still prompt) |
+| P9 | Side-by-side + polish + migration (source spans from comrak; delete tree-sitter-md; docs rewrite; criterion perf gates; optionally retire masking) | 🚧 in progress |
+
+**P9 is not complete.** Shipped this pass: `cmd-shift-m` cycles Rich → Source → Split; source spans come from comrak (tree-sitter-md removed from `markrust-core`); `docs/architecture.md` rewritten. Still open: criterion perf gates; masking/`spans.rs` still exist (intentionally — source mode); table toolbar; full YAML frontmatter; pixel-accurate table context menu.
 
 ### Proven invariants (enforced by tests — keep them green)
 
@@ -41,48 +44,50 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 - **Meaning preservation**: `html(x) == html(n(x))` under the comrak-HTML oracle.
 - 26 documented Normalize-only skips (nested same-mark emphasis — inherent to flat inline runs, Lexical shares it; comrak multi-line inline-HTML literal quirks; link-in-image-alt). Preserve identity still holds for every skip.
 - Byte-exact save round-trip e2e (`task_table_fence_frontmatter_survive_save_roundtrip`) still passes.
+- Source spans share kinds with the rich tree on `showcase.md` (`source_spans_share_comrak_grammar_with_rich_tree`).
+- Dirty-tab disjoint external edits merge (`dirty_tab_merges_disjoint_external_edits`).
 
 ### Key modules
 
-- `crates/markrust-core/src/rich/` — `tree` (RichTree/Block/Inline + fidelity), `import` (comrak → tree), `serialize`/`escape` (Preserve/Normalize), `engine` (view contract), `command` (RichCommand → byte splices), `input_rules` (Typora-style `# ` / lists / fences / auto-close), `save` (SaveCandidates).
-- `crates/markrust-core/src/offset_map.rs` — `map_offset_across_change` (nimbalyst port); `Document::apply_external_edit` / `peel_typing_range`.
+- `crates/markrust-core/src/rich/` — `tree` (RichTree/Block/Inline + fidelity), `import` (comrak → tree), `serialize`/`escape` (Preserve/Normalize), `engine` (view contract), `command` (RichCommand → byte splices), `input_rules` (Typora-style `# ` / lists / fences / auto-close), `save` (SaveCandidates + hunk preview).
+- `crates/markrust-core/src/parser.rs` — background comrak span extraction for source-mode masking (same grammar as import).
+- `crates/markrust-core/src/offset_map.rs` — `map_offset_across_change` (nimbalyst port).
+- `crates/markrust-core/src/merge.rs` — `three_way_merge` for dirty-tab disk reconciliation.
+- `crates/markrust-core/src/document.rs` — `saved_content`, `apply_external_edit`, `apply_merged_edit`, `peel_typing_range`.
 - `crates/markrust-editor/src/wysiwyg/` — `view` (RichEditorView over virtualized `list()`), `blocks` (per-kind renderers), `block_text` (caret/hit-testing/IME host).
-- `crates/markrust-editor/src/source/` — the masking source editor (kept as always-working fallback and future source mode).
+- `crates/markrust-editor/src/source/` — the masking source editor (fallback and source/split panes).
 - `crates/markrust-app/src/crash.rs` — panic logger (see Crash handling).
 
 ## P4 shipped
 
-Editing core is in: `rich/command.rs` (`InsertText`, `Backspace`, `Delete`, `SplitBlock`, `InsertLineBreak`, `ToggleMark`, `ToggleLink`, `SetBlockType`, `ToggleBlockquote`, `ToggleList`, `SetTaskChecked`, `IndentList`, `OutdentList`), `UndoStack` `Transaction` with typing coalescing and caret restore, WYSIWYG caret/selection/hit-testing via `block_text.rs`, IME (`EntityInputHandler`, preedit does not touch the model). Default tab mode is WYSIWYG. Source mode remains the fallback (`cmd-shift-m`).
+Editing core is in: `rich/command.rs` (`InsertText`, `Backspace`, `Delete`, `SplitBlock`, `InsertLineBreak`, `ToggleMark`, `ToggleLink`, `SetBlockType`, `ToggleBlockquote`, `ToggleList`, `SetTaskChecked`, `IndentList`, `OutdentList`), `UndoStack` `Transaction` with typing coalescing and caret restore, WYSIWYG caret/selection/hit-testing via `block_text.rs`, IME (`EntityInputHandler`, preedit does not touch the model). Default tab mode is WYSIWYG. `cmd-shift-m` cycles Rich → Source → Split.
 
 Proven by tests: insert in one block leaves other blocks' bytes untouched; coalesced typing undo restores string + caret; backspace deletes the visible grapheme not `**` wrappers; split paragraph/list; toggle bold; wrap link; empty-item Enter outdents/exits; indent/outdent; task checkbox splice.
 
-## P5–P8 design notes (for the next agent)
+## P5–P9 design notes (for the next agent)
 
 Shipped this pass (keep previous bullets; this pass added):
+- **P9 partial:** tree-sitter-md removed from `markrust-core`. `extract_syntax_spans` walks the comrak AST (shared `parse_options` / `LineStarts` with `rich::import`). Background parser still off the UI thread. Source mode remains masking, now grammar-aligned with WYSIWYG. Split mode in the window (source | rich).
+- P8: dirty tabs 3-way merge (`three_way_merge` + `Document::apply_merged_edit`); own-save watcher events ignored (`ours == theirs`); conflict still prompts. Autosave no longer spuriously prompts reload after it writes.
+- P7: Normalize save prompt includes a hunk preview (`SaveCandidates::hunk_preview`).
+- Chip/caption/frontmatter IME: `WidgetImeSink` reports widget bounds; text-leaf caret is not used as the IME origin while a widget is focused.
 - Input-rule polish: `_`/`__` italic/bold, nested italic inside bold, list-item-local `# ` / fences, `Document::peel_typing_range` so heading conversion is one undo even when the prefix was a slice of a longer Typing tx.
-- Chip/caption: IME composition into the draft; click-away + Escape; empty alt shows “Add a caption”.
-- IME preedit underline in the focused leaf; `character_index_for_point` searches every painted leaf; wrapped-row y is clamped.
 - P6: delete row/col (keep ≥1 of each); first row stays header; insert caret lands in the new cell; right-click table menu.
-- P7: Keep original / Normalize / Cancel on explicit Save when candidates differ (autosave stays verbatim). In-place title/tags in the WYSIWYG frontmatter bar (`SetFrontmatterField`).
-- P8: `map_offset_across_change` + `Document::apply_external_edit`; reload maps source and rich carets. Watcher/parse stay off the UI thread.
 
 Previously shipped:
-- Input rules as pure functions in `rich/input_rules.rs` (`# `, `- `/`* `/`+ `, `1. `/`1) `, `> `, fences, `---`/`***`/`___`, auto-close `*`/`**`/` `/`~~`), disabled in code/raw, heading+space is one undo group.
+- Input rules as pure functions in `rich/input_rules.rs` (`# `, `- `/`* `/`+ `, `1. `/`1) `, `> `, fences, `---`/`***`/`___`, auto-close `*`/`**`/`_`/`__`/` `/`~~`), disabled in code/raw, heading+space is one undo group.
 - `SetCodeInfo` / `SetImageAlt` / `SetFrontmatter` commands. WYSIWYG: clickable language chip and image caption (click → type → Enter commits).
 - Fenced code bodies are editable `BlockTextElement`s (not inert `StyledText`).
 - IME: `bounds_for_range` uses the painted caret rect; `character_index_for_point` hit-tests the focused leaf.
 - Source-mode inline delimiters keep glyph width when masked (transparent paint) so unmasking does not wrap the line. Block markers (`#`, list bullets) still collapse to visual chrome.
 - P6: `TableTab` (Tab/Shift-Tab in a table), `InsertTableRow` / `InsertTableColumn` (Tab on the last cell inserts a row). Cells were already `BlockTextElement`s.
-- P7: frontmatter panel (title + “edit in source” hook → `WorkspaceCommand::EditFrontmatter`). `normalize_review_decision` / `should_offer_normalize_review` in `session.rs` (headless-tested). No dialog chrome yet.
 - File-open hang fix remains: watcher `recv` on a background task; parse via `apply_pending_parse` off the frame.
 
 Still open (do not shrink the goal):
-- Chip/caption IME candidate window may still appear at the last text-leaf caret (draft routing works).
+- Chip/caption IME candidate window: bounds are reported from the widget overlay; needs a real IME session to prove the OS candidate window follows.
 - Table menu is a corner overlay, not a pixel-accurate context menu; no toolbar buttons.
-- Normalize dialog has no hunk preview (choice only).
 - Frontmatter in-place is title/tags only (not a full YAML editor).
-- P8: dirty-tab 3-way merge still skipped (`SkipBecauseDirty`); autosave does not map offsets.
-- P9 unchanged.
+- P9: no criterion perf gates; masking/`parser.rs`/`spans.rs` not deleted (source mode still uses them; they now project comrak, not tree-sitter-md). Fenced-code highlighting still uses tree-sitter rust/json/yaml/bash — that stays.
 
 Earlier P5 (still in):
 - Checkbox clicks → `SetTaskChecked`; Tab/Shift-Tab → `IndentList`/`OutdentList` outside tables; empty-item Enter outdents or exits.
@@ -94,11 +99,11 @@ Earlier P5 (still in):
 - **Build env**: `export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` — `xcode-select` points at CommandLineTools, which lacks the Metal shader compiler (`xcrun: unable to find utility "metal"`).
 - **Always `cargo build --workspace`** before running `target/debug/markrust`: building `-p markrust-app` rebuilds only the lib — the `markrust` bin package stays stale (this burned a debugging hour).
 - **gpui font-kit**: `gpui_platform` must keep `features = ["font-kit"]` or macOS gets a silent `NoopTextSystem` and renders no text at all.
-- **gpui run invariants**: `TextRun`s passed to `shape_line`/`StyledText::with_runs` must exactly tile the text on char boundaries; tree-sitter highlight spans nest/overlap and must be sanitized first (see `wysiwyg/blocks.rs::code_runs` and `source/element.rs::build_runs_for_line`).
+- **gpui run invariants**: `TextRun`s passed to `shape_line`/`StyledText::with_runs` must exactly tile the text on char boundaries; tree-sitter *code* highlight spans nest/overlap and must be sanitized first (see `wysiwyg/blocks.rs::code_runs` and `source/element.rs::build_runs_for_line`).
 - **Visual verification**: run the app, `screencapture -x out.png` (needs sandbox disabled → permission prompt), read the PNG. Launching the app steals focus — batch checks and kill instances promptly; every panic-abort also spawns a macOS crash dialog for the user.
 - **Panic analysis**: panics append structured reports (message, location, full backtrace) to `~/Library/Logs/MarkRust/panics.log` via `markrust_app::crash::install_panic_logger()`. Check that file first when the app dies; it is written before the crash dialog appears.
 - `cargo test/build` piped to `grep`/`tail` masks exit codes — check `pipestatus` or run unpiped.
 
 ## Historical note
 
-The pre-WYSIWYG roadmap lives in `ROADMAP.md` (repo root). The delimiter-masking design (`docs/delimiter-masking.md`) describes the source mode; `docs/architecture.md` needs its parser/data-flow sections rewritten in P9 (tree-sitter-md removal).
+The pre-WYSIWYG roadmap lives in `ROADMAP.md` (repo root). The delimiter-masking design (`docs/delimiter-masking.md`) describes **source mode**. `docs/architecture.md` matches the comrak / RichTree / source-projection pipeline.

@@ -263,7 +263,9 @@ fn content_start(source: &str, caret: usize) -> usize {
         i = skip_ws(bytes, i, limit);
     }
     if i < limit {
-        if matches!(bytes[i], b'-' | b'*' | b'+') && bytes.get(i + 1) == Some(&b' ') && i + 2 <= limit
+        if matches!(bytes[i], b'-' | b'*' | b'+')
+            && bytes.get(i + 1) == Some(&b' ')
+            && i + 2 <= limit
         {
             i += 2;
             i = skip_task_prefix(source, i, limit);
@@ -300,7 +302,10 @@ fn ordered_marker_end(bytes: &[u8], start: usize, limit: usize) -> Option<usize>
     while i < limit && bytes[i].is_ascii_digit() && i - start < 9 {
         i += 1;
     }
-    if i < limit && matches!(bytes[i], b'.' | b')') && bytes.get(i + 1) == Some(&b' ') && i + 2 <= limit
+    if i < limit
+        && matches!(bytes[i], b'.' | b')')
+        && bytes.get(i + 1) == Some(&b' ')
+        && i + 2 <= limit
     {
         return Some(i + 2);
     }

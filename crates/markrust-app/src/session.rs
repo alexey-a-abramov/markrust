@@ -75,28 +75,54 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
 }
 
-/// Whether an on-disk change should reload a tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReloadDecision {
+/// How to react to an on-disk change for an open tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalChangeAction {
     Ignore,
+    /// Clean tab; ask before replacing the buffer with disk bytes.
     PromptReload,
-    SkipBecauseDirty,
+    /// Dirty tab; disjoint edits were combined. Apply `merged` and map carets.
+    Apply(String),
+    /// Dirty tab; both sides changed the same lines.
+    PromptConflict,
 }
 
+/// Classify a watcher event using the last known disk snapshot, in-memory
+/// buffer, and current disk bytes.
+pub fn classify_external_change(
+    tab_path: Option<&Path>,
+    changed_path: &Path,
+    saved: &str,
+    ours: &str,
+    theirs: &str,
+) -> ExternalChangeAction {
+    match tab_path {
+        Some(path) if path == changed_path => {}
+        _ => return ExternalChangeAction::Ignore,
+    }
+    match markrust_core::three_way_merge(saved, ours, theirs) {
+        markrust_core::MergeOutcome::Unchanged => ExternalChangeAction::Ignore,
+        markrust_core::MergeOutcome::TakeTheirs => ExternalChangeAction::PromptReload,
+        markrust_core::MergeOutcome::Merged(merged) => ExternalChangeAction::Apply(merged),
+        markrust_core::MergeOutcome::Conflict => ExternalChangeAction::PromptConflict,
+    }
+}
+
+/// Path-only helper kept for tests that do not have buffer contents.
 pub fn reload_decision(
     dirty: bool,
     tab_path: Option<&Path>,
     changed_path: &Path,
-) -> ReloadDecision {
+) -> ExternalChangeAction {
     match tab_path {
         Some(path) if path == changed_path => {
             if dirty {
-                ReloadDecision::SkipBecauseDirty
+                ExternalChangeAction::PromptConflict
             } else {
-                ReloadDecision::PromptReload
+                ExternalChangeAction::PromptReload
             }
         }
-        _ => ReloadDecision::Ignore,
+        _ => ExternalChangeAction::Ignore,
     }
 }
 
@@ -312,8 +338,7 @@ impl HeadlessWorkspace {
             return Err(SessionError::UntitledHasNoPath);
         }
         let mut engine = markrust_core::rich::RichEngine::new();
-        let candidates =
-            markrust_core::rich::save_candidates(tab.editor.document(), &mut engine);
+        let candidates = markrust_core::rich::save_candidates(tab.editor.document(), &mut engine);
         if should_offer_normalize_review(&candidates) {
             let Some(text) = normalize_review_decision(&candidates, choice) else {
                 return Ok(EditorOutcome::Noop);
@@ -348,9 +373,7 @@ impl HeadlessWorkspace {
             },
         )
         .map_err(|_| SessionError::InvalidRange)?;
-        tab.editor
-            .apply(EditorCommand::JumpTo(caret.cursor()))
-            .ok();
+        tab.editor.apply(EditorCommand::JumpTo(caret.cursor())).ok();
         Ok(EditorOutcome::Changed)
     }
 
@@ -501,17 +524,42 @@ impl HeadlessWorkspace {
     }
 
     fn note_external_change(&mut self, path: &Path) {
+        let Ok(theirs) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let mut pending = None;
+        let mut merges = Vec::new();
         for (index, tab) in self.tabs.iter().enumerate() {
-            match reload_decision(
-                tab.editor.document().dirty,
-                tab.editor.document().path.as_deref(),
+            let doc = tab.editor.document();
+            match classify_external_change(
+                doc.path.as_deref(),
                 path,
+                doc.saved_content(),
+                &doc.buffer.content(),
+                &theirs,
             ) {
-                ReloadDecision::PromptReload => {
-                    self.pending_external_change = Some((index, path.to_path_buf()));
+                ExternalChangeAction::PromptReload | ExternalChangeAction::PromptConflict => {
+                    pending = Some((index, path.to_path_buf()));
                 }
-                ReloadDecision::SkipBecauseDirty | ReloadDecision::Ignore => {}
+                ExternalChangeAction::Apply(merged) => merges.push((index, merged)),
+                ExternalChangeAction::Ignore => {}
             }
+        }
+        for (index, merged) in merges {
+            let Some(tab) = self.tabs.get_mut(index) else {
+                continue;
+            };
+            let caret = tab.editor.cursor_offset();
+            let mapped = tab
+                .editor
+                .document_mut()
+                .apply_merged_edit(&merged, &theirs, &[caret]);
+            if let Some(offset) = mapped.first() {
+                let _ = tab.editor.apply(EditorCommand::JumpTo(*offset));
+            }
+        }
+        if let Some(pending) = pending {
+            self.pending_external_change = Some(pending);
         }
     }
 
@@ -614,20 +662,36 @@ mod tests {
     }
 
     #[test]
-    fn reload_skips_dirty_tabs() {
+    fn reload_path_only_flags_conflict_when_dirty() {
         let path = Path::new("/tmp/note.md");
         assert_eq!(
             reload_decision(true, Some(path), path),
-            ReloadDecision::SkipBecauseDirty
+            ExternalChangeAction::PromptConflict
         );
         assert_eq!(
             reload_decision(false, Some(path), path),
-            ReloadDecision::PromptReload
+            ExternalChangeAction::PromptReload
         );
         assert_eq!(
             reload_decision(false, Some(path), Path::new("/tmp/other.md")),
-            ReloadDecision::Ignore
+            ExternalChangeAction::Ignore
         );
+    }
+
+    #[test]
+    fn classify_merges_disjoint_dirty_edits() {
+        let path = Path::new("/tmp/note.md");
+        let action = classify_external_change(
+            Some(path),
+            path,
+            "aaa\nbbb\nccc\n",
+            "aaa\nBBB\nccc\n",
+            "aaa\nbbb\nCCC\n",
+        );
+        match action {
+            ExternalChangeAction::Apply(merged) => assert_eq!(merged, "aaa\nBBB\nCCC\n"),
+            other => panic!("expected apply, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1,6 +1,10 @@
-# Delimiter masking
+# Delimiter masking (source mode)
 
-Seamless WYSIWYG hides Markdown delimiter tokens (`**`, `` ` ``, `#`, link brackets, etc.) until the user focuses or selects inside the syntax node.
+Source mode — not the default WYSIWYG surface — hides Markdown delimiter tokens (`**`, `` ` ``, `#`, link brackets, etc.) until the user focuses or selects inside the syntax node. The default **Rich** mode edits the `RichTree` and never paints source delimiters.
+
+Syntax spans for masking are derived from the **same comrak AST** as `RichTree` import (`extract_syntax_spans`). There is no tree-sitter-md grammar on this path.
+
+## Visibility rule
 
 ## Visibility rule
 
@@ -48,3 +52,9 @@ Source: `**bold** plain`
 
 - Caret at offset 0 (inside bold span) → both `**` pairs visible.
 - Caret at offset 10 (in "plain") → bold delimiters masked.
+
+## Related
+
+- [Architecture](architecture.md) — rope / RichTree / source projection
+- [WYSIWYG roadmap](roadmap.md) — phase status
+

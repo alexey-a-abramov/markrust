@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use crate::buffer::DocumentBuffer;
 use crate::mode::DocumentProcessingMode;
+use crate::offset_map::map_offset_across_change;
 use crate::parser::{BackgroundMarkdownParser, ParseSnapshot, ParseUpdate};
 use crate::spans::SyntaxNodeSpan;
-use crate::offset_map::map_offset_across_change;
 use crate::undo::{
     is_typing_burst, EditOperation, SelectionSnapshot, Transaction, TransactionKind, UndoStack,
 };
@@ -25,6 +25,7 @@ pub struct Document {
     pub dirty: bool,
     pub syntax_spans: Vec<SyntaxNodeSpan>,
     pub parsed_revision: u64,
+    saved_content: String,
     undo: UndoStack,
     parser: BackgroundMarkdownParser,
 }
@@ -45,6 +46,7 @@ impl Document {
     }
 
     fn from_parts(buffer: DocumentBuffer, mode: DocumentProcessingMode) -> Self {
+        let saved_content = buffer.content();
         let mut doc = Self {
             path: None,
             buffer,
@@ -52,6 +54,7 @@ impl Document {
             dirty: false,
             syntax_spans: Vec::new(),
             parsed_revision: 0,
+            saved_content,
             undo: UndoStack::new(),
             parser: BackgroundMarkdownParser::new(),
         };
@@ -70,6 +73,11 @@ impl Document {
         &self.undo
     }
 
+    /// Last reconciled on-disk snapshot (load, save, or last merged disk bytes).
+    pub fn saved_content(&self) -> &str {
+        &self.saved_content
+    }
+
     /// Undo the last transaction and drop it from redo, as if it never happened.
     /// Used to fold a typing prefix into a following input-rule rewrite.
     pub fn revert_last_quietly(&mut self) -> Option<Transaction> {
@@ -85,7 +93,10 @@ impl Document {
     /// On success the buffer no longer contains `range` and the caller should
     /// insert at `range.start`. Returns the caret to restore if the following
     /// command is undone.
-    pub fn peel_typing_range(&mut self, range: std::ops::Range<usize>) -> Option<SelectionSnapshot> {
+    pub fn peel_typing_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+    ) -> Option<SelectionSnapshot> {
         let last = self.undo.last()?;
         if last.kind != TransactionKind::Typing {
             return None;
@@ -133,8 +144,29 @@ impl Document {
         }
         self.buffer = DocumentBuffer::with_text(new_content);
         self.dirty = false;
+        self.saved_content = new_content.to_string();
         self.undo = UndoStack::new();
         self.schedule_parse();
+        mapped
+    }
+
+    /// Apply a 3-way merge of dirty in-memory edits with on-disk bytes.
+    /// Keeps the tab dirty when `merged` still differs from `disk`.
+    /// `disk` becomes the last-known disk snapshot so the same change is not
+    /// merged twice. Undo is cleared (ops would not invert against the merge).
+    pub fn apply_merged_edit(&mut self, merged: &str, disk: &str, offsets: &[usize]) -> Vec<usize> {
+        let old = self.buffer.content();
+        let mapped = offsets
+            .iter()
+            .map(|offset| map_offset_across_change(&old, merged, *offset))
+            .collect();
+        if old != merged {
+            self.buffer = DocumentBuffer::with_text(merged);
+            self.undo = UndoStack::new();
+            self.schedule_parse();
+        }
+        self.dirty = merged != disk;
+        self.saved_content = disk.to_string();
         mapped
     }
 
@@ -392,6 +424,7 @@ impl Document {
 
     pub fn save_and_mark_clean(&mut self) -> io::Result<()> {
         self.save()?;
+        self.saved_content = self.buffer.content();
         self.mark_clean();
         Ok(())
     }
@@ -399,6 +432,7 @@ impl Document {
     pub fn save_as(&mut self, path: PathBuf) -> io::Result<()> {
         atomic_write(&path, &self.buffer.content())?;
         self.path = Some(path);
+        self.saved_content = self.buffer.content();
         self.dirty = false;
         Ok(())
     }
@@ -414,6 +448,7 @@ impl Document {
     pub fn replace_content(&mut self, content: &str) {
         self.buffer = DocumentBuffer::with_text(content);
         self.dirty = false;
+        self.saved_content = content.to_string();
         self.undo = UndoStack::new();
         self.schedule_parse();
     }
@@ -497,7 +532,7 @@ mod tests {
         let doc = Document::new("# Hello\n\n**bold**");
         assert!(
             doc.syntax_spans.is_empty(),
-            "Document::new must not run tree-sitter on the caller (got {} spans)",
+            "Document::new must not parse Markdown on the caller (got {} spans)",
             doc.syntax_spans.len()
         );
     }
@@ -834,6 +869,20 @@ mod tests {
         assert_eq!(mapped, vec![2, 8]);
         assert_eq!(doc.buffer.content(), "abcXYZdef");
         assert!(!doc.dirty);
+        assert!(!doc.undo_stack().can_undo());
+        assert_eq!(doc.saved_content(), "abcXYZdef");
+    }
+
+    #[test]
+    fn apply_merged_edit_keeps_dirty_and_maps_caret() {
+        let mut doc = Document::new("aaa\nbbb\nccc\n");
+        doc.insert(4, "X");
+        assert!(doc.dirty);
+        let mapped = doc.apply_merged_edit("aaa\nXbbb\nCCC\n", "aaa\nbbb\nCCC\n", &[5]);
+        assert_eq!(doc.buffer.content(), "aaa\nXbbb\nCCC\n");
+        assert!(doc.dirty);
+        assert_eq!(doc.saved_content(), "aaa\nbbb\nCCC\n");
+        assert_eq!(mapped.len(), 1);
         assert!(!doc.undo_stack().can_undo());
     }
 }

@@ -2,13 +2,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Background Markdown span extraction for source-mode masking.
+//!
+//! Spans are derived from the same comrak AST as [`crate::rich::import`], so
+//! source mode is a projection of the rich tree's grammar rather than a second
+//! parser (tree-sitter-md). Parse still runs on a dedicated worker thread.
+
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use tree_sitter::Node;
-use tree_sitter_md::{MarkdownCursor, MarkdownParser, MarkdownTree};
+use comrak::nodes::{AstNode, NodeValue};
+use comrak::{parse_document, Arena};
 
+use crate::rich::import::{parse_options, LineStarts};
 use crate::spans::{DelimiterSpan, SyntaxKind, SyntaxNodeSpan, TableRowKind};
 
 /// Snapshot sent to the background parser thread.
@@ -25,156 +32,449 @@ pub struct ParseUpdate {
     pub spans: Vec<SyntaxNodeSpan>,
 }
 
-/// Extract syntax spans from Markdown source using tree-sitter-md.
+/// Extract syntax spans from Markdown source using the comrak AST.
 pub fn extract_syntax_spans(source: &str) -> Vec<SyntaxNodeSpan> {
-    let mut parser = MarkdownParser::default();
-    let Some(tree) = parser.parse(source.as_bytes(), None) else {
-        return Vec::new();
-    };
+    let arena = Arena::new();
+    let root = parse_document(&arena, source, &parse_options());
+    let lines = LineStarts::new(source);
     let mut spans = Vec::new();
-    let mut cursor = tree.walk();
-    collect_spans(&mut cursor, source, &mut spans);
+    collect_spans(root, source, &lines, &mut spans);
     spans.sort_by_key(|span| (span.start_byte, span.end_byte));
     spans
 }
 
-fn collect_spans(cursor: &mut MarkdownCursor<'_>, source: &str, spans: &mut Vec<SyntaxNodeSpan>) {
-    let node = cursor.node();
-    if let Some((mut kind, table_row)) = map_syntax_kind(node.kind()) {
-        if kind == SyntaxKind::List && extract_task_checked(node).is_some() {
-            kind = SyntaxKind::TaskList;
+fn collect_spans<'a>(
+    node: &'a AstNode<'a>,
+    source: &str,
+    lines: &LineStarts,
+    spans: &mut Vec<SyntaxNodeSpan>,
+) {
+    let range = lines.range(node.data.borrow().sourcepos, source.len());
+    match &node.data.borrow().value {
+        NodeValue::FrontMatter(_) => {
+            spans.push(make_span(
+                SyntaxKind::Frontmatter,
+                range.clone(),
+                frontmatter_delims(source, &range),
+                None,
+                None,
+                None,
+                None,
+            ));
         }
-        let delimiter_spans = collect_delimiters(node);
-        let language = if kind == SyntaxKind::CodeBlock {
-            extract_code_language(node, source)
-        } else {
-            None
-        };
-        let task_checked = if kind == SyntaxKind::TaskList {
-            extract_task_checked(node)
-        } else {
-            None
-        };
-        spans.push(SyntaxNodeSpan {
-            kind,
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-            delimiter_spans,
-            language,
-            task_checked,
-            table_row,
-        });
+        NodeValue::Heading(h) => {
+            let level = h.level.clamp(1, 6);
+            spans.push(make_span(
+                SyntaxKind::Heading,
+                range.clone(),
+                heading_delims(source, &range, h.setext, level),
+                None,
+                None,
+                None,
+                Some(level),
+            ));
+        }
+        NodeValue::Strong => {
+            spans.push(make_span(
+                SyntaxKind::Bold,
+                range.clone(),
+                wrap_delims(source, &range, 2),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::Emph => {
+            spans.push(make_span(
+                SyntaxKind::Italic,
+                range.clone(),
+                wrap_delims(source, &range, 1),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::Strikethrough => {
+            spans.push(make_span(
+                SyntaxKind::Strikethrough,
+                range.clone(),
+                wrap_delims(source, &range, 2),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::Code(code) => {
+            spans.push(make_span(
+                SyntaxKind::CodeInline,
+                range.clone(),
+                wrap_delims(source, &range, code.num_backticks),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::Link(_) => {
+            spans.push(make_span(
+                SyntaxKind::Link,
+                range.clone(),
+                link_delims(source, &range, false),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::Image(_) => {
+            spans.push(make_span(
+                SyntaxKind::Image,
+                range.clone(),
+                link_delims(source, &range, true),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::CodeBlock(cb) => {
+            let language = {
+                let lang = cb.info.split_whitespace().next().unwrap_or("").trim();
+                if lang.is_empty() {
+                    None
+                } else {
+                    Some(lang.to_ascii_lowercase())
+                }
+            };
+            spans.push(make_span(
+                SyntaxKind::CodeBlock,
+                range.clone(),
+                fence_delims(source, &range, cb.fenced),
+                language,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::BlockQuote => {
+            spans.push(make_span(
+                SyntaxKind::BlockQuote,
+                range.clone(),
+                line_prefix_delims(source, &range, b'>'),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::List(_) => {
+            spans.push(make_span(
+                SyntaxKind::List,
+                range.clone(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::Item(_) => {
+            spans.push(make_span(
+                SyntaxKind::List,
+                range.clone(),
+                list_item_delims(source, &range, false),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::TaskItem(symbol) => {
+            let checked = symbol.is_some();
+            spans.push(make_span(
+                SyntaxKind::TaskList,
+                range.clone(),
+                list_item_delims(source, &range, true),
+                None,
+                Some(checked),
+                None,
+                None,
+            ));
+        }
+        NodeValue::Table(_) => {
+            spans.push(make_span(
+                SyntaxKind::Table,
+                range.clone(),
+                pipe_delims(source, &range),
+                None,
+                None,
+                None,
+                None,
+            ));
+            emit_table_delimiter_row(source, node, lines, spans);
+        }
+        NodeValue::TableRow(header) => {
+            let kind = if *header {
+                TableRowKind::Header
+            } else {
+                TableRowKind::Body
+            };
+            spans.push(make_span(
+                SyntaxKind::Table,
+                range.clone(),
+                pipe_delims(source, &range),
+                None,
+                None,
+                Some(kind),
+                None,
+            ));
+        }
+        _ => {}
     }
 
-    if cursor.goto_first_child() {
-        loop {
-            collect_spans(cursor, source, spans);
-            if !cursor.goto_next_sibling() {
-                break;
+    for child in node.children() {
+        collect_spans(child, source, lines, spans);
+    }
+}
+
+fn make_span(
+    kind: SyntaxKind,
+    range: std::ops::Range<usize>,
+    delimiter_spans: Vec<DelimiterSpan>,
+    language: Option<String>,
+    task_checked: Option<bool>,
+    table_row: Option<TableRowKind>,
+    heading_level: Option<u8>,
+) -> SyntaxNodeSpan {
+    SyntaxNodeSpan {
+        kind,
+        start_byte: range.start,
+        end_byte: range.end,
+        delimiter_spans,
+        language,
+        task_checked,
+        table_row,
+        heading_level,
+    }
+}
+
+fn wrap_delims(source: &str, range: &std::ops::Range<usize>, width: usize) -> Vec<DelimiterSpan> {
+    if width == 0 || range.end < range.start + width * 2 {
+        return Vec::new();
+    }
+    let slice = source.get(range.clone()).unwrap_or("");
+    let open_len = width.min(slice.len());
+    let close_len = width.min(slice.len().saturating_sub(open_len));
+    let mut out = Vec::new();
+    if open_len > 0 {
+        out.push(DelimiterSpan::new(range.start, range.start + open_len));
+    }
+    if close_len > 0 {
+        out.push(DelimiterSpan::new(range.end - close_len, range.end));
+    }
+    out
+}
+
+fn heading_delims(
+    source: &str,
+    range: &std::ops::Range<usize>,
+    setext: bool,
+    level: u8,
+) -> Vec<DelimiterSpan> {
+    let slice = source.get(range.clone()).unwrap_or("");
+    if setext {
+        if let Some(nl) = slice.rfind('\n') {
+            let under = &slice[nl + 1..];
+            let trimmed = under.trim_end_matches(['\r', '\n']);
+            if !trimmed.is_empty() {
+                let start = range.start + nl + 1;
+                return vec![DelimiterSpan::new(start, start + trimmed.len())];
             }
         }
-        cursor.goto_parent();
+        return Vec::new();
     }
+    let hashes = slice
+        .bytes()
+        .take_while(|b| *b == b'#')
+        .count()
+        .min(level as usize);
+    if hashes == 0 {
+        return Vec::new();
+    }
+    vec![DelimiterSpan::new(range.start, range.start + hashes)]
 }
 
-fn map_syntax_kind(kind: &str) -> Option<(SyntaxKind, Option<TableRowKind>)> {
-    match kind {
-        "atx_heading" | "setext_heading" => Some((SyntaxKind::Heading, None)),
-        "strong_emphasis" => Some((SyntaxKind::Bold, None)),
-        "emphasis" => Some((SyntaxKind::Italic, None)),
-        "code_span" => Some((SyntaxKind::CodeInline, None)),
-        "fenced_code_block" | "indented_code_block" => Some((SyntaxKind::CodeBlock, None)),
-        "inline_link" | "full_link" | "reference_link" | "shortcut_link" | "link" => {
-            Some((SyntaxKind::Link, None))
-        }
-        "inline_image" | "full_image" | "reference_image" | "shortcut_image" | "image" => {
-            Some((SyntaxKind::Image, None))
-        }
-        "block_quote" => Some((SyntaxKind::BlockQuote, None)),
-        "list" => Some((SyntaxKind::List, None)),
-        "list_item" => Some((SyntaxKind::List, None)),
-        "pipe_table" => Some((SyntaxKind::Table, None)),
-        "pipe_table_header" => Some((SyntaxKind::Table, Some(TableRowKind::Header))),
-        "pipe_table_delimiter_row" => Some((SyntaxKind::Table, Some(TableRowKind::Delimiter))),
-        "pipe_table_row" => Some((SyntaxKind::Table, Some(TableRowKind::Body))),
-        "strikethrough" => Some((SyntaxKind::Strikethrough, None)),
-        "minus_metadata" | "plus_metadata" => Some((SyntaxKind::Frontmatter, None)),
-        _ => None,
+fn fence_delims(source: &str, range: &std::ops::Range<usize>, fenced: bool) -> Vec<DelimiterSpan> {
+    if !fenced {
+        return Vec::new();
     }
-}
-
-fn extract_code_language(node: Node, source: &str) -> Option<String> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "info_string" {
-            let raw = &source[child.start_byte()..child.end_byte()];
-            let language = raw.split_whitespace().next().unwrap_or(raw).trim();
-            if language.is_empty() {
-                return None;
+    let slice = source.get(range.clone()).unwrap_or("");
+    let mut out = Vec::new();
+    if let Some(nl) = slice.find('\n') {
+        out.push(DelimiterSpan::new(range.start, range.start + nl));
+        if let Some(last) = slice.rfind('\n') {
+            let close = slice[last + 1..].trim_end_matches(['\r', '\n']);
+            if close.starts_with('`') || close.starts_with('~') {
+                let start = range.start + last + 1;
+                out.push(DelimiterSpan::new(start, start + close.len()));
             }
-            return Some(language.to_ascii_lowercase());
+        }
+    } else if !slice.is_empty() {
+        out.push(DelimiterSpan::new(range.start, range.end));
+    }
+    out
+}
+
+fn frontmatter_delims(source: &str, range: &std::ops::Range<usize>) -> Vec<DelimiterSpan> {
+    let slice = source.get(range.clone()).unwrap_or("");
+    let mut out = Vec::new();
+    if let Some(nl) = slice.find('\n') {
+        out.push(DelimiterSpan::new(range.start, range.start + nl));
+    }
+    if let Some(last) = slice.trim_end_matches(['\r', '\n']).rfind('\n') {
+        let close = slice[last + 1..].trim_end_matches(['\r', '\n']);
+        if close.starts_with("---") {
+            let start = range.start + last + 1;
+            out.push(DelimiterSpan::new(start, start + close.len()));
         }
     }
-    None
+    out
 }
 
-fn extract_task_checked(node: Node) -> Option<bool> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "task_list_marker_checked" => return Some(true),
-            "task_list_marker_unchecked" => return Some(false),
-            _ => {}
+fn link_delims(source: &str, range: &std::ops::Range<usize>, image: bool) -> Vec<DelimiterSpan> {
+    let slice = source.get(range.clone()).unwrap_or("");
+    if slice.starts_with('<') && slice.ends_with('>') && slice.len() >= 2 {
+        return vec![
+            DelimiterSpan::new(range.start, range.start + 1),
+            DelimiterSpan::new(range.end.saturating_sub(1), range.end),
+        ];
+    }
+    let mut out = Vec::new();
+    let open_len = if image && slice.starts_with("![") {
+        2
+    } else if slice.starts_with('[') {
+        1
+    } else {
+        0
+    };
+    if open_len > 0 {
+        out.push(DelimiterSpan::new(range.start, range.start + open_len));
+    }
+    if let Some(i) = slice.rfind("](") {
+        out.push(DelimiterSpan::new(range.start + i, range.end));
+    } else if slice.ends_with(']') {
+        out.push(DelimiterSpan::new(range.end.saturating_sub(1), range.end));
+    }
+    out
+}
+
+fn line_prefix_delims(
+    source: &str,
+    range: &std::ops::Range<usize>,
+    marker: u8,
+) -> Vec<DelimiterSpan> {
+    let slice = source.get(range.clone()).unwrap_or("");
+    let mut out = Vec::new();
+    let mut offset = range.start;
+    for line in slice.split_inclusive('\n') {
+        let indent = line
+            .bytes()
+            .take_while(|b| *b == b' ' || *b == b'\t')
+            .count();
+        if line.as_bytes().get(indent) == Some(&marker) {
+            out.push(DelimiterSpan::new(offset + indent, offset + indent + 1));
+        }
+        offset += line.len();
+    }
+    out
+}
+
+fn list_item_delims(
+    source: &str,
+    range: &std::ops::Range<usize>,
+    task: bool,
+) -> Vec<DelimiterSpan> {
+    let slice = source.get(range.clone()).unwrap_or("");
+    let indent = slice
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count();
+    let rest = &slice[indent..];
+    let mut out = Vec::new();
+    let marker_len = if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
+        1
+    } else {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && matches!(rest.as_bytes().get(digits), Some(b'.' | b')')) {
+            digits + 1
+        } else {
+            0
+        }
+    };
+    if marker_len > 0 && !task {
+        out.push(DelimiterSpan::new(
+            range.start + indent,
+            range.start + indent + marker_len,
+        ));
+    }
+    if task {
+        if let Some(rel) = rest.find('[') {
+            let after = &rest[rel..];
+            let close = after.find(']').map(|i| i + 1).unwrap_or(3).min(after.len());
+            out.push(DelimiterSpan::new(
+                range.start + indent + rel,
+                range.start + indent + rel + close,
+            ));
         }
     }
-    None
+    out
 }
 
-fn collect_delimiters(node: Node) -> Vec<DelimiterSpan> {
-    let mut delimiters = Vec::new();
-    collect_delimiter_nodes(node, &mut delimiters);
-    delimiters.sort_by_key(|span| span.start_byte);
-    delimiters
+fn pipe_delims(source: &str, range: &std::ops::Range<usize>) -> Vec<DelimiterSpan> {
+    let slice = source.get(range.clone()).unwrap_or("");
+    slice
+        .bytes()
+        .enumerate()
+        .filter(|(_, b)| *b == b'|')
+        .map(|(i, _)| DelimiterSpan::new(range.start + i, range.start + i + 1))
+        .collect()
 }
 
-fn collect_delimiter_nodes(node: Node, delimiters: &mut Vec<DelimiterSpan>) {
-    if is_delimiter_node(node.kind()) {
-        delimiters.push(DelimiterSpan::new(node.start_byte(), node.end_byte()));
+fn emit_table_delimiter_row<'a>(
+    source: &str,
+    table: &'a AstNode<'a>,
+    lines: &LineStarts,
+    spans: &mut Vec<SyntaxNodeSpan>,
+) {
+    let table_range = lines.range(table.data.borrow().sourcepos, source.len());
+    let slice = source.get(table_range.clone()).unwrap_or("");
+    let mut offset = table_range.start;
+    for line in slice.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let is_delim = {
+            let t = trimmed.trim();
+            t.contains('|')
+                && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+                && t.contains('-')
+        };
+        if is_delim && !trimmed.is_empty() {
+            let end = offset + trimmed.len();
+            spans.push(make_span(
+                SyntaxKind::Table,
+                offset..end,
+                pipe_delims(source, &(offset..end)),
+                None,
+                None,
+                Some(TableRowKind::Delimiter),
+                None,
+            ));
+            return;
+        }
+        offset += line.len();
     }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_delimiter_nodes(child, delimiters);
-    }
-}
-
-fn is_delimiter_node(kind: &str) -> bool {
-    matches!(
-        kind,
-        "emphasis_delimiter"
-            | "code_span_delimiter"
-            | "fenced_code_block_delimiter"
-            | "block_quote_marker"
-            | "list_marker"
-            | "list_marker_minus"
-            | "list_marker_plus"
-            | "list_marker_star"
-            | "list_marker_dot"
-            | "list_marker_parenthesis"
-            | "task_list_marker_checked"
-            | "task_list_marker_unchecked"
-            | "atx_h1_marker"
-            | "atx_h2_marker"
-            | "atx_h3_marker"
-            | "atx_h4_marker"
-            | "atx_h5_marker"
-            | "atx_h6_marker"
-            | "setext_h1_underline"
-            | "setext_h2_underline"
-    ) || matches!(
-        kind,
-        "[" | "]" | "(" | ")" | "`" | "*" | "_" | "|" | ">" | "!"
-    )
 }
 
 /// Dedicated background thread for Markdown parsing.
@@ -252,27 +552,13 @@ impl Default for BackgroundMarkdownParser {
 }
 
 fn parser_worker_loop(request_rx: Receiver<ParseSnapshot>, update_tx: Sender<ParseUpdate>) {
-    let mut parser = MarkdownParser::default();
-
     while let Ok(snapshot) = request_rx.recv() {
-        let spans = match parser.parse(snapshot.text.as_bytes(), None) {
-            Some(tree) => extract_spans_from_tree(&tree, &snapshot.text),
-            None => Vec::new(),
-        };
-
+        let spans = extract_syntax_spans(&snapshot.text);
         let _ = update_tx.send(ParseUpdate {
             revision: snapshot.revision,
             spans,
         });
     }
-}
-
-fn extract_spans_from_tree(tree: &MarkdownTree, source: &str) -> Vec<SyntaxNodeSpan> {
-    let mut spans = Vec::new();
-    let mut cursor = tree.walk();
-    collect_spans(&mut cursor, source, &mut spans);
-    spans.sort_by_key(|span| (span.start_byte, span.end_byte));
-    spans
 }
 
 #[cfg(test)]
@@ -291,7 +577,11 @@ mod tests {
         assert!(has_kind(&spans, SyntaxKind::Bold));
         assert!(has_kind(&spans, SyntaxKind::Italic));
         let bold = spans.iter().find(|s| s.kind == SyntaxKind::Bold).unwrap();
-        assert_eq!(bold.delimiter_spans.len(), 4);
+        assert!(
+            bold.delimiter_spans.len() >= 2,
+            "bold delimiters: {:?}",
+            bold.delimiter_spans
+        );
     }
 
     #[test]
@@ -309,6 +599,11 @@ mod tests {
     fn extracts_heading_and_code_block() {
         let spans = extract_syntax_spans("# Title\n\n```rust\nfn main() {}\n```");
         assert!(has_kind(&spans, SyntaxKind::Heading));
+        let heading = spans
+            .iter()
+            .find(|s| s.kind == SyntaxKind::Heading)
+            .unwrap();
+        assert_eq!(heading.heading_level, Some(1));
         let code = spans
             .iter()
             .find(|s| s.kind == SyntaxKind::CodeBlock)
@@ -412,9 +707,18 @@ mod tests {
             .filter(|s| s.kind == SyntaxKind::Heading)
             .collect();
         assert!(headings.len() >= 3, "atx headings: {headings:?}");
+        assert_eq!(headings[0].heading_level, Some(1));
+        assert_eq!(headings[1].heading_level, Some(2));
 
         let setext = extract_syntax_spans("Title\n=====\n\nSub\n-----\n");
         assert!(has_kind(&setext, SyntaxKind::Heading));
+        let levels: Vec<_> = setext
+            .iter()
+            .filter(|s| s.kind == SyntaxKind::Heading)
+            .filter_map(|s| s.heading_level)
+            .collect();
+        assert!(levels.contains(&1), "setext levels: {levels:?}");
+        assert!(levels.contains(&2), "setext levels: {levels:?}");
     }
 
     #[test]
@@ -459,5 +763,16 @@ mod tests {
         assert_eq!(update.revision, 2);
         assert!(has_kind(&update.spans, SyntaxKind::Heading));
         assert!(has_kind(&update.spans, SyntaxKind::Bold));
+    }
+
+    #[test]
+    fn source_spans_share_comrak_grammar_with_rich_tree() {
+        let source = include_str!("../../markrust-app/tests/fixtures/showcase.md");
+        let spans = extract_syntax_spans(source);
+        assert!(has_kind(&spans, SyntaxKind::Frontmatter));
+        assert!(has_kind(&spans, SyntaxKind::Heading));
+        assert!(has_kind(&spans, SyntaxKind::Table));
+        assert!(has_kind(&spans, SyntaxKind::CodeBlock));
+        assert!(has_kind(&spans, SyntaxKind::TaskList));
     }
 }

@@ -1591,7 +1591,13 @@ fn place_table_caret(
     row: usize,
     col: usize,
 ) {
-    let probe = table_start.min(engine.tree().blocks.last().map_or(0, |b| b.source_range.end));
+    let probe = table_start.min(
+        engine
+            .tree()
+            .blocks
+            .last()
+            .map_or(0, |b| b.source_range.end),
+    );
     let Some(pos) = engine
         .table_pos(probe)
         .or_else(|| engine.table_pos(caret.cursor()))
@@ -2243,8 +2249,17 @@ mod tests {
         let source = "| a |\n|---|\n";
         let (mut doc, mut engine, mut caret) = setup(source);
         engine.sync(&doc);
-        caret.collapse_to(engine.tree().blocks[0].children[0].children[0].source_range.start);
-        apply(&mut doc, &mut engine, &mut caret, RichCommand::DeleteTableRow);
+        caret.collapse_to(
+            engine.tree().blocks[0].children[0].children[0]
+                .source_range
+                .start,
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteTableRow,
+        );
         engine.sync(&doc);
         assert_eq!(engine.tree().blocks[0].children.len(), 1);
         assert!(matches!(
@@ -2258,7 +2273,11 @@ mod tests {
         let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
         let (mut doc, mut engine, mut caret) = setup(source);
         engine.sync(&doc);
-        caret.collapse_to(engine.tree().blocks[0].children[0].children[0].source_range.start);
+        caret.collapse_to(
+            engine.tree().blocks[0].children[0].children[0]
+                .source_range
+                .start,
+        );
         apply(
             &mut doc,
             &mut engine,

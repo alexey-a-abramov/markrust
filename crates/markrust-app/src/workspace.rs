@@ -14,8 +14,9 @@ use crate::drop::{
     classify_editor_drop, classify_window_drop, markdown_image_reference, DropIntent,
 };
 use crate::session::{
-    list_markdown_files, normalize_review_decision, reload_decision, should_offer_normalize_review,
-    DropTarget, NormalizeReviewChoice, ReloadDecision, WorkspaceCommand,
+    classify_external_change, list_markdown_files, normalize_review_decision,
+    should_offer_normalize_review, DropTarget, ExternalChangeAction, NormalizeReviewChoice,
+    WorkspaceCommand,
 };
 use markrust_core::Document;
 use markrust_editor::{EditorCommand, MarkdownEditor, MarkdownEditorView, RichEditorView};
@@ -29,6 +30,8 @@ pub enum EditorMode {
     Wysiwyg,
     /// Raw markdown with delimiter masking.
     Source,
+    /// Source on the left, WYSIWYG on the right.
+    Split,
 }
 
 #[allow(dead_code)]
@@ -95,21 +98,23 @@ impl Workspace {
             WorkspaceCommand::Editor(editor_command) => {
                 let mode = self.active_tab().map(|t| t.mode);
                 let tab_id = self.active_tab().map(|t| t.id);
-                match mode {
-                    Some(EditorMode::Wysiwyg) => {
-                        if let Some(tab) = self.tabs.get(self.active_tab) {
-                            tab.rich_view.update(cx, |view, cx| {
-                                view.apply_editor_command(editor_command.clone(), cx);
-                            });
-                        }
+                let use_rich = match mode {
+                    Some(EditorMode::Wysiwyg) => true,
+                    Some(EditorMode::Split) => self
+                        .active_tab()
+                        .is_some_and(|tab| tab.rich_view.read(cx).is_focused(window)),
+                    _ => false,
+                };
+                if use_rich {
+                    if let Some(tab) = self.tabs.get(self.active_tab) {
+                        tab.rich_view.update(cx, |view, cx| {
+                            view.apply_editor_command(editor_command.clone(), cx);
+                        });
                     }
-                    _ => {
-                        if let Some(tab) = self.active_tab() {
-                            tab.editor.update(cx, |editor, cx| {
-                                editor.apply_command(editor_command, cx);
-                            });
-                        }
-                    }
+                } else if let Some(tab) = self.active_tab() {
+                    tab.editor.update(cx, |editor, cx| {
+                        editor.apply_command(editor_command, cx);
+                    });
                 }
                 if let Some(id) = tab_id {
                     self.schedule_autosave(id, cx);
@@ -176,6 +181,14 @@ impl Workspace {
                                 editor.apply_command(EditorCommand::JumpTo(offset), cx);
                             });
                         }
+                        EditorMode::Split => {
+                            tab.rich_view.update(cx, |view, cx| {
+                                view.jump_to(offset, cx);
+                            });
+                            tab.editor.update(cx, |editor, cx| {
+                                editor.apply_command(EditorCommand::JumpTo(offset), cx);
+                            });
+                        }
                     }
                 }
             }
@@ -189,9 +202,8 @@ impl Workspace {
                 }
             }
             WorkspaceCommand::SetFrontmatterField { key, value } => {
-                if let Some((view, id)) = self
-                    .active_tab()
-                    .map(|tab| (tab.rich_view.clone(), tab.id))
+                if let Some((view, id)) =
+                    self.active_tab().map(|tab| (tab.rich_view.clone(), tab.id))
                 {
                     view.update(cx, |view, cx| {
                         view.apply_rich(
@@ -208,10 +220,8 @@ impl Workspace {
             WorkspaceCommand::AdvanceTime { .. } => {}
             WorkspaceCommand::ExternalFileChange(path) => {
                 if let Some(index) = self.tab_index_for_path(&path, cx) {
-                    let dirty = self.tabs[index].document.read(cx).dirty;
-                    if reload_decision(dirty, Some(&path), &path) == ReloadDecision::PromptReload {
-                        self.pending_external_change = Some((index, path));
-                        cx.notify();
+                    if let Ok(theirs) = std::fs::read_to_string(&path) {
+                        self.apply_external_bytes(index, path, theirs, cx);
                     }
                 }
             }
@@ -227,8 +237,9 @@ impl Workspace {
         let index = self.active_tab;
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.mode = match tab.mode {
-                EditorMode::Source => EditorMode::Wysiwyg,
                 EditorMode::Wysiwyg => EditorMode::Source,
+                EditorMode::Source => EditorMode::Split,
+                EditorMode::Split => EditorMode::Wysiwyg,
             };
             cx.notify();
         }
@@ -382,7 +393,10 @@ impl Workspace {
         cx.notify();
     }
 
-    pub fn normalize_candidates(&self, cx: &gpui::App) -> Option<markrust_core::rich::SaveCandidates> {
+    pub fn normalize_candidates(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<markrust_core::rich::SaveCandidates> {
         let tab = self.active_tab()?;
         let doc = tab.document.read(cx);
         let mut engine = markrust_core::rich::RichEngine::new();
@@ -471,15 +485,21 @@ impl Workspace {
                 refresh_sidebar = true;
             }
             if let Some(index) = self.tab_index_for_path(&path, cx) {
-                let dirty = self.tabs[index].document.read(cx).dirty;
-                let tab_path = self.tabs[index].document.read(cx).path.clone();
-                match reload_decision(dirty, tab_path.as_deref(), &path) {
-                    ReloadDecision::PromptReload => {
-                        self.pending_external_change = Some((index, path));
-                        cx.notify();
+                let workspace = cx.entity();
+                let watched = path.clone();
+                cx.spawn(async move |_, cx| {
+                    let read_path = watched.clone();
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { std::fs::read_to_string(&read_path) })
+                        .await;
+                    if let Ok(theirs) = result {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.apply_external_bytes(index, watched, theirs, cx);
+                        });
                     }
-                    ReloadDecision::SkipBecauseDirty | ReloadDecision::Ignore => {}
-                }
+                })
+                .detach();
             }
         }
         if refresh_sidebar {
@@ -538,6 +558,59 @@ impl Workspace {
         Ok(())
     }
 
+    fn apply_external_bytes(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        theirs: String,
+        cx: &mut Context<Self>,
+    ) {
+        let action = {
+            let Some(tab) = self.tabs.get(index) else {
+                return;
+            };
+            let doc = tab.document.read(cx);
+            if doc.path.as_deref() != Some(path.as_path()) {
+                return;
+            }
+            classify_external_change(
+                doc.path.as_deref(),
+                &path,
+                doc.saved_content(),
+                &doc.buffer.content(),
+                &theirs,
+            )
+        };
+        match action {
+            ExternalChangeAction::Ignore => {}
+            ExternalChangeAction::PromptReload | ExternalChangeAction::PromptConflict => {
+                self.pending_external_change = Some((index, path));
+                cx.notify();
+            }
+            ExternalChangeAction::Apply(merged) => {
+                let source_caret = self.tabs[index].editor.read(cx).cursor_offset();
+                let rich_caret = self.tabs[index].rich_view.read(cx).cursor_offset();
+                let document = self.tabs[index].document.clone();
+                let mapped = document.update(cx, |doc, cx| {
+                    let mapped =
+                        doc.apply_merged_edit(&merged, &theirs, &[source_caret, rich_caret]);
+                    cx.notify();
+                    mapped
+                });
+                let source_mapped = mapped.first().copied().unwrap_or(source_caret);
+                let rich_mapped = mapped.get(1).copied().unwrap_or(rich_caret);
+                self.tabs[index].editor.update(cx, |editor, cx| {
+                    editor.apply_command(EditorCommand::JumpTo(source_mapped), cx);
+                });
+                self.tabs[index].rich_view.update(cx, |view, cx| {
+                    view.jump_to(rich_mapped, cx);
+                });
+                spawn_parse_pump(document, cx);
+                cx.notify();
+            }
+        }
+    }
+
     pub fn list_files(&self) -> Vec<PathBuf> {
         self.cached_files.clone()
     }
@@ -550,6 +623,9 @@ impl Workspace {
             tab.editor.update(cx, |editor, cx| {
                 editor.theme = theme.clone();
                 cx.notify();
+            });
+            tab.rich_view.update(cx, |view, cx| {
+                view.set_theme(theme.clone(), cx);
             });
         }
         cx.notify();

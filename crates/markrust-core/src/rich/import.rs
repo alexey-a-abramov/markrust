@@ -18,8 +18,9 @@ use super::tree::{
 };
 
 /// Parse options shared with `export::markdown_to_html_gfm` (parse-relevant
-/// subset) plus sourcepos tracking.
-fn parse_options() -> Options<'static> {
+/// subset) plus sourcepos tracking. Also used by the background span extractor
+/// so source-mode masking and the rich tree share one grammar.
+pub(crate) fn parse_options() -> Options<'static> {
     let mut options = Options::default();
     options.extension.strikethrough = true;
     options.extension.table = true;
@@ -31,10 +32,10 @@ fn parse_options() -> Options<'static> {
 }
 
 /// Byte offsets of every line start, for sourcepos conversion.
-struct LineStarts(Vec<usize>);
+pub(crate) struct LineStarts(Vec<usize>);
 
 impl LineStarts {
-    fn new(source: &str) -> Self {
+    pub(crate) fn new(source: &str) -> Self {
         let mut starts = vec![0];
         for (i, b) in source.bytes().enumerate() {
             if b == b'\n' {
@@ -46,7 +47,7 @@ impl LineStarts {
 
     /// comrak sourcepos: 1-based line, 1-based *byte* column, end-inclusive.
     /// (Byte-column semantics are pinned by `sourcepos_columns_are_bytes`.)
-    fn range(&self, sp: Sourcepos, source_len: usize) -> std::ops::Range<usize> {
+    pub(crate) fn range(&self, sp: Sourcepos, source_len: usize) -> std::ops::Range<usize> {
         let start = self
             .0
             .get(sp.start.line.saturating_sub(1))

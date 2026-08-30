@@ -19,7 +19,7 @@ pub use drop::{
     classify_editor_drop, classify_window_drop, is_image, markdown_image_reference, DropIntent,
 };
 pub use session::{
-    list_markdown_files, normalize_review_decision, reload_decision, should_offer_normalize_review,
-    AutosaveScheduler, DropTarget, HeadlessWorkspace, NormalizeReviewChoice, ReloadDecision,
-    SessionError, WorkspaceCommand,
+    classify_external_change, list_markdown_files, normalize_review_decision, reload_decision,
+    should_offer_normalize_review, AutosaveScheduler, DropTarget, ExternalChangeAction,
+    HeadlessWorkspace, NormalizeReviewChoice, SessionError, WorkspaceCommand,
 };

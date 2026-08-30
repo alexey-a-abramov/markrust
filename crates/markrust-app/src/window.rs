@@ -61,12 +61,21 @@ impl MarkRustWindow {
             .as_ref()
             .is_some_and(should_offer_normalize_review);
         if needs_review {
+            let preview = candidates
+                .as_ref()
+                .map(|c| c.hunk_preview(20))
+                .unwrap_or_default();
+            let message = if preview.is_empty() {
+                "Keep original writes the buffer as-is. Normalize rewrites to house style. Cancel aborts the save.".to_string()
+            } else {
+                format!(
+                    "Keep original writes the buffer as-is. Normalize rewrites to house style. Cancel aborts the save.\n\n{preview}"
+                )
+            };
             let receiver = window.prompt(
                 PromptLevel::Info,
                 "Normalize markdown on save?",
-                Some(
-                    "Keep original writes the buffer as-is. Normalize rewrites to house style. Cancel aborts the save.",
-                ),
+                Some(message.as_str()),
                 &[
                     PromptButton::ok("Keep original"),
                     PromptButton::new("Normalize"),
@@ -82,11 +91,8 @@ impl MarkRustWindow {
                     _ => NormalizeReviewChoice::Cancel,
                 };
                 let _ = workspace.update_in(cx, |workspace, window, cx| {
-                    let _ = workspace.dispatch(
-                        WorkspaceCommand::SaveWithReview(choice),
-                        window,
-                        cx,
-                    );
+                    let _ =
+                        workspace.dispatch(WorkspaceCommand::SaveWithReview(choice), window, cx);
                 });
             })
             .detach();
@@ -256,6 +262,7 @@ impl Render for MarkRustWindow {
         let theme = workspace.config.editor_theme();
         let mode_label = match workspace.active_tab().map(|tab| tab.mode) {
             Some(crate::workspace::EditorMode::Wysiwyg) => "Rich",
+            Some(crate::workspace::EditorMode::Split) => "Split",
             _ => "Source",
         };
         let active = workspace.active_tab;
@@ -325,16 +332,26 @@ impl Render for MarkRustWindow {
             .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(theme.drop_zone_bg))
             .children(external_change.map(|(index, path)| {
                 let ws = workspace_entity.clone();
+                let dirty = workspace
+                    .tabs
+                    .get(index)
+                    .map(|tab| tab.document.read(cx).dirty)
+                    .unwrap_or(false);
+                let banner = if dirty {
+                    format!(
+                        "File changed on disk and this tab has unsaved edits: {}. Click to reload (your edits will be lost).",
+                        path.display()
+                    )
+                } else {
+                    format!("File changed on disk: {}. Click to reload.", path.display())
+                };
                 div()
                     .px_4()
                     .py_2()
                     .bg(theme.accent.opacity(0.85))
                     .text_color(theme.sidebar_selected_text)
                     .text_sm()
-                    .child(format!(
-                        "File changed on disk: {}. Click to reload.",
-                        path.display()
-                    ))
+                    .child(banner)
                     .cursor_pointer()
                     .id("external-change-banner")
                     .on_click(cx.listener(move |_, _, _, cx| {
@@ -634,18 +651,51 @@ impl Render for MarkRustWindow {
                                         })),
                                 )
                             })
-                            .child(div().flex_1().p(px(24.)).child({
+                            .child({
                                 let tab =
                                     workspace.active_tab().unwrap_or_else(|| &workspace.tabs[0]);
                                 match tab.mode {
-                                    crate::workspace::EditorMode::Wysiwyg => {
-                                        tab.rich_view.clone().into_any_element()
-                                    }
-                                    crate::workspace::EditorMode::Source => {
-                                        tab.editor_view.clone().into_any_element()
-                                    }
+                                    crate::workspace::EditorMode::Wysiwyg => div()
+                                        .flex_1()
+                                        .p(px(24.))
+                                        .child(tab.rich_view.clone())
+                                        .into_any_element(),
+                                    crate::workspace::EditorMode::Source => div()
+                                        .flex_1()
+                                        .p(px(24.))
+                                        .child(tab.editor_view.clone())
+                                        .into_any_element(),
+                                    crate::workspace::EditorMode::Split => div()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_row()
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .id("split-source")
+                                                .flex_1()
+                                                .min_w(px(120.))
+                                                .p(px(12.))
+                                                .overflow_hidden()
+                                                .child(tab.editor_view.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(1.))
+                                                .h_full()
+                                                .bg(theme.separator),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("split-rich")
+                                                .flex_1()
+                                                .min_w(px(120.))
+                                                .overflow_hidden()
+                                                .child(tab.rich_view.clone()),
+                                        )
+                                        .into_any_element(),
                                 }
-                            })),
+                            }),
                     )
                     .child(if outline_open {
                         div()

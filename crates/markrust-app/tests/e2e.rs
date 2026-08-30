@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use markrust_app::{
     classify_editor_drop, classify_window_drop, markdown_image_reference, reload_decision,
-    DropIntent, DropTarget, HeadlessWorkspace, ReloadDecision, SessionError, WorkspaceCommand,
+    DropIntent, DropTarget, ExternalChangeAction, HeadlessWorkspace, SessionError,
+    WorkspaceCommand,
 };
 use markrust_core::markdown_to_html_gfm;
 use markrust_editor::{EditorCommand, VisibilityState, WrapKind};
@@ -244,7 +245,7 @@ fn file_watcher_reload_decision_and_reload_tab() {
         .unwrap();
     assert_eq!(
         reload_decision(false, Some(&path), &path),
-        ReloadDecision::PromptReload
+        ExternalChangeAction::PromptReload
     );
 
     std::fs::write(&path, "v2\n").unwrap();
@@ -265,6 +266,43 @@ fn file_watcher_reload_decision_and_reload_tab() {
     workspace
         .apply(WorkspaceCommand::ExternalFileChange(path.clone()))
         .unwrap();
+    assert!(workspace.pending_external_change.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dirty_tab_merges_disjoint_external_edits() {
+    let dir = unique_temp("merge");
+    let path = dir.join("note.md");
+    std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
+
+    let mut workspace = HeadlessWorkspace::new();
+    workspace
+        .apply(WorkspaceCommand::OpenFile(path.clone()))
+        .unwrap();
+    let content = workspace.active().unwrap().editor.content();
+    let at = content.find("bbb").unwrap();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::SetSelection {
+            start: at,
+            end: at + 3,
+        }))
+        .unwrap();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+            "BBB".into(),
+        )))
+        .unwrap();
+    assert!(workspace.active().unwrap().editor.document().dirty);
+    std::fs::write(&path, "aaa\nbbb\nCCC\n").unwrap();
+    workspace
+        .apply(WorkspaceCommand::ExternalFileChange(path.clone()))
+        .unwrap();
+    assert_eq!(
+        workspace.active().unwrap().editor.content(),
+        "aaa\nBBB\nCCC\n"
+    );
+    assert!(workspace.active().unwrap().editor.document().dirty);
     assert!(workspace.pending_external_change.is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }

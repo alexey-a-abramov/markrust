@@ -20,7 +20,6 @@ description = "Fast native Markdown workspace for developers"
 [workspace.dependencies]
 ropey = "1.6"
 tree-sitter = "0.26"
-tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 rayon = "1.10"
 thiserror = "2.0"
 

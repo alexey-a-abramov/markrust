@@ -2,7 +2,7 @@
 
 Fast, native, local-first Markdown workspace for developers.
 
-MarkRust is a free, open-source editor that keeps documents as plain UTF-8 Markdown on disk while rendering a seamless inline WYSIWYG view (Typora-style delimiter masking).
+MarkRust is a free, open-source editor that keeps documents as plain UTF-8 Markdown on disk while rendering a true WYSIWYG view (bold is bold). Source mode with Typora-style delimiter masking and a side-by-side split are optional (`Cmd/Ctrl+Shift+M`).
 
 ## Status
 
@@ -97,16 +97,16 @@ bash scripts/release.sh
 | `Cmd/Ctrl+Z` | Undo |
 | `Cmd/Ctrl+Shift+Z` | Redo |
 | `Cmd/Ctrl+P` | Command palette |
+| `Cmd/Ctrl+Shift+M` | Cycle Rich / Source / Split |
 | `Cmd/Ctrl+Shift+T` | Toggle light/dark theme |
-
-Formatting shortcuts (`Cmd/Ctrl+B`, `Cmd/Ctrl+I`, `Cmd/Ctrl+K`) are planned for v0.2.
+| `Cmd/Ctrl+B` / `I` / `E` / `K` | Bold / italic / code / link |
 
 ## Workspace crates
 
 | Crate | Purpose |
 |---|---|
-| `markrust-core` | Rope buffer, undo/redo, tree-sitter spans |
-| `markrust-editor` | Delimiter masking, layout, GPUI element |
+| `markrust-core` | Rope buffer, undo/redo, comrak RichTree + source spans |
+| `markrust-editor` | WYSIWYG view, source-mode masking, layout, GPUI elements |
 | `markrust-app` | GPUI shell (workspace, file tree, palette) |
 | `markrust` | CLI + desktop binary |
 

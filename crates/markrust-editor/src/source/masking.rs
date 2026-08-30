@@ -143,6 +143,7 @@ mod tests {
             language: None,
             task_checked: None,
             table_row: None,
+            heading_level: None,
         }
     }
 
@@ -158,6 +159,7 @@ mod tests {
             language: None,
             task_checked: None,
             table_row: None,
+            heading_level: None,
         }
     }
 

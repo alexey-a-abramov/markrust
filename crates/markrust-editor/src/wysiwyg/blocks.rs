@@ -14,7 +14,9 @@ use gpui::{
 };
 use markrust_core::rich::{Block, BlockKind, ColumnAlign, NodeId, RichTree};
 
-use super::block_text::{build_code_layout, build_leaf_layout, BlockTextElement, WysiwygHost};
+use super::block_text::{
+    build_code_layout, build_leaf_layout, BlockTextElement, WidgetImeSink, WysiwygHost,
+};
 use crate::highlight::highlight_code_block;
 use crate::theme::EditorTheme;
 
@@ -131,6 +133,19 @@ fn render_block<H: WysiwygHost>(
                         editor_away.update(cx, |host, cx| host.finish_widget(cx));
                     })
                 });
+            let chip = div().relative().child(chip).when(editing, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(WidgetImeSink {
+                            editor: editor.clone(),
+                        }),
+                )
+            });
             div()
                 .my(px(4.))
                 .p(px(12.))
@@ -392,8 +407,8 @@ fn paragraph_element<H: WysiwygHost>(
                 .flex_col()
                 .gap(px(2.))
                 .child(img(source).max_w_full().rounded_md())
-                .child(
-                    div()
+                .child({
+                    let caption_el = div()
                         .id(("img-alt", image_range.start as u64))
                         .text_size(px(12.))
                         .text_color(snap.theme.secondary_text)
@@ -422,8 +437,21 @@ fn paragraph_element<H: WysiwygHost>(
                             el.on_mouse_down_out(move |_, _, cx| {
                                 editor_away.update(cx, |host, cx| host.finish_widget(cx));
                             })
-                        }),
-                ),
+                        });
+                    div().relative().child(caption_el).when(editing, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .child(WidgetImeSink {
+                                    editor: editor.clone(),
+                                }),
+                        )
+                    })
+                }),
         );
     }
     container.into_any_element()

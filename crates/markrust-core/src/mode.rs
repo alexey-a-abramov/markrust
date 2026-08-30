@@ -10,7 +10,7 @@ pub enum DocumentProcessingMode {
     /// Parse Markdown and expose syntax spans for seamless WYSIWYG rendering.
     #[default]
     MarkdownWysiwyg,
-    /// Skip tree-sitter; treat the buffer as plain text.
+    /// Skip Markdown parse; treat the buffer as plain text.
     PlainText,
 }
 

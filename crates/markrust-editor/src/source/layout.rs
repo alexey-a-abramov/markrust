@@ -238,10 +238,12 @@ fn span_style(span: &SyntaxNodeSpan) -> SegmentStyle {
 }
 
 pub fn heading_level(span: &SyntaxNodeSpan) -> u8 {
-    span.delimiter_spans
-        .first()
-        .map(|delimiter| delimiter.len().clamp(1, 6) as u8)
-        .unwrap_or(1)
+    span.heading_level.unwrap_or_else(|| {
+        span.delimiter_spans
+            .first()
+            .map(|delimiter| delimiter.len().clamp(1, 6) as u8)
+            .unwrap_or(1)
+    })
 }
 
 fn coalesce_segments(len: usize, style_at: &[SegmentStyle]) -> Vec<LayoutSegment> {
@@ -680,6 +682,7 @@ mod tests {
             language: None,
             task_checked: None,
             table_row: None,
+            heading_level: None,
         }
     }
 

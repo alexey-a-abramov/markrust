@@ -1,13 +1,15 @@
 # MarkRust architecture
 
-MarkRust uses a decoupled reactive pipeline: input mutates a rope-backed buffer, a background parser produces syntax spans, and the editor projects styled glyphs with delimiter masking.
+MarkRust is a **true WYSIWYG** Markdown editor: the user edits a rendered rich document; Markdown is the on-disk serialization. A **source** surface (Typora-style delimiter masking) and a **side-by-side** split are optional. All native Rust on GPUI.
+
+The rope buffer is the single source of truth. A derived `RichTree` (comrak) is authoritative for interpretation and command targeting. Source-mode masking is a projection of that same grammar, not a second Markdown parser.
 
 ## Crate boundaries
 
 | Crate | Responsibility | GUI deps |
 |---|---|---|
-| `markrust-core` | Buffer, undo, line index, tree-sitter spans, revision tokens | None |
-| `markrust-editor` | `HeadlessEditor` + masking/layout; GPUI `MarkdownEditor` adapter | GPUI (view only) |
+| `markrust-core` | Rope buffer, undo, line index, comrak `RichTree` + source spans, revision tokens | None |
+| `markrust-editor` | `HeadlessEditor` + source masking/layout; GPUI `MarkdownEditor` and `RichEditorView` | GPUI (view only) |
 | `markrust-app` | `HeadlessWorkspace` session + GPUI window chrome | GPUI (Zed git pin) |
 | `markrust` | CLI (`parse_args` / `run`) and desktop binary | GUI only for `--gui` |
 
@@ -19,19 +21,21 @@ MarkRust uses a decoupled reactive pipeline: input mutates a rope-backed buffer,
 GPUI window / CLI
         ↓  WorkspaceCommand / EditorCommand
 HeadlessWorkspace (tabs, drop routing, autosave clock, export)
-        ↓  EditorCommand
-HeadlessEditor (Document + caret/selection)
+        ↓  EditorCommand / RichCommand
+HeadlessEditor / RichEngine (Document + caret/selection)
         ↓
-compute_visibility / build_display_layout / export HTML
+source: compute_visibility / build_display_layout
+WYSIWYG: RichEditorView over RichTree
+export HTML (comrak, same extension set as import)
 ```
 
-- `EditorCommand`: insert, backspace, delete, move/select caret, undo/redo, jump.
-- `WorkspaceCommand`: save/open/export, drop files, theme, tabs, heading jump, `AdvanceTime` (fake clock), external-change reload.
+- `EditorCommand`: insert, backspace, delete, move/select caret, undo/redo, jump, wrap.
+- `RichCommand`: WYSIWYG typing, marks, lists, tables, frontmatter fields — compiled to byte splices on the rope.
+- `WorkspaceCommand`: save/open/export, drop files, theme, tabs, heading jump, `AdvanceTime` (fake clock), external-change reload, `SaveWithReview`.
 - Drop classification stays pure in `drop.rs`.
-- File-watcher reload policy is `reload_decision` (skip dirty tabs).
+- File-watcher policy is `classify_external_change` (ignore own saves; 3-way merge dirty tabs; prompt on conflict or clean-tab disk change).
 
 Unit tests live next to the modules. Headless e2e lives in `crates/markrust-app/tests/e2e.rs` (no window). CLI e2e lives in `crates/markrust/tests/e2e.rs` (`assert_cmd`, never empty args / `--gui`).
-
 
 ## Data flow
 
@@ -40,32 +44,52 @@ Keyboard/Mouse/IME/FileWatcher
         ↓
 DocumentBuffer (ropey) + UndoStack
         ↓
-BackgroundMarkdownParser (tree-sitter-md thread)
+BackgroundMarkdownParser (comrak on a worker thread)
         ↓
-SyntaxNodeSpan map (revision-stamped)
+SyntaxNodeSpan map (revision-stamped)  — source-mode masking only
+RichEngine::sync → RichTree              — WYSIWYG + commands
         ↓
-compute_visibility (carets, selections, spans)
-        ↓
-Layout + Paint (Phase 2 GPUI)
+Source: compute_visibility + layout + paint
+WYSIWYG: virtualized block list + BlockTextElement
 ```
+
+Parse and the folder watcher `recv` stay off the GPUI UI thread. `Document::new` / `from_file` only *schedule* a parse; the frame drains with `apply_pending_parse`.
 
 ## Document model
 
 - **On disk:** plain UTF-8 `.md` / `.txt` — no proprietary container.
-- **`DocumentProcessingMode`:** `MarkdownWysiwyg` runs tree-sitter; `PlainText` skips parsing.
+- **`DocumentProcessingMode`:** `MarkdownWysiwyg` parses with comrak; `PlainText` skips parsing.
 - **`revision`:** monotonic counter on every buffer edit; parse results carry the revision they were computed for so stale updates are ignored.
+- **`saved_content`:** last reconciled disk snapshot (load, save, or last merged disk bytes). Used as the 3-way merge base.
 
 ## Parser strategy
 
 | Layer | Engine | When |
 |---|---|---|
-| Hot path | tree-sitter-md | Every edit (background thread) |
-| Export (later) | comrak | On demand for HTML |
+| Document structure + source spans | comrak (same options as HTML export) | Every edit, background thread |
+| WYSIWYG tree | `rich::import` (comrak → `RichTree`) | On `RichEngine::sync` |
+| Fenced-code highlighting | tree-sitter rust/json/yaml/bash | Viewport paint of a code body |
 
-## Future trait boundaries (stubs in later phases)
+tree-sitter-md is not used. Source-mode `SyntaxNodeSpan`s are extracted from the comrak AST so masking cannot disagree with the rich tree's grammar.
 
-- `TextLayoutEngine` — measure, line break, glyph runs
-- `SyntaxHighlighter` — viewport-local highlight spans
-- `FileSystemAdapter` — read, write, watch with workspace sandbox
+## Editing surfaces
 
-See [delimiter-masking.md](delimiter-masking.md) for the WYSIWYG visibility algorithm.
+| Mode | Default | How |
+|---|---|---|
+| **Rich** (WYSIWYG) | yes | `RichEditorView` — bold is bold; Markdown is serialization |
+| **Source** | `cmd-shift-m` | Existing delimiter-masking editor; spans from comrak |
+| **Split** | cycle `cmd-shift-m` again | Source left, Rich right; shared `Document` |
+
+Caret/selection are source byte offsets. `RichEngine` provides delimiter-skipping snap/step for WYSIWYG.
+
+## Save and external edits
+
+- Default save writes the buffer verbatim (untouched blocks are untouched bytes).
+- When house-style Normalize would change the file, Save offers Keep original / Normalize / Cancel with a hunk preview.
+- Autosave writes the buffer as-is (no Normalize).
+- External disk changes: if the buffer still matches the last snapshot, prompt to reload; if the tab is dirty, 3-way line-merge disjoint edits (carets mapped with `map_offset_across_change`); overlapping edits prompt before discarding.
+
+## Related
+
+- [WYSIWYG roadmap](roadmap.md) — phase status and handoff
+- [Delimiter masking](delimiter-masking.md) — source-mode visibility algorithm
