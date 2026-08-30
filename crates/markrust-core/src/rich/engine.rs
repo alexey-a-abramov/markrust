@@ -152,7 +152,7 @@ impl RichEngine {
                 Inline::OpaqueInline { source_range, .. } => {
                     source_range.start <= byte && byte <= source_range.end
                 }
-                Inline::Math { source_range, .. } => {
+                Inline::Math { source_range, .. } | Inline::WikiLink { source_range, .. } => {
                     source_range.start <= byte && byte <= source_range.end
                 }
                 _ => false,
@@ -422,23 +422,7 @@ impl RichEngine {
     /// Headings as (source offset, level, text) — replaces the span-based
     /// outline for WYSIWYG mode.
     pub fn outline(&self) -> Vec<(usize, u8, String)> {
-        fn walk(blocks: &[Block], out: &mut Vec<(usize, u8, String)>) {
-            for b in blocks {
-                if let BlockKind::Heading { level, .. } = b.kind {
-                    let mut text = String::new();
-                    for inline in &b.inlines {
-                        if let Inline::Run { text: t, .. } = inline {
-                            text.push_str(t);
-                        }
-                    }
-                    out.push((b.source_range.start, level, text));
-                }
-                walk(&b.children, out);
-            }
-        }
-        let mut out = Vec::new();
-        walk(&self.tree.blocks, &mut out);
-        out
+        self.tree.outline()
     }
 }
 
@@ -462,7 +446,8 @@ fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
                 match inline {
                     Inline::Run { source_range, .. }
                     | Inline::Image { source_range, .. }
-                    | Inline::Math { source_range, .. } => {
+                    | Inline::Math { source_range, .. }
+                    | Inline::WikiLink { source_range, .. } => {
                         out.push(source_range.clone());
                     }
                     Inline::OpaqueInline {
@@ -641,6 +626,18 @@ mod tests {
         let open = source.find('$').unwrap();
         assert_eq!(engine.snap_caret(open, Bias::Right), open);
         let inner = source.find('x').unwrap();
+        assert_eq!(engine.snap_caret(inner, Bias::Right), inner);
+        assert!(engine.in_raw_context(inner));
+        assert!(!engine.in_raw_context(0));
+    }
+
+    #[test]
+    fn snap_caret_sits_on_wikilink_brackets() {
+        let source = "see [[page]] tail\n";
+        let (_doc, engine) = engine_for(source);
+        let open = source.find("[[").unwrap();
+        assert_eq!(engine.snap_caret(open, Bias::Right), open);
+        let inner = source.find("page").unwrap();
         assert_eq!(engine.snap_caret(inner, Bias::Right), inner);
         assert!(engine.in_raw_context(inner));
         assert!(!engine.in_raw_context(0));

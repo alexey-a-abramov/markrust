@@ -69,6 +69,7 @@ fn render_block<H: WysiwygHost>(
         BlockKind::Paragraph => {
             paragraph_element(snap, block, theme.font_size, FontWeight::NORMAL, editor)
         }
+        BlockKind::Toc { .. } => render_toc(snap, block, editor),
         BlockKind::Heading { level, .. } => {
             let size = theme.heading_font_size(*level);
             div()
@@ -301,6 +302,71 @@ fn render_alert<H: WysiwygHost>(
         .border_color(accent)
         .child(header)
         .children(children)
+        .into_any_element()
+}
+
+fn render_toc<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    block: &Block,
+    editor: Entity<H>,
+) -> AnyElement {
+    let theme = &snap.theme;
+    let reveal = RevealState {
+        caret: snap.caret,
+        selection: snap.selected_range.clone(),
+    };
+    if reveal.intersects(&block.source_range) {
+        return paragraph_element(snap, block, theme.font_size, FontWeight::NORMAL, editor);
+    }
+    let entries = snap.tree.outline();
+    if entries.is_empty() {
+        let caret_at = block.source_range.start;
+        let editor_click = editor.clone();
+        return div()
+            .id(("toc-empty", block.id.0))
+            .py(px(4.))
+            .text_size(px(theme.font_size * 0.9))
+            .text_color(theme.secondary_text)
+            .cursor(CursorStyle::PointingHand)
+            .child(SharedString::from("No headings"))
+            .on_click(move |_, window, cx| {
+                editor_click.update(cx, |host, cx| {
+                    host.click_source(caret_at, false, window, cx);
+                });
+            })
+            .into_any_element();
+    }
+    let rows: Vec<AnyElement> = entries
+        .iter()
+        .map(|(offset, level, title)| {
+            let indent = px(12.0 * (*level as f32 - 1.0).max(0.0));
+            let jump = *offset;
+            let editor_click = editor.clone();
+            let label = if title.trim().is_empty() {
+                SharedString::from("(untitled)")
+            } else {
+                SharedString::from(title.clone())
+            };
+            div()
+                .id(("toc-item", jump as u64))
+                .pl(indent)
+                .py(px(2.))
+                .text_size(px(theme.font_size))
+                .text_color(theme.link)
+                .cursor(CursorStyle::PointingHand)
+                .child(label)
+                .on_click(move |_, window, cx| {
+                    editor_click.update(cx, |host, cx| {
+                        host.click_source(jump, false, window, cx);
+                    });
+                })
+                .into_any_element()
+        })
+        .collect();
+    div()
+        .id(("toc", block.id.0))
+        .py(px(4.))
+        .children(rows)
         .into_any_element()
 }
 

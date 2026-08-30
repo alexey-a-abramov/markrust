@@ -10,7 +10,7 @@ use comrak::{markdown_to_html, Options};
 
 /// Render Markdown source to an HTML fragment using GFM extensions plus
 /// Typora extras that the rich tree also parses (footnotes, description lists,
-/// dollar math, GitHub alerts).
+/// dollar math, GitHub alerts, wikilinks).
 pub fn markdown_to_html_gfm(source: &str) -> String {
     let mut options = Options::default();
     options.extension.strikethrough = true;
@@ -23,6 +23,7 @@ pub fn markdown_to_html_gfm(source: &str) -> String {
     options.extension.subscript = true;
     options.extension.math_dollars = true;
     options.extension.alerts = true;
+    options.extension.wikilinks_title_after_pipe = true;
     options.extension.tagfilter = true;
     options.extension.front_matter_delimiter = Some("---".into());
     options.render.unsafe_ = true;
@@ -110,6 +111,20 @@ mod tests {
         assert!(
             html.contains("$5"),
             "currency must remain text, html: {html}"
+        );
+    }
+
+    #[test]
+    fn exports_wikilinks() {
+        let html = markdown_to_html_gfm("see [[page]] and [[page|Label]]");
+        assert!(
+            html.contains("data-wikilink=\"true\"") && html.contains("href=\"page\""),
+            "wikilink html: {html}"
+        );
+        assert!(html.contains("Label"), "piped label html: {html}");
+        assert!(
+            !html.contains("[[page]]"),
+            "raw wiki chrome must not appear: {html}"
         );
     }
 

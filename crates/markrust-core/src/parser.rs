@@ -8,7 +8,9 @@
 //! source mode is a projection of the rich tree's grammar rather than a second
 //! parser (tree-sitter-md). `==highlight==` is not a comrak node; it is paired
 //! with the same rules as [`crate::rich::import`] so source masking matches
-//! WYSIWYG. Dollar math (`$` / `$$`) is a comrak node (`math_dollars`). GitHub
+//! WYSIWYG. Dollar math (`$` / `$$`) is a comrak node (`math_dollars`). Wikilinks
+//! (`[[target]]` / `[[target|label]]`) are comrak `wikilinks_title_after_pipe`.
+//! GitHub
 //! alerts (`> [!NOTE]`, …) are comrak `alerts`. Parse still runs on a dedicated
 //! worker thread.
 
@@ -149,6 +151,17 @@ fn collect_spans<'a>(
                 SyntaxKind::Math,
                 full,
                 delimiter_spans,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::WikiLink(_) => {
+            spans.push(make_span(
+                SyntaxKind::WikiLink,
+                range.clone(),
+                wiki_delims(source, &range),
                 None,
                 None,
                 None,
@@ -402,7 +415,11 @@ fn collect_eqeq_skip_ranges<'a>(
     let range = lines.range(node.data.borrow().sourcepos, source.len());
     let skip_here = matches!(
         node.data.borrow().value,
-        NodeValue::Code(_) | NodeValue::HtmlInline(_) | NodeValue::Image(_) | NodeValue::Math(_)
+        NodeValue::Code(_)
+            | NodeValue::HtmlInline(_)
+            | NodeValue::Image(_)
+            | NodeValue::Math(_)
+            | NodeValue::WikiLink(_)
     );
     if skip_here {
         skip.push(range);
@@ -522,6 +539,26 @@ fn frontmatter_delims(source: &str, range: &std::ops::Range<usize>) -> Vec<Delim
         }
     }
     out
+}
+
+fn wiki_delims(source: &str, range: &std::ops::Range<usize>) -> Vec<DelimiterSpan> {
+    let slice = source.get(range.clone()).unwrap_or("");
+    if slice.len() < 4 || !slice.starts_with("[[") || !slice.ends_with("]]") {
+        return wrap_delims(source, range, 2);
+    }
+    let inner = &slice[2..slice.len() - 2];
+    if let Some(pipe) = inner.find('|') {
+        // Hide `[[target|` so only the label remains, matching WYSIWYG.
+        vec![
+            DelimiterSpan::new(range.start, range.start + 2 + pipe + 1),
+            DelimiterSpan::new(range.end - 2, range.end),
+        ]
+    } else {
+        vec![
+            DelimiterSpan::new(range.start, range.start + 2),
+            DelimiterSpan::new(range.end - 2, range.end),
+        ]
+    }
 }
 
 fn link_delims(source: &str, range: &std::ops::Range<usize>, image: bool) -> Vec<DelimiterSpan> {
@@ -975,6 +1012,24 @@ mod tests {
             "$$E=mc^2$$"
         );
         assert_eq!(delim_text(source, maths[1]), vec!["$$", "$$"]);
+    }
+
+    #[test]
+    fn extracts_wikilink_delimiters() {
+        let source = "see [[page]] and [[page|Label]]";
+        let spans = extract_syntax_spans(source);
+        let wikis: Vec<_> = spans
+            .iter()
+            .filter(|s| s.kind == SyntaxKind::WikiLink)
+            .collect();
+        assert_eq!(wikis.len(), 2, "wiki spans: {spans:?}");
+        assert_eq!(&source[wikis[0].start_byte..wikis[0].end_byte], "[[page]]");
+        assert_eq!(delim_text(source, wikis[0]), vec!["[[", "]]"]);
+        assert_eq!(
+            &source[wikis[1].start_byte..wikis[1].end_byte],
+            "[[page|Label]]"
+        );
+        assert_eq!(delim_text(source, wikis[1]), vec!["[[page|", "]]"]);
     }
 
     #[test]

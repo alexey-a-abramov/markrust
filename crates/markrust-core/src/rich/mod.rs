@@ -22,9 +22,9 @@ pub use input_rules::{match_input_rule, InputRule};
 pub use save::{save_candidates, DiffHunk, SaveCandidates};
 pub use serialize::{serialize_block, serialize_tree, SerializeMode};
 pub use tree::{
-    find_alert_chrome, AlertChrome, AlertKind, Block, BlockKind, BreakStyle, ColumnAlign,
-    FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs, MarkFidelity, MarkSet,
-    NodeId, RichTree,
+    find_alert_chrome, is_toc_marker, wiki_visible_range, AlertChrome, AlertKind, Block, BlockKind,
+    BreakStyle, ColumnAlign, FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs,
+    MarkFidelity, MarkSet, NodeId, RichTree,
 };
 
 #[cfg(test)]
@@ -208,6 +208,7 @@ mod tests {
                 Inline::Math {
                     literal, display, ..
                 } => format!("math:{}:{literal}", if *display { "$$" } else { "$" }),
+                Inline::WikiLink { target, label, .. } => format!("wiki:{target}:{label}"),
                 Inline::SoftBreak => "soft".into(),
                 Inline::HardBreak { .. } => "hard".into(),
                 Inline::Image { alt, url, .. } => format!("img:{alt}:{url}"),
@@ -471,6 +472,74 @@ mod tests {
                 && rewritten.contains("$5"),
             "dirty serialize must keep dollar math, got {rewritten:?}"
         );
+    }
+
+    #[test]
+    fn wikilinks_are_first_class_not_opaque() {
+        let source = "see [[page]] and [[page|Label]]\n";
+        let tree = import(source);
+        let wikis: Vec<_> = tree.blocks[0]
+            .inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::WikiLink {
+                    target, label, raw, ..
+                } => Some((target.as_str(), label.as_str(), raw.as_ref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            wikis,
+            vec![
+                ("page", "page", "[[page]]"),
+                ("page", "Label", "[[page|Label]]")
+            ]
+        );
+        assert!(!tree.blocks[0].inlines.iter().any(|i| match i {
+            Inline::WikiLink { .. } => false,
+            Inline::Run { text, .. } => text.contains("[["),
+            Inline::OpaqueInline { raw, .. } => raw.contains("[["),
+            _ => false,
+        }));
+        assert_eq!(preserve(source), source);
+        let dirty = std::collections::HashSet::from([tree.blocks[0].id]);
+        let rewritten = serialize_tree(&tree, source, SerializeMode::Preserve, &dirty);
+        assert!(
+            rewritten.contains("[[page]]") && rewritten.contains("[[page|Label]]"),
+            "dirty serialize must keep wikilinks, got {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn toc_marker_is_a_block_and_roundtrips() {
+        for source in ["[TOC]\n", "[toc]\n", "[[toc]]\n", "[[TOC]]\n"] {
+            let tree = import(source);
+            match &tree.blocks[0].kind {
+                BlockKind::Toc { wiki } => {
+                    assert_eq!(
+                        *wiki,
+                        source.trim().eq_ignore_ascii_case("[[toc]]"),
+                        "{source}"
+                    );
+                }
+                other => panic!("expected Toc for {source:?}, got {other:?}"),
+            }
+            assert_eq!(preserve(source), source, "{source:?}");
+        }
+        let mixed = "# One\n\n[TOC]\n\n## Two\n";
+        let tree = import(mixed);
+        assert!(matches!(
+            tree.blocks[1].kind,
+            BlockKind::Toc { wiki: false }
+        ));
+        let outline = tree.outline();
+        assert_eq!(outline.len(), 2);
+        assert_eq!(outline[0].2, "One");
+        assert_eq!(outline[1].2, "Two");
+        assert_eq!(preserve(mixed), mixed);
+        let heading_wiki = "# [[page|Hello]]\n";
+        let tree = import(heading_wiki);
+        assert_eq!(tree.outline()[0].2, "Hello");
     }
 
     #[test]

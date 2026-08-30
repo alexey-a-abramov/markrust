@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WYSIWYG `[[wikilink]]` / `[[target|label]]` paint as in-place links (`[[ ]]` hidden unless the caret intersects). `[TOC]` / `[[toc]]` paint a generated heading list from the document outline (marker shown when the caret intersects). Source bytes stay in the file. Source mode masks wiki brackets with the same caret/selection rule as `**`.
 - Parse/layout perf gates: 256 KiB mixed GFM load+parse timeout tests, 64 KiB source-layout timeout tests, plus criterion benches (`cargo bench -p markrust-core --bench parse`, `cargo bench -p markrust-editor --bench layout`).
 - Contextual table toolbar when the caret is in a table (row/col insert and delete). Right-click still focuses the cell.
 - Frontmatter panel edits title, description, tags, and the inner YAML body.
@@ -22,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Source-mode syntax spans are extracted from comrak (same grammar as the WYSIWYG `RichTree`). tree-sitter-md is no longer a `markrust-core` dependency. Fenced-code highlighting still uses tree-sitter for rust/json/yaml/bash. Source mode masks `==highlight==` (and `~sub~` / `^sup^` / `$` / `$$` math) with the same caret/selection rule as `**`.
+- Source-mode syntax spans are extracted from comrak (same grammar as the WYSIWYG `RichTree`). tree-sitter-md is no longer a `markrust-core` dependency. Fenced-code highlighting still uses tree-sitter for rust/json/yaml/bash. Source mode masks `==highlight==` (and `~sub~` / `^sup^` / `$` / `$$` math / `[[wikilink]]`) with the same caret/selection rule as `**`.
 - Architecture docs rewritten for the rope + RichTree + source-projection pipeline.
 
 ### Added (earlier this cycle)

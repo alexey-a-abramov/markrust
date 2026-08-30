@@ -2,7 +2,7 @@
 
 Source mode — not the default WYSIWYG surface — hides Markdown delimiter tokens (`**`, `` ` ``, `#`, link brackets, etc.) until the user focuses or selects inside the syntax node. The default **Rich** mode edits the `RichTree` and never paints source delimiters.
 
-Syntax spans for masking are derived from the **same comrak AST** as `RichTree` import (`extract_syntax_spans`). There is no tree-sitter-md grammar on this path. Typora `==highlight==` is not a comrak node; the span extractor pairs it with the same rules as rich import so source masking matches WYSIWYG. Dollar math (`$` / `$$`) is a comrak node (`math_dollars`); currency like `$5` and `$` inside code are left as text.
+Syntax spans for masking are derived from the **same comrak AST** as `RichTree` import (`extract_syntax_spans`). There is no tree-sitter-md grammar on this path. Typora `==highlight==` is not a comrak node; the span extractor pairs it with the same rules as rich import so source masking matches WYSIWYG. Dollar math (`$` / `$$`) is a comrak node (`math_dollars`); currency like `$5` and `$` inside code are left as text. Wikilinks (`[[target]]` / `[[target|label]]`) mask `[[` / `]]` (and `target|` when a label is present) with the same caret/selection rule.
 
 ## Visibility rule
 

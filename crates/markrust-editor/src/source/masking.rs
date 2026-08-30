@@ -463,4 +463,30 @@ mod tests {
             VisibilityState::Visible
         );
     }
+
+    #[test]
+    fn wikilink_caret_outside_masks_inside_reveals() {
+        let source = "see [[page]] here";
+        let spans = markrust_core::extract_syntax_spans(source);
+        let wiki = spans
+            .iter()
+            .find(|span| span.kind == SyntaxKind::WikiLink)
+            .expect("wiki span");
+        assert_eq!(
+            wiki.delimiter_spans
+                .iter()
+                .map(|d| &source[d.start_byte..d.end_byte])
+                .collect::<Vec<_>>(),
+            vec!["[[", "]]"]
+        );
+        assert_eq!(
+            delimiter_visibility_for_span(wiki, &[Caret::new(0)], &[]),
+            VisibilityState::Masked
+        );
+        let inside = source.find("page").unwrap();
+        assert_eq!(
+            delimiter_visibility_for_span(wiki, &[Caret::new(inside)], &[]),
+            VisibilityState::Visible
+        );
+    }
 }

@@ -151,7 +151,18 @@ impl<'a> Ser<'a> {
         }
 
         match &block.kind {
-            BlockKind::Paragraph | BlockKind::TableCell => {
+            BlockKind::Paragraph | BlockKind::TableCell | BlockKind::Toc { .. } => {
+                if let BlockKind::Toc { wiki } = &block.kind {
+                    if self.normalize() {
+                        let marker = self.slice(block).trim();
+                        if super::tree::is_toc_marker(marker) {
+                            self.out.push_str(marker);
+                        } else {
+                            self.out.push_str(if *wiki { "[[toc]]" } else { "[TOC]" });
+                        }
+                        return;
+                    }
+                }
                 self.emit_inlines(&block.inlines, false);
             }
             BlockKind::Heading { level, style } => {
@@ -621,6 +632,24 @@ impl<'a> Ser<'a> {
                         at_line_start = false;
                     }
                 }
+                Inline::WikiLink {
+                    target, label, raw, ..
+                } => {
+                    if self.normalize() {
+                        self.out.push_str("[[");
+                        self.out.push_str(target);
+                        if !label.is_empty() && label != target {
+                            self.out.push('|');
+                            self.out.push_str(label);
+                        }
+                        self.out.push_str("]]");
+                    } else {
+                        self.out.push_str(raw);
+                    }
+                    if !raw.is_empty() || !target.is_empty() {
+                        at_line_start = false;
+                    }
+                }
                 Inline::OpaqueInline { raw, .. } => {
                     self.out.push_str(raw);
                     if !raw.is_empty() {
@@ -650,7 +679,9 @@ fn inline_keys(inline: &Inline) -> Vec<MarkKey> {
     let (marks, link) = match inline {
         Inline::Run { marks, link, .. } => (*marks, link.clone()),
         Inline::Image { marks, link, .. } => (*marks, link.clone()),
-        Inline::OpaqueInline { marks, .. } | Inline::Math { marks, .. } => (*marks, None),
+        Inline::OpaqueInline { marks, .. }
+        | Inline::Math { marks, .. }
+        | Inline::WikiLink { marks, .. } => (*marks, None),
         _ => (MarkSet::empty(), None),
     };
     let fidelity = match inline {

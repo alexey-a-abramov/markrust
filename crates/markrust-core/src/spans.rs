@@ -24,6 +24,8 @@ pub enum SyntaxKind {
     Subscript,
     /// `$…$` / `$$…$$` (comrak `math_dollars`).
     Math,
+    /// `[[target]]` / `[[target|label]]` (comrak wikilinks).
+    WikiLink,
     /// GitHub `> [!NOTE]` / TIP / IMPORTANT / WARNING / CAUTION.
     Alert,
     Other,

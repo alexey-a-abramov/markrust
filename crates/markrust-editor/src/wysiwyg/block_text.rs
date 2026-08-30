@@ -237,6 +237,12 @@ fn math_delim_run(text_style: &TextStyle, theme: &EditorTheme) -> TextRun {
     run
 }
 
+fn wiki_delim_run(text_style: &TextStyle, theme: &EditorTheme) -> TextRun {
+    let mut run = text_style.to_run(0);
+    run.color = theme.delimiter;
+    run
+}
+
 /// Layout for a projected HTML block (tags stripped). `source_at` is relative
 /// to the HTML literal; `block_start` is the document offset of that literal.
 /// Inner Markdown (`**bold**`, links, code) is parsed so it does not paint as
@@ -698,6 +704,76 @@ pub fn build_leaf_layout_inlines(
                     );
                 }
             }
+            Inline::WikiLink {
+                label,
+                raw,
+                source_range,
+                marks,
+                ..
+            } => {
+                if html.hidden() {
+                    continue;
+                }
+                let paint = merge_html_paint(*marks, &html.paint());
+                let link_run = style_run(text_style, theme, base_weight, *marks, true, &paint);
+                if reveal.intersects(source_range) {
+                    let raw_s = raw.as_ref();
+                    if raw_s.len() >= 4 && raw_s.starts_with("[[") && raw_s.ends_with("]]") {
+                        let delim = wiki_delim_run(text_style, theme);
+                        push(
+                            &mut text,
+                            &mut runs,
+                            &mut source_at,
+                            &raw_s[..2],
+                            source_range.start..source_range.start + 2,
+                            delim.clone(),
+                        );
+                        push(
+                            &mut text,
+                            &mut runs,
+                            &mut source_at,
+                            &raw_s[2..raw_s.len() - 2],
+                            source_range.start + 2..source_range.end.saturating_sub(2),
+                            link_run,
+                        );
+                        push(
+                            &mut text,
+                            &mut runs,
+                            &mut source_at,
+                            &raw_s[raw_s.len() - 2..],
+                            source_range.end.saturating_sub(2)..source_range.end,
+                            delim,
+                        );
+                    } else {
+                        push(
+                            &mut text,
+                            &mut runs,
+                            &mut source_at,
+                            raw_s,
+                            source_range.clone(),
+                            link_run,
+                        );
+                    }
+                } else {
+                    let vis_range =
+                        markrust_core::rich::wiki_visible_range(raw, source_range.clone());
+                    let rel_start = vis_range.start.saturating_sub(source_range.start);
+                    let rel_end = vis_range
+                        .end
+                        .saturating_sub(source_range.start)
+                        .min(raw.len())
+                        .max(rel_start);
+                    let visible = raw.get(rel_start..rel_end).filter(|s| !s.is_empty());
+                    push(
+                        &mut text,
+                        &mut runs,
+                        &mut source_at,
+                        visible.unwrap_or(label),
+                        vis_range,
+                        link_run,
+                    );
+                }
+            }
             Inline::OpaqueInline {
                 raw, source_range, ..
             } => match markrust_core::html_visual::classify_opaque_inline(raw, &mut html) {
@@ -764,6 +840,7 @@ pub fn build_leaf_layout_inlines(
                     Inline::Run { source_range, .. }
                     | Inline::Image { source_range, .. }
                     | Inline::Math { source_range, .. }
+                    | Inline::WikiLink { source_range, .. }
                     | Inline::OpaqueInline { source_range, .. } => Some(source_range.end),
                     _ => None,
                 })
@@ -1707,6 +1784,41 @@ mod tests {
             layout.text
         );
         assert_eq!(layout.text, "see $x^2$ here");
+    }
+
+    #[test]
+    fn wikilink_hides_brackets_and_paints_as_link() {
+        let layout = layout_for("see [[page]] here\n");
+        assert_eq!(layout.text, "see page here");
+        assert!(
+            !layout.text.contains('[') && !layout.text.contains(']'),
+            "wiki brackets must not paint when caret is outside, got {:?}",
+            layout.text
+        );
+        assert!(
+            layout.runs.iter().any(|run| run.underline.is_some()),
+            "expected link underline, runs={:?}",
+            layout.runs
+        );
+        let piped = layout_for("go [[page|Label]]\n");
+        assert_eq!(piped.text, "go Label");
+        assert!(
+            !piped.text.contains("page"),
+            "target must hide when labeled"
+        );
+    }
+
+    #[test]
+    fn wikilink_reveals_brackets_when_caret_intersects() {
+        let source = "see [[page]] here\n";
+        let inside = source.find("page").unwrap();
+        let layout = layout_for_caret(source, inside);
+        assert!(
+            layout.text.contains("[[page]]"),
+            "expected revealed [[…]], got {:?}",
+            layout.text
+        );
+        assert_eq!(layout.text, "see [[page]] here");
     }
 
     #[test]

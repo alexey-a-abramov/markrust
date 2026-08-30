@@ -237,6 +237,7 @@ fn span_style(span: &SyntaxNodeSpan) -> SegmentStyle {
         SyntaxKind::Strikethrough => SegmentStyle::Strikethrough,
         SyntaxKind::Highlight => SegmentStyle::Highlight,
         SyntaxKind::Math => SegmentStyle::Math,
+        SyntaxKind::WikiLink => SegmentStyle::Link,
         SyntaxKind::Alert => SegmentStyle::BlockQuote,
         _ => SegmentStyle::Plain,
     }
@@ -1003,6 +1004,54 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s.style, SegmentStyle::Delimiter { visible: true })),
             "expected visible $, segments={:?}",
+            layout.segments
+        );
+        assert!(!layout
+            .segments
+            .iter()
+            .any(|s| matches!(s.style, SegmentStyle::Delimiter { visible: false })));
+    }
+
+    #[test]
+    fn wikilink_masks_brackets_when_caret_outside() {
+        let content = "see [[page]] here";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let layout =
+            build_display_layout(content, &spans, &[Caret::new(0)], &[], &EditorTheme::dark());
+        let masked: Vec<_> = layout
+            .segments
+            .iter()
+            .filter(|s| matches!(s.style, SegmentStyle::Delimiter { visible: false }))
+            .collect();
+        assert!(
+            masked.len() >= 2,
+            "expected masked [[ ]], segments={:?}",
+            layout.segments
+        );
+        assert!(layout
+            .segments
+            .iter()
+            .any(|s| matches!(s.style, SegmentStyle::Link)));
+    }
+
+    #[test]
+    fn wikilink_reveals_brackets_when_caret_inside() {
+        let content = "see [[page]] here";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let inside = content.find("page").unwrap();
+        let layout = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(inside)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        assert!(
+            layout
+                .segments
+                .iter()
+                .any(|s| matches!(s.style, SegmentStyle::Delimiter { visible: true })),
+            "expected visible [[ ]], segments={:?}",
             layout.segments
         );
         assert!(!layout

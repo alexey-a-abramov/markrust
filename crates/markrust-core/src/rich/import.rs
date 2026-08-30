@@ -15,8 +15,9 @@ use comrak::nodes::{
 use comrak::{parse_document, Arena, Options};
 
 use super::tree::{
-    find_alert_chrome, AlertKind, Block, BlockKind, BreakStyle, ColumnAlign, FenceFidelity,
-    Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs, MarkFidelity, MarkSet, RichTree,
+    find_alert_chrome, is_toc_marker, AlertKind, Block, BlockKind, BreakStyle, ColumnAlign,
+    FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs, MarkFidelity, MarkSet,
+    RichTree,
 };
 
 /// Parse options shared with `export::markdown_to_html_gfm` (parse-relevant
@@ -41,6 +42,8 @@ pub(crate) fn parse_options() -> Options<'static> {
     options.extension.subscript = true;
     options.extension.math_dollars = true;
     options.extension.alerts = true;
+    // Typora `[[target]]` / `[[target|label]]` (title after pipe).
+    options.extension.wikilinks_title_after_pipe = true;
     options.extension.front_matter_delimiter = Some("---".into());
     options.render.sourcepos = true;
     options
@@ -306,6 +309,15 @@ impl<'s> Importer<'s> {
             }
             apply_eqeq_highlight(&mut block.inlines, &self.link_groups);
         }
+        if matches!(block.kind, BlockKind::Paragraph)
+            && is_toc_marker(self.slice(&block.source_range))
+        {
+            let wiki = self
+                .slice(&block.source_range)
+                .trim()
+                .eq_ignore_ascii_case("[[toc]]");
+            block.kind = BlockKind::Toc { wiki };
+        }
         block
     }
 
@@ -477,7 +489,22 @@ impl<'s> Importer<'s> {
                     marks: ctx.marks,
                 });
             }
-            // Inline HTML, footnote refs, wikilinks, ...
+            NodeValue::WikiLink(link) => {
+                let mut label = String::new();
+                collect_text(node, &mut label);
+                if label.is_empty() {
+                    label = link.url.clone();
+                }
+                let raw = Box::<str>::from(self.slice(&range));
+                out.push(Inline::WikiLink {
+                    target: link.url.clone(),
+                    label,
+                    raw,
+                    source_range: range,
+                    marks: ctx.marks,
+                });
+            }
+            // Inline HTML, footnote refs, leftover unknowns: verbatim.
             _ => {
                 let slice = self.slice(&range);
                 out.push(Inline::OpaqueInline {
@@ -732,6 +759,25 @@ fn rebuild_with_highlight(inlines: &[Inline], pairs: &[(EqDelim, EqDelim, u64)])
                 out.push(Inline::Math {
                     literal: literal.clone(),
                     display: *display,
+                    raw: raw.clone(),
+                    source_range: source_range.clone(),
+                    marks: m,
+                });
+            }
+            Inline::WikiLink {
+                target,
+                label,
+                raw,
+                source_range,
+                marks,
+            } => {
+                let mut m = *marks;
+                if highlight_group_for_inline(pairs, inline_i).is_some() {
+                    m = m.with(MarkSet::HIGHLIGHT);
+                }
+                out.push(Inline::WikiLink {
+                    target: target.clone(),
+                    label: label.clone(),
                     raw: raw.clone(),
                     source_range: source_range.clone(),
                     marks: m,

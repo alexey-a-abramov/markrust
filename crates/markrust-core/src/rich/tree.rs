@@ -163,6 +163,12 @@ pub enum BlockKind {
     },
     DefinitionTerm,
     DefinitionDetails,
+    /// `[TOC]` / `[[toc]]` placeholder. WYSIWYG paints the heading outline;
+    /// source bytes stay the marker.
+    Toc {
+        /// `true` when written as `[[toc]]`.
+        wiki: bool,
+    },
     /// Anything we do not model (HTML blocks, …): inert, serialized
     /// verbatim from `raw`. Dollar math is [`Inline::Math`], not opaque.
     Opaque {
@@ -297,7 +303,21 @@ pub enum Inline {
         /// Emphasis context the fragment sits inside.
         marks: MarkSet,
     },
-    /// Inline HTML, footnote refs, wikilinks, ...: verbatim.
+    /// `[[target]]` / `[[target|label]]` (comrak wikilinks, Typora pipe-after).
+    /// `[[` / `]]` (and `target|` when a label is present) are chrome.
+    WikiLink {
+        /// Destination (left of `|` in Typora `[[target|label]]`).
+        target: String,
+        /// Visible label (right of `|`, or the target when unpiped).
+        label: String,
+        /// Full `[[…]]` source slice (byte-exact for dirty serialize).
+        raw: Box<str>,
+        /// Full span including `[[` / `]]`.
+        source_range: Range<usize>,
+        /// Emphasis context the fragment sits inside.
+        marks: MarkSet,
+    },
+    /// Inline HTML, footnote refs, leftover unknowns: verbatim.
     OpaqueInline {
         raw: Box<str>,
         source_range: Range<usize>,
@@ -314,8 +334,71 @@ impl Inline {
             Inline::Image { alt, .. } => alt.len(),
             Inline::SoftBreak | Inline::HardBreak { .. } => 1,
             Inline::Math { literal, .. } => literal.len(),
+            Inline::WikiLink { label, .. } => label.len(),
             Inline::OpaqueInline { raw, .. } => raw.len(),
         }
+    }
+}
+
+impl RichTree {
+    /// Headings as `(source offset, level, plain text)`.
+    pub fn outline(&self) -> Vec<(usize, u8, String)> {
+        fn walk(blocks: &[Block], out: &mut Vec<(usize, u8, String)>) {
+            for b in blocks {
+                if let BlockKind::Heading { level, .. } = b.kind {
+                    out.push((b.source_range.start, level, heading_plain_text(&b.inlines)));
+                }
+                walk(&b.children, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.blocks, &mut out);
+        out
+    }
+}
+
+fn heading_plain_text(inlines: &[Inline]) -> String {
+    let mut text = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Run { text: t, .. } => text.push_str(t),
+            Inline::WikiLink { label, .. } => text.push_str(label),
+            Inline::Math { literal, .. } => text.push_str(literal),
+            _ => {}
+        }
+    }
+    text
+}
+
+/// True when a paragraph's source is Typora's TOC marker (`[TOC]` / `[[toc]]`).
+pub fn is_toc_marker(source: &str) -> bool {
+    let t = source.trim();
+    t.eq_ignore_ascii_case("[toc]") || t.eq_ignore_ascii_case("[[toc]]")
+}
+
+/// Source range of the visible wiki label (`label` after `|`, else the target).
+pub fn wiki_visible_range(raw: &str, source_range: Range<usize>) -> Range<usize> {
+    if raw.len() != source_range.len()
+        || raw.len() < 4
+        || !raw.starts_with("[[")
+        || !raw.ends_with("]]")
+    {
+        return source_range;
+    }
+    let inner = &raw[2..raw.len() - 2];
+    if let Some(pipe) = inner.find('|') {
+        let rel = 2 + pipe + 1;
+        source_range.start + rel
+            ..source_range
+                .end
+                .saturating_sub(2)
+                .max(source_range.start + rel)
+    } else {
+        source_range.start + 2
+            ..source_range
+                .end
+                .saturating_sub(2)
+                .max(source_range.start + 2)
     }
 }
 
