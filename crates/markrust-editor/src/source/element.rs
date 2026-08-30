@@ -295,6 +295,7 @@ fn shape_lines(
         let font_size = font_size_for_line(layout, theme, doc_start, doc_end);
         let height = px(theme.line_height_for_font_size(font_size));
         let runs = build_runs_for_line(layout, theme, *display_start, *display_end, &line_text);
+
         let shaped = window
             .text_system()
             .shape_line(line_text.clone(), px(font_size), &runs, None);
@@ -372,7 +373,17 @@ fn build_runs_for_line(
             .unwrap_or(layout.doc_to_display.len());
         let segment_end_display = layout.display_offset_for_doc(segment_end_doc);
         let run_end = segment_end_display.min(display_end).max(pos + 1);
-        let len = (run_end - pos).min(line_text.len());
+        // Cap at the REMAINING shaped-text length: line_text has the trailing
+        // newline trimmed, and run lengths must sum to exactly its length.
+        let emitted: usize = pos - display_start;
+        let remaining = line_text.len().saturating_sub(emitted);
+        let mut len = (run_end - pos).min(remaining);
+        // The display projection substitutes multi-byte glyphs (bullets,
+        // checkboxes, image markers); a segment boundary can land inside one.
+        // Snap forward to the next char boundary of the shaped text.
+        while len < remaining && !line_text.is_char_boundary(emitted + len) {
+            len += 1;
+        }
         if len == 0 {
             break;
         }
@@ -385,6 +396,18 @@ fn build_runs_for_line(
             strikethrough: styled_strikethrough(style),
         });
         pos += len;
+    }
+
+    let covered: usize = runs.iter().map(|r| r.len).sum();
+    if covered < line_text.len() {
+        runs.push(TextRun {
+            len: line_text.len() - covered,
+            font: body_font(theme),
+            color: theme.text,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
     }
 
     if runs.is_empty() {
@@ -469,7 +492,7 @@ fn styled_background(theme: &EditorTheme, style: SegmentStyle) -> Option<gpui::H
     }
 }
 
-fn syntax_color(theme: &EditorTheme, kind: HighlightKind) -> gpui::Hsla {
+pub(crate) fn syntax_color(theme: &EditorTheme, kind: HighlightKind) -> gpui::Hsla {
     match kind {
         HighlightKind::Keyword => theme.syntax_keyword,
         HighlightKind::String => theme.syntax_string,

@@ -11,6 +11,7 @@ pub mod highlight;
 pub mod source;
 pub mod table;
 pub mod theme;
+pub mod wysiwyg;
 
 // Compatibility aliases for the pre-`source` module paths.
 pub use source::{editor, element, layout, masking};
@@ -32,3 +33,4 @@ pub use source::masking::{
 };
 pub use table::{parse_column_alignments, ColumnAlign};
 pub use theme::EditorTheme;
+pub use wysiwyg::RichEditorView;

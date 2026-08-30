@@ -45,6 +45,7 @@ pub fn run_gui_with_open(open_path: Option<PathBuf>) {
         let config = AppConfig::load();
         cx.bind_keys([
             KeyBinding::new("cmd-s", crate::window::Save, None),
+            KeyBinding::new("cmd-shift-m", crate::window::ToggleEditorMode, None),
             KeyBinding::new("cmd-o", crate::window::OpenFile, None),
             KeyBinding::new("cmd-shift-o", crate::window::OpenFolder, None),
             KeyBinding::new("cmd-n", crate::window::NewDocument, None),

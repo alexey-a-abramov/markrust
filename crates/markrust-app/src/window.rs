@@ -32,7 +32,8 @@ actions!(
         CommandPalette,
         ExportHtml,
         Undo,
-        Redo
+        Redo,
+        ToggleEditorMode
     ]
 );
 
@@ -110,6 +111,18 @@ impl MarkRustWindow {
         self.workspace.update(cx, |workspace, cx| {
             let _ = workspace.dispatch(WorkspaceCommand::CloseTab, window, cx);
         });
+    }
+
+    fn toggle_editor_mode(
+        &mut self,
+        _: &ToggleEditorMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.toggle_editor_mode(cx);
+        });
+        cx.notify();
     }
 
     fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
@@ -199,6 +212,10 @@ impl Render for MarkRustWindow {
 
         let workspace = self.workspace.read(cx);
         let theme = workspace.config.editor_theme();
+        let mode_label = match workspace.active_tab().map(|tab| tab.mode) {
+            Some(crate::workspace::EditorMode::Wysiwyg) => "Rich",
+            _ => "Source",
+        };
         let active = workspace.active_tab;
         let tab_count = workspace.tabs.len();
         let files = workspace.list_files();
@@ -232,6 +249,7 @@ impl Render for MarkRustWindow {
             .on_action(cx.listener(Self::new_document))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::toggle_editor_mode))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_outline))
             .on_action(cx.listener(Self::command_palette))
@@ -326,6 +344,14 @@ impl Render for MarkRustWindow {
                         "toolbar-theme",
                         cx.listener(|this, _, window, cx| {
                             this.toggle_theme(&ToggleTheme, window, cx)
+                        }),
+                    ))
+                    .child(toolbar_button(
+                        mode_label,
+                        &theme,
+                        "toolbar-editor-mode",
+                        cx.listener(|this, _, window, cx| {
+                            this.toggle_editor_mode(&ToggleEditorMode, window, cx)
                         }),
                     )),
             )
@@ -509,12 +535,18 @@ impl Render for MarkRustWindow {
                             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                                 style.bg(theme.drop_zone_bg)
                             })
-                            .child(
-                                workspace
-                                    .active_tab()
-                                    .map(|tab| tab.editor_view.clone())
-                                    .unwrap_or_else(|| workspace.tabs[0].editor_view.clone()),
-                            ),
+                            .child({
+                                let tab =
+                                    workspace.active_tab().unwrap_or_else(|| &workspace.tabs[0]);
+                                match tab.mode {
+                                    crate::workspace::EditorMode::Wysiwyg => {
+                                        tab.rich_view.clone().into_any_element()
+                                    }
+                                    crate::workspace::EditorMode::Source => {
+                                        tab.editor_view.clone().into_any_element()
+                                    }
+                                }
+                            }),
                     )
                     .child(if outline_open {
                         div()

@@ -16,8 +16,18 @@ use crate::session::{
     list_markdown_files, reload_decision, DropTarget, ReloadDecision, WorkspaceCommand,
 };
 use markrust_core::Document;
-use markrust_editor::{EditorCommand, MarkdownEditor, MarkdownEditorView};
+use markrust_editor::{EditorCommand, MarkdownEditor, MarkdownEditorView, RichEditorView};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+
+/// Which editing surface a tab shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditorMode {
+    /// Raw markdown with delimiter masking (currently the editable surface).
+    #[default]
+    Source,
+    /// Rendered rich document (read-only until the command layer lands).
+    Wysiwyg,
+}
 
 #[allow(dead_code)]
 pub struct DocumentTab {
@@ -25,6 +35,8 @@ pub struct DocumentTab {
     pub document: Entity<Document>,
     pub editor: Entity<MarkdownEditor>,
     pub editor_view: Entity<MarkdownEditorView>,
+    pub rich_view: Entity<RichEditorView>,
+    pub mode: EditorMode,
     pub title: String,
 }
 
@@ -154,6 +166,18 @@ impl Workspace {
         Ok(())
     }
 
+    /// Cycle the active tab between the source and WYSIWYG surfaces.
+    pub fn toggle_editor_mode(&mut self, cx: &mut Context<Self>) {
+        let index = self.active_tab;
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.mode = match tab.mode {
+                EditorMode::Source => EditorMode::Wysiwyg,
+                EditorMode::Wysiwyg => EditorMode::Source,
+            };
+            cx.notify();
+        }
+    }
+
     pub fn active_tab(&self) -> Option<&DocumentTab> {
         self.tabs.get(self.active_tab)
     }
@@ -232,6 +256,8 @@ impl Workspace {
         let theme = self.config.editor_theme();
         let editor = cx.new(|cx| MarkdownEditor::new(document.clone(), theme, window, cx));
         let editor_view = cx.new(|_| MarkdownEditorView::new(editor.clone()));
+        let rich_view =
+            cx.new(|cx| RichEditorView::new(document.clone(), self.config.editor_theme(), cx));
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.tabs.push(DocumentTab {
@@ -239,6 +265,8 @@ impl Workspace {
             document,
             editor,
             editor_view,
+            rich_view,
+            mode: EditorMode::default(),
             title,
         });
         self.active_tab = self.tabs.len() - 1;
