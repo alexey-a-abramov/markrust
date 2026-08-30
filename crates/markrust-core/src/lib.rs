@@ -11,6 +11,7 @@ pub mod frontmatter;
 pub mod line_index;
 pub mod mode;
 pub mod parser;
+pub mod rich;
 pub mod spans;
 pub mod undo;
 
