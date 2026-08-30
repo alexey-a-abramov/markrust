@@ -369,4 +369,72 @@ mod tests {
         assert!(sel.overlaps(0, 4));
         assert!(!Selection::new(0, 0).overlaps(0, 4));
     }
+
+    #[test]
+    fn highlight_caret_outside_masks_eqeq() {
+        let source = "hello ==mark== world";
+        let spans = markrust_core::extract_syntax_spans(source);
+        let hl = spans
+            .iter()
+            .find(|span| span.kind == SyntaxKind::Highlight)
+            .expect("highlight span");
+        assert_eq!(hl.delimiter_spans.len(), 2);
+        assert_eq!(
+            delimiter_visibility_for_span(hl, &[Caret::new(0)], &[]),
+            VisibilityState::Masked
+        );
+        let vis = compute_visibility(&[Caret::new(0)], &[], &spans);
+        assert!(
+            vis.iter().all(|state| *state == VisibilityState::Masked),
+            "{vis:?}"
+        );
+    }
+
+    #[test]
+    fn highlight_caret_inside_reveals_eqeq() {
+        let source = "hello ==mark== world";
+        let spans = markrust_core::extract_syntax_spans(source);
+        let hl = spans
+            .iter()
+            .find(|span| span.kind == SyntaxKind::Highlight)
+            .expect("highlight span");
+        let inside = source.find("mark").expect("inner text");
+        assert_eq!(
+            delimiter_visibility_for_span(hl, &[Caret::new(inside)], &[]),
+            VisibilityState::Visible
+        );
+        let vis = compute_visibility(&[Caret::new(inside)], &[], &spans);
+        assert!(
+            vis.iter().all(|state| *state == VisibilityState::Visible),
+            "{vis:?}"
+        );
+    }
+
+    #[test]
+    fn sub_sup_caret_outside_masks_inside_reveals() {
+        for (source, kind) in [
+            ("H~2~O", SyntaxKind::Subscript),
+            ("mc^2^", SyntaxKind::Superscript),
+        ] {
+            let spans = markrust_core::extract_syntax_spans(source);
+            let span = spans.iter().find(|s| s.kind == kind).expect("span");
+            assert_eq!(
+                span.delimiter_spans.len(),
+                2,
+                "{source} delimiters: {:?}",
+                span.delimiter_spans
+            );
+            assert_eq!(
+                delimiter_visibility_for_span(span, &[Caret::new(0)], &[]),
+                VisibilityState::Masked,
+                "{source} caret outside"
+            );
+            let inner = span.start_byte + 1;
+            assert_eq!(
+                delimiter_visibility_for_span(span, &[Caret::new(inner)], &[]),
+                VisibilityState::Visible,
+                "{source} caret inside"
+            );
+        }
+    }
 }

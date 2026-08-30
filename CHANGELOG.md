@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Source-mode syntax spans are extracted from comrak (same grammar as the WYSIWYG `RichTree`). tree-sitter-md is no longer a `markrust-core` dependency. Fenced-code highlighting still uses tree-sitter for rust/json/yaml/bash.
+- Source-mode syntax spans are extracted from comrak (same grammar as the WYSIWYG `RichTree`). tree-sitter-md is no longer a `markrust-core` dependency. Fenced-code highlighting still uses tree-sitter for rust/json/yaml/bash. Source mode masks `==highlight==` (and `~sub~` / `^sup^`) with the same caret/selection rule as `**`.
 - Architecture docs rewritten for the rope + RichTree + source-projection pipeline.
 
 ### Added (earlier this cycle)

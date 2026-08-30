@@ -31,6 +31,7 @@ pub enum SegmentStyle {
     Table { row: TableRowKind },
     Frontmatter,
     Strikethrough,
+    Highlight,
     SyntaxHighlight(HighlightKind),
 }
 
@@ -233,6 +234,7 @@ fn span_style(span: &SyntaxNodeSpan) -> SegmentStyle {
         },
         SyntaxKind::Frontmatter => SegmentStyle::Frontmatter,
         SyntaxKind::Strikethrough => SegmentStyle::Strikethrough,
+        SyntaxKind::Highlight => SegmentStyle::Highlight,
         _ => SegmentStyle::Plain,
     }
 }
@@ -907,5 +909,58 @@ mod tests {
         assert_eq!(h_masked, theme.heading_font_size(1));
         let body = source_line_font_size(&masked, &theme, content, 8, content.len());
         assert_eq!(body, theme.font_size);
+    }
+
+    #[test]
+    fn highlight_eqeq_masks_when_caret_outside() {
+        let content = "hello ==mark== world";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let layout = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(0)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        let masked: Vec<_> = layout
+            .segments
+            .iter()
+            .filter(|s| matches!(s.style, SegmentStyle::Delimiter { visible: false }))
+            .collect();
+        assert!(
+            masked.len() >= 2,
+            "expected masked ==, segments={:?}",
+            layout.segments
+        );
+        assert!(layout
+            .segments
+            .iter()
+            .any(|s| matches!(s.style, SegmentStyle::Highlight)));
+    }
+
+    #[test]
+    fn highlight_eqeq_reveals_when_caret_inside() {
+        let content = "hello ==mark== world";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let inside = content.find("mark").unwrap();
+        let layout = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(inside)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        assert!(
+            layout
+                .segments
+                .iter()
+                .any(|s| matches!(s.style, SegmentStyle::Delimiter { visible: true })),
+            "expected visible ==, segments={:?}",
+            layout.segments
+        );
+        assert!(!layout
+            .segments
+            .iter()
+            .any(|s| matches!(s.style, SegmentStyle::Delimiter { visible: false })));
     }
 }

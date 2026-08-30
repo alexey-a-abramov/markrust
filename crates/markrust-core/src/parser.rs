@@ -6,7 +6,9 @@
 //!
 //! Spans are derived from the same comrak AST as [`crate::rich::import`], so
 //! source mode is a projection of the rich tree's grammar rather than a second
-//! parser (tree-sitter-md). Parse still runs on a dedicated worker thread.
+//! parser (tree-sitter-md). `==highlight==` is not a comrak node; it is paired
+//! with the same rules as [`crate::rich::import`] so source masking matches
+//! WYSIWYG. Parse still runs on a dedicated worker thread.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -39,6 +41,7 @@ pub fn extract_syntax_spans(source: &str) -> Vec<SyntaxNodeSpan> {
     let lines = LineStarts::new(source);
     let mut spans = Vec::new();
     collect_spans(root, source, &lines, &mut spans);
+    collect_eqeq_highlights(root, source, &lines, &mut spans);
     spans.sort_by_key(|span| (span.start_byte, span.end_byte));
     spans
 }
@@ -109,7 +112,7 @@ fn collect_spans<'a>(
         }
         NodeValue::Superscript => {
             spans.push(make_span(
-                SyntaxKind::Other,
+                SyntaxKind::Superscript,
                 range.clone(),
                 wrap_delims(source, &range, 1),
                 None,
@@ -120,7 +123,7 @@ fn collect_spans<'a>(
         }
         NodeValue::Subscript => {
             spans.push(make_span(
-                SyntaxKind::Other,
+                SyntaxKind::Subscript,
                 range.clone(),
                 wrap_delims(source, &range, 1),
                 None,
@@ -259,6 +262,113 @@ fn collect_spans<'a>(
 
     for child in node.children() {
         collect_spans(child, source, lines, spans);
+    }
+}
+
+/// Pair Typora `==highlight==` the same way rich import does. comrak has no
+/// highlight node, so this walks inline blocks after the AST pass.
+fn collect_eqeq_highlights<'a>(
+    node: &'a AstNode<'a>,
+    source: &str,
+    lines: &LineStarts,
+    spans: &mut Vec<SyntaxNodeSpan>,
+) {
+    let inline_block = matches!(
+        node.data.borrow().value,
+        NodeValue::Paragraph | NodeValue::Heading(_) | NodeValue::TableCell
+    );
+    if inline_block {
+        emit_eqeq_spans(node, source, lines, spans);
+        return;
+    }
+    let skip_subtree = matches!(
+        node.data.borrow().value,
+        NodeValue::CodeBlock(_) | NodeValue::HtmlBlock(_) | NodeValue::FrontMatter(_)
+    );
+    if skip_subtree {
+        return;
+    }
+    for child in node.children() {
+        collect_eqeq_highlights(child, source, lines, spans);
+    }
+}
+
+fn emit_eqeq_spans<'a>(
+    node: &'a AstNode<'a>,
+    source: &str,
+    lines: &LineStarts,
+    spans: &mut Vec<SyntaxNodeSpan>,
+) {
+    let range = lines.range(node.data.borrow().sourcepos, source.len());
+    let mut skip = Vec::new();
+    collect_eqeq_skip_ranges(node, source, lines, &mut skip);
+    let bytes = source.as_bytes();
+    let end = range.end.min(bytes.len());
+    let mut delims = Vec::new();
+    let mut j = range.start;
+    while j + 1 < end {
+        if bytes[j] == b'=' && bytes[j + 1] == b'=' {
+            let escaped = j > 0 && bytes[j - 1] == b'\\';
+            let skipped = skip.iter().any(|r| j >= r.start && j < r.end);
+            if !escaped && !skipped {
+                delims.push(j);
+            }
+            j += 2;
+            continue;
+        }
+        j += 1;
+    }
+    let mut i = 0;
+    while i + 1 < delims.len() {
+        let a = delims[i];
+        let b = delims[i + 1];
+        let empty = b == a + 2;
+        let across_break = source.get(a + 2..b).is_some_and(|s| s.contains('\n'));
+        if empty || across_break {
+            i += 1;
+            continue;
+        }
+        let span_end = b + 2;
+        spans.push(make_span(
+            SyntaxKind::Highlight,
+            a..span_end,
+            vec![
+                DelimiterSpan::new(a, a + 2),
+                DelimiterSpan::new(b, span_end),
+            ],
+            None,
+            None,
+            None,
+            None,
+        ));
+        i += 2;
+    }
+}
+
+fn collect_eqeq_skip_ranges<'a>(
+    node: &'a AstNode<'a>,
+    source: &str,
+    lines: &LineStarts,
+    skip: &mut Vec<std::ops::Range<usize>>,
+) {
+    let range = lines.range(node.data.borrow().sourcepos, source.len());
+    let skip_here = matches!(
+        node.data.borrow().value,
+        NodeValue::Code(_) | NodeValue::HtmlInline(_) | NodeValue::Image(_)
+    );
+    if skip_here {
+        skip.push(range);
+        return;
+    }
+    if matches!(node.data.borrow().value, NodeValue::Link(_)) {
+        if let Some(slice) = source.get(range.clone()) {
+            if let Some(i) = slice.rfind("](") {
+                skip.push(range.start + i..range.end);
+            }
+        }
+    }
+    for child in node.children() {
+        collect_eqeq_skip_ranges(child, source, lines, skip);
     }
 }
 
@@ -593,6 +703,13 @@ mod tests {
         spans.iter().any(|s| s.kind == kind)
     }
 
+    fn delim_text<'a>(source: &'a str, span: &SyntaxNodeSpan) -> Vec<&'a str> {
+        span.delimiter_spans
+            .iter()
+            .map(|d| source.get(d.start_byte..d.end_byte).unwrap_or(""))
+            .collect()
+    }
+
     #[test]
     fn extracts_bold_and_italic() {
         let spans = extract_syntax_spans("**bold** and *italic*");
@@ -695,6 +812,84 @@ mod tests {
     fn extracts_strikethrough() {
         let spans = extract_syntax_spans("~~gone~~");
         assert!(has_kind(&spans, SyntaxKind::Strikethrough));
+    }
+
+    #[test]
+    fn extracts_eqeq_highlight_delimiters() {
+        let source = "hello ==mark== world";
+        let spans = extract_syntax_spans(source);
+        let hl = spans
+            .iter()
+            .find(|s| s.kind == SyntaxKind::Highlight)
+            .expect("highlight span");
+        assert_eq!(&source[hl.start_byte..hl.end_byte], "==mark==");
+        assert_eq!(delim_text(source, hl), vec!["==", "=="]);
+    }
+
+    #[test]
+    fn extracts_eqeq_highlight_around_nested_bold() {
+        let source = "==**bold**==";
+        let spans = extract_syntax_spans(source);
+        assert!(has_kind(&spans, SyntaxKind::Highlight));
+        assert!(has_kind(&spans, SyntaxKind::Bold));
+        let hl = spans
+            .iter()
+            .find(|s| s.kind == SyntaxKind::Highlight)
+            .unwrap();
+        assert_eq!(delim_text(source, hl), vec!["==", "=="]);
+    }
+
+    #[test]
+    fn unmatched_or_empty_eqeq_is_not_a_highlight_span() {
+        assert!(!has_kind(
+            &extract_syntax_spans("hello == world"),
+            SyntaxKind::Highlight
+        ));
+        assert!(!has_kind(
+            &extract_syntax_spans("===="),
+            SyntaxKind::Highlight
+        ));
+    }
+
+    #[test]
+    fn eqeq_inside_code_or_link_url_is_not_highlight() {
+        assert!(!has_kind(
+            &extract_syntax_spans("`==x==`"),
+            SyntaxKind::Highlight
+        ));
+        assert!(!has_kind(
+            &extract_syntax_spans("```\n==x==\n```\n"),
+            SyntaxKind::Highlight
+        ));
+        let linked = extract_syntax_spans("[x](http://a.com/==b==)");
+        assert!(!has_kind(&linked, SyntaxKind::Highlight));
+        let labeled = extract_syntax_spans("[==x==](http://a.com)");
+        assert!(has_kind(&labeled, SyntaxKind::Highlight));
+    }
+
+    #[test]
+    fn setext_underline_is_not_highlight() {
+        let spans = extract_syntax_spans("Title\n=====\n");
+        assert!(has_kind(&spans, SyntaxKind::Heading));
+        assert!(!has_kind(&spans, SyntaxKind::Highlight));
+    }
+
+    #[test]
+    fn extracts_subscript_and_superscript_delimiters() {
+        let sub_src = "H~2~O";
+        let sub = extract_syntax_spans(sub_src);
+        let sub_span = sub
+            .iter()
+            .find(|s| s.kind == SyntaxKind::Subscript)
+            .expect("subscript");
+        assert_eq!(delim_text(sub_src, sub_span), vec!["~", "~"]);
+        let sup_src = "mc^2^";
+        let sup = extract_syntax_spans(sup_src);
+        let sup_span = sup
+            .iter()
+            .find(|s| s.kind == SyntaxKind::Superscript)
+            .expect("superscript");
+        assert_eq!(delim_text(sup_src, sup_span), vec!["^", "^"]);
     }
 
     #[test]

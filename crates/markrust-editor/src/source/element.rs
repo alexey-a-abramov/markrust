@@ -498,7 +498,7 @@ fn styled_background(theme: &EditorTheme, style: SegmentStyle) -> Option<gpui::H
         SegmentStyle::Table {
             row: TableRowKind::Header,
         } => Some(theme.table_header_bg),
-        SegmentStyle::CodeInline => Some(theme.code_bg),
+        SegmentStyle::CodeInline | SegmentStyle::Highlight => Some(theme.code_bg),
         _ => None,
     }
 }

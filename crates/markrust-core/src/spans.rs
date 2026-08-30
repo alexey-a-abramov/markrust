@@ -18,6 +18,10 @@ pub enum SyntaxKind {
     Table,
     Strikethrough,
     Frontmatter,
+    /// Typora `==highlight==` (not a comrak node; same pairing as rich import).
+    Highlight,
+    Superscript,
+    Subscript,
     Other,
 }
 

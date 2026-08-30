@@ -70,7 +70,7 @@ Parse, the folder watcher `recv`, remote image HTTP, and GPUI image decode stay 
 | WYSIWYG tree | `rich::import` (comrak → `RichTree`) | On `RichEngine::sync` |
 | Fenced-code highlighting | tree-sitter rust/json/yaml/bash | Viewport paint of a code body |
 
-tree-sitter-md is not used. Source-mode `SyntaxNodeSpan`s are extracted from the comrak AST so masking cannot disagree with the rich tree's grammar.
+tree-sitter-md is not used. Source-mode `SyntaxNodeSpan`s are extracted from the comrak AST so masking cannot disagree with the rich tree's grammar. `==highlight==` is paired in that same pass (comrak has no highlight node).
 
 ## Editing surfaces
 
