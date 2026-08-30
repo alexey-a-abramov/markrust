@@ -5,17 +5,18 @@
 //! Per-kind block renderers for the WYSIWYG surface.
 
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    div, img, prelude::*, px, AnyElement, CursorStyle, Entity, FontWeight, MouseButton,
+    div, img, prelude::*, px, AnyElement, CursorStyle, Entity, FontWeight, MouseButton, ObjectFit,
     SharedString, StyledText, TextStyle,
 };
-use markrust_core::rich::{Block, BlockKind, ColumnAlign, NodeId, RichTree};
+use markrust_core::rich::{Block, BlockKind, ColumnAlign, Inline, NodeId, RichTree};
 
 use super::block_text::{
-    build_code_layout, build_leaf_layout, BlockTextElement, WidgetImeSink, WysiwygHost,
+    build_code_layout, build_leaf_layout, build_leaf_layout_inlines, BlockTextElement,
+    WidgetImeSink, WysiwygHost,
 };
 use crate::highlight::highlight_code_block;
 use crate::theme::EditorTheme;
@@ -191,10 +192,10 @@ fn render_block<H: WysiwygHost>(
         BlockKind::Table { alignments } => render_table(snap, block, alignments, editor),
         BlockKind::TableRow { .. } | BlockKind::TableCell => div().into_any_element(),
         BlockKind::ThematicBreak => div()
-            .my(px(12.))
-            .h(px(2.))
-            .rounded_full()
-            .bg(theme.separator)
+            .w_full()
+            .my(px(16.))
+            .h(px(1.))
+            .bg(theme.table_delimiter)
             .into_any_element(),
         BlockKind::Opaque { raw } => {
             let text_style = base_text_style(theme, theme.font_size * 0.9, FontWeight::NORMAL);
@@ -347,8 +348,9 @@ fn render_table<H: WysiwygHost>(
         .into_any_element()
 }
 
-/// A leaf block's inline content as wrapped rich text (plus trailing image
-/// elements for standalone images).
+/// A leaf block's inline content as wrapped rich text, with local images as
+/// GPUI `img()` pixels (filesystem `PathBuf`, decoded on the background
+/// executor) rather than alt-text placeholders.
 fn paragraph_element<H: WysiwygHost>(
     snap: &Arc<RenderSnapshot>,
     block: &Block,
@@ -358,112 +360,275 @@ fn paragraph_element<H: WysiwygHost>(
 ) -> AnyElement {
     let theme = &snap.theme;
     let text_style = base_text_style(theme, font_size, base_weight);
-    let images: Vec<(String, String, std::ops::Range<usize>)> = block
-        .inlines
-        .iter()
-        .filter_map(|inline| match inline {
-            markrust_core::rich::Inline::Image {
+    let line_height = theme.line_height_for_font_size(font_size);
+    let mut children: Vec<AnyElement> = Vec::new();
+    let mut text_start = 0usize;
+    for i in 0..block.inlines.len() {
+        let image = match &block.inlines[i] {
+            Inline::Image {
                 alt,
                 url,
                 source_range,
                 ..
             } => Some((alt.clone(), url.clone(), source_range.clone())),
             _ => None,
-        })
-        .collect();
-    let layout = std::sync::Arc::new(build_leaf_layout(block, &text_style, theme, base_weight));
-    let line_height = theme.line_height_for_font_size(font_size);
-    let mut container = div().flex().flex_col().gap(px(4.)).child(BlockTextElement {
-        editor: editor.clone(),
-        layout,
+        };
+        let Some((alt, url, range)) = image else {
+            continue;
+        };
+        push_text_child(
+            &mut children,
+            &block.inlines[text_start..i],
+            block.source_range.clone(),
+            &text_style,
+            theme,
+            base_weight,
+            font_size,
+            line_height,
+            editor.clone(),
+        );
+        children.push(render_image(snap, &alt, &url, range, editor.clone()));
+        text_start = i + 1;
+    }
+    push_text_child(
+        &mut children,
+        &block.inlines[text_start..],
+        block.source_range.clone(),
+        &text_style,
+        theme,
+        base_weight,
         font_size,
         line_height,
-        theme: theme.clone(),
-    });
-    for (alt, url, image_range) in images {
-        let source: SharedString = resolve_image_source(snap, &url).into();
-        let caption = snap
-            .editing_image
-            .as_ref()
-            .and_then(|(range, draft)| (*range == image_range).then(|| draft.clone()))
-            .unwrap_or_else(|| {
-                if alt.is_empty() {
-                    "Add a caption".to_string()
-                } else {
-                    alt.clone()
-                }
-            });
-        let editing = snap
-            .editing_image
-            .as_ref()
-            .is_some_and(|(range, _)| *range == image_range);
-        let editor_cap = editor.clone();
-        let editor_away = editor.clone();
-        let alt_for_edit = alt.clone();
-        container = container.child(
-            div()
-                .my(px(4.))
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(img(source).max_w_full().rounded_md())
-                .child({
-                    let caption_el = div()
-                        .id(("img-alt", image_range.start as u64))
-                        .text_size(px(12.))
-                        .text_color(snap.theme.secondary_text)
-                        .italic()
-                        .cursor(CursorStyle::PointingHand)
-                        .when(editing, |el| {
-                            el.border_b_1().border_color(snap.theme.accent)
-                        })
-                        .child(SharedString::from(if editing {
-                            format!(
-                                "{}{}|",
-                                caption,
-                                snap.widget_preedit.as_deref().unwrap_or("")
-                            )
-                        } else {
-                            caption
-                        }))
-                        .on_click(move |_, _, cx| {
-                            let range = image_range.clone();
-                            let current = alt_for_edit.clone();
-                            editor_cap.update(cx, |host, cx| {
-                                host.edit_image_alt(range, &current, cx);
-                            });
-                        })
-                        .when(editing, |el| {
-                            el.on_mouse_down_out(move |_, _, cx| {
-                                editor_away.update(cx, |host, cx| host.finish_widget(cx));
-                            })
-                        });
-                    div().relative().child(caption_el).when(editing, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .bottom_0()
-                                .child(WidgetImeSink {
-                                    editor: editor.clone(),
-                                }),
-                        )
-                    })
-                }),
+        editor.clone(),
+    );
+    if children.is_empty() {
+        // Empty paragraph still needs a caret hit target.
+        let layout = build_leaf_layout(block, &text_style, theme, base_weight);
+        children.push(
+            BlockTextElement {
+                editor,
+                layout: Arc::new(layout),
+                font_size,
+                line_height,
+                theme: theme.clone(),
+            }
+            .into_any_element(),
         );
     }
-    container.into_any_element()
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .children(children)
+        .into_any_element()
 }
 
-fn resolve_image_source(snap: &Arc<RenderSnapshot>, url: &str) -> String {
-    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
-        return url.to_string();
+#[allow(clippy::too_many_arguments)]
+fn push_text_child<H: WysiwygHost>(
+    children: &mut Vec<AnyElement>,
+    inlines: &[Inline],
+    block_range: Range<usize>,
+    text_style: &TextStyle,
+    theme: &EditorTheme,
+    base_weight: FontWeight,
+    font_size: f32,
+    line_height: f32,
+    editor: Entity<H>,
+) {
+    if inlines.is_empty() {
+        return;
     }
-    match &snap.base_dir {
-        Some(dir) => dir.join(url).to_string_lossy().into_owned(),
-        None => url.to_string(),
+    let layout = build_leaf_layout_inlines(inlines, block_range, text_style, theme, base_weight);
+    if layout.text.is_empty() {
+        return;
+    }
+    children.push(
+        BlockTextElement {
+            editor,
+            layout: Arc::new(layout),
+            font_size,
+            line_height,
+            theme: theme.clone(),
+        }
+        .into_any_element(),
+    );
+}
+
+fn render_image<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    alt: &str,
+    url: &str,
+    image_range: Range<usize>,
+    editor: Entity<H>,
+) -> AnyElement {
+    let caption = snap
+        .editing_image
+        .as_ref()
+        .and_then(|(range, draft)| (*range == image_range).then(|| draft.clone()))
+        .unwrap_or_else(|| {
+            if alt.is_empty() {
+                "Add a caption".to_string()
+            } else {
+                alt.to_string()
+            }
+        });
+    let editing = snap
+        .editing_image
+        .as_ref()
+        .is_some_and(|(range, _)| *range == image_range);
+    let editor_cap = editor.clone();
+    let editor_away = editor.clone();
+    let editor_click = editor.clone();
+    let alt_for_edit = alt.to_string();
+    let caret_at = image_range.start;
+    let fallback_label = if alt.is_empty() {
+        "Missing image".to_string()
+    } else {
+        alt.to_string()
+    };
+    let secondary = snap.theme.secondary_text;
+    let code_bg = snap.theme.code_bg;
+    // GPUI: `img(String)` is an *embedded asset*, not a file. Local Markdown
+    // images must be `PathBuf` so decode runs on the background executor and
+    // the view is notified when pixels are ready.
+    let pixels = match resolve_image_source(snap.base_dir.as_deref(), url) {
+        ResolvedImage::File(path) => img(path),
+        ResolvedImage::Uri(uri) => img(uri),
+    }
+    .id(("md-img", image_range.start as u64))
+    .w_full()
+    .max_w(px(720.))
+    .max_h(px(480.))
+    .object_fit(ObjectFit::Contain)
+    .rounded_md()
+    .cursor(CursorStyle::PointingHand)
+    .with_loading(move || {
+        div()
+            .h(px(72.))
+            .w_full()
+            .rounded_md()
+            .bg(code_bg)
+            .into_any_element()
+    })
+    .with_fallback(move || {
+        div()
+            .text_color(secondary)
+            .italic()
+            .child(SharedString::from(format!("🖼 {fallback_label}")))
+            .into_any_element()
+    })
+    .on_click(move |_, window, cx| {
+        editor_click.update(cx, |host, cx| {
+            host.click_source(caret_at, false, window, cx);
+        });
+    });
+    div()
+        .my(px(4.))
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(pixels)
+        .child({
+            let caption_el = div()
+                .id(("img-alt", image_range.start as u64))
+                .text_size(px(12.))
+                .text_color(snap.theme.secondary_text)
+                .italic()
+                .cursor(CursorStyle::PointingHand)
+                .when(editing, |el| {
+                    el.border_b_1().border_color(snap.theme.accent)
+                })
+                .child(SharedString::from(if editing {
+                    format!(
+                        "{}{}|",
+                        caption,
+                        snap.widget_preedit.as_deref().unwrap_or("")
+                    )
+                } else {
+                    caption
+                }))
+                .on_click(move |_, _, cx| {
+                    let range = image_range.clone();
+                    let current = alt_for_edit.clone();
+                    editor_cap.update(cx, |host, cx| {
+                        host.edit_image_alt(range, &current, cx);
+                    });
+                })
+                .when(editing, |el| {
+                    el.on_mouse_down_out(move |_, _, cx| {
+                        editor_away.update(cx, |host, cx| host.finish_widget(cx));
+                    })
+                });
+            div().relative().child(caption_el).when(editing, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(WidgetImeSink {
+                            editor: editor.clone(),
+                        }),
+                )
+            })
+        })
+        .into_any_element()
+}
+
+/// How a Markdown image destination is handed to GPUI's `img()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedImage {
+    /// Local file; GPUI `From<PathBuf>` → `Resource::Path` (background decode).
+    File(PathBuf),
+    /// `http(s):` / `data:` ; GPUI `From<String>` → `Resource::Uri`.
+    Uri(String),
+}
+
+pub(crate) fn resolve_image_source(base_dir: Option<&Path>, url: &str) -> ResolvedImage {
+    let trimmed = url.trim();
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("data:")
+    {
+        return ResolvedImage::Uri(trimmed.to_string());
+    }
+    let path_url = trimmed
+        .strip_prefix("file://")
+        .map(|rest| rest.strip_prefix("localhost").unwrap_or(rest))
+        .unwrap_or(trimmed);
+    let decoded = percent_decode_path(path_url);
+    let path = match base_dir {
+        Some(dir) if !Path::new(&decoded).is_absolute() => dir.join(&decoded),
+        _ => PathBuf::from(&decoded),
+    };
+    ResolvedImage::File(path)
+}
+
+fn percent_decode_path(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -547,4 +712,54 @@ fn text_runs_from_highlights(
         runs.push(style.to_run(body.len()));
     }
     runs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_relative_url_is_a_filesystem_path() {
+        let base = Path::new("/docs/notes");
+        assert_eq!(
+            resolve_image_source(Some(base), "assets/icon/icon.png"),
+            ResolvedImage::File(base.join("assets/icon/icon.png"))
+        );
+        assert_eq!(
+            resolve_image_source(Some(base), "photo%20one.png"),
+            ResolvedImage::File(base.join("photo one.png"))
+        );
+    }
+
+    #[test]
+    fn absolute_and_file_urls_stay_paths() {
+        assert_eq!(
+            resolve_image_source(Some(Path::new("/docs")), "/tmp/pic.png"),
+            ResolvedImage::File(PathBuf::from("/tmp/pic.png"))
+        );
+        assert_eq!(
+            resolve_image_source(None, "file:///Users/me/pic.png"),
+            ResolvedImage::File(PathBuf::from("/Users/me/pic.png"))
+        );
+    }
+
+    #[test]
+    fn remote_and_data_urls_stay_uris() {
+        assert_eq!(
+            resolve_image_source(Some(Path::new("/docs")), "https://cdn.example/a.png"),
+            ResolvedImage::Uri("https://cdn.example/a.png".into())
+        );
+        assert_eq!(
+            resolve_image_source(None, "data:image/png;base64,xx"),
+            ResolvedImage::Uri("data:image/png;base64,xx".into())
+        );
+    }
+
+    #[test]
+    fn string_img_source_would_not_be_a_file() {
+        // Regression lock: GPUI treats String as Embedded or Uri, never Path.
+        // Local markdown images must keep going through ResolvedImage::File.
+        let resolved = resolve_image_source(Some(Path::new("/doc")), "img.webp");
+        assert!(matches!(resolved, ResolvedImage::File(_)));
+    }
 }

@@ -22,6 +22,11 @@ Visit the [MarkRust homepage](https://markrust.example.com) or read the [documen
 
 ![Placeholder landscape](assets/icon/icon.png)
 
+A line with a hard break\
+continues below. Bracket autolink: <https://example.com>
+
+---
+
 ## Lists
 
 ### Bullet List

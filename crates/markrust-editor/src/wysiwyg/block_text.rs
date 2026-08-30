@@ -111,6 +111,24 @@ pub fn build_leaf_layout(
     theme: &EditorTheme,
     base_weight: gpui::FontWeight,
 ) -> LeafLayout {
+    build_leaf_layout_inlines(
+        &block.inlines,
+        block.source_range.clone(),
+        text_style,
+        theme,
+        base_weight,
+    )
+}
+
+/// Visible text for a slice of inlines. Images are omitted here; the block
+/// renderer paints local files as `img()` elements instead of alt placeholders.
+pub fn build_leaf_layout_inlines(
+    inlines: &[Inline],
+    block_range: Range<usize>,
+    text_style: &TextStyle,
+    theme: &EditorTheme,
+    base_weight: gpui::FontWeight,
+) -> LeafLayout {
     let mut text = String::new();
     let mut runs: Vec<TextRun> = Vec::new();
     let mut source_at = Vec::new();
@@ -145,7 +163,7 @@ pub fn build_leaf_layout(
         runs.push(run);
     };
 
-    for inline in &block.inlines {
+    for inline in inlines {
         match inline {
             Inline::Run {
                 text: t,
@@ -164,9 +182,11 @@ pub fn build_leaf_layout(
                     run.font.style = gpui::FontStyle::Italic;
                 }
                 if marks.contains(MarkSet::STRIKE) {
+                    // Inherit the run color so strike-through stays on the
+                    // glyph (Typora-style), including links and emphasis.
                     run.strikethrough = Some(gpui::StrikethroughStyle {
                         thickness: px(1.),
-                        color: Some(theme.secondary_text),
+                        color: None,
                     });
                 }
                 if marks.contains(MarkSet::CODE) {
@@ -190,32 +210,20 @@ pub fn build_leaf_layout(
                     run,
                 );
             }
-            Inline::Image {
-                alt, source_range, ..
-            } => {
-                let label = format!("🖼 {alt}");
-                let mut run = text_style.to_run(0);
-                run.color = theme.image_text;
-                run.font.style = gpui::FontStyle::Italic;
-                push(
-                    &mut text,
-                    &mut runs,
-                    &mut source_at,
-                    &label,
-                    source_range.clone(),
-                    run,
-                );
+            Inline::Image { .. } => {
+                // Pixels + caption are sibling elements; keep this layout as
+                // surrounding visible text so mixed paragraphs still wrap.
             }
             Inline::SoftBreak => {
                 let run = text_style.to_run(0);
-                let src = block.source_range.start;
+                let src = block_range.start;
                 push(&mut text, &mut runs, &mut source_at, " ", src..src + 1, run);
             }
             Inline::HardBreak {
                 style: BreakStyle::TwoSpaces | BreakStyle::Backslash,
             } => {
                 let run = text_style.to_run(0);
-                let src = block.source_range.start;
+                let src = block_range.start;
                 push(
                     &mut text,
                     &mut runs,
@@ -244,11 +252,10 @@ pub fn build_leaf_layout(
     }
 
     if text.is_empty() {
-        source_at = vec![block.source_range.start, block.source_range.start];
+        source_at = vec![block_range.start, block_range.start];
     } else if source_at.len() == text.len() {
         source_at.push(
-            block
-                .inlines
+            inlines
                 .iter()
                 .rev()
                 .find_map(|i| match i {
@@ -257,11 +264,11 @@ pub fn build_leaf_layout(
                     | Inline::OpaqueInline { source_range, .. } => Some(source_range.end),
                     _ => None,
                 })
-                .unwrap_or(block.source_range.end),
+                .unwrap_or(block_range.end),
         );
     }
     while source_at.len() < text.len() + 1 {
-        source_at.push(*source_at.last().unwrap_or(&block.source_range.end));
+        source_at.push(*source_at.last().unwrap_or(&block_range.end));
     }
     source_at.truncate(text.len() + 1);
 
@@ -275,7 +282,7 @@ pub fn build_leaf_layout(
         text,
         runs,
         source_at,
-        block_start: block.source_range.start,
+        block_start: block_range.start,
     }
 }
 
@@ -855,13 +862,58 @@ mod tests {
     }
 
     #[test]
-    fn image_alt_is_visible_placeholder() {
+    fn image_only_layout_omits_alt_placeholder() {
         let layout = layout_for("![cat](img.png)\n");
         assert!(
-            layout.text.contains("cat"),
-            "expected alt placeholder, got {:?}",
+            !layout.text.contains("cat") && !layout.text.contains('🖼'),
+            "pixels are a sibling img(); text layout must not use an alt placeholder, got {:?}",
             layout.text
         );
+        assert!(layout.text.is_empty());
+    }
+
+    #[test]
+    fn mixed_text_and_image_keeps_surrounding_visible_text() {
+        let layout = layout_for("hello ![cat](img.png) world\n");
+        assert_eq!(layout.text, "hello  world");
+        assert!(!layout.text.contains('🖼'));
+    }
+
+    #[test]
+    fn strikethrough_is_painted_on_the_visible_run() {
+        let layout = layout_for("~~gone~~\n");
+        assert_eq!(layout.text, "gone");
+        assert!(
+            layout.runs.iter().any(|run| run.strikethrough.is_some()),
+            "expected strikethrough paint, runs={:?}",
+            layout.runs
+        );
+    }
+
+    #[test]
+    fn autolink_is_painted_as_a_link() {
+        let layout = layout_for("<https://example.com>\n");
+        assert!(
+            layout.text.contains("https://example.com"),
+            "autolink visible text, got {:?}",
+            layout.text
+        );
+        assert!(
+            layout
+                .runs
+                .iter()
+                .any(|run| run.underline.is_some() && run.color != EditorTheme::dark().text),
+            "expected link underline + color, runs={:?}",
+            layout.runs
+        );
+    }
+
+    #[test]
+    fn hard_break_is_a_visible_newline() {
+        let two_spaces = layout_for("a  \nb\n");
+        assert_eq!(two_spaces.text, "a\nb", "two-space hard break");
+        let backslash = layout_for("a\\\nb\n");
+        assert_eq!(backslash.text, "a\nb", "backslash hard break");
     }
 
     #[test]

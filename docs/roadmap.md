@@ -76,6 +76,8 @@ Shipped this pass (keep previous bullets; this pass added):
 - IME origin (`wysiwyg/ime.rs`): `bounds_for_range` uses `ImeOriginState` — focused widget, else the leaf whose source range contains the document caret (wrapped-line caret rect, table cell, body). After that origin is painted, `Window::invalidate_character_coordinates` pushes it to the platform (GPUI equivalent of `set_ime_cursor_position`) so the OS does not keep a stale candidate window. Unit tests assert a later decoy leaf cannot steal the rect, and that after an insert the origin follows a caret move into a table cell or caption. **Does not prove the OS candidate window follows.**
 - Input-rule polish: `_`/`__` italic/bold, nested italic inside bold, list-item-local `# ` / fences, `Document::peel_typing_range` so heading conversion is one undo even when the prefix was a slice of a longer Typing tx. `[` / `]` / `<` type as raw (task lists, links, HTML); fences/thematic breaks do not insert newlines inside table cells.
 - P6: delete row/col (keep ≥1 of each); first row stays header; insert caret lands in the new cell; contextual table toolbar when the caret is in a table; right-click focuses the cell (toolbar follows).
+- **Inline images as pixels:** local Markdown images (`PNG`/`JPEG`/`GIF`/`WebP`, plus anything else GPUI can decode) resolve relative to the document directory and load through `img(PathBuf)` so GPUI treats them as filesystem `Resource::Path`. Decode stays on the background executor; the view is notified when frames are ready. Alt/caption editing is unchanged. A `String` source was a bundled-asset lookup, so the previous `img(path_string)` never showed file pixels.
+- Thematic breaks paint as a full-width rule (not an 8%-opacity hairline). Autolinks keep link color + underline. Strikethrough inherits the run color. Hard breaks (`  ` / `\`) are a visible newline in the leaf layout.
 
 Previously shipped:
 - Input rules as pure functions in `rich/input_rules.rs` (`# `, `- `/`* `/`+ `, `1. `/`1) `, `> `, fences, `---`/`***`/`___`, auto-close `*`/`**`/`_`/`__`/` `/`~~`), disabled in code/raw, heading+space is one undo group.
@@ -88,6 +90,7 @@ Previously shipped:
 
 Still open (do not shrink the goal):
 - IME candidate window: origin rectangles are unit-tested for body caret, wrapped lines, table cells, language chip, image caption, and frontmatter fields, including after an edit then a caret move into a table cell or caption. The resolved origin is pushed with `invalidate_character_coordinates` after caret/widget paint, not only returned from `bounds_for_range`. A human must still enable a CJK IME in the GUI (Hiragana / Pinyin / etc.) and confirm the OS candidate window follows the caret in each of those surfaces. Russian/Colemak layouts on this Mac are not a candidate-window proof. **This is the remaining P5 gap; the GOAL is not complete.**
+- Remote `http(s)` images still go through GPUI URI loading (network); missing local files fall back to an alt placeholder. Mixed text+image paragraphs stack the image between text runs (not CSS-inline inside a shaped line).
 - Masking/`parser.rs`/`spans.rs` are not deleted (source mode still uses them; they project comrak, not tree-sitter-md). Fenced-code highlighting still uses tree-sitter rust/json/yaml/bash — that stays.
 
 Earlier P5 (still in):

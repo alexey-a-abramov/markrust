@@ -264,6 +264,7 @@ mod tests {
             .any(|k| matches!(k, BlockKind::ListItem { task: Some(_) })));
         assert!(all.iter().any(|k| matches!(k, BlockKind::CodeBlock { .. })));
         assert!(all.iter().any(|k| matches!(k, BlockKind::BlockQuote)));
+        assert!(all.iter().any(|k| matches!(k, BlockKind::ThematicBreak)));
         // Block source ranges of top-level blocks are ordered and in bounds.
         let mut prev_end = 0;
         for b in &tree.blocks {
