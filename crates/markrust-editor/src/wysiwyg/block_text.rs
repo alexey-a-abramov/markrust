@@ -211,8 +211,8 @@ pub fn build_leaf_layout_inlines(
                 );
             }
             Inline::Image { .. } => {
-                // Pixels + caption are sibling elements; keep this layout as
-                // surrounding visible text so mixed paragraphs still wrap.
+                // Pixels are sibling flex items in a line-box; this slice is
+                // surrounding visible text only.
             }
             Inline::SoftBreak => {
                 let run = text_style.to_run(0);
@@ -339,6 +339,8 @@ pub struct BlockTextElement<H: WysiwygHost> {
     pub font_size: f32,
     pub line_height: f32,
     pub theme: EditorTheme,
+    /// Size to unwrapped text width so mixed paragraphs can sit on one flex row.
+    pub hug_width: bool,
 }
 
 pub struct Prepaint<H: WysiwygHost> {
@@ -376,9 +378,20 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let wrap = (window.viewport_size().width - px(80.)).max(px(120.));
-        let height = self.measure_height(window, wrap);
         let mut style = Style::default();
-        style.size.width = relative(1.).into();
+        let width = if self.hug_width {
+            let measured = self.measure_unwrapped_width(window);
+            measured.min(wrap).max(px(1.))
+        } else {
+            wrap
+        };
+        let height = self.measure_height(window, width);
+        if self.hug_width {
+            style.size.width = width.into();
+            style.flex_shrink = 0.;
+        } else {
+            style.size.width = relative(1.).into();
+        }
         style.size.height = height.max(px(self.line_height)).into();
         style.min_size.height = px(self.line_height).into();
         let _ = cx;
@@ -544,6 +557,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
                     font_size,
                     line_height,
                     theme: theme.clone(),
+                    hug_width: false,
                 };
                 let lines = element.shape(window, bounds.size.width);
                 let vis = visible_index_at(&lines, bounds, event.position, px(line_height));
@@ -572,6 +586,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
                     font_size,
                     line_height,
                     theme: theme.clone(),
+                    hug_width: false,
                 };
                 let lines = element.shape(window, bounds.size.width);
                 let vis = visible_index_at(&lines, bounds, event.position, px(line_height));
@@ -609,6 +624,14 @@ impl<H: WysiwygHost> BlockTextElement<H> {
             .map(|l| l.size(lh).height.max(lh))
             .fold(px(0.), |a, b| a + b)
             .max(lh)
+    }
+
+    fn measure_unwrapped_width(&self, window: &mut Window) -> Pixels {
+        let lines = self.shape(window, px(100_000.));
+        lines
+            .iter()
+            .map(|l| l.width())
+            .fold(px(0.), |a, b| a.max(b))
     }
 }
 

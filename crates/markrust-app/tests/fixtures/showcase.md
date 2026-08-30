@@ -22,6 +22,8 @@ Visit the [MarkRust homepage](https://markrust.example.com) or read the [documen
 
 ![Placeholder landscape](assets/icon/icon.png)
 
+Inline with adjacent text: hello ![icon](assets/icon/icon.png) world.
+
 A line with a hard break\
 continues below. Bracket autolink: <https://example.com>
 

@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dirty-tab 3-way merge when a file changes on disk; carets are mapped across the merge.
 - Normalize-on-save dialog shows a line hunk preview.
 - Chip/caption/frontmatter IME origin uses the widget bounds, not the last text-leaf caret. Body/wrapped/table IME origin is the focused leaf's caret rect (not last-painted). Caret moves and widget focus push that origin via GPUI `invalidate_character_coordinates`. The OS IME candidate window is still unverified.
-- WYSIWYG local images render as pixels (filesystem path, background decode) with alt/caption still editable. Thematic breaks, autolink paint, strikethrough, and hard-break newlines match the rendered document instead of source chrome.
+- WYSIWYG local images render as pixels (filesystem path, background decode) with alt/caption still editable. Mixed text+image paragraphs lay out as a wrapping horizontal line-box (inline images capped at 1.5em); a standalone image paragraph stays block-sized. Thematic breaks, autolink paint, strikethrough, and hard-break newlines match the rendered document instead of source chrome.
 
 ### Changed
 

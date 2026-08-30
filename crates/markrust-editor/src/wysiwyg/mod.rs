@@ -8,6 +8,7 @@
 mod block_text;
 mod blocks;
 mod ime;
+mod inline_layout;
 mod view;
 
 pub use view::RichEditorView;

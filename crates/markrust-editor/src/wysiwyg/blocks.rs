@@ -18,6 +18,10 @@ use super::block_text::{
     build_code_layout, build_leaf_layout, build_leaf_layout_inlines, BlockTextElement,
     WidgetImeSink, WysiwygHost,
 };
+use super::inline_layout::{
+    classify_paragraph, image_role, inline_image_height, inline_segments, ImageRole, InlineSegment,
+    ParagraphFlow, BLOCK_IMAGE_MAX_HEIGHT, BLOCK_IMAGE_MAX_WIDTH,
+};
 use crate::highlight::highlight_code_block;
 use crate::theme::EditorTheme;
 
@@ -160,6 +164,7 @@ fn render_block<H: WysiwygHost>(
                     font_size: theme.font_size * 0.9,
                     line_height,
                     theme: theme.clone(),
+                    hug_width: false,
                 })
                 .into_any_element()
         }
@@ -350,7 +355,9 @@ fn render_table<H: WysiwygHost>(
 
 /// A leaf block's inline content as wrapped rich text, with local images as
 /// GPUI `img()` pixels (filesystem `PathBuf`, decoded on the background
-/// executor) rather than alt-text placeholders.
+/// executor). Mixed text+image paragraphs are a wrapping flex row (GPUI cannot
+/// mix Image and glyphs in one `TextRun`); standalone image paragraphs stay
+/// block-sized.
 fn paragraph_element<H: WysiwygHost>(
     snap: &Arc<RenderSnapshot>,
     block: &Block,
@@ -361,66 +368,126 @@ fn paragraph_element<H: WysiwygHost>(
     let theme = &snap.theme;
     let text_style = base_text_style(theme, font_size, base_weight);
     let line_height = theme.line_height_for_font_size(font_size);
-    let mut children: Vec<AnyElement> = Vec::new();
-    let mut text_start = 0usize;
-    for i in 0..block.inlines.len() {
-        let image = match &block.inlines[i] {
-            Inline::Image {
-                alt,
-                url,
-                source_range,
-                ..
-            } => Some((alt.clone(), url.clone(), source_range.clone())),
-            _ => None,
-        };
-        let Some((alt, url, range)) = image else {
-            continue;
-        };
-        push_text_child(
-            &mut children,
-            &block.inlines[text_start..i],
-            block.source_range.clone(),
-            &text_style,
-            theme,
-            base_weight,
-            font_size,
-            line_height,
-            editor.clone(),
-        );
-        children.push(render_image(snap, &alt, &url, range, editor.clone()));
-        text_start = i + 1;
-    }
-    push_text_child(
-        &mut children,
-        &block.inlines[text_start..],
-        block.source_range.clone(),
-        &text_style,
-        theme,
-        base_weight,
-        font_size,
-        line_height,
-        editor.clone(),
-    );
-    if children.is_empty() {
-        // Empty paragraph still needs a caret hit target.
-        let layout = build_leaf_layout(block, &text_style, theme, base_weight);
-        children.push(
+    let flow = classify_paragraph(&block.inlines);
+    let role = image_role(flow).unwrap_or(ImageRole::Inline);
+    match flow {
+        ParagraphFlow::TextOnly => {
+            let layout = build_leaf_layout(block, &text_style, theme, base_weight);
             BlockTextElement {
                 editor,
                 layout: Arc::new(layout),
                 font_size,
                 line_height,
                 theme: theme.clone(),
+                hug_width: false,
             }
-            .into_any_element(),
-        );
+            .into_any_element()
+        }
+        ParagraphFlow::Standalone => {
+            let mut children: Vec<AnyElement> = Vec::new();
+            for inline in &block.inlines {
+                if let Inline::Image {
+                    alt,
+                    url,
+                    source_range,
+                    ..
+                } = inline
+                {
+                    children.push(render_image(
+                        snap,
+                        alt,
+                        url,
+                        source_range.clone(),
+                        editor.clone(),
+                        ImageRole::Block,
+                        font_size,
+                    ));
+                }
+            }
+            if children.is_empty() {
+                let layout = build_leaf_layout(block, &text_style, theme, base_weight);
+                children.push(
+                    BlockTextElement {
+                        editor,
+                        layout: Arc::new(layout),
+                        font_size,
+                        line_height,
+                        theme: theme.clone(),
+                        hug_width: false,
+                    }
+                    .into_any_element(),
+                );
+            }
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .children(children)
+                .into_any_element()
+        }
+        ParagraphFlow::Mixed => {
+            let mut children: Vec<AnyElement> = Vec::new();
+            for seg in inline_segments(&block.inlines) {
+                match seg {
+                    InlineSegment::Text { start, end } => {
+                        push_text_child(
+                            &mut children,
+                            &block.inlines[start..end],
+                            block.source_range.clone(),
+                            &text_style,
+                            theme,
+                            base_weight,
+                            font_size,
+                            line_height,
+                            editor.clone(),
+                            true,
+                        );
+                    }
+                    InlineSegment::Image { index } => {
+                        if let Inline::Image {
+                            alt,
+                            url,
+                            source_range,
+                            ..
+                        } = &block.inlines[index]
+                        {
+                            children.push(render_image(
+                                snap,
+                                alt,
+                                url,
+                                source_range.clone(),
+                                editor.clone(),
+                                role,
+                                font_size,
+                            ));
+                        }
+                    }
+                }
+            }
+            if children.is_empty() {
+                let layout = build_leaf_layout(block, &text_style, theme, base_weight);
+                children.push(
+                    BlockTextElement {
+                        editor,
+                        layout: Arc::new(layout),
+                        font_size,
+                        line_height,
+                        theme: theme.clone(),
+                        hug_width: false,
+                    }
+                    .into_any_element(),
+                );
+            }
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .children(children)
+                .into_any_element()
+        }
     }
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(4.))
-        .children(children)
-        .into_any_element()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -434,6 +501,7 @@ fn push_text_child<H: WysiwygHost>(
     font_size: f32,
     line_height: f32,
     editor: Entity<H>,
+    hug_width: bool,
 ) {
     if inlines.is_empty() {
         return;
@@ -449,6 +517,7 @@ fn push_text_child<H: WysiwygHost>(
             font_size,
             line_height,
             theme: theme.clone(),
+            hug_width,
         }
         .into_any_element(),
     );
@@ -460,6 +529,8 @@ fn render_image<H: WysiwygHost>(
     url: &str,
     image_range: Range<usize>,
     editor: Entity<H>,
+    role: ImageRole,
+    font_size: f32,
 ) -> AnyElement {
     let caption = snap
         .editing_image
@@ -488,6 +559,9 @@ fn render_image<H: WysiwygHost>(
     };
     let secondary = snap.theme.secondary_text;
     let code_bg = snap.theme.code_bg;
+    let inline_h = px(inline_image_height(font_size));
+    let edit_on_click = role == ImageRole::Inline;
+    let click_range = image_range.clone();
     // GPUI: `img(String)` is an *embedded asset*, not a file. Local Markdown
     // images must be `PathBuf` so decode runs on the background executor and
     // the view is notified when pixels are ready.
@@ -496,83 +570,117 @@ fn render_image<H: WysiwygHost>(
         ResolvedImage::Uri(uri) => img(uri),
     }
     .id(("md-img", image_range.start as u64))
-    .w_full()
-    .max_w(px(720.))
-    .max_h(px(480.))
     .object_fit(ObjectFit::Contain)
     .rounded_md()
-    .cursor(CursorStyle::PointingHand)
-    .with_loading(move || {
-        div()
-            .h(px(72.))
-            .w_full()
-            .rounded_md()
-            .bg(code_bg)
-            .into_any_element()
-    })
-    .with_fallback(move || {
-        div()
-            .text_color(secondary)
-            .italic()
-            .child(SharedString::from(format!("🖼 {fallback_label}")))
-            .into_any_element()
-    })
+    .cursor(CursorStyle::PointingHand);
+    let pixels = match role {
+        ImageRole::Inline => {
+            let fallback_label = fallback_label.clone();
+            pixels
+                .h(inline_h)
+                .max_h(inline_h)
+                .flex_none()
+                .with_loading(move || {
+                    div()
+                        .h(inline_h)
+                        .w(inline_h)
+                        .rounded_md()
+                        .bg(code_bg)
+                        .into_any_element()
+                })
+                .with_fallback(move || missing_image_fallback(secondary, &fallback_label))
+        }
+        ImageRole::Block => pixels
+            .max_w(px(BLOCK_IMAGE_MAX_WIDTH))
+            .max_h(px(BLOCK_IMAGE_MAX_HEIGHT))
+            .with_loading(move || {
+                div()
+                    .h(px(72.))
+                    .w_full()
+                    .rounded_md()
+                    .bg(code_bg)
+                    .into_any_element()
+            })
+            .with_fallback(move || missing_image_fallback(secondary, &fallback_label)),
+    }
     .on_click(move |_, window, cx| {
         editor_click.update(cx, |host, cx| {
             host.click_source(caret_at, false, window, cx);
+            if edit_on_click {
+                host.edit_image_alt(click_range.clone(), &alt_for_edit, cx);
+            }
         });
     });
-    div()
-        .my(px(4.))
-        .flex()
-        .flex_col()
-        .gap(px(2.))
-        .child(pixels)
-        .child({
-            let caption_el = div()
-                .id(("img-alt", image_range.start as u64))
-                .text_size(px(12.))
-                .text_color(snap.theme.secondary_text)
-                .italic()
-                .cursor(CursorStyle::PointingHand)
-                .when(editing, |el| {
-                    el.border_b_1().border_color(snap.theme.accent)
-                })
-                .child(SharedString::from(if editing {
-                    format!(
-                        "{}{}|",
-                        caption,
-                        snap.widget_preedit.as_deref().unwrap_or("")
-                    )
-                } else {
-                    caption
-                }))
-                .on_click(move |_, _, cx| {
-                    let range = image_range.clone();
-                    let current = alt_for_edit.clone();
-                    editor_cap.update(cx, |host, cx| {
-                        host.edit_image_alt(range, &current, cx);
-                    });
-                })
-                .when(editing, |el| {
-                    el.on_mouse_down_out(move |_, _, cx| {
-                        editor_away.update(cx, |host, cx| host.finish_widget(cx));
-                    })
-                });
-            div().relative().child(caption_el).when(editing, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .child(WidgetImeSink {
-                            editor: editor.clone(),
-                        }),
-                )
-            })
+    let show_caption = role == ImageRole::Block || editing;
+    let caption_el = div()
+        .id(("img-alt", image_range.start as u64))
+        .text_size(px(12.))
+        .text_color(snap.theme.secondary_text)
+        .italic()
+        .cursor(CursorStyle::PointingHand)
+        .when(editing, |el| {
+            el.border_b_1().border_color(snap.theme.accent)
         })
+        .child(SharedString::from(if editing {
+            format!(
+                "{}{}|",
+                caption,
+                snap.widget_preedit.as_deref().unwrap_or("")
+            )
+        } else {
+            caption
+        }))
+        .on_click({
+            let range = image_range.clone();
+            let current = alt.to_string();
+            move |_, _, cx| {
+                editor_cap.update(cx, |host, cx| {
+                    host.edit_image_alt(range.clone(), &current, cx);
+                });
+            }
+        })
+        .when(editing, |el| {
+            el.on_mouse_down_out(move |_, _, cx| {
+                editor_away.update(cx, |host, cx| host.finish_widget(cx));
+            })
+        });
+    let caption_row = div().relative().child(caption_el).when(editing, |el| {
+        el.child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .child(WidgetImeSink {
+                    editor: editor.clone(),
+                }),
+        )
+    });
+    match role {
+        ImageRole::Inline => {
+            let mut el = div().flex_none().flex().flex_col().child(pixels);
+            if show_caption {
+                el = el.child(caption_row);
+            }
+            el.into_any_element()
+        }
+        ImageRole::Block => div()
+            .my(px(4.))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(pixels)
+            .child(caption_row)
+            .into_any_element(),
+    }
+}
+
+fn missing_image_fallback(secondary: gpui::Hsla, label: &str) -> AnyElement {
+    div()
+        .text_color(secondary)
+        .italic()
+        .child(SharedString::from(format!("🖼 {label}")))
         .into_any_element()
 }
 
