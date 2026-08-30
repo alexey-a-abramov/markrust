@@ -136,8 +136,10 @@ pub enum BlockKind {
     TableCell,
     ThematicBreak,
     /// Anything we do not model (HTML blocks, footnote definitions, math,
-    /// ...): inert, serialized as its raw source slice, byte for byte.
-    Opaque,
+    /// ...): inert, serialized verbatim from `raw`.
+    Opaque {
+        raw: String,
+    },
 }
 
 /// Inline marks as a small bitset (avoids a bitflags dependency).
@@ -176,6 +178,11 @@ pub struct MarkFidelity {
     pub strong_delim: u8,
     /// Number of backticks around inline code.
     pub code_backticks: usize,
+    /// Identity of the originating emphasis nodes (0 = unassigned): adjacent
+    /// distinct nodes with the same mark must not merge on serialization.
+    pub emph_group: u64,
+    pub strong_group: u64,
+    pub strike_group: u64,
 }
 
 impl Default for MarkFidelity {
@@ -184,6 +191,9 @@ impl Default for MarkFidelity {
             emph_delim: b'*',
             strong_delim: b'*',
             code_backticks: 1,
+            emph_group: 0,
+            strong_group: 0,
+            strike_group: 0,
         }
     }
 }
@@ -194,6 +204,9 @@ pub struct LinkAttrs {
     pub title: Option<String>,
     /// True when the source had no `](...)` form (autolink / bare URL).
     pub autolink: bool,
+    /// Identity of the originating link node: adjacent links with identical
+    /// attrs must not merge into one span on serialization.
+    pub group: u64,
 }
 
 /// How a hard break was written.
@@ -221,6 +234,10 @@ pub enum Inline {
         url: String,
         title: Option<String>,
         source_range: Range<usize>,
+        /// Emphasis context the image sits inside (kept through transitions).
+        marks: MarkSet,
+        /// Enclosing link, when the image is the content of one.
+        link: Option<LinkAttrs>,
     },
     SoftBreak,
     HardBreak {
@@ -230,6 +247,8 @@ pub enum Inline {
     OpaqueInline {
         raw: Box<str>,
         source_range: Range<usize>,
+        /// Emphasis context the fragment sits inside.
+        marks: MarkSet,
     },
 }
 

@@ -140,7 +140,12 @@ impl<'a> Ser<'a> {
                 self.emit_inlines(&block.inlines, false);
             }
             BlockKind::Heading { level, style } => {
-                let setext = !self.normalize() && *style == HeadingStyle::Setext && *level <= 2;
+                let multiline = block
+                    .inlines
+                    .iter()
+                    .any(|i| matches!(i, Inline::SoftBreak | Inline::HardBreak { .. }));
+                let setext = *level <= 2
+                    && ((*style == HeadingStyle::Setext && !self.normalize()) || multiline);
                 if setext {
                     self.emit_inlines(&block.inlines, false);
                     self.line_break();
@@ -151,7 +156,9 @@ impl<'a> Ser<'a> {
                         self.out.push('#');
                     }
                     self.out.push(' ');
-                    self.emit_inlines(&block.inlines, false);
+                    let text_start = self.out.len();
+                    self.emit_inlines_opts(&block.inlines, false, true);
+                    escape_trailing_hashes(&mut self.out, text_start);
                 }
             }
             BlockKind::CodeBlock {
@@ -161,7 +168,17 @@ impl<'a> Ser<'a> {
             } => {
                 let (ch, len) = match (self.normalize(), fence) {
                     (false, Some(f)) => (f.fence_char as char, f.fence_length.max(3)),
-                    _ => ('`', 3usize),
+                    _ => {
+                        // House fence is ``` but must not collide with fence
+                        // runs inside the literal (or an info string that a
+                        // backtick fence cannot carry).
+                        let backtick_run = longest_line_start_run(literal, '`');
+                        if backtick_run >= 3 || info.contains('`') {
+                            ('~', (longest_line_start_run(literal, '~') + 1).max(3))
+                        } else {
+                            ('`', (backtick_run + 1).max(3))
+                        }
+                    }
                 };
                 let fence_str: String = std::iter::repeat_n(ch, len).collect();
                 self.out.push_str(&fence_str);
@@ -187,9 +204,10 @@ impl<'a> Ser<'a> {
                 self.delim.truncate(saved);
             }
             BlockKind::BulletList { tight, marker } => {
-                let marker = if self.normalize() { b'-' } else { *marker };
-                let marker = if matches!(marker, b'-' | b'*' | b'+') {
-                    marker as char
+                // The author's marker survives normalize too: rewriting all
+                // bullets to one char would merge adjacent sibling lists.
+                let marker = if matches!(*marker, b'-' | b'*' | b'+') {
+                    *marker as char
                 } else {
                     '-'
                 };
@@ -200,11 +218,7 @@ impl<'a> Ser<'a> {
                 tight,
                 delimiter,
             } => {
-                let delim_ch = if self.normalize() {
-                    '.'
-                } else {
-                    *delimiter as char
-                };
+                let delim_ch = *delimiter as char;
                 let start = *start;
                 self.emit_list_items(block, *tight, move |i| format!("{}{delim_ch} ", start + i));
             }
@@ -220,7 +234,9 @@ impl<'a> Ser<'a> {
             }
             BlockKind::ThematicBreak => {
                 if self.normalize() {
-                    self.out.push_str("---");
+                    // "***": "---" would collide with frontmatter at document
+                    // start and setext underlines after paragraphs.
+                    self.out.push_str("***");
                 } else {
                     let slice = self.slice(block);
                     self.out.push_str(if slice.is_empty() {
@@ -230,10 +246,15 @@ impl<'a> Ser<'a> {
                     });
                 }
             }
-            BlockKind::Opaque => {
-                // Inert: always the raw slice, even under a dirty ancestor.
-                let slice = self.slice(block);
-                self.out.push_str(slice);
+            BlockKind::Opaque { raw } => {
+                // Inert content; each continuation line re-prefixed so it
+                // stays inside the current container (quote, list item).
+                for (i, line) in raw.split('\n').enumerate() {
+                    if i > 0 {
+                        self.line_break();
+                    }
+                    self.out.push_str(line);
+                }
             }
         }
     }
@@ -260,16 +281,18 @@ impl<'a> Ser<'a> {
                     self.blank_sep();
                 }
             }
-            let mut marker = marker_for(i);
+            let marker = marker_for(i);
+            self.out.push_str(&marker);
+            // Continuation lines indent by the list-marker width only; a task
+            // checkbox is item *content*, not part of the marker.
+            let saved = self.delim.len();
+            self.delim.push_str(&" ".repeat(marker.len()));
             if let BlockKind::ListItem {
                 task: Some(checked),
             } = &item.kind
             {
-                marker.push_str(if *checked { "[x] " } else { "[ ] " });
+                self.out.push_str(if *checked { "[x] " } else { "[ ] " });
             }
-            self.out.push_str(&marker);
-            let saved = self.delim.len();
-            self.delim.push_str(&" ".repeat(marker.len()));
             // Item children are tight when the list is tight (paragraphs not
             // separated by blank lines).
             self.emit_children(&item.children, tight);
@@ -349,72 +372,95 @@ impl<'a> Ser<'a> {
     }
 
     fn emit_inlines(&mut self, inlines: &[Inline], in_table: bool) {
-        let mut open_marks: Vec<(MarkSet, String, String)> = Vec::new(); // (mark, open, close)
-        let mut open_link: Option<LinkAttrs> = None;
+        self.emit_inlines_opts(inlines, in_table, false);
+    }
 
-        let close_all = |ser: &mut Ser, open_marks: &mut Vec<(MarkSet, String, String)>| {
-            while let Some((_, _, close)) = open_marks.pop() {
-                ser.out.push_str(&close);
+    /// `single_line`: soft/hard breaks become spaces (ATX headings).
+    fn emit_inlines_opts(&mut self, inlines: &[Inline], in_table: bool, single_line: bool) {
+        let mut stack: Vec<(MarkKey, String)> = Vec::new(); // (key, close-delim)
+        let mut at_line_start =
+            self.out.is_empty() || self.out.ends_with('\n') || self.out.ends_with(&self.delim);
+        let mut skip_autolink: Option<String> = None;
+
+        for (i, inline) in inlines.iter().enumerate() {
+            // Autolinks emit once for their whole run group.
+            if let Inline::Run { link: Some(l), .. } = inline {
+                if l.autolink {
+                    if skip_autolink.as_deref() != Some(l.url.as_str()) {
+                        close_down_to(self, &mut stack, 0);
+                        self.out.push('<');
+                        self.out.push_str(&l.url);
+                        self.out.push('>');
+                        at_line_start = false;
+                        skip_autolink = Some(l.url.clone());
+                    }
+                    continue;
+                }
             }
-        };
+            skip_autolink = None;
 
-        for (idx, inline) in inlines.iter().enumerate() {
+            match inline {
+                Inline::SoftBreak => {
+                    close_before_break(self, &mut stack, inlines, i);
+                    if in_table || single_line {
+                        self.out.push(' ');
+                    } else {
+                        self.line_break();
+                        at_line_start = true;
+                    }
+                    continue;
+                }
+                Inline::HardBreak { style } => {
+                    close_before_break(self, &mut stack, inlines, i);
+                    if in_table || single_line {
+                        self.out.push(' ');
+                    } else {
+                        let marker = match (self.normalize(), style) {
+                            (true, _) | (false, BreakStyle::Backslash) => "\\",
+                            (false, BreakStyle::TwoSpaces) => "  ",
+                        };
+                        self.out.push_str(marker);
+                        self.line_break();
+                        at_line_start = true;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            let wanted = inline_keys(inline);
+            // Close entries (LIFO) until the stack is a subset of `wanted`.
+            let keep = stack
+                .iter()
+                .take_while(|(k, _)| wanted.iter().any(|w| keys_match(k, w)))
+                .count();
+            close_down_to(self, &mut stack, keep);
+            // Open missing keys, longest extent first (outermost).
+            let mut missing: Vec<&MarkKey> = wanted
+                .iter()
+                .filter(|k| !stack.iter().any(|(sk, _)| keys_match(sk, k)))
+                .collect();
+            missing.sort_by_key(|k| std::cmp::Reverse(key_extent(inlines, i, k)));
+            for key in missing {
+                let (open, close) = key_delims(key, inline, self.normalize());
+                if open.starts_with('[') && self.out.ends_with('!') && !self.out.ends_with("\\!") {
+                    // "!" + "[" would form image syntax; escape the bang.
+                    let bang = self.out.len() - 1;
+                    self.out.insert(bang, '\\');
+                }
+                self.out.push_str(&open);
+                stack.push((key.clone(), close));
+                at_line_start = false;
+            }
+
             match inline {
                 Inline::Run {
                     text,
                     raw,
                     marks,
-                    link,
                     fidelity,
                     ..
                 } => {
-                    // Link transitions (outermost).
-                    let link_changed = open_link.as_ref() != link.as_ref();
-                    if link_changed {
-                        close_all(self, &mut open_marks);
-                        if let Some(prev) = open_link.take() {
-                            self.close_link(&prev);
-                        }
-                        if let Some(next) = link {
-                            if next.autolink {
-                                // Autolinks emit their own form with the run text.
-                            } else {
-                                self.out.push('[');
-                            }
-                            open_link = Some(next.clone());
-                        }
-                    }
-
-                    if let Some(l) = &open_link {
-                        if l.autolink {
-                            // Emit as autolink and skip mark handling.
-                            self.out.push('<');
-                            self.out.push_str(&l.url);
-                            self.out.push('>');
-                            // Only once: clear so consecutive runs don't duplicate.
-                            open_link = None;
-                            continue;
-                        }
-                    }
-
-                    // Mark transitions (canonical order: BOLD, ITALIC, STRIKE).
-                    let wanted = marks.without(MarkSet::CODE);
-                    // Close marks not wanted (innermost first).
-                    while let Some((m, _, close)) = open_marks.last().cloned() {
-                        if wanted.contains(m) {
-                            break;
-                        }
-                        self.out.push_str(&close);
-                        open_marks.pop();
-                    }
-                    // Open missing marks in canonical order.
-                    for (mark, open, close) in mark_delims(wanted, fidelity, self.normalize()) {
-                        if !open_marks.iter().any(|(m, _, _)| *m == mark) {
-                            self.out.push_str(&open);
-                            open_marks.push((mark, open, close));
-                        }
-                    }
-
                     if marks.contains(MarkSet::CODE) {
                         let ticks = if self.normalize() {
                             1
@@ -425,15 +471,14 @@ impl<'a> Ser<'a> {
                     } else if let (false, Some(raw)) = (self.normalize(), raw) {
                         self.out.push_str(raw);
                     } else {
-                        let at_line_start = idx == 0
-                            && open_marks.is_empty()
-                            && open_link.is_none()
-                            && (self.out.is_empty() || self.out.ends_with(&self.delim));
                         let ctx = EscapeContext {
                             in_table,
-                            at_line_start,
+                            at_line_start: at_line_start && stack.is_empty(),
                         };
                         self.out.push_str(&escape_text(text, ctx));
+                    }
+                    if !text.is_empty() {
+                        at_line_start = false;
                     }
                 }
                 Inline::Image {
@@ -442,86 +487,184 @@ impl<'a> Ser<'a> {
                     self.out.push_str("![");
                     self.out.push_str(alt);
                     self.out.push_str("](");
-                    self.out.push_str(url);
+                    self.out.push_str(&printable_url(url));
                     if let Some(t) = title {
                         self.out.push_str(" \"");
-                        self.out.push_str(t);
+                        self.out.push_str(&t.replace('"', "\\\""));
                         self.out.push('"');
                     }
                     self.out.push(')');
-                }
-                Inline::SoftBreak => {
-                    if in_table {
-                        self.out.push(' ');
-                    } else {
-                        self.line_break();
-                    }
-                }
-                Inline::HardBreak { style } => {
-                    if in_table {
-                        self.out.push(' ');
-                    } else {
-                        let marker = match (self.normalize(), style) {
-                            (true, _) | (false, BreakStyle::Backslash) => "\\",
-                            (false, BreakStyle::TwoSpaces) => "  ",
-                        };
-                        self.out.push_str(marker);
-                        self.line_break();
-                    }
+                    at_line_start = false;
                 }
                 Inline::OpaqueInline { raw, .. } => {
                     self.out.push_str(raw);
+                    if !raw.is_empty() {
+                        at_line_start = false;
+                    }
                 }
+                _ => {}
             }
         }
-        close_all(self, &mut open_marks);
-        if let Some(l) = open_link.take() {
-            self.close_link(&l);
-        }
-    }
-
-    fn close_link(&mut self, link: &LinkAttrs) {
-        if link.autolink {
-            return;
-        }
-        self.out.push_str("](");
-        self.out.push_str(&link.url);
-        if let Some(t) = &link.title {
-            self.out.push_str(" \"");
-            self.out.push_str(t);
-            self.out.push('"');
-        }
-        self.out.push(')');
+        close_down_to(self, &mut stack, 0);
     }
 }
 
-/// Delimiters for each wanted mark in canonical nesting order.
-fn mark_delims(
-    wanted: MarkSet,
-    fidelity: &super::tree::MarkFidelity,
-    normalize: bool,
-) -> Vec<(MarkSet, String, String)> {
-    let mut out = Vec::new();
-    if wanted.contains(MarkSet::BOLD) {
-        let ch = if normalize {
-            '*'
-        } else {
-            fidelity.strong_delim as char
-        };
-        let d: String = [ch, ch].iter().collect();
-        out.push((MarkSet::BOLD, d.clone(), d));
+/// A mark or link entry in the inline nesting stack.
+#[derive(Debug, Clone, PartialEq)]
+enum MarkKey {
+    Bold(u64),
+    Italic(u64),
+    Strike(u64),
+    Link(LinkAttrs),
+}
+
+fn inline_keys(inline: &Inline) -> Vec<MarkKey> {
+    let (marks, link) = match inline {
+        Inline::Run { marks, link, .. } => (*marks, link.clone()),
+        Inline::Image { marks, link, .. } => (*marks, link.clone()),
+        Inline::OpaqueInline { marks, .. } => (*marks, None),
+        _ => (MarkSet::empty(), None),
+    };
+    let fidelity = match inline {
+        Inline::Run { fidelity, .. } => *fidelity,
+        _ => super::tree::MarkFidelity::default(),
+    };
+    let mut keys = Vec::new();
+    if let Some(l) = link {
+        if !l.autolink {
+            keys.push(MarkKey::Link(l));
+        }
     }
-    if wanted.contains(MarkSet::ITALIC) {
-        let ch = if normalize {
-            '*'
-        } else {
-            fidelity.emph_delim as char
-        };
-        let d = ch.to_string();
-        out.push((MarkSet::ITALIC, d.clone(), d));
+    if marks.contains(MarkSet::BOLD) {
+        keys.push(MarkKey::Bold(fidelity.strong_group));
     }
-    if wanted.contains(MarkSet::STRIKE) {
-        out.push((MarkSet::STRIKE, "~~".into(), "~~".into()));
+    if marks.contains(MarkSet::ITALIC) {
+        keys.push(MarkKey::Italic(fidelity.emph_group));
     }
-    out
+    if marks.contains(MarkSet::STRIKE) {
+        keys.push(MarkKey::Strike(fidelity.strike_group));
+    }
+    keys
+}
+
+/// Group 0 (images / inline HTML, which carry no fidelity) matches any group
+/// of the same mark so it does not force a close/reopen around itself.
+fn keys_match(stack_key: &MarkKey, wanted: &MarkKey) -> bool {
+    match (stack_key, wanted) {
+        (MarkKey::Bold(a), MarkKey::Bold(b))
+        | (MarkKey::Italic(a), MarkKey::Italic(b))
+        | (MarkKey::Strike(a), MarkKey::Strike(b)) => *a == *b || *a == 0 || *b == 0,
+        (a, b) => a == b,
+    }
+}
+
+/// How many consecutive inlines starting at `i` carry `key`.
+fn key_extent(inlines: &[Inline], i: usize, key: &MarkKey) -> usize {
+    inlines[i..]
+        .iter()
+        .take_while(|inline| {
+            matches!(inline, Inline::SoftBreak | Inline::HardBreak { .. })
+                || inline_keys(inline).iter().any(|k| keys_match(k, key))
+        })
+        .count()
+}
+
+fn key_delims(key: &MarkKey, inline: &Inline, normalize: bool) -> (String, String) {
+    let fidelity = match inline {
+        Inline::Run { fidelity, .. } => *fidelity,
+        _ => super::tree::MarkFidelity::default(),
+    };
+    match key {
+        MarkKey::Bold(_) => {
+            let ch = if normalize {
+                '*'
+            } else {
+                fidelity.strong_delim as char
+            };
+            let d: String = [ch, ch].iter().collect();
+            (d.clone(), d)
+        }
+        MarkKey::Italic(_) => {
+            let ch = if normalize {
+                '*'
+            } else {
+                fidelity.emph_delim as char
+            };
+            (ch.to_string(), ch.to_string())
+        }
+        MarkKey::Strike(_) => ("~~".into(), "~~".into()),
+        MarkKey::Link(l) => {
+            let mut close = String::from("](");
+            close.push_str(&printable_url(&l.url));
+            if let Some(t) = &l.title {
+                close.push_str(" \"");
+                close.push_str(&t.replace('"', "\\\""));
+                close.push('"');
+            }
+            close.push(')');
+            ("[".into(), close)
+        }
+    }
+}
+
+/// Before emitting a line break, close stack entries that do not continue in
+/// the next content inline (a link or emphasis must not swallow the break).
+fn close_before_break(
+    ser: &mut Ser,
+    stack: &mut Vec<(MarkKey, String)>,
+    inlines: &[Inline],
+    i: usize,
+) {
+    let next_keys = inlines[i + 1..]
+        .iter()
+        .find(|n| !matches!(n, Inline::SoftBreak | Inline::HardBreak { .. }))
+        .map(inline_keys)
+        .unwrap_or_default();
+    let keep = stack
+        .iter()
+        .take_while(|(k, _)| next_keys.iter().any(|w| keys_match(k, w)))
+        .count();
+    close_down_to(ser, stack, keep);
+}
+
+fn close_down_to(ser: &mut Ser, stack: &mut Vec<(MarkKey, String)>, keep: usize) {
+    while stack.len() > keep {
+        let (_, close) = stack.pop().unwrap();
+        ser.out.push_str(&close);
+    }
+}
+
+/// Destination form for a link/image URL: wrap in <> when it needs it.
+fn printable_url(url: &str) -> String {
+    let needs_brackets = url.is_empty()
+        || url.chars().any(|c| c == ' ' || c.is_control())
+        || url.matches('(').count() != url.matches(')').count();
+    if needs_brackets {
+        format!("<{url}>")
+    } else {
+        url.to_string()
+    }
+}
+
+/// Longest run of `ch` found at the start of any line in `text`.
+fn longest_line_start_run(text: &str, ch: char) -> usize {
+    text.lines()
+        .map(|line| line.chars().take_while(|c| *c == ch).count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Escape an unescaped trailing `#` sequence emitted for an ATX heading so
+/// the reparse doesn't strip it as a closing sequence.
+fn escape_trailing_hashes(out: &mut String, text_start: usize) {
+    let text = &out[text_start..];
+    let trailing = text.chars().rev().take_while(|c| *c == '#').count();
+    if trailing == 0 {
+        return;
+    }
+    let hash_start = out.len() - trailing;
+    if out[text_start..hash_start].ends_with('\\') {
+        return; // already escaped
+    }
+    out.insert(hash_start, '\\');
 }

@@ -66,6 +66,7 @@ impl LineStarts {
 struct Importer<'s> {
     source: &'s str,
     lines: LineStarts,
+    link_groups: std::cell::Cell<u64>,
 }
 
 /// Import markdown into a fresh [`RichTree`]; ids come from `ids`.
@@ -75,6 +76,7 @@ pub fn import_markdown(source: &str, ids: &mut IdGen) -> RichTree {
     let importer = Importer {
         source,
         lines: LineStarts::new(source),
+        link_groups: std::cell::Cell::new(0),
     };
 
     let mut frontmatter = None;
@@ -179,8 +181,20 @@ impl<'s> Importer<'s> {
             NodeValue::TableRow(header) => (BlockKind::TableRow { header: *header }, true),
             NodeValue::TableCell => (BlockKind::TableCell, false),
             NodeValue::ThematicBreak => (BlockKind::ThematicBreak, false),
-            // Everything else is inert and round-trips as its raw slice.
-            _ => (BlockKind::Opaque, false),
+            // Everything else is inert and round-trips verbatim. comrak's
+            // sourcepos for HTML blocks is unreliable, so prefer the literal.
+            NodeValue::HtmlBlock(h) => (
+                BlockKind::Opaque {
+                    raw: h.literal.trim_end_matches('\n').to_string(),
+                },
+                false,
+            ),
+            _ => (
+                BlockKind::Opaque {
+                    raw: self.slice(&source_range).to_string(),
+                },
+                false,
+            ),
         };
 
         let content_hash = super::engine::hash_str(self.slice(&source_range));
@@ -193,7 +207,10 @@ impl<'s> Importer<'s> {
             inlines: Vec::new(),
         };
 
-        if matches!(block.kind, BlockKind::Opaque | BlockKind::ThematicBreak) {
+        if matches!(
+            block.kind,
+            BlockKind::Opaque { .. } | BlockKind::ThematicBreak
+        ) {
             return block;
         }
         if matches!(block.kind, BlockKind::CodeBlock { .. }) {
@@ -251,6 +268,8 @@ impl<'s> Importer<'s> {
             NodeValue::Emph => {
                 let saved = (ctx.marks, ctx.fidelity);
                 ctx.marks = ctx.marks.with(MarkSet::ITALIC);
+                self.link_groups.set(self.link_groups.get() + 1);
+                ctx.fidelity.emph_group = self.link_groups.get();
                 if let Some(d) = self.slice(&range).bytes().next() {
                     if d == b'*' || d == b'_' {
                         ctx.fidelity.emph_delim = d;
@@ -264,6 +283,8 @@ impl<'s> Importer<'s> {
             NodeValue::Strong => {
                 let saved = (ctx.marks, ctx.fidelity);
                 ctx.marks = ctx.marks.with(MarkSet::BOLD);
+                self.link_groups.set(self.link_groups.get() + 1);
+                ctx.fidelity.strong_group = self.link_groups.get();
                 if let Some(d) = self.slice(&range).bytes().next() {
                     if d == b'*' || d == b'_' {
                         ctx.fidelity.strong_delim = d;
@@ -275,12 +296,14 @@ impl<'s> Importer<'s> {
                 (ctx.marks, ctx.fidelity) = saved;
             }
             NodeValue::Strikethrough => {
-                let saved = ctx.marks;
+                let saved = (ctx.marks, ctx.fidelity);
                 ctx.marks = ctx.marks.with(MarkSet::STRIKE);
+                self.link_groups.set(self.link_groups.get() + 1);
+                ctx.fidelity.strike_group = self.link_groups.get();
                 for child in node.children() {
                     self.import_inline(child, ctx, out);
                 }
-                ctx.marks = saved;
+                (ctx.marks, ctx.fidelity) = saved;
             }
             NodeValue::Code(code) => {
                 let mut fidelity = ctx.fidelity;
@@ -296,15 +319,43 @@ impl<'s> Importer<'s> {
             }
             NodeValue::Link(link) => {
                 let slice = self.slice(&range);
-                let autolink = !slice.contains("](");
+                // True autolinks: <url> form, a bare url (autolink ext), or a
+                // single text child identical to the destination.
+                let only_child_is_url = {
+                    let mut children = node.children();
+                    match (children.next(), children.next()) {
+                        (Some(c), None) => matches!(
+                            &c.data.borrow().value,
+                            NodeValue::Text(t) if *t == link.url
+                        ),
+                        _ => false,
+                    }
+                };
+                let autolink = (slice.starts_with('<') && slice.ends_with('>'))
+                    || slice == link.url
+                    || link.url == format!("mailto:{slice}")
+                    || only_child_is_url;
+                self.link_groups.set(self.link_groups.get() + 1);
                 let saved = ctx.link.take();
                 ctx.link = Some(LinkAttrs {
                     url: link.url.clone(),
                     title: (!link.title.is_empty()).then(|| link.title.clone()),
                     autolink,
+                    group: self.link_groups.get(),
                 });
+                let before = out.len();
                 for child in node.children() {
                     self.import_inline(child, ctx, out);
+                }
+                if out.len() == before {
+                    out.push(Inline::Run {
+                        text: String::new(),
+                        raw: None,
+                        source_range: range.clone(),
+                        marks: ctx.marks,
+                        link: ctx.link.clone(),
+                        fidelity: ctx.fidelity,
+                    });
                 }
                 ctx.link = saved;
             }
@@ -316,6 +367,8 @@ impl<'s> Importer<'s> {
                     url: link.url.clone(),
                     title: (!link.title.is_empty()).then(|| link.title.clone()),
                     source_range: range,
+                    marks: ctx.marks,
+                    link: ctx.link.clone(),
                 });
             }
             NodeValue::SoftBreak => out.push(Inline::SoftBreak),
@@ -333,6 +386,7 @@ impl<'s> Importer<'s> {
                 out.push(Inline::OpaqueInline {
                     raw: Box::from(slice),
                     source_range: range,
+                    marks: ctx.marks,
                 });
             }
         }

@@ -185,7 +185,7 @@ mod tests {
     fn unknown_constructs_become_opaque_with_exact_slices() {
         let source = "<div class=\"x\">\nraw html\n</div>\n\npara\n";
         let tree = import(source);
-        assert!(matches!(tree.blocks[0].kind, BlockKind::Opaque));
+        assert!(matches!(tree.blocks[0].kind, BlockKind::Opaque { .. }));
         assert_eq!(
             &source[tree.blocks[0].source_range.clone()],
             "<div class=\"x\">\nraw html\n</div>"

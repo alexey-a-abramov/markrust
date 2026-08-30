@@ -113,13 +113,13 @@ mod tests {
 
     #[test]
     fn preserved_equals_buffer_and_differs_only_when_style_deviates() {
-        let source = "# H\n\n* star bullet\n";
+        let source = "Title\n=====\n\npara\n";
         let doc = Document::new(source);
         let mut engine = RichEngine::new();
         let candidates = save_candidates(&doc, &mut engine);
         assert_eq!(candidates.preserved, source);
-        // House style rewrites '*' bullets to '-'.
-        assert!(candidates.normalized.contains("- star bullet"));
+        // House style rewrites single-line setext headings to ATX.
+        assert!(candidates.normalized.contains("# Title"));
         assert!(candidates.differs());
         assert!(candidates
             .hunks

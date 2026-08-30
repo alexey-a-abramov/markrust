@@ -42,6 +42,21 @@ pub fn escape_text(text: &str, ctx: EscapeContext) -> String {
             '&' if looks_like_entity(&text[i..]) => true,
             _ => false,
         };
+        if ch == '\t' && at_line_start {
+            // A leading tab would start an indented code block; re-encode.
+            out.push_str("&#9;");
+            at_line_start = false;
+            i += ch_len;
+            continue;
+        }
+        if ch == '\n' {
+            // A literal newline inside inline text (decoded &#10;) would
+            // split the block; re-encode it.
+            out.push_str("&#10;");
+            at_line_start = false;
+            i += ch_len;
+            continue;
+        }
         if escaped {
             out.push('\\');
         }

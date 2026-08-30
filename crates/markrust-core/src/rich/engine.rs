@@ -155,6 +155,111 @@ impl RichEngine {
         }
     }
 
+    /// One visible-grapheme step left from `byte`, skipping delimiter gaps
+    /// between runs and treating backslash escapes as atomic.
+    pub fn prev_caret(&self, source: &str, byte: usize) -> usize {
+        let byte = self.snap_caret(byte, Bias::Left);
+        let Some(block) = self.block_at(byte).and_then(|id| self.block(id)) else {
+            return byte.saturating_sub(1);
+        };
+        let ranges = inline_ranges(block);
+        let Some(idx) = ranges.iter().position(|r| r.start <= byte && byte <= r.end) else {
+            return byte;
+        };
+        if byte > ranges[idx].start {
+            return step_left_in_slice(source, ranges[idx].start, byte);
+        }
+        if idx > 0 {
+            let prev = &ranges[idx - 1];
+            return step_left_in_slice(source, prev.start, prev.end);
+        }
+        // Cross to the previous block.
+        let prev_block = self.block_before(block.id);
+        match prev_block {
+            Some(pb) => {
+                let pranges = inline_ranges(pb);
+                pranges.last().map(|r| r.end).unwrap_or(pb.source_range.end)
+            }
+            None => byte,
+        }
+    }
+
+    /// One visible-grapheme step right from `byte` (mirror of `prev_caret`).
+    pub fn next_caret(&self, source: &str, byte: usize) -> usize {
+        let byte = self.snap_caret(byte, Bias::Right);
+        let Some(block) = self.block_at(byte).and_then(|id| self.block(id)) else {
+            return (byte + 1).min(source.len());
+        };
+        let ranges = inline_ranges(block);
+        let Some(idx) = ranges.iter().position(|r| r.start <= byte && byte <= r.end) else {
+            return byte;
+        };
+        if byte < ranges[idx].end {
+            return step_right_in_slice(source, byte, ranges[idx].end);
+        }
+        if idx + 1 < ranges.len() {
+            let next = &ranges[idx + 1];
+            return step_right_in_slice(source, next.start, next.end);
+        }
+        match self.block_after(block.id) {
+            Some(nb) => {
+                let nranges = inline_ranges(nb);
+                nranges
+                    .first()
+                    .map(|r| r.start)
+                    .unwrap_or(nb.source_range.start)
+            }
+            None => byte,
+        }
+    }
+
+    /// Leaf block immediately before `id` in document order.
+    fn block_before(&self, id: NodeId) -> Option<&Block> {
+        let mut prev: Option<&Block> = None;
+        let mut found: Option<&Block> = None;
+        fn walk<'t>(
+            blocks: &'t [Block],
+            id: NodeId,
+            prev: &mut Option<&'t Block>,
+            found: &mut Option<&'t Block>,
+        ) {
+            for b in blocks {
+                if found.is_some() {
+                    return;
+                }
+                if b.id == id {
+                    *found = Some(b);
+                    return;
+                }
+                if b.children.is_empty() {
+                    *prev = Some(b);
+                }
+                walk(&b.children, id, prev, found);
+            }
+        }
+        walk(&self.tree.blocks, id, &mut prev, &mut found);
+        found.and(prev)
+    }
+
+    /// Leaf block immediately after `id` in document order.
+    fn block_after(&self, id: NodeId) -> Option<&Block> {
+        let mut take_next = false;
+        fn walk<'t>(blocks: &'t [Block], id: NodeId, take_next: &mut bool) -> Option<&'t Block> {
+            for b in blocks {
+                if *take_next && b.children.is_empty() {
+                    return Some(b);
+                }
+                if b.id == id {
+                    *take_next = true;
+                } else if let Some(found) = walk(&b.children, id, take_next) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(&self.tree.blocks, id, &mut take_next)
+    }
+
     /// Block ↔ source-line map over top-level blocks.
     pub fn line_map(&self, source: &str) -> Vec<BlockSpan> {
         let mut line_starts = vec![0usize];
@@ -207,7 +312,7 @@ fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     match &block.kind {
         // Code blocks and opaque blocks are edited as raw text.
-        BlockKind::CodeBlock { .. } | BlockKind::Opaque => {
+        BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. } => {
             out.push(block.source_range.clone());
         }
         _ => {
@@ -352,4 +457,34 @@ mod tests {
         assert_eq!(outline[2].1, 3);
         assert_eq!(&outline[2].2, "Quoted");
     }
+}
+
+/// Step one grapheme-ish unit left within [start, byte); backslash escapes
+/// ("\\X") are atomic.
+fn step_left_in_slice(source: &str, start: usize, byte: usize) -> usize {
+    let slice = &source[start..byte];
+    let Some(last) = slice.char_indices().last() else {
+        return start;
+    };
+    let mut pos = start + last.0;
+    if pos > start && source.as_bytes().get(pos - 1) == Some(&b'\\') {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Step one grapheme-ish unit right within (byte, end].
+fn step_right_in_slice(source: &str, byte: usize, end: usize) -> usize {
+    let slice = &source[byte..end];
+    let mut it = slice.char_indices();
+    let Some((_, first)) = it.next() else {
+        return end;
+    };
+    let mut adv = first.len_utf8();
+    if first == '\\' {
+        if let Some((_, c2)) = it.next() {
+            adv += c2.len_utf8();
+        }
+    }
+    (byte + adv).min(end)
 }
