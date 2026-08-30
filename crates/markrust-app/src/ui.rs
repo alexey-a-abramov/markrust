@@ -3,8 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use gpui::{
-    div, prelude::*, px, App, ClickEvent, FontWeight, InteractiveElement, IntoElement,
-    SharedString, Window,
+    div, prelude::*, px, rgb, App, ClickEvent, InteractiveElement, IntoElement, SharedString,
+    Window,
 };
 use markrust_editor::EditorTheme;
 
@@ -21,7 +21,7 @@ pub fn toolbar_button(
         .py_1()
         .mx_1()
         .rounded_md()
-        .text_sm()
+        .text_size(px(13.))
         .text_color(theme.sidebar_text)
         .cursor_pointer()
         .hover(move |s| s.bg(theme.toolbar_button_hover))
@@ -35,8 +35,7 @@ pub fn section_header(title: impl Into<SharedString>, theme: &EditorTheme) -> im
         .px_3()
         .pt_3()
         .pb_1()
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(px(11.))
         .text_color(theme.secondary_text)
         .child(title.into())
 }
@@ -56,7 +55,7 @@ pub fn sidebar_row(
         .px_3()
         .py_1()
         .rounded_md()
-        .text_sm()
+        .text_size(px(13.))
         .cursor_pointer()
         .text_color(if selected {
             theme.sidebar_selected_text
@@ -88,7 +87,7 @@ pub fn outline_row(
         .py_1()
         .mx_2()
         .rounded_md()
-        .text_sm()
+        .text_size(px(13.))
         .text_color(theme.sidebar_text)
         .cursor_pointer()
         .hover(move |s| s.bg(theme.sidebar_hover))
@@ -127,7 +126,7 @@ pub fn document_tab(
         .cursor_pointer()
         .child(
             div()
-                .text_sm()
+                .text_size(px(13.))
                 .text_color(if active {
                     theme.text
                 } else {
@@ -138,7 +137,7 @@ pub fn document_tab(
         .child(
             div()
                 .id(close_id)
-                .text_xs()
+                .text_size(px(11.))
                 .text_color(theme.secondary_text)
                 .px_1()
                 .rounded_sm()
@@ -154,7 +153,7 @@ pub fn muted_hint(text: impl Into<SharedString>, theme: &EditorTheme) -> impl In
     div()
         .px_3()
         .py_2()
-        .text_sm()
+        .text_size(px(13.))
         .text_color(theme.secondary_text)
         .child(text.into())
 }
@@ -174,14 +173,13 @@ pub fn empty_sidebar_state(
         .gap_3()
         .child(
             div()
-                .text_lg()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.text)
+                .text_size(px(22.))
+                .text_color(rgb(0xffffff))
                 .child("Welcome to MarkRust"),
         )
         .child(
             div()
-                .text_sm()
+                .text_size(px(13.))
                 .text_color(theme.secondary_text)
                 .child("Open a folder or file to get started, or drop items onto the window."),
         )
@@ -196,8 +194,8 @@ pub fn empty_sidebar_state(
                         .py_2()
                         .rounded_md()
                         .bg(theme.accent)
-                        .text_sm()
-                        .text_color(theme.sidebar_selected_text)
+                        .text_size(px(13.))
+                        .text_color(rgb(0xffffff))
                         .cursor_pointer()
                         .child("Open Folder")
                         .on_click(on_open_folder),
@@ -210,7 +208,7 @@ pub fn empty_sidebar_state(
                         .rounded_md()
                         .border_1()
                         .border_color(theme.separator)
-                        .text_sm()
+                        .text_size(px(13.))
                         .text_color(theme.sidebar_text)
                         .cursor_pointer()
                         .hover(move |s| s.bg(theme_clone.toolbar_button_hover))

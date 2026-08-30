@@ -2,11 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
+use gpui::{
+    px, size, App, AppContext, Bounds, KeyBinding, TextRenderingMode, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions,
+};
 use gpui_platform::application;
 
 use crate::config::AppConfig;
@@ -25,23 +27,15 @@ pub fn run_gui() {
     run_gui_with_open(None);
 }
 
-fn load_bundled_fonts(cx: &mut App) {
-    let fonts: Vec<Cow<'static, [u8]>> = vec![
-        Cow::Borrowed(include_bytes!("../../../assets/fonts/Inter-Regular.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../../../assets/fonts/Inter-Italic.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../../../assets/fonts/Inter-Bold.ttf").as_slice()),
-        Cow::Borrowed(include_bytes!("../../../assets/fonts/Inter-BoldItalic.ttf").as_slice()),
-    ];
-    if let Err(error) = cx.text_system().add_fonts(fonts) {
-        eprintln!("Failed to load bundled Inter fonts: {error}");
-    }
-}
-
 /// Launch the desktop editor, optionally opening a file or workspace folder.
 pub fn run_gui_with_open(open_path: Option<PathBuf>) {
+    crate::egui_app::run(open_path);
+}
+
+#[allow(dead_code)]
+fn run_gpui_gui(open_path: Option<PathBuf>) {
     application().run(move |cx: &mut App| {
-        load_bundled_fonts(cx);
+        cx.set_text_rendering_mode(TextRenderingMode::Grayscale);
         let config = AppConfig::load();
         cx.bind_keys([
             KeyBinding::new("cmd-s", crate::window::Save, None),
@@ -63,10 +57,12 @@ pub fn run_gui_with_open(open_path: Option<PathBuf>) {
                     ..Default::default()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_background: WindowBackgroundAppearance::Opaque,
                 icon: load_window_icon(),
                 ..Default::default()
             },
             move |window, cx| {
+                window.set_rem_size(px(16.));
                 let config = config.clone();
                 let open_path = open_path.clone();
                 let workspace = cx.new(|cx| {

@@ -7,6 +7,7 @@
 mod app;
 mod config;
 mod drop;
+mod egui_app;
 mod session;
 mod ui;
 mod window;

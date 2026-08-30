@@ -151,6 +151,17 @@ impl HeadlessEditor {
         self.document.buffer.content()
     }
 
+    /// Replace the whole buffer from a UI widget (egui TextEdit). Groups as one undo step.
+    pub fn set_content_from_ui(&mut self, text: &str) {
+        if self.content() == text {
+            return;
+        }
+        let len = self.document.buffer.len_bytes();
+        self.document.replace_range(0, len, text);
+        self.state.clamp_to(self.document.buffer.len_bytes());
+        self.sync_parse();
+    }
+
     pub fn cursor_offset(&self) -> usize {
         self.state.cursor_offset()
     }
@@ -510,5 +521,16 @@ mod tests {
         assert_eq!(editor.document().mode, DocumentProcessingMode::PlainText);
         assert!(editor.visibility().is_empty());
         assert_eq!(editor.word_count(), 2);
+    }
+
+    #[test]
+    fn set_content_from_ui_replaces_buffer_and_clamps_caret() {
+        let mut editor = HeadlessEditor::new("hello");
+        editor.apply(EditorCommand::JumpTo(5)).unwrap();
+        editor.set_content_from_ui("# Title\n\nbody");
+        assert_eq!(editor.content(), "# Title\n\nbody");
+        assert!(editor.cursor_offset() <= editor.content().len());
+        editor.set_content_from_ui("# Title\n\nbody");
+        assert_eq!(editor.content(), "# Title\n\nbody");
     }
 }

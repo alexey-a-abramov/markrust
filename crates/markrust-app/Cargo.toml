@@ -24,3 +24,6 @@ thiserror = "2.0"
 anyhow = "1.0"
 unicode-segmentation = "1.12"
 image = { version = "0.25", default-features = false, features = ["png"] }
+eframe = "0.32"
+egui = "0.32"
+rfd = "0.15"

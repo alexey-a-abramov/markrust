@@ -4,7 +4,7 @@
 
 use gpui::{
     actions, div, prelude::*, px, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, PathPromptOptions, Render, SharedString, Window,
+    PathPromptOptions, Render, SharedString, Window,
 };
 use markrust_core::parse_frontmatter;
 use markrust_editor::outline_headings;
@@ -221,9 +221,9 @@ impl Render for MarkRustWindow {
             .flex()
             .flex_col()
             .bg(theme.chrome_bg)
-            .text_color(theme.text)
+            .text_color(gpui::white())
             .font_family(theme.font_family.clone())
-            .text_size(px(14.))
+            .text_size(px(16.))
             .track_focus(&self.focus_handle)
             .key_context("MarkRust")
             .on_action(cx.listener(Self::save))
@@ -286,9 +286,8 @@ impl Render for MarkRustWindow {
                     .border_color(theme.separator)
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
+                            .text_size(px(16.))
+                            .text_color(gpui::white())
                             .mr_4()
                             .child("MarkRust"),
                     )
