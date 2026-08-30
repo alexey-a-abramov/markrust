@@ -31,7 +31,7 @@ impl IdGen {
 }
 
 /// Whole-document projection.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RichTree {
     /// YAML frontmatter is document metadata, not a block (panel edits it).
     pub frontmatter: Option<Frontmatter>,
@@ -49,6 +49,9 @@ pub struct Frontmatter {
 pub struct Block {
     pub id: NodeId,
     pub source_range: Range<usize>,
+    /// Hash of the source slice at import time; used by the engine to keep
+    /// NodeIds stable for unchanged blocks across reparses.
+    pub content_hash: u64,
     pub kind: BlockKind,
     /// Child blocks (container kinds only).
     pub children: Vec<Block>,

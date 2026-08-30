@@ -183,9 +183,11 @@ impl<'s> Importer<'s> {
             _ => (BlockKind::Opaque, false),
         };
 
+        let content_hash = super::engine::hash_str(self.slice(&source_range));
         let mut block = Block {
             id,
             source_range,
+            content_hash,
             kind,
             children: Vec::new(),
             inlines: Vec::new(),

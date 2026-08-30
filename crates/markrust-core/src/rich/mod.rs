@@ -6,11 +6,13 @@
 //! WYSIWYG editor. The source string stays the single source of truth; see
 //! `docs/architecture.md`.
 
+pub mod engine;
 pub mod escape;
 pub mod import;
 pub mod serialize;
 pub mod tree;
 
+pub use engine::{Bias, BlockSpan, BlockSplice, RichEngine};
 pub use import::import_markdown;
 pub use serialize::{serialize_tree, SerializeMode};
 pub use tree::{
