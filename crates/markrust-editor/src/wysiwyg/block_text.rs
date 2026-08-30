@@ -105,8 +105,9 @@ impl LeafLayout {
     }
 }
 
-/// Caret/selection used to reveal `$` / `$$` in WYSIWYG (Typora: hide unless
-/// the caret or a non-empty selection intersects the math span).
+/// Caret/selection used to reveal `$` / `$$` / `[[wiki]]` / `:emoji:` in
+/// WYSIWYG (Typora: hide chrome unless the caret or a non-empty selection
+/// intersects the span).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevealState {
     pub caret: usize,
@@ -774,6 +775,46 @@ pub fn build_leaf_layout_inlines(
                     );
                 }
             }
+            Inline::Emoji {
+                glyph,
+                raw,
+                source_range,
+                marks,
+                link,
+                ..
+            } => {
+                if html.hidden() {
+                    continue;
+                }
+                let paint = merge_html_paint(*marks, &html.paint());
+                let run = style_run(
+                    text_style,
+                    theme,
+                    base_weight,
+                    *marks,
+                    link.is_some(),
+                    &paint,
+                );
+                if reveal.intersects(source_range) {
+                    push(
+                        &mut text,
+                        &mut runs,
+                        &mut source_at,
+                        raw,
+                        source_range.clone(),
+                        run,
+                    );
+                } else {
+                    push(
+                        &mut text,
+                        &mut runs,
+                        &mut source_at,
+                        glyph,
+                        source_range.clone(),
+                        run,
+                    );
+                }
+            }
             Inline::OpaqueInline {
                 raw, source_range, ..
             } => match markrust_core::html_visual::classify_opaque_inline(raw, &mut html) {
@@ -841,6 +882,7 @@ pub fn build_leaf_layout_inlines(
                     | Inline::Image { source_range, .. }
                     | Inline::Math { source_range, .. }
                     | Inline::WikiLink { source_range, .. }
+                    | Inline::Emoji { source_range, .. }
                     | Inline::OpaqueInline { source_range, .. } => Some(source_range.end),
                     _ => None,
                 })
@@ -1819,6 +1861,95 @@ mod tests {
             layout.text
         );
         assert_eq!(layout.text, "see [[page]] here");
+    }
+
+    #[test]
+    fn emoji_hides_shortcode_and_paints_glyph() {
+        let layout = layout_for("see :smile: here\n");
+        assert_eq!(layout.text, "see 😄 here");
+        assert!(
+            !layout.text.contains(":smile:"),
+            "shortcode must not paint when caret is outside, got {:?}",
+            layout.text
+        );
+        let heart = layout_for("love :heart: now\n");
+        assert!(
+            heart.text.contains("❤️"),
+            "expected heart glyph, got {:?}",
+            heart.text
+        );
+        assert!(!heart.text.contains(":heart:"));
+        let plus = layout_for(":+1:\n");
+        assert_eq!(plus.text, "👍");
+        let rocket = layout_for(":rocket:\n");
+        assert_eq!(rocket.text, "🚀");
+    }
+
+    #[test]
+    fn emoji_reveals_shortcode_when_caret_intersects() {
+        let source = "see :smile: here\n";
+        let inside = source.find("smile").unwrap();
+        let layout = layout_for_caret(source, inside);
+        assert!(
+            layout.text.contains(":smile:"),
+            "expected revealed :smile:, got {:?}",
+            layout.text
+        );
+        assert!(
+            !layout.text.contains("😄"),
+            "glyph must hide while caret is in the shortcode, got {:?}",
+            layout.text
+        );
+        assert_eq!(layout.text, "see :smile: here");
+        let on_colon = layout_for_caret(source, source.find(":smile:").unwrap());
+        assert!(
+            on_colon.text.contains(":smile:"),
+            "caret on opening colon must reveal, got {:?}",
+            on_colon.text
+        );
+        let start = source.find(":smile:").unwrap();
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let theme = EditorTheme::dark();
+        let style = TextStyle {
+            color: theme.text,
+            font_family: theme.font_family.clone().into(),
+            font_size: px(theme.font_size).into(),
+            ..Default::default()
+        };
+        let selected = build_leaf_layout_revealed(
+            &tree.blocks[0],
+            &style,
+            &theme,
+            gpui::FontWeight::NORMAL,
+            &RevealState {
+                caret: 0,
+                selection: start..start + 7,
+            },
+        );
+        assert!(
+            selected.text.contains(":smile:"),
+            "selection overlap must reveal, got {:?}",
+            selected.text
+        );
+    }
+
+    #[test]
+    fn unknown_emoji_shortcode_stays_visible() {
+        let layout = layout_for("see :not_an_emoji: here\n");
+        assert_eq!(layout.text, "see :not_an_emoji: here");
+        let mixed = layout_for("a :smile: and :foo: b\n");
+        assert!(
+            mixed.text.contains("😄"),
+            "known name must paint, got {:?}",
+            mixed.text
+        );
+        assert!(
+            mixed.text.contains(":foo:"),
+            "unknown name must stay, got {:?}",
+            mixed.text
+        );
+        assert!(!mixed.text.contains(":smile:"));
     }
 
     #[test]

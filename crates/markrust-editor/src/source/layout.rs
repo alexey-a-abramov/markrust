@@ -18,21 +18,31 @@ use crate::theme::EditorTheme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentStyle {
     Plain,
-    Delimiter { visible: bool },
+    Delimiter {
+        visible: bool,
+    },
     Bold,
     Italic,
-    Heading { level: u8 },
+    Heading {
+        level: u8,
+    },
     CodeInline,
     CodeBlock,
     BlockQuote,
     Link,
     Image,
-    TaskList { checked: bool },
-    Table { row: TableRowKind },
+    TaskList {
+        checked: bool,
+    },
+    Table {
+        row: TableRowKind,
+    },
     Frontmatter,
     Strikethrough,
     Highlight,
     Math,
+    /// Known `:name:` shortcode painted as a glyph when the caret is outside.
+    Emoji,
     SyntaxHighlight(HighlightKind),
 }
 
@@ -173,6 +183,19 @@ fn build_segments(
             style_at[byte] = SegmentStyle::Delimiter { visible: *visible };
         }
     }
+    for span in spans {
+        if span.kind != SyntaxKind::Emoji {
+            continue;
+        }
+        let revealed =
+            delimiter_visibility_for_span(span, carets, selections) == VisibilityState::Visible;
+        if revealed {
+            continue;
+        }
+        let start = span.start_byte.min(style_at.len());
+        let end = span.end_byte.min(style_at.len());
+        style_at[start..end].fill(SegmentStyle::Emoji);
+    }
 
     coalesce_segments(content.len(), &style_at)
 }
@@ -238,6 +261,7 @@ fn span_style(span: &SyntaxNodeSpan) -> SegmentStyle {
         SyntaxKind::Highlight => SegmentStyle::Highlight,
         SyntaxKind::Math => SegmentStyle::Math,
         SyntaxKind::WikiLink => SegmentStyle::Link,
+        SyntaxKind::Emoji => SegmentStyle::Emoji,
         SyntaxKind::Alert => SegmentStyle::BlockQuote,
         _ => SegmentStyle::Plain,
     }
@@ -354,6 +378,19 @@ fn project_display(
                     &display_text[display_pos..],
                     content,
                 );
+            }
+            SegmentStyle::Emoji => {
+                let display_pos = display_text.len();
+                if let Some(glyph) = markrust_core::rich::lookup_shortcode(slice) {
+                    display_text.push_str(glyph);
+                } else {
+                    display_text.push_str(slice);
+                }
+                for byte in segment.doc_start..=segment.doc_end.min(content.len()) {
+                    if byte < doc_to_display.len() {
+                        doc_to_display[byte] = Some(display_pos);
+                    }
+                }
             }
             _ => {
                 let start_display = display_text.len();
@@ -1058,6 +1095,64 @@ mod tests {
             .segments
             .iter()
             .any(|s| matches!(s.style, SegmentStyle::Delimiter { visible: false })));
+    }
+
+    #[test]
+    fn emoji_paints_glyph_when_caret_outside() {
+        let content = "see :smile: here";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let layout =
+            build_display_layout(content, &spans, &[Caret::new(0)], &[], &EditorTheme::dark());
+        assert!(
+            layout.display_text.contains("😄"),
+            "expected glyph in source layout, got {:?}",
+            layout.display_text
+        );
+        assert!(
+            !layout.display_text.contains(":smile:"),
+            "shortcode must hide when caret is outside, got {:?}",
+            layout.display_text
+        );
+        assert!(layout
+            .segments
+            .iter()
+            .any(|s| matches!(s.style, SegmentStyle::Emoji)));
+        let unknown = build_display_layout(
+            "see :not_an_emoji: here",
+            &markrust_core::extract_syntax_spans("see :not_an_emoji: here"),
+            &[Caret::new(0)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        assert!(
+            unknown.display_text.contains(":not_an_emoji:"),
+            "unknown must stay, got {:?}",
+            unknown.display_text
+        );
+    }
+
+    #[test]
+    fn emoji_reveals_shortcode_when_caret_inside() {
+        let content = "see :smile: here";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let inside = content.find("smile").unwrap();
+        let layout = build_display_layout(
+            content,
+            &spans,
+            &[Caret::new(inside)],
+            &[],
+            &EditorTheme::dark(),
+        );
+        assert!(
+            layout.display_text.contains(":smile:"),
+            "expected revealed :smile:, got {:?}",
+            layout.display_text
+        );
+        assert!(
+            !layout.display_text.contains("😄"),
+            "glyph must hide while editing, got {:?}",
+            layout.display_text
+        );
     }
 
     #[test]

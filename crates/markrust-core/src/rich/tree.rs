@@ -317,6 +317,24 @@ pub enum Inline {
         /// Emphasis context the fragment sits inside.
         marks: MarkSet,
     },
+    /// GitHub/Typora `:name:` shortcode. WYSIWYG paints `glyph` unless the
+    /// caret intersects; source bytes stay `:name:`. Unknown names stay
+    /// [`Inline::Run`].
+    Emoji {
+        /// Alias without colons (`smile`).
+        name: String,
+        /// Unicode to paint when the caret is outside the span.
+        glyph: String,
+        /// Full `:name:` source slice (byte-exact for dirty serialize).
+        raw: Box<str>,
+        /// Full span including both colons.
+        source_range: Range<usize>,
+        /// Emphasis context the fragment sits inside.
+        marks: MarkSet,
+        /// Enclosing link, when the shortcode is link text.
+        link: Option<LinkAttrs>,
+        fidelity: MarkFidelity,
+    },
     /// Inline HTML, footnote refs, leftover unknowns: verbatim.
     OpaqueInline {
         raw: Box<str>,
@@ -335,6 +353,7 @@ impl Inline {
             Inline::SoftBreak | Inline::HardBreak { .. } => 1,
             Inline::Math { literal, .. } => literal.len(),
             Inline::WikiLink { label, .. } => label.len(),
+            Inline::Emoji { glyph, .. } => glyph.len(),
             Inline::OpaqueInline { raw, .. } => raw.len(),
         }
     }
@@ -364,6 +383,7 @@ fn heading_plain_text(inlines: &[Inline]) -> String {
             Inline::Run { text: t, .. } => text.push_str(t),
             Inline::WikiLink { label, .. } => text.push_str(label),
             Inline::Math { literal, .. } => text.push_str(literal),
+            Inline::Emoji { glyph, .. } => text.push_str(glyph),
             _ => {}
         }
     }

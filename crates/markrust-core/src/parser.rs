@@ -10,7 +10,8 @@
 //! with the same rules as [`crate::rich::import`] so source masking matches
 //! WYSIWYG. Dollar math (`$` / `$$`) is a comrak node (`math_dollars`). Wikilinks
 //! (`[[target]]` / `[[target|label]]`) are comrak `wikilinks_title_after_pipe`.
-//! GitHub
+//! GitHub/Typora emoji shortcodes (`:smile:`) are paired from a modest alias
+//! table (unknown `:foo:` stays text). GitHub
 //! alerts (`> [!NOTE]`, …) are comrak `alerts`. Parse still runs on a dedicated
 //! worker thread.
 
@@ -46,6 +47,7 @@ pub fn extract_syntax_spans(source: &str) -> Vec<SyntaxNodeSpan> {
     let mut spans = Vec::new();
     collect_spans(root, source, &lines, &mut spans);
     collect_eqeq_highlights(root, source, &lines, &mut spans);
+    collect_emoji_shortcodes(root, source, &lines, &mut spans);
     spans.sort_by_key(|span| (span.start_byte, span.end_byte));
     spans
 }
@@ -403,6 +405,61 @@ fn emit_eqeq_spans<'a>(
             None,
         ));
         i += 2;
+    }
+}
+
+fn collect_emoji_shortcodes<'a>(
+    node: &'a AstNode<'a>,
+    source: &str,
+    lines: &LineStarts,
+    spans: &mut Vec<SyntaxNodeSpan>,
+) {
+    let inline_block = matches!(
+        node.data.borrow().value,
+        NodeValue::Paragraph | NodeValue::Heading(_) | NodeValue::TableCell
+    );
+    if inline_block {
+        emit_emoji_spans(node, source, lines, spans);
+        return;
+    }
+    let skip_subtree = matches!(
+        node.data.borrow().value,
+        NodeValue::CodeBlock(_) | NodeValue::HtmlBlock(_) | NodeValue::FrontMatter(_)
+    );
+    if skip_subtree {
+        return;
+    }
+    for child in node.children() {
+        collect_emoji_shortcodes(child, source, lines, spans);
+    }
+}
+
+fn emit_emoji_spans<'a>(
+    node: &'a AstNode<'a>,
+    source: &str,
+    lines: &LineStarts,
+    spans: &mut Vec<SyntaxNodeSpan>,
+) {
+    let range = lines.range(node.data.borrow().sourcepos, source.len());
+    let mut skip = Vec::new();
+    collect_eqeq_skip_ranges(node, source, lines, &mut skip);
+    let slice = source.get(range.clone()).unwrap_or("");
+    for m in crate::rich::emoji::find_emoji_shortcodes(slice) {
+        let abs_start = range.start + m.start;
+        let abs_end = range.start + m.end;
+        let skipped = skip.iter().any(|r| abs_start < r.end && abs_end > r.start);
+        if skipped {
+            continue;
+        }
+        spans.push(make_span(
+            SyntaxKind::Emoji,
+            abs_start..abs_end,
+            vec![DelimiterSpan::new(abs_start, abs_end)],
+            None,
+            None,
+            None,
+            None,
+        ));
     }
 }
 
@@ -1030,6 +1087,41 @@ mod tests {
             "[[page|Label]]"
         );
         assert_eq!(delim_text(source, wikis[1]), vec!["[[page|", "]]"]);
+    }
+
+    #[test]
+    fn extracts_known_emoji_shortcodes_not_unknown() {
+        let source = "hi :smile: and :not_an_emoji: :rocket:";
+        let spans = extract_syntax_spans(source);
+        let emojis: Vec<_> = spans
+            .iter()
+            .filter(|s| s.kind == SyntaxKind::Emoji)
+            .collect();
+        assert_eq!(emojis.len(), 2, "emoji spans: {spans:?}");
+        assert_eq!(&source[emojis[0].start_byte..emojis[0].end_byte], ":smile:");
+        assert_eq!(delim_text(source, emojis[0]), vec![":smile:"]);
+        assert_eq!(
+            &source[emojis[1].start_byte..emojis[1].end_byte],
+            ":rocket:"
+        );
+        assert!(
+            !emojis
+                .iter()
+                .any(|s| source[s.start_byte..s.end_byte].contains("not_an_emoji")),
+            "unknown name must not be an Emoji span"
+        );
+    }
+
+    #[test]
+    fn emoji_inside_code_is_not_a_span() {
+        assert!(!has_kind(
+            &extract_syntax_spans("`:smile:`"),
+            SyntaxKind::Emoji
+        ));
+        assert!(!has_kind(
+            &extract_syntax_spans("```\n:smile:\n```\n"),
+            SyntaxKind::Emoji
+        ));
     }
 
     #[test]

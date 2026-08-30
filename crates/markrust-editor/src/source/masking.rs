@@ -489,4 +489,36 @@ mod tests {
             VisibilityState::Visible
         );
     }
+
+    #[test]
+    fn emoji_caret_outside_masks_inside_reveals() {
+        let source = "see :smile: here";
+        let spans = markrust_core::extract_syntax_spans(source);
+        let emoji = spans
+            .iter()
+            .find(|span| span.kind == SyntaxKind::Emoji)
+            .expect("emoji span");
+        assert_eq!(
+            emoji
+                .delimiter_spans
+                .iter()
+                .map(|d| &source[d.start_byte..d.end_byte])
+                .collect::<Vec<_>>(),
+            vec![":smile:"]
+        );
+        assert_eq!(
+            delimiter_visibility_for_span(emoji, &[Caret::new(0)], &[]),
+            VisibilityState::Masked
+        );
+        let inside = source.find("smile").unwrap();
+        assert_eq!(
+            delimiter_visibility_for_span(emoji, &[Caret::new(inside)], &[]),
+            VisibilityState::Visible
+        );
+        let unknown = markrust_core::extract_syntax_spans("see :not_an_emoji: here");
+        assert!(
+            !unknown.iter().any(|s| s.kind == SyntaxKind::Emoji),
+            "unknown name must not be an Emoji span, got {unknown:?}"
+        );
+    }
 }

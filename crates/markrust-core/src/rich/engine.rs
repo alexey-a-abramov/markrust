@@ -152,7 +152,9 @@ impl RichEngine {
                 Inline::OpaqueInline { source_range, .. } => {
                     source_range.start <= byte && byte <= source_range.end
                 }
-                Inline::Math { source_range, .. } | Inline::WikiLink { source_range, .. } => {
+                Inline::Math { source_range, .. }
+                | Inline::WikiLink { source_range, .. }
+                | Inline::Emoji { source_range, .. } => {
                     source_range.start <= byte && byte <= source_range.end
                 }
                 _ => false,
@@ -447,7 +449,8 @@ fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
                     Inline::Run { source_range, .. }
                     | Inline::Image { source_range, .. }
                     | Inline::Math { source_range, .. }
-                    | Inline::WikiLink { source_range, .. } => {
+                    | Inline::WikiLink { source_range, .. }
+                    | Inline::Emoji { source_range, .. } => {
                         out.push(source_range.clone());
                     }
                     Inline::OpaqueInline {

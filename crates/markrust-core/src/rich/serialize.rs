@@ -650,6 +650,16 @@ impl<'a> Ser<'a> {
                         at_line_start = false;
                     }
                 }
+                Inline::Emoji { name, raw, .. } => {
+                    if self.normalize() {
+                        self.out.push(':');
+                        self.out.push_str(name);
+                        self.out.push(':');
+                    } else {
+                        self.out.push_str(raw);
+                    }
+                    at_line_start = false;
+                }
                 Inline::OpaqueInline { raw, .. } => {
                     self.out.push_str(raw);
                     if !raw.is_empty() {
@@ -678,14 +688,16 @@ enum MarkKey {
 fn inline_keys(inline: &Inline) -> Vec<MarkKey> {
     let (marks, link) = match inline {
         Inline::Run { marks, link, .. } => (*marks, link.clone()),
-        Inline::Image { marks, link, .. } => (*marks, link.clone()),
+        Inline::Image { marks, link, .. } | Inline::Emoji { marks, link, .. } => {
+            (*marks, link.clone())
+        }
         Inline::OpaqueInline { marks, .. }
         | Inline::Math { marks, .. }
         | Inline::WikiLink { marks, .. } => (*marks, None),
         _ => (MarkSet::empty(), None),
     };
     let fidelity = match inline {
-        Inline::Run { fidelity, .. } => *fidelity,
+        Inline::Run { fidelity, .. } | Inline::Emoji { fidelity, .. } => *fidelity,
         _ => super::tree::MarkFidelity::default(),
     };
     let mut keys = Vec::new();
@@ -742,7 +754,7 @@ fn key_extent(inlines: &[Inline], i: usize, key: &MarkKey) -> usize {
 
 fn key_delims(key: &MarkKey, inline: &Inline, normalize: bool) -> (String, String) {
     let fidelity = match inline {
-        Inline::Run { fidelity, .. } => *fidelity,
+        Inline::Run { fidelity, .. } | Inline::Emoji { fidelity, .. } => *fidelity,
         _ => super::tree::MarkFidelity::default(),
     };
     match key {

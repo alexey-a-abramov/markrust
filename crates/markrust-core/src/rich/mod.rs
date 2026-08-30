@@ -7,6 +7,7 @@
 //! `docs/architecture.md`.
 
 pub mod command;
+pub mod emoji;
 pub mod engine;
 pub mod escape;
 pub mod import;
@@ -16,6 +17,7 @@ pub mod serialize;
 pub mod tree;
 
 pub use command::{apply_rich_command, BlockType, CaretState, RichCommand, RichError, RichOutcome};
+pub use emoji::{lookup_emoji, lookup_shortcode};
 pub use engine::{Bias, BlockSpan, BlockSplice, RichEngine, TablePos};
 pub use import::import_markdown;
 pub use input_rules::{match_input_rule, InputRule};
@@ -209,6 +211,7 @@ mod tests {
                     literal, display, ..
                 } => format!("math:{}:{literal}", if *display { "$$" } else { "$" }),
                 Inline::WikiLink { target, label, .. } => format!("wiki:{target}:{label}"),
+                Inline::Emoji { name, glyph, .. } => format!("emoji:{name}:{glyph}"),
                 Inline::SoftBreak => "soft".into(),
                 Inline::HardBreak { .. } => "hard".into(),
                 Inline::Image { alt, url, .. } => format!("img:{alt}:{url}"),
@@ -508,6 +511,87 @@ mod tests {
             rewritten.contains("[[page]]") && rewritten.contains("[[page|Label]]"),
             "dirty serialize must keep wikilinks, got {rewritten:?}"
         );
+    }
+
+    #[test]
+    fn emoji_shortcodes_are_first_class_not_opaque() {
+        let source = "hi :smile: and :heart: and :+1: :rocket:\n";
+        let tree = import(source);
+        let emojis: Vec<_> = tree.blocks[0]
+            .inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Emoji {
+                    name, glyph, raw, ..
+                } => Some((name.as_str(), glyph.as_str(), raw.as_ref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            emojis,
+            vec![
+                ("smile", "😄", ":smile:"),
+                ("heart", "❤️", ":heart:"),
+                ("+1", "👍", ":+1:"),
+                ("rocket", "🚀", ":rocket:"),
+            ]
+        );
+        assert!(!tree.blocks[0].inlines.iter().any(|i| match i {
+            Inline::Emoji { .. } => false,
+            Inline::Run { text, .. } => text.contains(":smile:") || text.contains(":rocket:"),
+            Inline::OpaqueInline { raw, .. } => raw.contains(":smile:"),
+            _ => false,
+        }));
+        assert_eq!(preserve(source), source);
+        let dirty = std::collections::HashSet::from([tree.blocks[0].id]);
+        let rewritten = serialize_tree(&tree, source, SerializeMode::Preserve, &dirty);
+        assert!(
+            rewritten.contains(":smile:")
+                && rewritten.contains(":heart:")
+                && rewritten.contains(":+1:")
+                && rewritten.contains(":rocket:"),
+            "dirty serialize must keep :name:, got {rewritten:?}"
+        );
+        assert!(
+            !rewritten.contains("😄") && !rewritten.contains("🚀"),
+            "disk form must stay shortcodes, got {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_emoji_shortcode_stays_text() {
+        let source = "see :not_an_emoji: here\n";
+        let tree = import(source);
+        assert!(
+            !tree.blocks[0]
+                .inlines
+                .iter()
+                .any(|i| matches!(i, Inline::Emoji { .. })),
+            "unknown :foo: must not be Inline::Emoji, got {:?}",
+            tree.blocks[0].inlines
+        );
+        assert!(tree.blocks[0].inlines.iter().any(|i| match i {
+            Inline::Run { text, .. } => text.contains(":not_an_emoji:"),
+            _ => false,
+        }));
+        assert_eq!(preserve(source), source);
+    }
+
+    #[test]
+    fn emoji_shortcode_inside_code_is_not_emoji() {
+        for source in ["`:smile:`\n", "```\n:smile:\n```\n"] {
+            let tree = import(source);
+            let has_emoji = tree
+                .blocks
+                .iter()
+                .any(|b| b.inlines.iter().any(|i| matches!(i, Inline::Emoji { .. })));
+            assert!(
+                !has_emoji,
+                "expected no emoji in {source:?}, got {:?}",
+                tree.blocks
+            );
+            assert_eq!(preserve(source), source);
+        }
     }
 
     #[test]

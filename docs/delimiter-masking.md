@@ -2,7 +2,7 @@
 
 Source mode — not the default WYSIWYG surface — hides Markdown delimiter tokens (`**`, `` ` ``, `#`, link brackets, etc.) until the user focuses or selects inside the syntax node. The default **Rich** mode edits the `RichTree` and never paints source delimiters.
 
-Syntax spans for masking are derived from the **same comrak AST** as `RichTree` import (`extract_syntax_spans`). There is no tree-sitter-md grammar on this path. Typora `==highlight==` is not a comrak node; the span extractor pairs it with the same rules as rich import so source masking matches WYSIWYG. Dollar math (`$` / `$$`) is a comrak node (`math_dollars`); currency like `$5` and `$` inside code are left as text. Wikilinks (`[[target]]` / `[[target|label]]`) mask `[[` / `]]` (and `target|` when a label is present) with the same caret/selection rule.
+Syntax spans for masking are derived from the **same comrak AST** as `RichTree` import (`extract_syntax_spans`). There is no tree-sitter-md grammar on this path. Typora `==highlight==` is not a comrak node; the span extractor pairs it with the same rules as rich import so source masking matches WYSIWYG. Dollar math (`$` / `$$`) is a comrak node (`math_dollars`); currency like `$5` and `$` inside code are left as text. Wikilinks (`[[target]]` / `[[target|label]]`) mask `[[` / `]]` (and `target|` when a label is present) with the same caret/selection rule. Known GitHub/Typora emoji shortcodes (`:smile:`) paint as the Unicode glyph when the caret is outside and show `:name:` when it intersects; unmatched `:foo:` stays text.
 
 ## Visibility rule
 
@@ -48,6 +48,9 @@ One `VisibilityState` is returned per delimiter in document order (flattened acr
 | `$` / `$$` math, caret outside | Masked (formula body stays, italic monospace) |
 | `$` / `$$` math, caret or selection inside | Visible |
 | `$5`, `$ a $`, `` `$1+2$` `` | Not a math span |
+| Known `:smile:` / `:heart:` / `:+1:` (etc.), caret outside | Glyph (shortcode hidden) |
+| Known `:smile:`, caret or selection inside | Visible `:name:` |
+| Unmatched `:foo:`, `` `:smile:` `` | Not an emoji span (text stays) |
 | `[!NOTE]` / TIP / IMPORTANT / WARNING / CAUTION in a GitHub alert, caret outside the tag line | Masked (callout body stays) |
 | `[!NOTE]` (etc.), caret or selection on the tag line | Visible |
 

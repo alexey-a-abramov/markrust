@@ -26,6 +26,8 @@ pub enum SyntaxKind {
     Math,
     /// `[[target]]` / `[[target|label]]` (comrak wikilinks).
     WikiLink,
+    /// GitHub/Typora `:smile:` (matched names only; unknown `:foo:` is text).
+    Emoji,
     /// GitHub `> [!NOTE]` / TIP / IMPORTANT / WARNING / CAUTION.
     Alert,
     Other,

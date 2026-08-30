@@ -308,6 +308,7 @@ impl<'s> Importer<'s> {
                 self.import_inline(child, &mut ctx, &mut block.inlines);
             }
             apply_eqeq_highlight(&mut block.inlines, &self.link_groups);
+            super::emoji::apply_emoji_shortcodes(&mut block.inlines);
         }
         if matches!(block.kind, BlockKind::Paragraph)
             && is_toc_marker(self.slice(&block.source_range))
@@ -781,6 +782,31 @@ fn rebuild_with_highlight(inlines: &[Inline], pairs: &[(EqDelim, EqDelim, u64)])
                     raw: raw.clone(),
                     source_range: source_range.clone(),
                     marks: m,
+                });
+            }
+            Inline::Emoji {
+                name,
+                glyph,
+                raw,
+                source_range,
+                marks,
+                link,
+                fidelity,
+            } => {
+                let mut m = *marks;
+                let mut fid = *fidelity;
+                if let Some(g) = highlight_group_for_inline(pairs, inline_i) {
+                    m = m.with(MarkSet::HIGHLIGHT);
+                    fid.highlight_group = g;
+                }
+                out.push(Inline::Emoji {
+                    name: name.clone(),
+                    glyph: glyph.clone(),
+                    raw: raw.clone(),
+                    source_range: source_range.clone(),
+                    marks: m,
+                    link: link.clone(),
+                    fidelity: fid,
                 });
             }
             other => out.push(other.clone()),
