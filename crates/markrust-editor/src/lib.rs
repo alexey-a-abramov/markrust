@@ -2,29 +2,31 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Delimiter masking and GPUI editor surface for MarkRust.
+//! Editor surfaces for MarkRust: the source-mode (delimiter masking) editor
+//! lives in `source`; shared headless commands, highlighting, tables, and
+//! theming live at the top level.
 
-pub mod editor;
-pub mod element;
 pub mod headless;
 pub mod highlight;
-pub mod layout;
-pub mod masking;
+pub mod source;
 pub mod table;
 pub mod theme;
 
-pub use editor::MarkdownEditor;
-pub use element::{EditorElement, MarkdownEditorView};
+// Compatibility aliases for the pre-`source` module paths.
+pub use source::{editor, element, layout, masking};
+
 pub use headless::{
     apply_editor_command, CaretMove, EditorCommand, EditorError, EditorOutcome, EditorState,
     HeadlessEditor,
 };
 pub use highlight::{highlight_code_block, HighlightKind, HighlightSpan};
-pub use layout::{
+pub use source::editor::MarkdownEditor;
+pub use source::element::{EditorElement, MarkdownEditorView};
+pub use source::layout::{
     build_display_layout, cursor_line_col, outline_headings, DisplayLayout, LayoutSegment,
     SegmentStyle,
 };
-pub use masking::{
+pub use source::masking::{
     compute_delimiter_entries, compute_visibility, delimiter_visibility_for_span, ByteRange, Caret,
     DelimiterVisibilityEntry, Selection, VisibilityState,
 };
