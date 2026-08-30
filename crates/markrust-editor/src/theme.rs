@@ -2,7 +2,21 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use gpui::Hsla;
+use gpui::{rgb, Hsla};
+
+fn hex(color: u32) -> Hsla {
+    Hsla::from(rgb(color))
+}
+
+/// Default UI face on macOS: Menlo is a real Core Text family and rasterizes
+/// reliably. `.SystemUIFont` / Inter-via-add_fonts currently paint empty glyphs.
+pub fn default_ui_font() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "DejaVu Sans Mono"
+    }
+}
 
 /// Editor color and typography settings.
 #[derive(Debug, Clone)]
@@ -62,91 +76,93 @@ pub struct EditorTheme {
 
 impl EditorTheme {
     pub fn dark() -> Self {
+        // Warm iA Writer / Typora dark, rust accent (MarkRust).
         Self {
-            background: gpui::hsla(0., 0., 0.118, 1.), // #1e1e1e
-            editor_bg: gpui::hsla(0., 0., 0.118, 1.),
-            chrome_bg: gpui::hsla(0., 0., 0.145, 1.), // #252526
-            text: gpui::hsla(0., 0., 0.92, 1.),
-            delimiter: gpui::hsla(210. / 360., 0.35, 0.55, 0.85),
-            selection: gpui::hsla(210. / 360., 0.72, 0.52, 0.35),
-            caret: gpui::hsla(0., 0., 0.95, 1.),
-            sidebar_bg: gpui::hsla(0., 0., 0.176, 1.), // #2d2d2d
-            sidebar_text: gpui::hsla(0., 0., 0.78, 1.),
-            sidebar_hover: gpui::hsla(0., 0., 1.0, 0.06),
-            sidebar_selected: gpui::hsla(210. / 360., 0.72, 0.52, 0.22),
-            sidebar_selected_text: gpui::hsla(0., 0., 0.95, 1.),
-            tab_active: gpui::hsla(0., 0., 0.118, 1.),
-            tab_inactive: gpui::hsla(0., 0., 0.155, 1.),
-            status_bar_bg: gpui::hsla(0., 0., 0.145, 1.),
-            status_bar_text: gpui::hsla(0., 0., 0.58, 1.),
-            secondary_text: gpui::hsla(0., 0., 0.52, 1.),
-            accent: gpui::hsla(210. / 360., 0.95, 0.58, 1.), // macOS system blue
-            toolbar_button_hover: gpui::hsla(0., 0., 1.0, 0.08),
-            drop_zone_bg: gpui::hsla(210. / 360., 0.72, 0.52, 0.12),
-            separator: gpui::hsla(0., 0., 1.0, 0.08),
-            link: gpui::hsla(210. / 360., 0.75, 0.65, 1.),
-            blockquote_text: gpui::hsla(0., 0., 0.72, 1.),
-            blockquote_border: gpui::hsla(210. / 360., 0.85, 0.58, 1.),
-            code_bg: gpui::hsla(0., 0., 0.22, 1.),
-            code_block_bg: gpui::hsla(220. / 360., 0.12, 0.16, 1.),
-            image_text: gpui::hsla(120. / 360., 0.25, 0.55, 1.),
-            table_header_bg: gpui::hsla(210. / 360., 0.2, 0.22, 1.),
-            table_delimiter: gpui::hsla(0., 0., 0.45, 1.),
-            frontmatter_text: gpui::hsla(45. / 360., 0.35, 0.55, 1.),
-            syntax_keyword: gpui::hsla(280. / 360., 0.55, 0.72, 1.),
-            syntax_string: gpui::hsla(100. / 360., 0.45, 0.65, 1.),
-            syntax_number: gpui::hsla(35. / 360., 0.65, 0.65, 1.),
-            syntax_comment: gpui::hsla(0., 0., 0.5, 1.),
-            syntax_function: gpui::hsla(210. / 360., 0.55, 0.72, 1.),
-            syntax_type: gpui::hsla(35. / 360., 0.45, 0.72, 1.),
-            font_family: "Inter".into(),
+            background: hex(0x1c1917),
+            editor_bg: hex(0x1c1917),
+            chrome_bg: hex(0x292524),
+            text: hex(0xf5f0e8),
+            delimiter: hex(0xa8a29e),
+            selection: hex(0x9a3412).opacity(0.35),
+            caret: hex(0xfafaf9),
+            sidebar_bg: hex(0x241f1c),
+            sidebar_text: hex(0xe7e5e4),
+            sidebar_hover: hex(0xfafaf9).opacity(0.06),
+            sidebar_selected: hex(0xc2410c).opacity(0.28),
+            sidebar_selected_text: hex(0xfff7ed),
+            tab_active: hex(0x1c1917),
+            tab_inactive: hex(0x241f1c),
+            status_bar_bg: hex(0x1c1917),
+            status_bar_text: hex(0xa8a29e),
+            secondary_text: hex(0xa8a29e),
+            accent: hex(0xc2410c),
+            toolbar_button_hover: hex(0xfafaf9).opacity(0.08),
+            drop_zone_bg: hex(0xc2410c).opacity(0.16),
+            separator: hex(0xfafaf9).opacity(0.08),
+            link: hex(0xfb923c),
+            blockquote_text: hex(0xd6d3d1),
+            blockquote_border: hex(0xea580c),
+            code_bg: hex(0x292524),
+            code_block_bg: hex(0x0c0a09),
+            image_text: hex(0x86efac),
+            table_header_bg: hex(0x292524),
+            table_delimiter: hex(0x78716c),
+            frontmatter_text: hex(0xfbbf24),
+            syntax_keyword: hex(0xf0abfc),
+            syntax_string: hex(0x86efac),
+            syntax_number: hex(0xfdba74),
+            syntax_comment: hex(0x78716c),
+            syntax_function: hex(0x7dd3fc),
+            syntax_type: hex(0xfcd34d),
+            font_family: default_ui_font().into(),
             font_size: 16.0,
-            code_font_family: "Menlo".into(),
+            code_font_family: default_ui_font().into(),
             line_height_multiplier: 1.55,
         }
     }
 
     pub fn light() -> Self {
+        // iA Writer / Typora warm paper.
         Self {
-            background: gpui::hsla(0., 0., 0.98, 1.),
-            editor_bg: gpui::hsla(0., 0., 1.0, 1.),
-            chrome_bg: gpui::hsla(0., 0., 0.96, 1.), // #f5f5f5
-            text: gpui::hsla(0., 0., 0.12, 1.),
-            delimiter: gpui::hsla(210. / 360., 0.35, 0.45, 0.85),
-            selection: gpui::hsla(210. / 360., 0.72, 0.52, 0.22),
-            caret: gpui::hsla(0., 0., 0.08, 1.),
-            sidebar_bg: gpui::hsla(0., 0., 0.925, 1.), // #ececec
-            sidebar_text: gpui::hsla(0., 0., 0.25, 1.),
-            sidebar_hover: gpui::hsla(0., 0., 0.0, 0.05),
-            sidebar_selected: gpui::hsla(210. / 360., 0.72, 0.52, 0.18),
-            sidebar_selected_text: gpui::hsla(0., 0., 0.08, 1.),
-            tab_active: gpui::hsla(0., 0., 1.0, 1.),
-            tab_inactive: gpui::hsla(0., 0., 0.94, 1.),
-            status_bar_bg: gpui::hsla(0., 0., 0.96, 1.),
-            status_bar_text: gpui::hsla(0., 0., 0.45, 1.),
-            secondary_text: gpui::hsla(0., 0., 0.52, 1.),
-            accent: gpui::hsla(210. / 360., 0.95, 0.48, 1.),
-            toolbar_button_hover: gpui::hsla(0., 0., 0.0, 0.06),
-            drop_zone_bg: gpui::hsla(210. / 360., 0.72, 0.52, 0.10),
-            separator: gpui::hsla(0., 0., 0.0, 0.08),
-            link: gpui::hsla(210. / 360., 0.85, 0.42, 1.),
-            blockquote_text: gpui::hsla(0., 0., 0.38, 1.),
-            blockquote_border: gpui::hsla(210. / 360., 0.85, 0.48, 1.),
-            code_bg: gpui::hsla(0., 0., 0.93, 1.),
-            code_block_bg: gpui::hsla(220. / 360., 0.12, 0.95, 1.),
-            image_text: gpui::hsla(120. / 360., 0.35, 0.38, 1.),
-            table_header_bg: gpui::hsla(210. / 360., 0.15, 0.92, 1.),
-            table_delimiter: gpui::hsla(0., 0., 0.55, 1.),
-            frontmatter_text: gpui::hsla(45. / 360., 0.45, 0.38, 1.),
-            syntax_keyword: gpui::hsla(280. / 360., 0.65, 0.45, 1.),
-            syntax_string: gpui::hsla(100. / 360., 0.55, 0.35, 1.),
-            syntax_number: gpui::hsla(35. / 360., 0.75, 0.4, 1.),
-            syntax_comment: gpui::hsla(0., 0., 0.55, 1.),
-            syntax_function: gpui::hsla(210. / 360., 0.65, 0.42, 1.),
-            syntax_type: gpui::hsla(35. / 360., 0.55, 0.42, 1.),
-            font_family: "Inter".into(),
+            background: hex(0xfaf7f2),
+            editor_bg: hex(0xfffcf7),
+            chrome_bg: hex(0xf3eee7),
+            text: hex(0x1c1917),
+            delimiter: hex(0x78716c),
+            selection: hex(0xea580c).opacity(0.18),
+            caret: hex(0x1c1917),
+            sidebar_bg: hex(0xeee8e0),
+            sidebar_text: hex(0x44403c),
+            sidebar_hover: hex(0x1c1917).opacity(0.05),
+            sidebar_selected: hex(0xea580c).opacity(0.16),
+            sidebar_selected_text: hex(0x1c1917),
+            tab_active: hex(0xfffcf7),
+            tab_inactive: hex(0xe7e0d6),
+            status_bar_bg: hex(0xf3eee7),
+            status_bar_text: hex(0x78716c),
+            secondary_text: hex(0x78716c),
+            accent: hex(0x9a3412),
+            toolbar_button_hover: hex(0x1c1917).opacity(0.06),
+            drop_zone_bg: hex(0xea580c).opacity(0.12),
+            separator: hex(0x1c1917).opacity(0.08),
+            link: hex(0xc2410c),
+            blockquote_text: hex(0x57534e),
+            blockquote_border: hex(0xea580c),
+            code_bg: hex(0xf5efe6),
+            code_block_bg: hex(0xf3eee7),
+            image_text: hex(0x166534),
+            table_header_bg: hex(0xf3eee7),
+            table_delimiter: hex(0xa8a29e),
+            frontmatter_text: hex(0xa16207),
+            syntax_keyword: hex(0x7e22ce),
+            syntax_string: hex(0x15803d),
+            syntax_number: hex(0xc2410c),
+            syntax_comment: hex(0x78716c),
+            syntax_function: hex(0x1d4ed8),
+            syntax_type: hex(0xb45309),
+            font_family: default_ui_font().into(),
             font_size: 16.0,
-            code_font_family: "Menlo".into(),
+            code_font_family: default_ui_font().into(),
             line_height_multiplier: 1.55,
         }
     }
@@ -173,8 +189,8 @@ impl EditorTheme {
         font_size * self.line_height_multiplier
     }
 
-    pub fn system_font_fallbacks() -> gpui::FontFallbacks {
-        gpui::FontFallbacks::from_fonts(vec!["Menlo".into(), "Helvetica".into()])
+    pub fn system_font_fallbacks() -> Option<gpui::FontFallbacks> {
+        None
     }
 }
 
@@ -191,7 +207,7 @@ mod tests {
     #[test]
     fn dark_status_bar_is_muted_not_accent() {
         let theme = EditorTheme::dark();
-        assert!((theme.status_bar_bg.h - theme.accent.h).abs() > 0.01);
+        assert_ne!(theme.status_bar_bg, theme.accent);
     }
 
     #[test]

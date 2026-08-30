@@ -29,4 +29,4 @@ pub use masking::{
     DelimiterVisibilityEntry, Selection, VisibilityState,
 };
 pub use table::{parse_column_alignments, ColumnAlign};
-pub use theme::EditorTheme;
+pub use theme::{default_ui_font, EditorTheme};

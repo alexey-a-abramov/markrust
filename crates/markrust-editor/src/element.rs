@@ -426,7 +426,7 @@ fn styled_font(theme: &EditorTheme, style: SegmentStyle) -> gpui::Font {
     gpui::Font {
         family: family.into(),
         features: gpui::FontFeatures::default(),
-        fallbacks: Some(EditorTheme::system_font_fallbacks()),
+        fallbacks: EditorTheme::system_font_fallbacks(),
         weight,
         style: font_style,
     }
@@ -436,7 +436,7 @@ fn body_font(theme: &EditorTheme) -> gpui::Font {
     gpui::Font {
         family: theme.font_family.clone().into(),
         features: gpui::FontFeatures::default(),
-        fallbacks: Some(EditorTheme::system_font_fallbacks()),
+        fallbacks: EditorTheme::system_font_fallbacks(),
         weight: gpui::FontWeight::NORMAL,
         style: gpui::FontStyle::Normal,
     }
