@@ -25,7 +25,7 @@ use super::blocks::{render_top_block, RenderSnapshot};
 use super::image::{
     cache_path_for_url, collect_remote_image_urls, default_image_cache_dir, fetch_remote_image,
 };
-use super::ime::{caret_from_element_bounds, widget_caret_rect, ImeLeafHit, ImeOriginState};
+use super::ime::{ImeLeafHit, ImeOriginState};
 use crate::headless::{CaretMove, EditorCommand, EditorOutcome};
 use crate::theme::EditorTheme;
 
@@ -568,29 +568,11 @@ impl RichEditorView {
     }
 
     fn offset_from_utf16(content: &str, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for ch in content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-        utf8_offset
+        super::ime::offset_from_utf16(content, offset)
     }
 
     fn offset_to_utf16(content: &str, offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut utf8_count = 0;
-        for ch in content.chars() {
-            if utf8_count >= offset {
-                break;
-            }
-            utf8_count += ch.len_utf8();
-            utf16_offset += ch.len_utf16();
-        }
-        utf16_offset
+        super::ime::offset_to_utf16(content, offset)
     }
 
     fn widget_insert(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
@@ -882,19 +864,17 @@ impl EntityInputHandler for RichEditorView {
         cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         if let Some((draft, preedit)) = self.widget_display() {
-            let content = format!("{}{}", draft, preedit.unwrap_or_default());
-            let n = Self::offset_to_utf16(&content, content.len());
-            return Some(UTF16Selection {
-                range: n..n,
-                reversed: false,
-            });
+            return Some(super::ime::widget_selected_text_range(
+                &draft,
+                preedit.as_deref(),
+            ));
         }
         let content = self.document.read(cx).buffer.content();
-        Some(UTF16Selection {
-            range: Self::offset_to_utf16(&content, self.selected_range.start)
-                ..Self::offset_to_utf16(&content, self.selected_range.end),
-            reversed: self.selection_reversed,
-        })
+        Some(super::ime::body_selected_text_range(
+            &content,
+            self.selected_range.clone(),
+            self.selection_reversed,
+        ))
     }
 
     fn marked_text_range(
@@ -906,9 +886,11 @@ impl EntityInputHandler for RichEditorView {
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked_range = None;
-        self.preedit = None;
-        self.widget_preedit = None;
+        super::ime::clear_composition(
+            &mut self.preedit,
+            &mut self.widget_preedit,
+            &mut self.marked_range,
+        );
     }
 
     fn replace_text_in_range(
@@ -921,31 +903,20 @@ impl EntityInputHandler for RichEditorView {
         if !matches!(self.widget_edit, WidgetEdit::Idle) {
             self.widget_preedit = None;
             if let Some(draft) = self.widget_draft_mut() {
-                if let Some(range_utf16) = range_utf16 {
-                    let content = draft.clone();
-                    let start = Self::offset_from_utf16(&content, range_utf16.start);
-                    let end = Self::offset_from_utf16(&content, range_utf16.end);
-                    let start = start.min(draft.len());
-                    let end = end.min(draft.len()).max(start);
-                    draft.replace_range(start..end, new_text);
-                } else {
-                    draft.push_str(new_text);
-                }
+                super::ime::replace_in_widget_draft(draft, range_utf16, new_text);
             }
             self.snapshot = None;
             cx.notify();
             return;
         }
-        if let Some(range_utf16) = range_utf16 {
-            let content = self.document.read(cx).buffer.content();
-            let start = Self::offset_from_utf16(&content, range_utf16.start);
-            let end = Self::offset_from_utf16(&content, range_utf16.end);
-            self.selected_range = start..end;
-            self.selection_reversed = false;
-        } else if let Some(marked) = self.marked_range.take() {
-            self.selected_range = marked;
-            self.selection_reversed = false;
-        }
+        let content = self.document.read(cx).buffer.content();
+        super::ime::apply_replace_range_to_selection(
+            &content,
+            range_utf16,
+            &mut self.marked_range,
+            &mut self.selected_range,
+            &mut self.selection_reversed,
+        );
         self.preedit = None;
         self.apply_rich(RichCommand::InsertText(new_text.to_string()), cx);
     }
@@ -959,22 +930,14 @@ impl EntityInputHandler for RichEditorView {
         cx: &mut Context<Self>,
     ) {
         if !matches!(self.widget_edit, WidgetEdit::Idle) {
-            self.widget_preedit = if new_text.is_empty() {
-                None
-            } else {
-                Some(new_text.to_string())
-            };
+            super::ime::set_preedit(&mut self.widget_preedit, new_text);
             self.snapshot = None;
             cx.notify();
             return;
         }
         // Preedit is display-only; the model is untouched until commit.
-        self.preedit = if new_text.is_empty() {
-            None
-        } else {
-            Some(new_text.to_string())
-        };
-        self.marked_range = Some(self.cursor_offset()..self.cursor_offset());
+        let caret = self.cursor_offset();
+        super::ime::begin_body_preedit(&mut self.preedit, &mut self.marked_range, new_text, caret);
         cx.notify();
     }
 
@@ -985,13 +948,7 @@ impl EntityInputHandler for RichEditorView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        if let Some(caret) = self.ime.caret_rect() {
-            return Some(caret);
-        }
-        if self.ime.widget_focused() {
-            return Some(widget_caret_rect(bounds));
-        }
-        Some(caret_from_element_bounds(bounds))
+        Some(super::ime::ime_origin_bounds(&self.ime, bounds))
     }
 
     fn character_index_for_point(

@@ -12,7 +12,7 @@ The live WYSIWYG tracker is [`docs/roadmap.md`](docs/roadmap.md). This file is t
 - [x] Phase 4: GFM completeness (tables, task lists, export)
 - [ ] Phase 5: Distribution (release binaries, Homebrew, crates.io)
 
-Remaining for the Typora/WYSIWYG product goal (see `docs/roadmap.md` P5): the OS IME candidate window is not proven on a real CJK session.
+Remaining for the Typora/WYSIWYG product goal (see `docs/roadmap.md` P5): cargo tests simulate IME composition and origin follow; the OS IME candidate window is not proven on a real CJK session.
 
 ## Explicitly deferred
 
