@@ -359,6 +359,75 @@ mod tests {
     }
 
     #[test]
+    fn highlight_eqeq_is_a_mark_not_source_chrome() {
+        let tree = import("hello ==mark== world\n");
+        let highlighted = tree.blocks[0].inlines.iter().find_map(|i| match i {
+            Inline::Run { text, marks, .. } if marks.contains(MarkSet::HIGHLIGHT) => {
+                Some(text.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(highlighted.as_deref(), Some("mark"));
+        assert!(!tree.blocks[0].inlines.iter().any(|i| match i {
+            Inline::Run { text, .. } => text.contains("=="),
+            Inline::OpaqueInline { raw, .. } => raw.contains("=="),
+            _ => false,
+        }));
+        assert_eq!(preserve("hello ==mark== world\n"), "hello ==mark== world\n");
+        let dirty = std::collections::HashSet::from([tree.blocks[0].id]);
+        let rewritten = serialize_tree(
+            &tree,
+            "hello ==mark== world\n",
+            SerializeMode::Preserve,
+            &dirty,
+        );
+        assert!(
+            rewritten.contains("==mark=="),
+            "dirty serialize must keep == delimiters, got {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn highlight_eqeq_nests_bold() {
+        let tree = import("==**bold**==\n");
+        let run = tree.blocks[0].inlines.iter().find_map(|i| match i {
+            Inline::Run { text, marks, .. } => Some((text.clone(), *marks)),
+            _ => None,
+        });
+        let (text, marks) = run.expect("run");
+        assert_eq!(text, "bold");
+        assert!(marks.contains(MarkSet::BOLD));
+        assert!(marks.contains(MarkSet::HIGHLIGHT));
+        assert_eq!(preserve("==**bold**==\n"), "==**bold**==\n");
+    }
+
+    #[test]
+    fn superscript_and_subscript_import() {
+        let sub = import("H~2~O\n");
+        let has_sub = sub.blocks[0].inlines.iter().any(|i| match i {
+            Inline::Run { text, marks, .. } => marks.contains(MarkSet::SUB) && text == "2",
+            _ => false,
+        });
+        assert!(
+            has_sub,
+            "expected subscript 2, got {:?}",
+            sub.blocks[0].inlines
+        );
+        let sup = import("mc^2^\n");
+        let has_sup = sup.blocks[0].inlines.iter().any(|i| match i {
+            Inline::Run { text, marks, .. } => marks.contains(MarkSet::SUP) && text == "2",
+            _ => false,
+        });
+        assert!(
+            has_sup,
+            "expected superscript 2, got {:?}",
+            sup.blocks[0].inlines
+        );
+        assert_eq!(preserve("H~2~O\n"), "H~2~O\n");
+        assert_eq!(preserve("mc^2^\n"), "mc^2^\n");
+    }
+
+    #[test]
     fn links_and_images_carry_attrs() {
         let source = "[text](https://e.com \"T\") ![alt](img.png) <https://auto.link>\n";
         let tree = import(source);
@@ -463,6 +532,9 @@ mod tests {
         "a <b>bold</b> and <br>break\n",
         "See[^1]\n\n[^1]: **bold** inside\n",
         "Term\n\n: **bold** details\n",
+        "==highlight== and <mark>mark</mark>\n",
+        "H~2~O and mc^2^ and H<sub>2</sub>O\n",
+        "<div>\n**bold** inner\n</div>\n",
     ];
 
     #[test]

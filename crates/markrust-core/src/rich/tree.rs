@@ -167,6 +167,12 @@ impl MarkSet {
     pub const ITALIC: MarkSet = MarkSet(1 << 1);
     pub const STRIKE: MarkSet = MarkSet(1 << 2);
     pub const CODE: MarkSet = MarkSet(1 << 3);
+    /// Typora `==highlight==` (not GFM; comrak has no node, applied on import).
+    pub const HIGHLIGHT: MarkSet = MarkSet(1 << 4);
+    /// Comrak `^superscript^` / HTML `<sup>`.
+    pub const SUP: MarkSet = MarkSet(1 << 5);
+    /// Comrak `~subscript~` / HTML `<sub>`.
+    pub const SUB: MarkSet = MarkSet(1 << 6);
 
     pub fn empty() -> MarkSet {
         MarkSet(0)
@@ -199,6 +205,9 @@ pub struct MarkFidelity {
     pub emph_group: u64,
     pub strong_group: u64,
     pub strike_group: u64,
+    pub highlight_group: u64,
+    pub sup_group: u64,
+    pub sub_group: u64,
 }
 
 impl Default for MarkFidelity {
@@ -210,6 +219,9 @@ impl Default for MarkFidelity {
             emph_group: 0,
             strong_group: 0,
             strike_group: 0,
+            highlight_group: 0,
+            sup_group: 0,
+            sub_group: 0,
         }
     }
 }

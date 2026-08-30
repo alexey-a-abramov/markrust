@@ -13,7 +13,7 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     SharedString, Style, TextRun, TextStyle, UnderlineStyle, Window, WrappedLine,
 };
-use markrust_core::rich::{Block, BreakStyle, Inline, MarkSet, NodeId};
+use markrust_core::rich::{import_markdown, Block, BreakStyle, IdGen, Inline, MarkSet, NodeId};
 
 use crate::theme::EditorTheme;
 
@@ -106,18 +106,31 @@ impl LeafLayout {
 }
 
 fn visible_for_html(s: &str, paint: &markrust_core::html_visual::HtmlPaint) -> String {
-    use markrust_core::html_visual::{to_subscript, to_superscript};
+    use markrust_core::html_visual::{map_subscript, map_superscript};
     if paint.sup && !paint.sub {
-        if let Some(t) = to_superscript(s) {
-            return t;
-        }
+        return map_superscript(s);
     }
     if paint.sub && !paint.sup {
-        if let Some(t) = to_subscript(s) {
-            return t;
-        }
+        return map_subscript(s);
     }
     s.to_string()
+}
+
+fn merge_html_paint(
+    marks: MarkSet,
+    html: &markrust_core::html_visual::HtmlPaint,
+) -> markrust_core::html_visual::HtmlPaint {
+    let mut paint = html.clone();
+    if marks.contains(MarkSet::HIGHLIGHT) {
+        paint.mark = true;
+    }
+    if marks.contains(MarkSet::SUP) {
+        paint.sup = true;
+    }
+    if marks.contains(MarkSet::SUB) {
+        paint.sub = true;
+    }
+    paint
 }
 
 fn style_run(
@@ -152,7 +165,7 @@ fn style_run(
     if code {
         run.font.family = theme.code_font_family.clone().into();
         run.background_color = Some(theme.code_bg);
-    } else if paint.mark {
+    } else if paint.mark || marks.contains(MarkSet::HIGHLIGHT) {
         run.background_color = Some(theme.accent.opacity(0.22));
     }
     if paint.underline {
@@ -175,7 +188,55 @@ fn style_run(
 
 /// Layout for a projected HTML block (tags stripped). `source_at` is relative
 /// to the HTML literal; `block_start` is the document offset of that literal.
+/// Inner Markdown (`**bold**`, links, code) is parsed so it does not paint as
+/// source chrome; HTML phrasing (`<mark>`, `<sub>`, …) is merged as marks.
 pub fn build_html_block_layout(
+    text: &str,
+    source_at: &[usize],
+    paints: &[markrust_core::html_visual::HtmlPaintRun],
+    block_start: usize,
+    text_style: &TextStyle,
+    theme: &EditorTheme,
+) -> LeafLayout {
+    let mut inlines = inlines_from_inner_markdown(text);
+    let markdown_visible = if inlines.is_empty() {
+        false
+    } else {
+        let probe = build_leaf_layout_inlines(
+            &inlines,
+            0..text.len(),
+            text_style,
+            theme,
+            gpui::FontWeight::NORMAL,
+        );
+        !probe.text.trim().is_empty()
+    };
+    if !markdown_visible && !text.is_empty() {
+        inlines = vec![Inline::Run {
+            text: text.to_string(),
+            raw: None,
+            source_range: 0..text.len(),
+            marks: MarkSet::empty(),
+            link: None,
+            fidelity: markrust_core::rich::MarkFidelity::default(),
+        }];
+    }
+    inlines = split_inlines_by_html_paints(inlines, paints);
+    let mut layout = build_leaf_layout_inlines(
+        &inlines,
+        0..text.len(),
+        text_style,
+        theme,
+        gpui::FontWeight::NORMAL,
+    );
+    if layout.text.is_empty() && !text.is_empty() {
+        return html_flow_layout(text, source_at, paints, block_start, text_style, theme);
+    }
+    remap_html_sources(&mut layout, source_at, block_start, text.len());
+    layout
+}
+
+fn html_flow_layout(
     text: &str,
     source_at: &[usize],
     paints: &[markrust_core::html_visual::HtmlPaintRun],
@@ -222,6 +283,169 @@ pub fn build_html_block_layout(
         source_at: mapped,
         block_start,
     }
+}
+
+fn inlines_from_inner_markdown(source: &str) -> Vec<Inline> {
+    let tree = import_markdown(source, &mut IdGen::default());
+    let mut out = Vec::new();
+    fn walk(blocks: &[Block], out: &mut Vec<Inline>, first: &mut bool) {
+        for b in blocks {
+            if !b.inlines.is_empty() {
+                if !*first {
+                    out.push(Inline::HardBreak {
+                        style: BreakStyle::Backslash,
+                    });
+                }
+                *first = false;
+                out.extend(b.inlines.iter().cloned());
+            }
+            walk(&b.children, out, first);
+        }
+    }
+    let mut first = true;
+    walk(&tree.blocks, &mut out, &mut first);
+    out
+}
+
+fn html_paint_marks(
+    p: &markrust_core::html_visual::HtmlPaint,
+) -> (MarkSet, Option<markrust_core::rich::LinkAttrs>) {
+    let mut m = MarkSet::empty();
+    if p.bold {
+        m = m.with(MarkSet::BOLD);
+    }
+    if p.italic {
+        m = m.with(MarkSet::ITALIC);
+    }
+    if p.strike {
+        m = m.with(MarkSet::STRIKE);
+    }
+    if p.code {
+        m = m.with(MarkSet::CODE);
+    }
+    if p.mark {
+        m = m.with(MarkSet::HIGHLIGHT);
+    }
+    if p.sup {
+        m = m.with(MarkSet::SUP);
+    }
+    if p.sub {
+        m = m.with(MarkSet::SUB);
+    }
+    let link = p.href.as_ref().map(|url| markrust_core::rich::LinkAttrs {
+        url: url.clone(),
+        title: None,
+        autolink: false,
+        group: 0,
+    });
+    (m, link)
+}
+
+fn paint_covering(
+    paints: &[markrust_core::html_visual::HtmlPaintRun],
+    off: usize,
+) -> markrust_core::html_visual::HtmlPaint {
+    let mut cur = 0usize;
+    for p in paints {
+        if off < cur + p.len {
+            return p.paint.clone();
+        }
+        cur += p.len;
+    }
+    markrust_core::html_visual::HtmlPaint::default()
+}
+
+fn split_inlines_by_html_paints(
+    inlines: Vec<Inline>,
+    paints: &[markrust_core::html_visual::HtmlPaintRun],
+) -> Vec<Inline> {
+    if paints.is_empty() {
+        return inlines;
+    }
+    let mut out = Vec::with_capacity(inlines.len());
+    for inline in inlines {
+        match inline {
+            Inline::Run {
+                text,
+                source_range,
+                marks,
+                link,
+                fidelity,
+                raw,
+            } => {
+                if text.is_empty() {
+                    continue;
+                }
+                let mut start = 0usize;
+                while start < text.len() {
+                    let src_off = if source_range.len() == text.len() {
+                        source_range.start + start
+                    } else {
+                        source_range.start + (source_range.len() * start / text.len().max(1))
+                    };
+                    let html = paint_covering(paints, src_off);
+                    let (extra, html_link) = html_paint_marks(&html);
+                    let mut end = start;
+                    for (rel, ch) in text[start..].char_indices() {
+                        let abs = start + rel;
+                        if rel > 0 {
+                            let off = if source_range.len() == text.len() {
+                                source_range.start + abs
+                            } else {
+                                source_range.start + (source_range.len() * abs / text.len().max(1))
+                            };
+                            if paint_covering(paints, off) != html {
+                                break;
+                            }
+                        }
+                        end = abs + ch.len_utf8();
+                    }
+                    if end <= start {
+                        break;
+                    }
+                    let src_start = if source_range.len() == text.len() {
+                        source_range.start + start
+                    } else {
+                        source_range.start + (source_range.len() * start / text.len().max(1))
+                    };
+                    let src_end = if source_range.len() == text.len() {
+                        source_range.start + end
+                    } else {
+                        source_range.start + (source_range.len() * end / text.len().max(1))
+                    };
+                    out.push(Inline::Run {
+                        text: text[start..end].to_string(),
+                        raw: raw.clone(),
+                        source_range: src_start..src_end.max(src_start),
+                        marks: marks.with(extra),
+                        link: link.clone().or(html_link),
+                        fidelity,
+                    });
+                    start = end;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn remap_html_sources(
+    layout: &mut LeafLayout,
+    html_source_at: &[usize],
+    block_start: usize,
+    inner_len: usize,
+) {
+    for slot in &mut layout.source_at {
+        let inner = (*slot).min(inner_len);
+        let html = html_source_at
+            .get(inner)
+            .copied()
+            .or_else(|| html_source_at.last().copied())
+            .unwrap_or(0);
+        *slot = block_start.saturating_add(html);
+    }
+    layout.block_start = block_start;
 }
 
 pub fn build_leaf_layout(
@@ -297,7 +521,7 @@ pub fn build_leaf_layout_inlines(
                 if html.hidden() {
                     continue;
                 }
-                let paint = html.paint();
+                let paint = merge_html_paint(*marks, &html.paint());
                 let visible = visible_for_html(t, &paint);
                 let run = style_run(
                     text_style,
@@ -1240,5 +1464,141 @@ mod tests {
         assert!(layout.contains_source(19));
         assert!(!layout.contains_source(9));
         assert!(!layout.contains_source(20));
+    }
+
+    fn html_block_layout(raw: &str) -> LeafLayout {
+        let theme = EditorTheme::dark();
+        let style = TextStyle {
+            color: theme.text,
+            font_family: theme.font_family.clone().into(),
+            font_size: px(theme.font_size).into(),
+            ..Default::default()
+        };
+        match markrust_core::html_visual::project_html_block(raw) {
+            markrust_core::html_visual::HtmlBlockVisual::Flow {
+                text,
+                source_at,
+                runs,
+            } => build_html_block_layout(&text, &source_at, &runs, 0, &style, &theme),
+            other => panic!("expected flow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn highlight_eqeq_hides_delimiters_and_paints_background() {
+        let layout = layout_for("hello ==mark== world\n");
+        assert_eq!(layout.text, "hello mark world");
+        assert!(
+            !layout.text.contains('='),
+            "highlight delimiters must not paint, got {:?}",
+            layout.text
+        );
+        assert!(
+            layout.runs.iter().any(|run| run.background_color.is_some()),
+            "expected highlight background, runs={:?}",
+            layout.runs
+        );
+    }
+
+    #[test]
+    fn highlight_eqeq_wraps_nested_bold() {
+        let layout = layout_for("==**bold**==\n");
+        assert_eq!(layout.text, "bold");
+        assert!(
+            layout
+                .runs
+                .iter()
+                .any(|run| run.font.weight == gpui::FontWeight::BOLD),
+            "expected bold inside highlight, runs={:?}",
+            layout.runs
+        );
+        assert!(
+            layout.runs.iter().any(|run| run.background_color.is_some()),
+            "expected highlight background, runs={:?}",
+            layout.runs
+        );
+    }
+
+    #[test]
+    fn html_mark_paints_background_not_tags() {
+        let layout = layout_for("a <mark>hot</mark> b\n");
+        assert_eq!(layout.text, "a hot b");
+        assert!(!layout.text.contains('<'));
+        assert!(
+            layout.runs.iter().any(|run| run.background_color.is_some()),
+            "expected <mark> background, runs={:?}",
+            layout.runs
+        );
+    }
+
+    #[test]
+    fn html_sub_sup_use_unicode_when_mapped() {
+        let layout = layout_for("H<sub>2</sub>O and x<sup>2</sup>\n");
+        assert!(
+            layout.text.contains('₂'),
+            "expected subscript two, got {:?}",
+            layout.text
+        );
+        assert!(
+            layout.text.contains('²'),
+            "expected superscript two, got {:?}",
+            layout.text
+        );
+        assert!(!layout.text.contains("<sub"));
+        assert!(!layout.text.contains("<sup"));
+    }
+
+    #[test]
+    fn markdown_sub_sup_use_unicode() {
+        let sub = layout_for("H~2~O\n");
+        assert!(
+            sub.text.contains('₂'),
+            "expected ~2~ subscript, got {:?}",
+            sub.text
+        );
+        assert!(
+            !sub.text.contains('~'),
+            "tilde must not paint, {:?}",
+            sub.text
+        );
+        let sup = layout_for("mc^2^\n");
+        assert!(
+            sup.text.contains('²'),
+            "expected ^2^ superscript, got {:?}",
+            sup.text
+        );
+        assert!(
+            !sup.text.contains('^'),
+            "caret must not paint, {:?}",
+            sup.text
+        );
+    }
+
+    #[test]
+    fn html_block_inner_markdown_paints_bold() {
+        let layout = html_block_layout("<div>\n**bold** and `code`\n</div>");
+        assert!(
+            layout.text.contains("bold"),
+            "inner text, got {:?}",
+            layout.text
+        );
+        assert!(
+            !layout.text.contains('*'),
+            "markdown markers must not paint, got {:?}",
+            layout.text
+        );
+        assert!(
+            !layout.text.contains("<div"),
+            "html tags must not paint, got {:?}",
+            layout.text
+        );
+        assert!(
+            layout
+                .runs
+                .iter()
+                .any(|run| run.font.weight == gpui::FontWeight::BOLD),
+            "expected nested bold in HTML block, runs={:?}",
+            layout.runs
+        );
     }
 }

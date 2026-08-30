@@ -611,6 +611,16 @@ mod tests {
     }
 
     #[test]
+    fn snap_caret_skips_highlight_delimiters() {
+        let source = "hello ==mark==!\n";
+        let (_doc, engine) = engine_for(source);
+        let open = source.find("==").unwrap();
+        assert_eq!(engine.snap_caret(open + 1, Bias::Right), open + 2);
+        let close = source.rfind("==").unwrap();
+        assert_eq!(engine.snap_caret(close + 1, Bias::Left), close);
+    }
+
+    #[test]
     fn line_map_covers_blocks_in_order() {
         let source = "# A\n\npara one\nwrapped\n\n- item\n";
         let (_doc, engine) = engine_for(source);

@@ -433,7 +433,7 @@ pub fn project_html_block(raw: &str) -> HtmlBlockVisual {
 }
 
 /// Map digits (and a few signs) to Unicode superscripts. `None` if any char
-/// cannot be raised — callers keep the original glyphs.
+/// cannot be raised — callers keep the original glyphs (footnote labels).
 pub fn to_superscript(s: &str) -> Option<String> {
     let mut out = String::new();
     for c in s.chars() {
@@ -449,6 +449,17 @@ pub fn to_subscript(s: &str) -> Option<String> {
         out.push(sub_char(c)?);
     }
     Some(out)
+}
+
+/// Per-character superscript map. Unmapped glyphs stay as-is. GPUI `TextRun`
+/// has no per-run font size or baseline offset, so this is the WYSIWYG path.
+pub fn map_superscript(s: &str) -> String {
+    s.chars().map(|c| super_char(c).unwrap_or(c)).collect()
+}
+
+/// Per-character subscript map. Unmapped glyphs stay as-is.
+pub fn map_subscript(s: &str) -> String {
+    s.chars().map(|c| sub_char(c).unwrap_or(c)).collect()
 }
 
 fn super_char(c: char) -> Option<char> {
@@ -468,7 +479,31 @@ fn super_char(c: char) -> Option<char> {
         '=' => '⁼',
         '(' => '⁽',
         ')' => '⁾',
+        'a' | 'A' => 'ᵃ',
+        'b' | 'B' => 'ᵇ',
+        'c' | 'C' => 'ᶜ',
+        'd' | 'D' => 'ᵈ',
+        'e' | 'E' => 'ᵉ',
+        'f' | 'F' => 'ᶠ',
+        'g' | 'G' => 'ᵍ',
+        'h' | 'H' => 'ʰ',
+        'i' | 'I' => 'ⁱ',
+        'j' | 'J' => 'ʲ',
+        'k' | 'K' => 'ᵏ',
+        'l' | 'L' => 'ˡ',
+        'm' | 'M' => 'ᵐ',
         'n' | 'N' => 'ⁿ',
+        'o' | 'O' => 'ᵒ',
+        'p' | 'P' => 'ᵖ',
+        'r' | 'R' => 'ʳ',
+        's' | 'S' => 'ˢ',
+        't' | 'T' => 'ᵗ',
+        'u' | 'U' => 'ᵘ',
+        'v' | 'V' => 'ᵛ',
+        'w' | 'W' => 'ʷ',
+        'x' | 'X' => 'ˣ',
+        'y' | 'Y' => 'ʸ',
+        'z' | 'Z' => 'ᶻ',
         _ => return None,
     })
 }
@@ -490,6 +525,23 @@ fn sub_char(c: char) -> Option<char> {
         '=' => '₌',
         '(' => '₍',
         ')' => '₎',
+        'a' | 'A' => 'ₐ',
+        'e' | 'E' => 'ₑ',
+        'h' | 'H' => 'ₕ',
+        'i' | 'I' => 'ᵢ',
+        'j' | 'J' => 'ⱼ',
+        'k' | 'K' => 'ₖ',
+        'l' | 'L' => 'ₗ',
+        'm' | 'M' => 'ₘ',
+        'n' | 'N' => 'ₙ',
+        'o' | 'O' => 'ₒ',
+        'p' | 'P' => 'ₚ',
+        'r' | 'R' => 'ᵣ',
+        's' | 'S' => 'ₛ',
+        't' | 'T' => 'ₜ',
+        'u' | 'U' => 'ᵤ',
+        'v' | 'V' => 'ᵥ',
+        'x' | 'X' => 'ₓ',
         _ => return None,
     })
 }
@@ -924,7 +976,35 @@ mod tests {
     #[test]
     fn superscript_digits() {
         assert_eq!(to_superscript("12").as_deref(), Some("¹²"));
-        assert_eq!(to_superscript("1a"), None);
+        assert_eq!(to_superscript("1q"), None);
         assert_eq!(to_subscript("2").as_deref(), Some("₂"));
+        assert_eq!(map_superscript("2x"), "²ˣ");
+        assert_eq!(map_subscript("2"), "₂");
+        assert!(map_superscript("q").contains('q'));
+    }
+
+    #[test]
+    fn html_block_mark_sub_sup_flags() {
+        match project_html_block("<p><mark>hi</mark> H<sub>2</sub><sup>n</sup></p>") {
+            HtmlBlockVisual::Flow { text, runs, .. } => {
+                assert!(text.contains("hi"), "{text:?}");
+                assert!(text.contains('2') || text.contains('H'), "{text:?}");
+                assert!(
+                    runs.iter().any(|r| r.paint.mark),
+                    "expected mark paint, {runs:?}"
+                );
+                assert!(
+                    runs.iter().any(|r| r.paint.sub),
+                    "expected sub paint, {runs:?}"
+                );
+                assert!(
+                    runs.iter().any(|r| r.paint.sup),
+                    "expected sup paint, {runs:?}"
+                );
+                assert!(!text.contains("<mark"));
+                assert!(!text.contains("<sub"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

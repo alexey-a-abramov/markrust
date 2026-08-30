@@ -107,6 +107,28 @@ fn collect_spans<'a>(
                 None,
             ));
         }
+        NodeValue::Superscript => {
+            spans.push(make_span(
+                SyntaxKind::Other,
+                range.clone(),
+                wrap_delims(source, &range, 1),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        NodeValue::Subscript => {
+            spans.push(make_span(
+                SyntaxKind::Other,
+                range.clone(),
+                wrap_delims(source, &range, 1),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
         NodeValue::Code(code) => {
             spans.push(make_span(
                 SyntaxKind::CodeInline,

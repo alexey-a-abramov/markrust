@@ -32,6 +32,10 @@ pub(crate) fn parse_options() -> Options<'static> {
     options.extension.tasklist = true;
     options.extension.footnotes = true;
     options.extension.description_lists = true;
+    // Typora extras (not GFM). `==highlight==` is not a comrak node; see
+    // `apply_eqeq_highlight`. Do not enable `underline` — it would steal GFM `__bold__`.
+    options.extension.superscript = true;
+    options.extension.subscript = true;
     options.extension.front_matter_delimiter = Some("---".into());
     options.render.sourcepos = true;
     options
@@ -269,6 +273,7 @@ impl<'s> Importer<'s> {
             for child in node.children() {
                 self.import_inline(child, &mut ctx, &mut block.inlines);
             }
+            apply_eqeq_highlight(&mut block.inlines, &self.link_groups);
         }
         block
     }
@@ -328,6 +333,26 @@ impl<'s> Importer<'s> {
                 ctx.marks = ctx.marks.with(MarkSet::STRIKE);
                 self.link_groups.set(self.link_groups.get() + 1);
                 ctx.fidelity.strike_group = self.link_groups.get();
+                for child in node.children() {
+                    self.import_inline(child, ctx, out);
+                }
+                (ctx.marks, ctx.fidelity) = saved;
+            }
+            NodeValue::Superscript => {
+                let saved = (ctx.marks, ctx.fidelity);
+                ctx.marks = ctx.marks.with(MarkSet::SUP);
+                self.link_groups.set(self.link_groups.get() + 1);
+                ctx.fidelity.sup_group = self.link_groups.get();
+                for child in node.children() {
+                    self.import_inline(child, ctx, out);
+                }
+                (ctx.marks, ctx.fidelity) = saved;
+            }
+            NodeValue::Subscript => {
+                let saved = (ctx.marks, ctx.fidelity);
+                ctx.marks = ctx.marks.with(MarkSet::SUB);
+                self.link_groups.set(self.link_groups.get() + 1);
+                ctx.fidelity.sub_group = self.link_groups.get();
                 for child in node.children() {
                     self.import_inline(child, ctx, out);
                 }
@@ -436,6 +461,206 @@ fn cover_children(block: &mut Block) {
             block.source_range.end = child.source_range.end;
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct EqDelim {
+    inline_i: usize,
+    off: usize,
+}
+
+/// Typora `==highlight==` is not a comrak node. Split matched pairs out of
+/// text runs (delimiters stay in the source gap, like `**`) and set
+/// [`MarkSet::HIGHLIGHT`]. Unmatched `==` stays visible. Empty `====` is
+/// not a pair. Spans that contain a break are left alone (single-line).
+fn apply_eqeq_highlight(inlines: &mut Vec<Inline>, groups: &std::cell::Cell<u64>) {
+    let delims = find_eqeq_delims(inlines);
+    let mut pairs: Vec<(EqDelim, EqDelim, u64)> = Vec::new();
+    let mut i = 0;
+    while i + 1 < delims.len() {
+        let a = delims[i];
+        let b = delims[i + 1];
+        let empty = a.inline_i == b.inline_i && b.off == a.off + 2;
+        let across_break = b.inline_i > a.inline_i
+            && inlines[a.inline_i + 1..b.inline_i]
+                .iter()
+                .any(|n| matches!(n, Inline::SoftBreak | Inline::HardBreak { .. }));
+        if empty || across_break {
+            i += 1;
+            continue;
+        }
+        groups.set(groups.get() + 1);
+        pairs.push((a, b, groups.get()));
+        i += 2;
+    }
+    if pairs.is_empty() {
+        return;
+    }
+    *inlines = rebuild_with_highlight(inlines, &pairs);
+}
+
+fn find_eqeq_delims(inlines: &[Inline]) -> Vec<EqDelim> {
+    let mut out = Vec::new();
+    for (inline_i, inline) in inlines.iter().enumerate() {
+        let Inline::Run { text, marks, .. } = inline else {
+            continue;
+        };
+        if marks.contains(MarkSet::CODE) {
+            continue;
+        }
+        let bytes = text.as_bytes();
+        let mut j = 0;
+        while j + 1 < bytes.len() {
+            if bytes[j] == b'=' && bytes[j + 1] == b'=' {
+                if j > 0 && bytes[j - 1] == b'\\' {
+                    j += 1;
+                    continue;
+                }
+                out.push(EqDelim { inline_i, off: j });
+                j += 2;
+            } else {
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+fn is_eqeq_chrome(pairs: &[(EqDelim, EqDelim, u64)], inline_i: usize, off: usize) -> bool {
+    pairs.iter().any(|(a, b, _)| {
+        (a.inline_i == inline_i && a.off == off) || (b.inline_i == inline_i && b.off == off)
+    })
+}
+
+fn highlight_group_at(
+    pairs: &[(EqDelim, EqDelim, u64)],
+    inline_i: usize,
+    off: usize,
+) -> Option<u64> {
+    pairs.iter().find_map(|(a, b, g)| {
+        let inside = if a.inline_i == b.inline_i {
+            inline_i == a.inline_i && off >= a.off + 2 && off < b.off
+        } else if inline_i == a.inline_i {
+            off >= a.off + 2
+        } else if inline_i == b.inline_i {
+            off < b.off
+        } else {
+            inline_i > a.inline_i && inline_i < b.inline_i
+        };
+        inside.then_some(*g)
+    })
+}
+
+fn highlight_group_for_inline(pairs: &[(EqDelim, EqDelim, u64)], inline_i: usize) -> Option<u64> {
+    pairs
+        .iter()
+        .find_map(|(a, b, g)| (inline_i > a.inline_i && inline_i < b.inline_i).then_some(*g))
+}
+
+fn mapped_source(src: &std::ops::Range<usize>, text_len: usize, off: usize) -> usize {
+    if src.len() == text_len {
+        src.start + off.min(text_len)
+    } else {
+        src.len()
+            .saturating_mul(off.min(text_len))
+            .checked_div(text_len)
+            .map(|n| src.start + n)
+            .unwrap_or(src.start)
+    }
+}
+
+fn rebuild_with_highlight(inlines: &[Inline], pairs: &[(EqDelim, EqDelim, u64)]) -> Vec<Inline> {
+    let mut out = Vec::with_capacity(inlines.len());
+    for (inline_i, inline) in inlines.iter().enumerate() {
+        match inline {
+            Inline::Run {
+                text,
+                source_range,
+                marks,
+                link,
+                fidelity,
+                ..
+            } => {
+                let mut start = 0usize;
+                while start < text.len() {
+                    if is_eqeq_chrome(pairs, inline_i, start) {
+                        start += 2;
+                        continue;
+                    }
+                    let group = highlight_group_at(pairs, inline_i, start);
+                    let mut end = start;
+                    for (rel, ch) in text[start..].char_indices() {
+                        let abs = start + rel;
+                        if rel > 0
+                            && (is_eqeq_chrome(pairs, inline_i, abs)
+                                || highlight_group_at(pairs, inline_i, abs) != group)
+                        {
+                            break;
+                        }
+                        end = abs + ch.len_utf8();
+                    }
+                    if end <= start {
+                        break;
+                    }
+                    let mut fid = *fidelity;
+                    let mut m = *marks;
+                    if let Some(g) = group {
+                        m = m.with(MarkSet::HIGHLIGHT);
+                        fid.highlight_group = g;
+                    }
+                    let src_start = mapped_source(source_range, text.len(), start);
+                    let src_end = mapped_source(source_range, text.len(), end);
+                    out.push(Inline::Run {
+                        text: text[start..end].to_string(),
+                        raw: None,
+                        source_range: src_start..src_end.max(src_start),
+                        marks: m,
+                        link: link.clone(),
+                        fidelity: fid,
+                    });
+                    start = end;
+                }
+            }
+            Inline::Image {
+                alt,
+                url,
+                title,
+                source_range,
+                marks,
+                link,
+            } => {
+                let mut m = *marks;
+                if highlight_group_for_inline(pairs, inline_i).is_some() {
+                    m = m.with(MarkSet::HIGHLIGHT);
+                }
+                out.push(Inline::Image {
+                    alt: alt.clone(),
+                    url: url.clone(),
+                    title: title.clone(),
+                    source_range: source_range.clone(),
+                    marks: m,
+                    link: link.clone(),
+                });
+            }
+            Inline::OpaqueInline {
+                raw,
+                source_range,
+                marks,
+            } => {
+                let mut m = *marks;
+                if highlight_group_for_inline(pairs, inline_i).is_some() {
+                    m = m.with(MarkSet::HIGHLIGHT);
+                }
+                out.push(Inline::OpaqueInline {
+                    raw: raw.clone(),
+                    source_range: source_range.clone(),
+                    marks: m,
+                });
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
 }
 
 fn collect_text<'a>(node: &'a AstNode<'a>, out: &mut String) {

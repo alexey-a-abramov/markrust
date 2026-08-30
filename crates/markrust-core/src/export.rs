@@ -18,6 +18,8 @@ pub fn markdown_to_html_gfm(source: &str) -> String {
     options.extension.tasklist = true;
     options.extension.footnotes = true;
     options.extension.description_lists = true;
+    options.extension.superscript = true;
+    options.extension.subscript = true;
     options.extension.tagfilter = true;
     options.extension.front_matter_delimiter = Some("---".into());
     options.render.unsafe_ = true;

@@ -603,6 +603,9 @@ enum MarkKey {
     Bold(u64),
     Italic(u64),
     Strike(u64),
+    Highlight(u64),
+    Sup(u64),
+    Sub(u64),
     Link(LinkAttrs),
 }
 
@@ -623,6 +626,9 @@ fn inline_keys(inline: &Inline) -> Vec<MarkKey> {
             keys.push(MarkKey::Link(l));
         }
     }
+    if marks.contains(MarkSet::HIGHLIGHT) {
+        keys.push(MarkKey::Highlight(fidelity.highlight_group));
+    }
     if marks.contains(MarkSet::BOLD) {
         keys.push(MarkKey::Bold(fidelity.strong_group));
     }
@@ -631,6 +637,12 @@ fn inline_keys(inline: &Inline) -> Vec<MarkKey> {
     }
     if marks.contains(MarkSet::STRIKE) {
         keys.push(MarkKey::Strike(fidelity.strike_group));
+    }
+    if marks.contains(MarkSet::SUP) {
+        keys.push(MarkKey::Sup(fidelity.sup_group));
+    }
+    if marks.contains(MarkSet::SUB) {
+        keys.push(MarkKey::Sub(fidelity.sub_group));
     }
     keys
 }
@@ -641,7 +653,10 @@ fn keys_match(stack_key: &MarkKey, wanted: &MarkKey) -> bool {
     match (stack_key, wanted) {
         (MarkKey::Bold(a), MarkKey::Bold(b))
         | (MarkKey::Italic(a), MarkKey::Italic(b))
-        | (MarkKey::Strike(a), MarkKey::Strike(b)) => *a == *b || *a == 0 || *b == 0,
+        | (MarkKey::Strike(a), MarkKey::Strike(b))
+        | (MarkKey::Highlight(a), MarkKey::Highlight(b))
+        | (MarkKey::Sup(a), MarkKey::Sup(b))
+        | (MarkKey::Sub(a), MarkKey::Sub(b)) => *a == *b || *a == 0 || *b == 0,
         (a, b) => a == b,
     }
 }
@@ -681,6 +696,9 @@ fn key_delims(key: &MarkKey, inline: &Inline, normalize: bool) -> (String, Strin
             (ch.to_string(), ch.to_string())
         }
         MarkKey::Strike(_) => ("~~".into(), "~~".into()),
+        MarkKey::Highlight(_) => ("==".into(), "==".into()),
+        MarkKey::Sup(_) => ("^".into(), "^".into()),
+        MarkKey::Sub(_) => ("~".into(), "~".into()),
         MarkKey::Link(l) => {
             let mut close = String::from("](");
             close.push_str(&printable_url(&l.url));
