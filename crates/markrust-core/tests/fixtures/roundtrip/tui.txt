@@ -1,0 +1,649 @@
+### case: empty-content
+--- input
+--- expected
+--- end
+
+### case: paragraph
+--- input
+foo
+--- expected
+foo
+--- end
+
+### case: headings
+--- input
+# heading1
+## heading2
+### heading3
+#### heading4
+##### heading5
+###### heading6
+--- expected
+# heading1
+
+## heading2
+
+### heading3
+
+#### heading4
+
+##### heading5
+
+###### heading6
+--- end
+
+### case: code-block
+--- input
+```
+foo
+```
+--- expected
+```
+foo
+```
+--- end
+
+### case: bullet-list
+--- input
+* foo
+* bar
+    * qux
+* baz
+--- expected
+* foo
+* bar
+    * qux
+* baz
+--- end
+
+### case: ordered-list
+--- input
+1. foo
+2. bar
+3. baz
+--- expected
+1. foo
+2. bar
+3. baz
+--- end
+
+### case: block-quote
+--- input
+> foo
+> bar
+>> baz
+> > qux
+> >> quxx
+--- expected
+> foo
+> bar
+> > baz
+> > qux
+> > > quxx
+--- end
+
+### case: thematic-break
+--- input
+---
+***
+- - -
+* * * *
+--- expected
+***
+
+***
+
+***
+
+***
+--- end
+
+### case: image
+--- input
+![](imgUrl)
+![altText](imgUrl)
+![altText](img*Url)
+![altText](url?key=abc&attribute=abc)
+--- expected
+![](imgUrl)
+![altText](imgUrl)
+![altText](img*Url)
+![altText](url?key=abc&attribute=abc)
+--- end
+
+### case: link
+--- input
+[](url)foo
+[text](url)
+[text](ur*l)
+[Editor](https://github.com/nhn_test/tui.editor)
+[this.is_a_test_link.com](this.is_a_test_link.com)
+[text](url?key=abc&attribute=abc)
+--- expected
+foo
+[text](url)
+[text](ur*l)
+[Editor](https://github.com/nhn_test/tui.editor)
+[this.is_a_test_link.com](this.is_a_test_link.com)
+[text](url?key=abc&attribute=abc)
+--- end
+
+### case: code
+--- input
+`foo bar baz`
+--- expected
+`foo bar baz`
+--- end
+
+### case: emphasis-strong-italic
+--- input
+**foo**
+__bar__
+*baz*
+_qux_
+--- expected
+**foo**
+**bar**
+*baz*
+*qux*
+--- end
+
+### case: strike
+--- input
+~~strike~~
+--- expected
+~~strike~~
+--- end
+
+### case: table
+--- input
+| thead | thead |
+| --- | --- |
+| tbody | tbody |
+
+| thead |thead |
+| -- | ----- |
+| tbody|tbody|
+| tbody|tbody|
+
+|||
+|-|-|
+|||
+--- expected
+| thead | thead |
+| ----- | ----- |
+| tbody | tbody |
+
+| thead | thead |
+| ----- | ----- |
+| tbody | tbody |
+| tbody | tbody |
+
+|  |  |
+| --- | --- |
+|  |  |
+
+--- end
+
+### case: table-column-align
+--- input
+| default | left | right | center |
+| --- | :--- | ---: | :---: |
+| tbody | tbody | tbody | tbody |
+
+|  |  |  |  |
+| --- | :--- | ---: | :---: |
+| default | left | right | center |
+--- expected
+| default | left | right | center |
+| ------- | :--- | ----: | :----: |
+| tbody | tbody | tbody | tbody |
+
+|  |  |  |  |
+| --- | :--- | ---: | :---: |
+| default | left | right | center |
+
+--- end
+
+### case: table-inline-syntax
+--- input
+| ![altText](imgUrl) | foo ![altText](imgUrl) baz |
+| ---- | ---- |
+| [linkText](linkUrl) | foo [linkText](linkUrl) baz |
+| **foo** _bar_ ~~baz~~ | **foo** *bar* ~~baz~~ [linkText](linkUrl) |
+--- expected
+| ![altText](imgUrl) | foo ![altText](imgUrl) baz |
+| --- | -------- |
+| [linkText](linkUrl) | foo [linkText](linkUrl) baz |
+| **foo** *bar* ~~baz~~ | **foo** *bar* ~~baz~~ [linkText](linkUrl) |
+
+--- end
+
+### case: task
+--- input
+* [ ] foo
+    * [x] baz
+* [x] bar
+
+1. [x] foo
+2. [ ] bar
+--- expected
+* [ ] foo
+    * [x] baz
+* [x] bar
+
+1. [x] foo
+2. [ ] bar
+--- end
+
+### case: list-in-block-quote
+--- input
+> * foo
+>   * baz
+> * bar
+>> 1. qux
+> > 2. quxx
+--- expected
+> * foo
+>     * baz
+> * bar
+> > 1. qux
+> > 2. quxx
+--- end
+
+### case: block-nodes-in-list
+--- input
+1. foo
+
+    ```
+    bar
+    ```
+
+    > bam
+--- expected
+1. foo
+
+    ```
+    bar
+    ```
+
+    > bam
+--- end
+
+### case: soft-break
+--- input
+foo
+bar
+
+baz
+
+
+
+qux
+--- expected
+foo
+bar
+
+baz
+
+qux
+--- end
+
+### case: br
+--- input
+foo
+<br>
+bar
+<br>
+<br>
+baz
+<br>
+<br>
+<br>
+qux
+--- expected
+foo
+
+bar
+
+<br>
+baz
+
+<br>
+<br>
+qux
+--- end
+
+### case: br-with-soft-break
+--- input
+foo
+
+<br>
+bar
+
+<br>
+<br>
+baz
+
+
+<br>
+qux
+<br>
+
+quux
+
+<br>
+
+quuz
+--- expected
+foo
+
+<br>
+bar
+
+<br>
+<br>
+baz
+
+<br>
+qux
+
+<br>
+quux
+
+<br>
+<br>
+quuz
+--- end
+
+### case: br-with-html-inline-node
+--- input
+foo
+bar
+Para       <b>Word</b><br>
+--- expected
+foo
+bar
+Para <b>Word</b>
+--- end
+
+### case: br-with-following-br
+--- input
+text1
+<br>
+text2<br>
+<br>
+text3
+--- expected
+text1
+
+text2
+
+text3
+--- end
+
+### case: br-in-middle-of-paragraph
+--- input
+text1
+<br>
+te<br>xt2<br>
+<br>
+text3
+--- expected
+text1
+
+te
+xt2
+
+text3
+--- end
+
+### case: html-comment
+--- input
+<!--
+foo
+
+bar
+baz
+-->
+--- expected
+<!--
+foo
+
+bar
+baz
+-->
+--- end
+
+### case: inline-html-emphasis-type
+--- input
+<b>foo</b>
+<strong>foo</strong>
+
+<i>foo</i>
+<em>foo</em>
+
+<s>foo</s>
+<del>foo</del>
+
+<code>foo</code>
+--- expected
+<b>foo</b>
+<strong>foo</strong>
+
+<i>foo</i>
+<em>foo</em>
+
+<s>foo</s>
+<del>foo</del>
+
+<code>foo</code>
+--- end
+
+### case: inline-html-link-type
+--- input
+<a href="#">foo</a>
+
+<img src="#">
+
+<img src="#" alt="test">
+--- expected
+<a href="#">foo</a>
+
+<img src="#">
+
+<img src="#" alt="test">
+--- end
+
+### case: table-with-br
+--- input
+| thead<br>thead | thead |
+| ----- | ----- |
+| tbody<br>tbody | tbody |
+| tbody | tbody<br>tbody<br>tbody |
+| tbody | **tbody**<br>_tbody_<br>~~tbody~~<br>`tbody` |
+| tbody | ![img](imgUrl)<br>[link](linkUrl) |
+--- expected
+| thead<br>thead | thead |
+| ---------- | ----- |
+| tbody<br>tbody | tbody |
+| tbody | tbody<br>tbody<br>tbody |
+| tbody | **tbody**<br>*tbody*<br>~~tbody~~<br>`tbody` |
+| tbody | ![img](imgUrl)<br>[link](linkUrl) |
+
+--- end
+
+### case: table-with-html-list
+--- input
+| thead |
+| ----- |
+| <ul><li>bullet</li></ul> |
+| <ol><li>ordered</li></ol> |
+| <ul><li>nested<ul><li>nested</li></ul></li></ul> |
+| <ul><li>nested<ul><li>nested</li><li>nested</li></ul></li></ul> |
+| <ol><li>mix**ed**<ul><li>**mix**ed</li></ul></li></ol> |
+| <ol><li>mix<i>ed</i><ul><li><strong>mix</strong>ed</li></ul></li></ol> |
+| foo<ul><li>bar</li></ul>baz |
+| ![altText](imgUrl) **mixed**<ul><li>[linkText](linkUrl) mixed</li></ul> |
+--- expected
+| thead |
+| ----- |
+| <ul><li>bullet</li></ul> |
+| <ol><li>ordered</li></ol> |
+| <ul><li>nested<ul><li>nested</li></ul></li></ul> |
+| <ul><li>nested<ul><li>nested</li><li>nested</li></ul></li></ul> |
+| <ol><li>mix**ed**<ul><li>**mix**ed</li></ul></li></ol> |
+| <ol><li>mix<i>ed</i><ul><li><strong>mix</strong>ed</li></ul></li></ol> |
+| foo<ul><li>bar</li></ul>baz |
+| ![altText](imgUrl) **mixed**<ul><li>[linkText](linkUrl) mixed</li></ul> |
+
+--- end
+
+### case: table-with-unmatched-html-list
+--- input
+| thead |
+| ----- |
+| <ul><li>bullet</li><ul> |
+| <ol><li>ordered</li><ol> |
+| <ul><li>nested<ul><li>nested</li><ul><li><ul> |
+--- expected
+| thead |
+| ----- |
+| <ul><li>bullet</li></ul> |
+| <ol><li>ordered</li></ol> |
+| <ul><li>nested<ul><li>nested</li></ul></li></ul> |
+
+--- end
+
+### case: html-paragraph-and-division
+--- input
+<p>paragraph</p>
+
+<div>division</div>
+--- expected
+paragraph
+division
+--- end
+
+### case: html-block-heading
+--- input
+<h1>heading1</h1>
+<h2>heading2</h2>
+<h3>heading3</h3>
+<h4>heading4</h4>
+<h5>heading4</h5>
+<h6>heading4</h6>
+--- expected
+<h1>heading1</h1><h2>heading2</h2><h3>heading3</h3><h4>heading4</h4><h5>heading4</h5><h6>heading4</h6>
+--- end
+
+### case: html-block-pre
+--- input
+<pre>code</pre>
+--- expected
+<pre>code</pre>
+--- end
+
+### case: html-block-blockquote
+--- input
+<blockquote>foo</blockquote>
+<blockquote>foo<blockquote>foo</blockquote></blockquote>
+--- expected
+<blockquote>foo</blockquote><blockquote>foo<blockquote>foo</blockquote></blockquote>
+--- end
+
+### case: html-block-bullet-list
+--- input
+<ul><li>foo</li></ul>
+<ul><li>foo<ul><li>foo</li></ul></li></ul>
+--- expected
+<ul><li>foo</li></ul><ul><li>foo<ul><li>foo</li></ul></li></ul>
+--- end
+
+### case: html-block-ordered-list
+--- input
+<ol><li>foo</li></ol>
+<ol><li>foo<ol><li>foo</li></ol></li></ol>
+--- expected
+<ol><li>foo</li></ol><ol><li>foo<ol><li>foo</li></ol></li></ol>
+--- end
+
+### case: html-block-task
+--- input
+<ul><li class="task-list-item" data-task>bullet task</li></ul>
+<ul><li class="task-list-item checked" data-task data-task-checked>ordered task</li></ul>
+--- expected
+<ul><li class="task-list-item" data-task>bullet task</li></ul><ul><li class="task-list-item checked" data-task data-task-checked>ordered task</li></ul>
+--- end
+
+### case: html-block-table
+--- input
+<table><thead><tr><th>foo</th></tr></thead><tbody><tr><td>bar</td></tr></tbody></table>
+--- expected
+<table><thead><tr><th>foo</th></tr></thead><tbody><tr><td>bar</td></tr></tbody></table>
+--- end
+
+### case: html-block-with-inline
+--- input
+<h1><b>foo</b></h1>
+<ul><li>foo <i>bar</i></li></ul>
+<blockquote><s>foo</s> bar</blockquote>
+--- expected
+<h1><b>foo</b></h1><ul><li>foo <i>bar</i></li></ul><blockquote><s>foo</s> bar</blockquote>
+--- end
+
+### case: custom-inline-info-only
+--- input
+$$custom$$
+--- expected
+$$custom$$
+--- end
+
+### case: custom-inline-info-and-text
+--- input
+$$custom inline$$
+--- expected
+$$custom inline$$
+--- end
+
+### case: front-matter
+--- input
+---
+title: foo
+desc: bar
+---
+--- expected
+---
+title: foo
+desc: bar
+---
+--- end
+
+### case: escape-markdown-text
+--- input
+\# heading
+\> blockquote
+\*test\*
+\* list
+--- expected
+\# heading
+\> blockquote
+\*test\*
+\* list
+--- end
+
+### case: escape-html-text
+--- input
+\<div>block\</div>
+\<strong>bold\</strong>
+--- expected
+\<div>block\</div>
+\<strong>bold\</strong>
+--- end
+
+### case: escape-backslash-mid-sentence
+--- input
+backslash \in the middle of a sentence
+--- expected
+backslash \\in the middle of a sentence
+--- end

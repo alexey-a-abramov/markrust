@@ -1,0 +1,306 @@
+### case: isolated-bold-with-inline-code
+--- input
+**Native (`nimbalyst://`)**
+--- expected
+**Native (`nimbalyst://`)**
+--- end
+
+### case: isolated-italic-with-bold-inline-code
+--- input
+*against the same **`TrackerProvider`** interface*
+--- expected
+*against the same **`TrackerProvider`** interface*
+--- end
+
+### case: tracker-strategy-excerpt
+--- input
+| Enterprise team on Jira | Native + Jira | Native for internal RFCs/decisions, Jira for the issues their org tracks centrally |
+| Startup using Linear | Native + Linear | Linear as primary work tracker, native for design docs and decisions |
+| Team running multiple repos | Native + GitHub Issues x N | Per-repo binding; provider can be configured for multiple repos |
+| Team on self-hosted Gitea | Native + Gitea (marketplace) | Same provider contract as GitHub; just a different extension |
+| Nimbalyst itself | Native + GitHub Issues + Linear | Our specific configuration - see "Nimbalyst's configuration" below |
+
+**What's**** ****per-workspace**** ****configurable:**
+
+## What capabilities exist today
+
+### Extension contribution surface
+From `packages/extension-sdk/src/types/extension.ts`:
+- `customEditors` - file-type-bound editors
+- `aiTools` - extensions register MCP-style tools surfaced to the agent
+- `panels` - sidebar / bottom-panel / non-file-based UIs
+
+### Architectural (universal)
+
+| Choice | Decision |
+| --- | --- |
+| **Provider mechanism** | **All foreign trackers are \****`TrackerProvider`**\*\** extensions.** Native is the only built-in. Distribution channels can pre-install some providers, but architecturally there is no "bundled" tier with privileged capability - the contract is the same for everyone. |
+| **Session linking** | **URN-based, switched in Phase 1.** Native links migrate to `nimbalyst://NIM-xxx` in the same change as the contract; foreign providers slot in cleanly afterward. |
+
+### Agent commit-message instructions
+
+**Per-provider**** ****\****syntax***\******* ******\****declaration,***\******* ******\****not***\******* ******\****hardcoded.** This matters for multi-tenant use: a workspace using Jira needs `Fixes PROJ-42`, a workspace using YouTrack needs something else, and core doesn't know about either. Each `TrackerProvider` declares its commit syntax in the manifest:
+
+> ### Tracker-aware commit messages
+>
+> When the session has linked tracker items and tracker automation is enabled, append closing-keyword lines to commit messages so each item closes automatically. Use the syntax matching the item's source:
+> - **Native (****`nimbalyst://`****)** or **Linear (****`linear://`****)**: `Fixes NIM-123`
+> - **GitHub same-repo**: `Fixes #42`
+> - **GitHub cross-repo**: `Fixes owner/repo#42`
+>
+> One closing line per linked item. The user can edit them out in the commit widget before confirming.
+
+--- expected
+| Enterprise team on Jira | Native + Jira | Native for internal RFCs/decisions, Jira for the issues their org tracks centrally |
+| Startup using Linear | Native + Linear | Linear as primary work tracker, native for design docs and decisions |
+| Team running multiple repos | Native + GitHub Issues x N | Per-repo binding; provider can be configured for multiple repos |
+| Team on self-hosted Gitea | Native + Gitea (marketplace) | Same provider contract as GitHub; just a different extension |
+| Nimbalyst itself | Native + GitHub Issues + Linear | Our specific configuration - see "Nimbalyst's configuration" below |
+
+**What's**** ****per-workspace**** ****configurable:**
+
+## What capabilities exist today
+
+### Extension contribution surface
+From `packages/extension-sdk/src/types/extension.ts`:
+- `customEditors` - file-type-bound editors
+- `aiTools` - extensions register MCP-style tools surfaced to the agent
+- `panels` - sidebar / bottom-panel / non-file-based UIs
+
+### Architectural (universal)
+
+| Choice | Decision |
+| --- | --- |
+| **Provider mechanism** | **All foreign trackers are \****`TrackerProvider`**\*\** extensions.** Native is the only built-in. Distribution channels can pre-install some providers, but architecturally there is no "bundled" tier with privileged capability - the contract is the same for everyone. |
+| **Session linking** | **URN-based, switched in Phase 1.** Native links migrate to `nimbalyst://NIM-xxx` in the same change as the contract; foreign providers slot in cleanly afterward. |
+
+### Agent commit-message instructions
+
+**Per-provider**** ****\****syntax***\******* ******\****declaration,***\******* ******\****not***\******* ******\****hardcoded.** This matters for multi-tenant use: a workspace using Jira needs `Fixes PROJ-42`, a workspace using YouTrack needs something else, and core doesn't know about either. Each `TrackerProvider` declares its commit syntax in the manifest:
+
+> ### Tracker-aware commit messages
+>
+> When the session has linked tracker items and tracker automation is enabled, append closing-keyword lines to commit messages so each item closes automatically. Use the syntax matching the item's source:
+> - **Native (****`nimbalyst://`****)** or **Linear (****`linear://`****)**: `Fixes NIM-123`
+> - **GitHub same-repo**: `Fixes #42`
+> - **GitHub cross-repo**: `Fixes owner/repo#42`
+>
+> One closing line per linked item. The user can edit them out in the commit widget before confirming.
+
+--- fixed-point-only
+--- end
+
+### case: frontmatter-and-checklist-state
+--- input
+---
+planStatus:
+  title: Lexical Upgrade
+  progress: 25
+---
+# Lexical Upgrade
+
+- [x] Add regression corpus
+- [ ] Upgrade dependencies
+--- expected
+---
+planStatus:
+  title: Lexical Upgrade
+  progress: 25
+---
+# Lexical Upgrade
+
+- [x] Add regression corpus
+- [ ] Upgrade dependencies
+--- end
+
+### case: angle-bracket-link
+--- input
+[Link 1](<https://example.com/path?t=13m43s>)
+--- expected
+[Link 1](https://example.com/path?t=13m43s)
+--- end
+
+### case: angle-bracket-link-after-quoted-text
+--- input
+"some quoted text" [Link 1](<https://example.com/path?t=13m43s>)
+--- expected
+"some quoted text" [Link 1](https://example.com/path?t=13m43s)
+--- end
+
+### case: angle-bracket-links-pipe-separated
+--- input
+[Link 1](<https://example.com/path?t=1m0s>) | [Link 2](<https://example.com/path?t=5m30s>)
+--- expected
+[Link 1](https://example.com/path?t=1m0s) | [Link 2](https://example.com/path?t=5m30s)
+--- end
+
+### case: plain-link-unchanged
+--- input
+[plain](https://example.com/path)
+--- expected
+[plain](https://example.com/path)
+--- end
+
+### case: single-node-export-heading
+--- input
+# Upgrade Heading
+--- expected
+# Upgrade Heading
+--- end
+
+### case: selection-export-inline-formatting
+--- input
+Paragraph with **bold** and `code`.
+--- expected
+Paragraph with **bold** and `code`.
+--- end
+
+### case: checkbox-basic-roundtrip
+--- input
+- [ ] Unchecked
+- [x] Checked
+- [ ] Another
+--- expected
+- [ ] Unchecked
+- [x] Checked
+- [ ] Another
+--- end
+
+### case: checkbox-frontmatter-roundtrip
+--- input
+---
+planStatus:
+  title: Test Plan
+  progress: 50
+---
+# Test Plan
+
+## Phase 1
+
+- [x] First completed task
+- [x] Second completed task
+- [ ] Pending task
+
+## Phase 2
+
+- [ ] Future task
+--- expected
+---
+planStatus:
+  title: Test Plan
+  progress: 50
+---
+# Test Plan
+
+## Phase 1
+
+- [x] First completed task
+- [x] Second completed task
+- [ ] Pending task
+
+## Phase 2
+
+- [ ] Future task
+--- fixed-point-only
+--- end
+
+### case: checkbox-complex-plan
+--- input
+---
+planStatus:
+  progress: 43
+---
+# Unified Tracker System
+
+## Implementation Phases
+
+### Phase 1: Database Content
+
+**Goal**: Tracker items can have rich content.
+
+- [x] Add content JSONB column
+- [x] Add archived columns
+- [x] IPC handlers for content
+- [x] Embed Lexical editor
+- [ ] Post-import option
+
+### Phase 2: Migration
+
+- [x] Import plan from file
+- [ ] Bulk import
+--- expected
+---
+planStatus:
+  progress: 43
+---
+# Unified Tracker System
+
+## Implementation Phases
+
+### Phase 1: Database Content
+
+**Goal**: Tracker items can have rich content.
+
+- [x] Add content JSONB column
+- [x] Add archived columns
+- [x] IPC handlers for content
+- [x] Embed Lexical editor
+- [ ] Post-import option
+
+### Phase 2: Migration
+
+- [x] Import plan from file
+- [ ] Bulk import
+--- fixed-point-only
+--- end
+
+### case: blank-line-between-heading-and-list
+--- input
+# A
+
+- Banana
+- Kiwi
+--- expected
+# A
+
+- Banana
+- Kiwi
+--- end
+
+### case: multiple-blank-lines
+--- input
+# A
+
+- Item 1
+
+
+And some text
+--- expected
+# A
+
+- Item 1
+
+
+And some text
+--- fixed-point-only
+--- end
+
+### case: blank-line-import-minimal
+--- input
+# A
+
+- Banana
+--- expected
+# A
+
+- Banana
+--- fixed-point-only
+--- end
+
+### case: escaped-star-adjacent-emphasis
+--- input
+***\*syntax\****
+--- expected
+***\*syntax\****
+--- fixed-point-only
+--- end
