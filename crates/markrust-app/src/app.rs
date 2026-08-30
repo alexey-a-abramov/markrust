@@ -40,6 +40,7 @@ fn load_bundled_fonts(cx: &mut App) {
 
 /// Launch the desktop editor, optionally opening a file or workspace folder.
 pub fn run_gui_with_open(open_path: Option<PathBuf>) {
+    crate::crash::install_panic_logger();
     application().run(move |cx: &mut App| {
         load_bundled_fonts(cx);
         let config = AppConfig::load();

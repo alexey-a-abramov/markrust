@@ -6,6 +6,7 @@
 
 mod app;
 mod config;
+pub mod crash;
 mod drop;
 mod session;
 mod ui;
