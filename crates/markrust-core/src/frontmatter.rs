@@ -8,7 +8,10 @@ pub struct FrontmatterInfo {
     pub start_byte: usize,
     pub end_byte: usize,
     pub title: Option<String>,
+    pub description: Option<String>,
     pub tags: Option<String>,
+    /// Inner YAML between the `---` fences (no fence lines).
+    pub yaml_body: String,
 }
 
 /// Detect `---` YAML frontmatter at the document start and extract a display title.
@@ -40,7 +43,9 @@ pub fn parse_frontmatter(source: &str) -> Option<FrontmatterInfo> {
         start_byte: start,
         end_byte: end,
         title: extract_yaml_scalar_key(yaml, "title"),
+        description: extract_yaml_scalar_key(yaml, "description"),
         tags: extract_yaml_scalar_key(yaml, "tags"),
+        yaml_body: yaml.to_string(),
     })
 }
 
@@ -227,6 +232,18 @@ mod tests {
         assert_eq!(info.tags.as_deref(), Some("[a, b]"));
         let nested = parse_frontmatter("---\nmeta:\n  tags: no\n---\n").unwrap();
         assert!(nested.tags.is_none());
+    }
+
+    #[test]
+    fn extracts_description_and_yaml_body() {
+        let source = "---\ntitle: Doc\ndescription: A note\ntags: [a]\nextra: 1\n---\n\n# Body\n";
+        let info = parse_frontmatter(source).unwrap();
+        assert_eq!(info.description.as_deref(), Some("A note"));
+        assert!(info.yaml_body.contains("title: Doc"));
+        assert!(info.yaml_body.contains("extra: 1"));
+        assert!(!info.yaml_body.contains("# Body"));
+        let nested = parse_frontmatter("---\nmeta:\n  description: no\n---\n").unwrap();
+        assert!(nested.description.is_none());
     }
 
     #[test]

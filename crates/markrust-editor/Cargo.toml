@@ -21,3 +21,8 @@ tree-sitter-bash = "0.25"
 
 [dev-dependencies]
 pretty_assertions = "1.4"
+criterion = { workspace = true }
+
+[[bench]]
+name = "layout"
+harness = false

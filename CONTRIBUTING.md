@@ -11,6 +11,8 @@ Thank you for your interest in MarkRust!
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo bench -p markrust-core --bench parse
+cargo bench -p markrust-editor --bench layout
 ```
 
 ## Pull requests

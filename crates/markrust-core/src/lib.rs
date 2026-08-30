@@ -13,6 +13,7 @@ pub mod merge;
 pub mod mode;
 pub mod offset_map;
 pub mod parser;
+pub mod perf_fixture;
 pub mod rich;
 pub mod spans;
 pub mod undo;

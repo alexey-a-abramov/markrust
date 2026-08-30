@@ -115,6 +115,8 @@ bash scripts/release.sh
 ```bash
 cargo build --workspace
 cargo test --workspace
+cargo bench -p markrust-core --bench parse
+cargo bench -p markrust-editor --bench layout
 cargo run -p markrust -- --version
 cargo run -p markrust            # launches GUI
 ```

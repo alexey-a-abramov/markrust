@@ -40,6 +40,25 @@ enum WidgetEdit {
         key: &'static str,
         draft: String,
     },
+    FrontmatterYaml {
+        draft: String,
+    },
+}
+
+impl WidgetEdit {
+    fn draft_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Idle => None,
+            Self::CodeInfo { draft, .. }
+            | Self::ImageAlt { draft, .. }
+            | Self::Frontmatter { draft, .. }
+            | Self::FrontmatterYaml { draft } => Some(draft),
+        }
+    }
+
+    fn allows_newline(&self) -> bool {
+        matches!(self, Self::FrontmatterYaml { .. })
+    }
 }
 
 #[derive(Clone)]
@@ -70,7 +89,6 @@ pub struct RichEditorView {
     ime_leaves: Vec<ImeLeaf>,
     widget_edit: WidgetEdit,
     widget_preedit: Option<String>,
-    table_menu: bool,
     _blink_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -88,7 +106,6 @@ impl RichEditorView {
         });
         let blur_sub = cx.on_blur(&focus_handle, window, |this, _window, cx| {
             this.commit_widget_edit(cx);
-            this.table_menu = false;
             this.stop_blink(cx);
         });
         let doc_sub = cx.observe(&document, |_, _, cx| cx.notify());
@@ -112,7 +129,6 @@ impl RichEditorView {
             ime_leaves: Vec::new(),
             widget_edit: WidgetEdit::Idle,
             widget_preedit: None,
-            table_menu: false,
             _blink_task: Task::ready(()),
             _subscriptions: vec![focus_sub, blur_sub, doc_sub],
         }
@@ -532,66 +548,56 @@ impl RichEditorView {
     }
 
     fn widget_insert(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
-        match &mut self.widget_edit {
-            WidgetEdit::Idle => false,
-            WidgetEdit::CodeInfo { draft, .. }
-            | WidgetEdit::ImageAlt { draft, .. }
-            | WidgetEdit::Frontmatter { draft, .. } => {
-                if text.contains('\n') {
-                    self.commit_widget_edit(cx);
-                    return true;
-                }
-                self.widget_preedit = None;
-                draft.push_str(text);
-                self.snapshot = None;
-                cx.notify();
-                true
-            }
+        if matches!(self.widget_edit, WidgetEdit::Idle) {
+            return false;
         }
+        if text.contains('\n') && !self.widget_edit.allows_newline() {
+            self.commit_widget_edit(cx);
+            return true;
+        }
+        self.widget_preedit = None;
+        if let Some(draft) = self.widget_edit.draft_mut() {
+            draft.push_str(text);
+        }
+        self.snapshot = None;
+        cx.notify();
+        true
     }
 
     fn widget_backspace(&mut self, cx: &mut Context<Self>) -> bool {
-        match &mut self.widget_edit {
-            WidgetEdit::Idle => false,
-            WidgetEdit::CodeInfo { draft, .. }
-            | WidgetEdit::ImageAlt { draft, .. }
-            | WidgetEdit::Frontmatter { draft, .. } => {
-                self.widget_preedit = None;
-                draft.pop();
-                self.snapshot = None;
-                cx.notify();
-                true
-            }
+        if matches!(self.widget_edit, WidgetEdit::Idle) {
+            return false;
         }
+        self.widget_preedit = None;
+        if let Some(draft) = self.widget_edit.draft_mut() {
+            draft.pop();
+        }
+        self.snapshot = None;
+        cx.notify();
+        true
     }
 
     fn widget_draft_mut(&mut self) -> Option<&mut String> {
-        match &mut self.widget_edit {
-            WidgetEdit::Idle => None,
-            WidgetEdit::CodeInfo { draft, .. }
-            | WidgetEdit::ImageAlt { draft, .. }
-            | WidgetEdit::Frontmatter { draft, .. } => Some(draft),
-        }
+        self.widget_edit.draft_mut()
     }
 
     fn widget_display(&self) -> Option<(String, Option<String>)> {
-        match &self.widget_edit {
-            WidgetEdit::Idle => None,
+        let draft = match &self.widget_edit {
+            WidgetEdit::Idle => return None,
             WidgetEdit::CodeInfo { draft, .. }
             | WidgetEdit::ImageAlt { draft, .. }
-            | WidgetEdit::Frontmatter { draft, .. } => {
-                Some((draft.clone(), self.widget_preedit.clone()))
-            }
-        }
+            | WidgetEdit::Frontmatter { draft, .. }
+            | WidgetEdit::FrontmatterYaml { draft } => draft.clone(),
+        };
+        Some((draft, self.widget_preedit.clone()))
     }
 
     fn cancel_widget_edit(&mut self, cx: &mut Context<Self>) -> bool {
-        if matches!(self.widget_edit, WidgetEdit::Idle) && !self.table_menu {
+        if matches!(self.widget_edit, WidgetEdit::Idle) {
             return false;
         }
         self.widget_edit = WidgetEdit::Idle;
         self.widget_preedit = None;
-        self.table_menu = false;
         self.snapshot = None;
         cx.notify();
         true
@@ -627,6 +633,10 @@ impl RichEditorView {
                 );
                 true
             }
+            WidgetEdit::FrontmatterYaml { draft } => {
+                self.apply_rich(RichCommand::SetFrontmatter { raw: draft }, cx);
+                true
+            }
         }
     }
 }
@@ -640,7 +650,6 @@ impl WysiwygHost for RichEditorView {
         cx: &mut Context<Self>,
     ) {
         self.commit_widget_edit(cx);
-        self.table_menu = false;
         self.is_selecting = true;
         self.focus_handle.focus(window, cx);
         self.move_to(source, extend, cx);
@@ -729,11 +738,20 @@ impl WysiwygHost for RichEditorView {
         cx.notify();
     }
 
+    fn edit_frontmatter_yaml(&mut self, current: &str, cx: &mut Context<Self>) {
+        self.commit_widget_edit(cx);
+        self.widget_edit = WidgetEdit::FrontmatterYaml {
+            draft: current.to_string(),
+        };
+        self.widget_preedit = None;
+        self.snapshot = None;
+        cx.notify();
+    }
+
     fn open_table_menu(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_widget_edit(cx);
         self.focus_handle.focus(window, cx);
         self.move_to(source, false, cx);
-        self.table_menu = true;
         cx.notify();
     }
 
@@ -1001,8 +1019,12 @@ impl Render for RichEditorView {
             WidgetEdit::Frontmatter { key, draft } => Some((*key, draft.clone())),
             _ => None,
         };
+        let editing_yaml = match &self.widget_edit {
+            WidgetEdit::FrontmatterYaml { draft } => Some(draft.clone()),
+            _ => None,
+        };
         let widget_preedit = self.widget_preedit.clone();
-        let table_menu = self.table_menu;
+        let in_table = self.engine.table_pos(self.cursor_offset()).is_some();
         div()
             .size_full()
             .relative()
@@ -1111,7 +1133,9 @@ impl Render for RichEditorView {
                 let editor = editor.clone();
                 move |_: &crate::editor::Enter, _, cx| {
                     editor.update(cx, |e, cx| {
-                        if !e.commit_widget_edit(cx) {
+                        if matches!(e.widget_edit, WidgetEdit::FrontmatterYaml { .. }) {
+                            let _ = e.widget_insert("\n", cx);
+                        } else if !e.commit_widget_edit(cx) {
                             e.apply_rich(RichCommand::SplitBlock, cx);
                         }
                     });
@@ -1174,110 +1198,18 @@ impl Render for RichEditorView {
                 }
             })
             .children(fm_info.map(|info| {
-                let editor_title = editor.clone();
-                let editor_tags = editor.clone();
-                let theme = theme.clone();
-                let title_value = match &editing_fm {
-                    Some(("title", draft)) => {
-                        format!("{}{}|", draft, widget_preedit.as_deref().unwrap_or(""))
-                    }
-                    _ => info.title.clone().unwrap_or_else(|| "Add a title".into()),
-                };
-                let tags_value = match &editing_fm {
-                    Some(("tags", draft)) => {
-                        format!("{}{}|", draft, widget_preedit.as_deref().unwrap_or(""))
-                    }
-                    _ => info.tags.clone().unwrap_or_else(|| "Add tags".into()),
-                };
-                let title_editing = matches!(editing_fm, Some(("title", _)));
-                let tags_editing = matches!(editing_fm, Some(("tags", _)));
-                let title_current = info.title.clone().unwrap_or_default();
-                let tags_current = info.tags.clone().unwrap_or_default();
-                div()
-                    .id("wysiwyg-frontmatter")
-                    .px(px(24.))
-                    .pt(px(12.))
-                    .child(
-                        div()
-                            .px(px(12.))
-                            .py(px(8.))
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.separator)
-                            .bg(theme.sidebar_bg)
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.secondary_text)
-                                    .child("Frontmatter"),
-                            )
-                            .child({
-                                let title_el = div()
-                                    .id("fm-title")
-                                    .text_sm()
-                                    .text_color(theme.frontmatter_text)
-                                    .cursor(CursorStyle::PointingHand)
-                                    .when(title_editing, |el| {
-                                        el.border_b_1().border_color(theme.accent)
-                                    })
-                                    .child(SharedString::from(format!("Title: {title_value}")))
-                                    .on_click(move |_, _, cx| {
-                                        editor_title.update(cx, |host, cx| {
-                                            host.edit_frontmatter_field(
-                                                "title",
-                                                &title_current,
-                                                cx,
-                                            );
-                                        });
-                                    });
-                                div().relative().child(title_el).when(title_editing, |el| {
-                                    el.child(
-                                        div()
-                                            .absolute()
-                                            .top_0()
-                                            .left_0()
-                                            .right_0()
-                                            .bottom_0()
-                                            .child(WidgetImeSink {
-                                                editor: editor.clone(),
-                                            }),
-                                    )
-                                })
-                            })
-                            .child({
-                                let tags_el = div()
-                                    .id("fm-tags")
-                                    .text_sm()
-                                    .text_color(theme.secondary_text)
-                                    .cursor(CursorStyle::PointingHand)
-                                    .when(tags_editing, |el| {
-                                        el.border_b_1().border_color(theme.accent)
-                                    })
-                                    .child(SharedString::from(format!("Tags: {tags_value}")))
-                                    .on_click(move |_, _, cx| {
-                                        editor_tags.update(cx, |host, cx| {
-                                            host.edit_frontmatter_field("tags", &tags_current, cx);
-                                        });
-                                    });
-                                div().relative().child(tags_el).when(tags_editing, |el| {
-                                    el.child(
-                                        div()
-                                            .absolute()
-                                            .top_0()
-                                            .left_0()
-                                            .right_0()
-                                            .bottom_0()
-                                            .child(WidgetImeSink {
-                                                editor: editor.clone(),
-                                            }),
-                                    )
-                                })
-                            }),
-                    )
+                frontmatter_panel(
+                    editor.clone(),
+                    &theme,
+                    &info,
+                    editing_fm.as_ref().map(|(k, d)| (*k, d.as_str())),
+                    editing_yaml.as_deref(),
+                    widget_preedit.as_deref(),
+                )
             }))
+            .when(in_table, |root| {
+                root.child(table_toolbar(editor.clone(), &theme))
+            })
             .child(
                 list(self.list_state.clone(), move |index, _window, _cx| {
                     render_top_block(&snapshot, index, editor.clone())
@@ -1286,67 +1218,290 @@ impl Render for RichEditorView {
                 .size_full()
                 .py(px(16.)),
             )
-            .when(table_menu, |root| {
-                let editor = cx.entity();
-                let theme = theme.clone();
-                root.child(table_menu_overlay(editor, &theme))
-            })
     }
 }
 
-fn table_menu_overlay(
+fn frontmatter_panel(
+    editor: gpui::Entity<RichEditorView>,
+    theme: &crate::theme::EditorTheme,
+    info: &markrust_core::FrontmatterInfo,
+    editing_fm: Option<(&'static str, &str)>,
+    editing_yaml: Option<&str>,
+    widget_preedit: Option<&str>,
+) -> gpui::AnyElement {
+    let pre = widget_preedit.unwrap_or("");
+    let field = |key: &'static str, placeholder: &str, stored: Option<&str>| -> String {
+        match editing_fm {
+            Some((k, draft)) if k == key => format!("{draft}{pre}|"),
+            _ => stored
+                .filter(|s| !s.is_empty())
+                .unwrap_or(placeholder)
+                .to_string(),
+        }
+    };
+    let title_value = field("title", "Add a title", info.title.as_deref());
+    let desc_value = field(
+        "description",
+        "Add a description",
+        info.description.as_deref(),
+    );
+    let tags_value = field("tags", "Add tags", info.tags.as_deref());
+    let yaml_editing = editing_yaml.is_some();
+    let yaml_value = match editing_yaml {
+        Some(draft) => format!("{draft}{pre}|"),
+        None => {
+            let body = info.yaml_body.trim();
+            if body.is_empty() {
+                "Add YAML".to_string()
+            } else {
+                body.to_string()
+            }
+        }
+    };
+    div()
+        .id("wysiwyg-frontmatter")
+        .px(px(24.))
+        .pt(px(12.))
+        .child(
+            div()
+                .px(px(12.))
+                .py(px(8.))
+                .rounded_md()
+                .border_1()
+                .border_color(theme.separator)
+                .bg(theme.sidebar_bg)
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.secondary_text)
+                        .child("Frontmatter"),
+                )
+                .child(frontmatter_field_row(FmField {
+                    editor: editor.clone(),
+                    theme,
+                    id: "fm-title",
+                    key: "title",
+                    label: "Title",
+                    display: title_value,
+                    current: info.title.clone().unwrap_or_default(),
+                    editing: matches!(editing_fm, Some(("title", _))),
+                    color: theme.frontmatter_text,
+                }))
+                .child(frontmatter_field_row(FmField {
+                    editor: editor.clone(),
+                    theme,
+                    id: "fm-description",
+                    key: "description",
+                    label: "Description",
+                    display: desc_value,
+                    current: info.description.clone().unwrap_or_default(),
+                    editing: matches!(editing_fm, Some(("description", _))),
+                    color: theme.secondary_text,
+                }))
+                .child(frontmatter_field_row(FmField {
+                    editor: editor.clone(),
+                    theme,
+                    id: "fm-tags",
+                    key: "tags",
+                    label: "Tags",
+                    display: tags_value,
+                    current: info.tags.clone().unwrap_or_default(),
+                    editing: matches!(editing_fm, Some(("tags", _))),
+                    color: theme.secondary_text,
+                }))
+                .child(frontmatter_yaml_row(
+                    editor,
+                    theme,
+                    yaml_value,
+                    info.yaml_body.clone(),
+                    yaml_editing,
+                )),
+        )
+        .into_any_element()
+}
+
+struct FmField<'a> {
+    editor: gpui::Entity<RichEditorView>,
+    theme: &'a crate::theme::EditorTheme,
+    id: &'static str,
+    key: &'static str,
+    label: &'static str,
+    display: String,
+    current: String,
+    editing: bool,
+    color: gpui::Hsla,
+}
+
+fn frontmatter_field_row(field: FmField<'_>) -> gpui::AnyElement {
+    let FmField {
+        editor,
+        theme,
+        id,
+        key,
+        label,
+        display,
+        current,
+        editing,
+        color,
+    } = field;
+    let editor_click = editor.clone();
+    let row = div()
+        .id(id)
+        .text_sm()
+        .text_color(color)
+        .cursor(CursorStyle::PointingHand)
+        .when(editing, |el| el.border_b_1().border_color(theme.accent))
+        .child(SharedString::from(format!("{label}: {display}")))
+        .on_click(move |_, _, cx| {
+            editor_click.update(cx, |host, cx| {
+                host.edit_frontmatter_field(key, &current, cx);
+            });
+        });
+    div()
+        .relative()
+        .child(row)
+        .when(editing, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .child(WidgetImeSink { editor }),
+            )
+        })
+        .into_any_element()
+}
+
+fn frontmatter_yaml_row(
+    editor: gpui::Entity<RichEditorView>,
+    theme: &crate::theme::EditorTheme,
+    display: String,
+    current: String,
+    editing: bool,
+) -> gpui::AnyElement {
+    let editor_click = editor.clone();
+    let lines: Vec<gpui::AnyElement> = display
+        .lines()
+        .map(|line| {
+            div()
+                .child(SharedString::from(line.to_string()))
+                .into_any_element()
+        })
+        .collect();
+    let block = div()
+        .id("fm-yaml")
+        .text_xs()
+        .font_family(theme.code_font_family.clone())
+        .text_color(theme.frontmatter_text)
+        .cursor(CursorStyle::PointingHand)
+        .when(editing, |el| el.border_b_1().border_color(theme.accent))
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.secondary_text)
+                .font_family(theme.font_family.clone())
+                .child("YAML"),
+        )
+        .children(lines)
+        .on_click(move |_, _, cx| {
+            editor_click.update(cx, |host, cx| {
+                host.edit_frontmatter_yaml(&current, cx);
+            });
+        });
+    div()
+        .relative()
+        .mt(px(4.))
+        .child(block)
+        .when(editing, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .child(WidgetImeSink { editor }),
+            )
+        })
+        .into_any_element()
+}
+
+fn table_toolbar(
     editor: gpui::Entity<RichEditorView>,
     theme: &crate::theme::EditorTheme,
 ) -> gpui::AnyElement {
-    let items: [(&str, RichCommand); 6] = [
+    let items: [(&str, &'static str, RichCommand); 6] = [
         (
-            "Insert row below",
+            "Row below",
+            "tbl-row-below",
             RichCommand::InsertTableRow { after: true },
         ),
         (
-            "Insert row above",
+            "Row above",
+            "tbl-row-above",
             RichCommand::InsertTableRow { after: false },
         ),
-        ("Delete row", RichCommand::DeleteTableRow),
+        ("Delete row", "tbl-row-del", RichCommand::DeleteTableRow),
         (
-            "Insert column right",
+            "Col right",
+            "tbl-col-right",
             RichCommand::InsertTableColumn { after: true },
         ),
         (
-            "Insert column left",
+            "Col left",
+            "tbl-col-left",
             RichCommand::InsertTableColumn { after: false },
         ),
-        ("Delete column", RichCommand::DeleteTableColumn),
+        ("Delete col", "tbl-col-del", RichCommand::DeleteTableColumn),
     ];
     div()
-        .absolute()
-        .top(px(8.))
-        .right(px(8.))
-        .p(px(6.))
-        .rounded_md()
-        .border_1()
-        .border_color(theme.separator)
-        .bg(theme.sidebar_bg)
-        .shadow_lg()
-        .children(items.into_iter().enumerate().map(|(i, (label, cmd))| {
-            let editor = editor.clone();
-            let theme = theme.clone();
+        .id("wysiwyg-table-toolbar")
+        .px(px(24.))
+        .pt(px(8.))
+        .child(
             div()
-                .id(("table-menu", i))
                 .px(px(8.))
                 .py(px(4.))
                 .rounded_md()
-                .text_sm()
-                .text_color(theme.text)
-                .cursor(CursorStyle::PointingHand)
-                .hover(move |s| s.bg(theme.sidebar_hover))
-                .child(SharedString::from(label))
-                .on_click(move |_, _, cx| {
-                    editor.update(cx, |view, cx| {
-                        view.table_menu = false;
-                        view.apply_rich(cmd.clone(), cx);
-                    });
-                })
-        }))
+                .border_1()
+                .border_color(theme.separator)
+                .bg(theme.sidebar_bg)
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.secondary_text)
+                        .px(px(6.))
+                        .child("Table"),
+                )
+                .children(items.into_iter().map(|(label, id, cmd)| {
+                    let editor = editor.clone();
+                    let theme = theme.clone();
+                    div()
+                        .id(id)
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded_md()
+                        .text_xs()
+                        .text_color(theme.text)
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |s| s.bg(theme.sidebar_hover))
+                        .child(SharedString::from(label))
+                        .on_click(move |_, _, cx| {
+                            editor.update(cx, |view, cx| {
+                                view.apply_rich(cmd.clone(), cx);
+                            });
+                        })
+                })),
+        )
         .into_any_element()
 }

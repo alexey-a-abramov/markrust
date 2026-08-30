@@ -22,3 +22,8 @@ similar = "2.6"
 
 [dev-dependencies]
 pretty_assertions = "1.4"
+criterion = { workspace = true }
+
+[[bench]]
+name = "parse"
+harness = false

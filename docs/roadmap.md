@@ -30,12 +30,12 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 | P3 | `rich/engine.rs` (NodeId stability, splices, caret snap/step, line map, outline) + **read-only WYSIWYG view** (`markrust-editor::wysiwyg`) + per-tab mode toggle (cmd-shift-m / toolbar) | ✅ done |
 | P4 | **Editing core** — `RichCommand` layer, Transaction undo upgrade (typing coalescing + caret restore), WYSIWYG caret/selection/hit-testing/IME | ✅ done |
 | P5 | Lists/tasks UX (Enter/Tab, checkbox clicks); input rules; code language chip; image alt/caption editing; IME caret bounds; stable-width inline delimiter masking | 🚧 in progress (widget IME now reports chip/caption/frontmatter bounds; not proven with a real IME candidate window) |
-| P6 | Tables: cell editing, Tab nav, insert/delete row/col, header constraints, right-click menu | 🚧 in progress |
-| P7 | Frontmatter in-place title/tags; Normalize review dialog on save | 🚧 in progress (hunk preview in the save prompt; still title/tags only) |
+| P6 | Tables: cell editing, Tab nav, insert/delete row/col, header constraints, right-click menu | ✅ done (contextual table toolbar when the caret is in a table; right-click focuses the cell; GPUI has no OS-native pixel-accurate context menu) |
+| P7 | Frontmatter in-place title/tags; Normalize review dialog on save | ✅ done (title, description, tags, and a YAML body field; hunk preview in the save prompt) |
 | P8 | External-edit reconciliation (`map_offset_across_change`, `apply_external_edit` / `apply_merged_edit`, 3-way dirty-tab merge) | ✅ done (proven by `three_way_merge` + headless dirty-tab merge e2e; overlapping edits still prompt) |
-| P9 | Side-by-side + polish + migration (source spans from comrak; delete tree-sitter-md; docs rewrite; criterion perf gates; optionally retire masking) | 🚧 in progress |
+| P9 | Side-by-side + polish + migration (source spans from comrak; delete tree-sitter-md; docs rewrite; criterion perf gates; optionally retire masking) | ✅ done (masking/`spans.rs` kept on purpose for source mode — the retire item was optional) |
 
-**P9 is not complete.** Shipped this pass: `cmd-shift-m` cycles Rich → Source → Split; source spans come from comrak (tree-sitter-md removed from `markrust-core`); `docs/architecture.md` rewritten. Still open: criterion perf gates; masking/`spans.rs` still exist (intentionally — source mode); table toolbar; full YAML frontmatter; pixel-accurate table context menu.
+**The Typora WYSIWYG GOAL is not complete.** P0–P4 and P6–P9 have test evidence. P5 still lacks a real-OS IME candidate-window proof (bounds are reported; no automated IME session).
 
 ### Proven invariants (enforced by tests — keep them green)
 
@@ -46,6 +46,7 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 - Byte-exact save round-trip e2e (`task_table_fence_frontmatter_survive_save_roundtrip`) still passes.
 - Source spans share kinds with the rich tree on `showcase.md` (`source_spans_share_comrak_grammar_with_rich_tree`).
 - Dirty-tab disjoint external edits merge (`dirty_tab_merges_disjoint_external_edits`).
+- Load+parse of a 256 KiB mixed GFM fixture stays under 2.5s (`large_document_load_and_parse_stays_under_budget`); source layout of a 64 KiB fixture under 2.5s (`large_document_layout_stays_under_budget`). `cargo bench -p markrust-core --bench parse` and `cargo bench -p markrust-editor --bench layout` for local criterion numbers.
 
 ### Key modules
 
@@ -56,6 +57,7 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 - `crates/markrust-core/src/document.rs` — `saved_content`, `apply_external_edit`, `apply_merged_edit`, `peel_typing_range`.
 - `crates/markrust-editor/src/wysiwyg/` — `view` (RichEditorView over virtualized `list()`), `blocks` (per-kind renderers), `block_text` (caret/hit-testing/IME host).
 - `crates/markrust-editor/src/source/` — the masking source editor (fallback and source/split panes).
+- `crates/markrust-core/src/perf_fixture.rs` — 256 KiB mixed GFM used by parse/layout budget tests and criterion benches.
 - `crates/markrust-app/src/crash.rs` — panic logger (see Crash handling).
 
 ## P4 shipped
@@ -67,12 +69,12 @@ Proven by tests: insert in one block leaves other blocks' bytes untouched; coale
 ## P5–P9 design notes (for the next agent)
 
 Shipped this pass (keep previous bullets; this pass added):
-- **P9 partial:** tree-sitter-md removed from `markrust-core`. `extract_syntax_spans` walks the comrak AST (shared `parse_options` / `LineStarts` with `rich::import`). Background parser still off the UI thread. Source mode remains masking, now grammar-aligned with WYSIWYG. Split mode in the window (source | rich).
+- **P9:** tree-sitter-md removed from `markrust-core`. `extract_syntax_spans` walks the comrak AST (shared `parse_options` / `LineStarts` with `rich::import`). Background parser still off the UI thread. Source mode remains masking, now grammar-aligned with WYSIWYG. Split mode in the window (source | rich). Criterion benches plus CI timeout tests gate load+parse (`extract_syntax_spans` / `import_markdown`) and source-mode `build_display_layout` on a 256 KiB fixture.
 - P8: dirty tabs 3-way merge (`three_way_merge` + `Document::apply_merged_edit`); own-save watcher events ignored (`ours == theirs`); conflict still prompts. Autosave no longer spuriously prompts reload after it writes.
-- P7: Normalize save prompt includes a hunk preview (`SaveCandidates::hunk_preview`).
+- P7: Normalize save prompt includes a hunk preview (`SaveCandidates::hunk_preview`). Frontmatter panel edits title, description, tags, and the inner YAML body.
 - Chip/caption/frontmatter IME: `WidgetImeSink` reports widget bounds; text-leaf caret is not used as the IME origin while a widget is focused.
-- Input-rule polish: `_`/`__` italic/bold, nested italic inside bold, list-item-local `# ` / fences, `Document::peel_typing_range` so heading conversion is one undo even when the prefix was a slice of a longer Typing tx.
-- P6: delete row/col (keep ≥1 of each); first row stays header; insert caret lands in the new cell; right-click table menu.
+- Input-rule polish: `_`/`__` italic/bold, nested italic inside bold, list-item-local `# ` / fences, `Document::peel_typing_range` so heading conversion is one undo even when the prefix was a slice of a longer Typing tx. `[` / `]` / `<` type as raw (task lists, links, HTML); fences/thematic breaks do not insert newlines inside table cells.
+- P6: delete row/col (keep ≥1 of each); first row stays header; insert caret lands in the new cell; contextual table toolbar when the caret is in a table; right-click focuses the cell (toolbar follows).
 
 Previously shipped:
 - Input rules as pure functions in `rich/input_rules.rs` (`# `, `- `/`* `/`+ `, `1. `/`1) `, `> `, fences, `---`/`***`/`___`, auto-close `*`/`**`/`_`/`__`/` `/`~~`), disabled in code/raw, heading+space is one undo group.
@@ -84,10 +86,8 @@ Previously shipped:
 - File-open hang fix remains: watcher `recv` on a background task; parse via `apply_pending_parse` off the frame.
 
 Still open (do not shrink the goal):
-- Chip/caption IME candidate window: bounds are reported from the widget overlay; needs a real IME session to prove the OS candidate window follows.
-- Table menu is a corner overlay, not a pixel-accurate context menu; no toolbar buttons.
-- Frontmatter in-place is title/tags only (not a full YAML editor).
-- P9: no criterion perf gates; masking/`parser.rs`/`spans.rs` not deleted (source mode still uses them; they now project comrak, not tree-sitter-md). Fenced-code highlighting still uses tree-sitter rust/json/yaml/bash — that stays.
+- Chip/caption/frontmatter IME candidate window: bounds are reported from the widget overlay; needs a real IME session to prove the OS candidate window follows. **This is the remaining P5 gap; the GOAL is not complete.**
+- Masking/`parser.rs`/`spans.rs` are not deleted (source mode still uses them; they project comrak, not tree-sitter-md). Fenced-code highlighting still uses tree-sitter rust/json/yaml/bash — that stays.
 
 Earlier P5 (still in):
 - Checkbox clicks → `SetTaskChecked`; Tab/Shift-Tab → `IndentList`/`OutdentList` outside tables; empty-item Enter outdents or exits.

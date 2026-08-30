@@ -4,12 +4,15 @@ import CodeBlock from '../../components/CodeBlock.astro';
 ---
 
 <DocsLayout title="Frontmatter">
-  <p>YAML frontmatter at the top of a document is preserved in the buffer and passed through on save.</p>
+  <p>YAML frontmatter at the top of a document is preserved in the buffer and passed through on save. In Rich mode the panel edits <code>title</code>, <code>description</code>, <code>tags</code>, and the inner YAML body.</p>
 
-  <CodeBlock code={`---\ntitle: Project README\nauthor: Alexey\n---\n\n# Content starts here`} lang="yaml" filename="document.md" />
+  <CodeBlock code={`---\ntitle: Project README\ndescription: Notes for the team\ntags: [docs, readme]\nauthor: Alexey\n---\n\n# Content starts here`} lang="yaml" filename="document.md" />
 
   <h2>Status bar</h2>
-  <p>When a <code>title:</code> field is present, the status bar shows <code>FM: &lt;title&gt;</code>.</p>
+  <p>When a <code>title:</code> field is present, the status bar shows the title next to the word count.</p>
+
+  <h2>Source mode</h2>
+  <p>The source-mode panel lists title, description, tags, and a YAML preview. Click it to jump to the start of the file and edit the fences in source.</p>
 
   <h2>Export</h2>
   <p>HTML export via comrak strips frontmatter from rendered output. The source file retains the YAML block.</p>

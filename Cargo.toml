@@ -22,6 +22,7 @@ ropey = "1.6"
 tree-sitter = "0.26"
 rayon = "1.10"
 thiserror = "2.0"
+criterion = "0.8"
 
 # Pin GPUI to a specific Zed git revision (update deliberately).
 gpui-rev = "8166e3d7b8b42d8aaf4d4dee7fcd25ab4ec65105"

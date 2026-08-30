@@ -38,6 +38,7 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     fn edit_code_info(&mut self, id: NodeId, cx: &mut Context<Self>);
     fn edit_image_alt(&mut self, source_range: Range<usize>, alt: &str, cx: &mut Context<Self>);
     fn edit_frontmatter_field(&mut self, key: &'static str, current: &str, cx: &mut Context<Self>);
+    fn edit_frontmatter_yaml(&mut self, current: &str, cx: &mut Context<Self>);
     fn open_table_menu(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>);
     fn finish_widget(&mut self, cx: &mut Context<Self>);
     fn preedit(&self) -> Option<&str>;

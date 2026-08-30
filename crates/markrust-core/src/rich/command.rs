@@ -204,9 +204,13 @@ fn insert_text(
     let offset = caret.cursor();
     let source = doc.buffer.content();
     let raw = engine.in_raw_context(offset);
+    let in_table = engine.in_table(offset);
     if !raw {
         if let Some(rule) = match_input_rule(&source, offset, text, false) {
-            return apply_input_rule(doc, engine, caret, rule);
+            // Newlines from fences / thematic breaks would split a GFM table row.
+            if !(in_table && input_rule_inserts_newline(&rule)) {
+                return apply_input_rule(doc, engine, caret, rule);
+            }
         }
     }
     let inserted = if raw {
@@ -286,6 +290,13 @@ fn apply_input_rule(
 
 fn is_coalescable_insert(text: &str) -> bool {
     crate::undo::is_typing_burst(text)
+}
+
+fn input_rule_inserts_newline(rule: &InputRule) -> bool {
+    match rule {
+        InputRule::InsertRaw(text) => text.contains('\n'),
+        InputRule::Replace { insert, .. } => insert.contains('\n'),
+    }
 }
 
 fn backspace(
@@ -2421,5 +2432,162 @@ mod tests {
         let after = doc.buffer.content();
         assert!(after.contains("tags: [a, b]"), "{after:?}");
         assert!(after.contains("title: Hello"), "{after:?}");
+    }
+
+    #[test]
+    fn set_frontmatter_field_description_and_yaml_body() {
+        let (mut doc, mut engine, mut caret) = setup("# Body\n");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetFrontmatterField {
+                key: "description".into(),
+                value: "A note".into(),
+            },
+        );
+        let after = doc.buffer.content();
+        assert!(after.contains("description: A note"), "{after:?}");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetFrontmatter {
+                raw: "title: T\ndescription: A note\nauthor: me".into(),
+            },
+        );
+        let after = doc.buffer.content();
+        assert!(after.contains("author: me"), "{after:?}");
+        assert!(after.contains("title: T"), "{after:?}");
+        assert!(after.contains("# Body"), "{after:?}");
+    }
+
+    #[test]
+    fn typing_brackets_builds_a_task_list_and_a_link() {
+        let (mut doc, mut engine, mut caret) = setup("");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("-".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText(" ".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("[".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText(" ".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("]".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText(" ".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("todo".into()),
+        );
+        let after = doc.buffer.content();
+        assert!(
+            after.starts_with("- [ ] todo"),
+            "task list must not escape brackets: {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(
+                engine.tree().blocks[0].children[0].kind,
+                BlockKind::ListItem { task: Some(false) }
+            ),
+            "{:?}",
+            engine.tree().blocks[0].children[0].kind
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("[".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("hi".into()),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("]".into()),
+        );
+        let after = doc.buffer.content();
+        assert_eq!(after, "[hi]");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("<".into()),
+        );
+        assert!(
+            doc.buffer.content().ends_with("<"),
+            "{}",
+            doc.buffer.content()
+        );
+        assert!(
+            !doc.buffer.content().contains("\\["),
+            "{}",
+            doc.buffer.content()
+        );
+    }
+
+    #[test]
+    fn table_cell_dashes_do_not_become_a_thematic_break() {
+        let source = "|  | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        engine.sync(&doc);
+        let cell_start = engine.tree().blocks[0].children[0].children[0]
+            .source_range
+            .start;
+        caret.collapse_to(cell_start);
+        for _ in 0..3 {
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("-".into()),
+            );
+        }
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("---\n\n"),
+            "thematic break must not split a table: {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "{:?}",
+            engine.tree().blocks[0].kind
+        );
     }
 }

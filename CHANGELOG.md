@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Parse/layout perf gates: 256 KiB mixed GFM load+parse timeout tests, 64 KiB source-layout timeout tests, plus criterion benches (`cargo bench -p markrust-core --bench parse`, `cargo bench -p markrust-editor --bench layout`).
+- Contextual table toolbar when the caret is in a table (row/col insert and delete). Right-click still focuses the cell.
+- Frontmatter panel edits title, description, tags, and the inner YAML body.
+- Input rules: `[` / `]` / `<` type unescaped so task lists, links, and HTML can be typed; fence/thematic-break rules do not insert newlines inside table cells.
 - Side-by-side editor mode: `cmd-shift-m` cycles Rich → Source → Split.
 - Dirty-tab 3-way merge when a file changes on disk; carets are mapped across the merge.
 - Normalize-on-save dialog shows a line hunk preview.

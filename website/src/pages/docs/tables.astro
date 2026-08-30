@@ -4,7 +4,7 @@ import CodeBlock from '../../components/CodeBlock.astro';
 ---
 
 <DocsLayout title="Tables">
-  <p>MarkRust supports GitHub Flavored Markdown pipe tables. Edit tables as raw pipe syntax — there is no interactive matrix editor in v0.1.</p>
+  <p>MarkRust supports GitHub Flavored Markdown pipe tables. In Rich mode, cells are editable. Tab / Shift-Tab move between cells (Tab on the last cell inserts a row). A table toolbar appears while the caret is in a table: insert or delete rows and columns. Right-click a cell to focus it (the toolbar follows). The first row stays the header; the last remaining row and column cannot be deleted.</p>
 
   <CodeBlock code={`| Column A | Column B |\n|----------|----------|\n| Cell 1   | Cell 2   |`} lang="markdown" />
 
@@ -17,5 +17,5 @@ import CodeBlock from '../../components/CodeBlock.astro';
   </ul>
 
   <h2>Rendering</h2>
-  <p>Header rows render bold. Delimiter rows use muted styling. Column padding respects alignment markers.</p>
+  <p>Header rows render bold. Source mode pads columns until the table is focused, then shows raw pipes.</p>
 </DocsLayout>

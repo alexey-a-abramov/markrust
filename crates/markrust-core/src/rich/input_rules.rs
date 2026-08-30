@@ -220,6 +220,10 @@ fn match_pending_opener(source: &str, caret: usize, typed: &str) -> Option<Input
             Some(InputRule::InsertRaw(typed.to_string()))
         }
         b if b.is_ascii_digit() && at_start => Some(InputRule::InsertRaw(typed.to_string())),
+        // Brackets and HTML would otherwise be backslash-escaped on every
+        // keystroke, so task lists, links, images, and raw HTML could not
+        // be typed in WYSIWYG.
+        b'[' | b']' | b'<' => Some(InputRule::InsertRaw(typed.to_string())),
         _ => None,
     }
 }
@@ -598,5 +602,37 @@ mod tests {
             matches!(hash, Some(InputRule::InsertRaw(ref s)) if s == "#"),
             "{hash:?}"
         );
+    }
+
+    #[test]
+    fn brackets_and_lt_are_typed_raw() {
+        assert!(matches!(
+            match_input_rule("", 0, "[", false),
+            Some(InputRule::InsertRaw(s)) if s == "["
+        ));
+        assert!(matches!(
+            match_input_rule("[text", 5, "]", false),
+            Some(InputRule::InsertRaw(s)) if s == "]"
+        ));
+        assert!(matches!(
+            match_input_rule("", 0, "<", false),
+            Some(InputRule::InsertRaw(s)) if s == "<"
+        ));
+        let (out, _) = apply("", 0, "[");
+        assert_eq!(out, "[");
+        let (out, _) = apply("[text", 5, "]");
+        assert_eq!(out, "[text]");
+        let (out, _) = apply("", 0, "<");
+        assert_eq!(out, "<");
+    }
+
+    #[test]
+    fn task_list_checkbox_can_be_typed() {
+        let (out, caret) = apply("- ", 2, "[");
+        assert_eq!(&out[..caret], "- [");
+        let (out, caret) = apply(&out, caret, " ");
+        let (out, caret) = apply(&out, caret, "]");
+        let (out, _) = apply(&out, caret, " ");
+        assert!(out.starts_with("- [ ] "), "{out:?}");
     }
 }

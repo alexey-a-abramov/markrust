@@ -765,8 +765,15 @@ mod tests {
                 value: "Hello".into(),
             })
             .unwrap();
+        workspace
+            .apply(WorkspaceCommand::SetFrontmatterField {
+                key: "description".into(),
+                value: "A note".into(),
+            })
+            .unwrap();
         let content = workspace.active().unwrap().editor.content();
         assert!(content.contains("title: Hello"), "{content}");
+        assert!(content.contains("description: A note"), "{content}");
         assert!(content.contains("# Body"), "{content}");
     }
 

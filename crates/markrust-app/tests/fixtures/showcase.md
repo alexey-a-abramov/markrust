@@ -1,5 +1,6 @@
 ---
 title: MarkRust Editor Showcase
+description: Exercises headings, lists, tables, code, and frontmatter
 author: Test Suite
 date: 2026-08-28
 tags: [markdown, editor, showcase]

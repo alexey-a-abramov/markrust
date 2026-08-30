@@ -610,6 +610,17 @@ impl Render for MarkRustWindow {
                                     .title
                                     .clone()
                                     .unwrap_or_else(|| "YAML frontmatter".into());
+                                let description = info.description.clone().unwrap_or_default();
+                                let tags = info.tags.clone().unwrap_or_default();
+                                let yaml_preview = {
+                                    let body = info.yaml_body.trim();
+                                    let mut lines = body.lines();
+                                    let first = lines.next().unwrap_or("");
+                                    match lines.next() {
+                                        Some(_) => format!("{first} …"),
+                                        None => first.to_string(),
+                                    }
+                                };
                                 area.child(
                                     div()
                                         .id("frontmatter-panel")
@@ -634,6 +645,30 @@ impl Render for MarkRustWindow {
                                                 .text_color(theme.frontmatter_text)
                                                 .child(SharedString::from(title)),
                                         )
+                                        .when(!description.is_empty(), |panel| {
+                                            panel.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.secondary_text)
+                                                    .child(SharedString::from(description)),
+                                            )
+                                        })
+                                        .when(!tags.is_empty(), |panel| {
+                                            panel.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.secondary_text)
+                                                    .child(SharedString::from(format!("Tags: {tags}"))),
+                                            )
+                                        })
+                                        .when(!yaml_preview.is_empty(), |panel| {
+                                            panel.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.secondary_text)
+                                                    .child(SharedString::from(yaml_preview)),
+                                            )
+                                        })
                                         .child(
                                             div()
                                                 .text_xs()
