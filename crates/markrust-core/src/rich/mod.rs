@@ -9,11 +9,13 @@
 pub mod engine;
 pub mod escape;
 pub mod import;
+pub mod save;
 pub mod serialize;
 pub mod tree;
 
 pub use engine::{Bias, BlockSpan, BlockSplice, RichEngine};
 pub use import::import_markdown;
+pub use save::{save_candidates, DiffHunk, SaveCandidates};
 pub use serialize::{serialize_tree, SerializeMode};
 pub use tree::{
     Block, BlockKind, BreakStyle, ColumnAlign, FenceFidelity, Frontmatter, HeadingStyle, IdGen,
