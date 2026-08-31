@@ -169,7 +169,7 @@ impl<'a> Ser<'a> {
                 let multiline = block
                     .inlines
                     .iter()
-                    .any(|i| matches!(i, Inline::SoftBreak | Inline::HardBreak { .. }));
+                    .any(|i| matches!(i, Inline::SoftBreak { .. } | Inline::HardBreak { .. }));
                 let setext = *level <= 2
                     && ((*style == HeadingStyle::Setext && !self.normalize()) || multiline);
                 if setext {
@@ -518,7 +518,7 @@ impl<'a> Ser<'a> {
             skip_autolink = None;
 
             match inline {
-                Inline::SoftBreak => {
+                Inline::SoftBreak { .. } => {
                     close_before_break(self, &mut stack, inlines, i);
                     if in_table || single_line {
                         self.out.push(' ');
@@ -528,7 +528,7 @@ impl<'a> Ser<'a> {
                     }
                     continue;
                 }
-                Inline::HardBreak { style } => {
+                Inline::HardBreak { style, .. } => {
                     close_before_break(self, &mut stack, inlines, i);
                     if in_table || single_line {
                         self.out.push(' ');
@@ -746,7 +746,7 @@ fn key_extent(inlines: &[Inline], i: usize, key: &MarkKey) -> usize {
     inlines[i..]
         .iter()
         .take_while(|inline| {
-            matches!(inline, Inline::SoftBreak | Inline::HardBreak { .. })
+            matches!(inline, Inline::SoftBreak { .. } | Inline::HardBreak { .. })
                 || inline_keys(inline).iter().any(|k| keys_match(k, key))
         })
         .count()
@@ -803,7 +803,7 @@ fn close_before_break(
 ) {
     let next_keys = inlines[i + 1..]
         .iter()
-        .find(|n| !matches!(n, Inline::SoftBreak | Inline::HardBreak { .. }))
+        .find(|n| !matches!(n, Inline::SoftBreak { .. } | Inline::HardBreak { .. }))
         .map(inline_keys)
         .unwrap_or_default();
     let keep = stack

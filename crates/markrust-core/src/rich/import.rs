@@ -127,6 +127,46 @@ impl<'s> Importer<'s> {
         self.source.get(range.clone()).unwrap_or("")
     }
 
+    /// Soft/hard break sourcepos can be empty; recover the newline (and any
+    /// hard-break marker) so WYSIWYG click/IME do not map onto the paragraph start.
+    fn break_source_range(&self, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        if range.end > range.start {
+            return range.start..range.end.min(self.source.len());
+        }
+        let start = range.start.min(self.source.len());
+        let bytes = self.source.as_bytes();
+        if bytes.get(start) == Some(&b'\n') {
+            return start..start + 1;
+        }
+        if start > 0 && bytes[start - 1] == b'\n' {
+            let mut lo = start - 1;
+            while lo > 0 && matches!(bytes[lo - 1], b' ' | b'\\') {
+                lo -= 1;
+                if bytes[lo] == b'\\' {
+                    break;
+                }
+            }
+            return lo..start;
+        }
+        start..self.source.len().min(start + 1)
+    }
+
+    /// Include the two-space / backslash marker so click maps onto the break
+    /// (end of the previous run), not only the newline (which snap would
+    /// send onto the next line).
+    fn expand_hard_break(&self, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let start = range.start.min(self.source.len());
+        let end = range.end.min(self.source.len()).max(start);
+        let bytes = self.source.as_bytes();
+        if start >= 1 && bytes[start - 1] == b'\\' {
+            return start - 1..end.max(start);
+        }
+        if start >= 2 && bytes[start - 2] == b' ' && bytes[start - 1] == b' ' {
+            return start - 2..end.max(start);
+        }
+        start..end
+    }
+
     fn import_block<'a>(&self, node: &'a AstNode<'a>, ids: &mut IdGen) -> Block {
         let source_range = self.node_range(node);
         let id = ids.next_id();
@@ -468,14 +508,20 @@ impl<'s> Importer<'s> {
                     link: ctx.link.clone(),
                 });
             }
-            NodeValue::SoftBreak => out.push(Inline::SoftBreak),
+            NodeValue::SoftBreak => out.push(Inline::SoftBreak {
+                source_range: self.break_source_range(range),
+            }),
             NodeValue::LineBreak => {
-                let style = if self.slice(&range).contains('\\') {
+                let source_range = self.expand_hard_break(self.break_source_range(range));
+                let style = if self.slice(&source_range).contains('\\') {
                     BreakStyle::Backslash
                 } else {
                     BreakStyle::TwoSpaces
                 };
-                out.push(Inline::HardBreak { style });
+                out.push(Inline::HardBreak {
+                    style,
+                    source_range,
+                });
             }
             NodeValue::Math(math) => {
                 let display = math.display_math;
@@ -573,7 +619,7 @@ fn apply_eqeq_highlight(inlines: &mut Vec<Inline>, groups: &std::cell::Cell<u64>
         let across_break = b.inline_i > a.inline_i
             && inlines[a.inline_i + 1..b.inline_i]
                 .iter()
-                .any(|n| matches!(n, Inline::SoftBreak | Inline::HardBreak { .. }));
+                .any(|n| matches!(n, Inline::SoftBreak { .. } | Inline::HardBreak { .. }));
         if empty || across_break {
             i += 1;
             continue;

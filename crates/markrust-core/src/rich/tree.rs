@@ -285,9 +285,14 @@ pub enum Inline {
         /// Enclosing link, when the image is the content of one.
         link: Option<LinkAttrs>,
     },
-    SoftBreak,
+    SoftBreak {
+        /// The source newline (markdown wrap). WYSIWYG paints a space.
+        source_range: Range<usize>,
+    },
     HardBreak {
         style: BreakStyle,
+        /// Two-space / backslash marker plus the newline.
+        source_range: Range<usize>,
     },
     /// `$…$` / `$$…$$` TeX (comrak `math_dollars`). Delimiters live in
     /// `source_range` / `raw`; the visible formula is `literal`.
@@ -345,12 +350,26 @@ pub enum Inline {
 }
 
 impl Inline {
+    /// Source bytes this inline occupies (advisory for breaks; exclusive end).
+    pub fn source_range(&self) -> Range<usize> {
+        match self {
+            Inline::Run { source_range, .. }
+            | Inline::Image { source_range, .. }
+            | Inline::Math { source_range, .. }
+            | Inline::WikiLink { source_range, .. }
+            | Inline::Emoji { source_range, .. }
+            | Inline::OpaqueInline { source_range, .. }
+            | Inline::SoftBreak { source_range }
+            | Inline::HardBreak { source_range, .. } => source_range.clone(),
+        }
+    }
+
     /// Visible text length contribution (for caret math in later phases).
     pub fn text_len(&self) -> usize {
         match self {
             Inline::Run { text, .. } => text.len(),
             Inline::Image { alt, .. } => alt.len(),
-            Inline::SoftBreak | Inline::HardBreak { .. } => 1,
+            Inline::SoftBreak { .. } | Inline::HardBreak { .. } => 1,
             Inline::Math { literal, .. } => literal.len(),
             Inline::WikiLink { label, .. } => label.len(),
             Inline::Emoji { glyph, .. } => glyph.len(),

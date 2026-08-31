@@ -460,7 +460,7 @@ fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
                             out.push(source_range.clone());
                         }
                     }
-                    Inline::SoftBreak | Inline::HardBreak { .. } => {}
+                    Inline::SoftBreak { .. } | Inline::HardBreak { .. } => {}
                 }
             }
             if out.is_empty() {

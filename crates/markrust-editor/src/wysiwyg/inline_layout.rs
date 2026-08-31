@@ -160,7 +160,7 @@ fn inline_has_visible_text(inline: &Inline) -> bool {
                 !raw.trim().is_empty()
             }
         }
-        Inline::Image { .. } | Inline::SoftBreak | Inline::HardBreak { .. } => false,
+        Inline::Image { .. } | Inline::SoftBreak { .. } | Inline::HardBreak { .. } => false,
     }
 }
 
@@ -189,7 +189,7 @@ mod tests {
                             Inline::WikiLink { label, .. } => n += label.chars().count(),
                             Inline::Emoji { glyph, .. } => n += glyph.chars().count(),
                             Inline::OpaqueInline { raw, .. } => n += raw.chars().count(),
-                            Inline::SoftBreak | Inline::HardBreak { .. } => n += 1,
+                            Inline::SoftBreak { .. } | Inline::HardBreak { .. } => n += 1,
                             Inline::Image { .. } => {}
                         }
                     }

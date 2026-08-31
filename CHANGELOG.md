@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Click/IME on a markdown soft wrap (`hello\nworld` paints `hello world`) or a hard break (`a  \nb` / `a\\\nb`) maps onto the break bytes, not the paragraph start. Quoted and list-wrapped lines map onto the newline, not `>` / `-`.
 - Opening a Markdown file no longer freezes the window: the folder watcher no longer blocks GPUI's UI thread, and Markdown parse stays on the background worker.
 - Empty list-item Enter outdents or exits the list instead of inserting a blank paragraph in place.
 - Source-mode line height for a heading vs body line is derived from syntax spans, not mask visibility.

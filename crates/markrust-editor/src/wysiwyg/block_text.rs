@@ -352,8 +352,10 @@ fn inlines_from_inner_markdown(source: &str) -> Vec<Inline> {
         for b in blocks {
             if !b.inlines.is_empty() {
                 if !*first {
+                    let at = out.last().map(|i| i.source_range().end).unwrap_or(0);
                     out.push(Inline::HardBreak {
                         style: BreakStyle::Backslash,
+                        source_range: at..at,
                     });
                 }
                 *first = false;
@@ -525,6 +527,16 @@ pub fn build_leaf_layout_revealed(
     )
 }
 
+/// Painted soft/hard breaks are one visible character; map that glyph onto
+/// the break's source bytes (never the paragraph start).
+fn paint_break_src(range: &Range<usize>) -> Range<usize> {
+    if range.end > range.start {
+        range.clone()
+    } else {
+        range.start..range.start.saturating_add(1)
+    }
+}
+
 /// Visible text for a slice of inlines. Images are omitted here; the block
 /// renderer paints files as `img()` elements (local paths and cached remotes)
 /// instead of alt placeholders.
@@ -607,7 +619,7 @@ pub fn build_leaf_layout_inlines(
                 // Pixels are sibling flex items in a line-box; this slice is
                 // surrounding visible text only.
             }
-            Inline::SoftBreak => {
+            Inline::SoftBreak { source_range } => {
                 if html.hidden() {
                     continue;
                 }
@@ -619,23 +631,29 @@ pub fn build_leaf_layout_inlines(
                     false,
                     &html.paint(),
                 );
-                let src = block_range.start;
-                push(&mut text, &mut runs, &mut source_at, " ", src..src + 1, run);
+                push(
+                    &mut text,
+                    &mut runs,
+                    &mut source_at,
+                    " ",
+                    paint_break_src(source_range),
+                    run,
+                );
             }
             Inline::HardBreak {
                 style: BreakStyle::TwoSpaces | BreakStyle::Backslash,
+                source_range,
             } => {
                 if html.hidden() {
                     continue;
                 }
                 let run = text_style.to_run(0);
-                let src = block_range.start;
                 push(
                     &mut text,
                     &mut runs,
                     &mut source_at,
                     "\n",
-                    src..src + 1,
+                    paint_break_src(source_range),
                     run,
                 );
             }
@@ -1593,6 +1611,56 @@ mod tests {
         assert_eq!(two_spaces.text, "a\nb", "two-space hard break");
         let backslash = layout_for("a\\\nb\n");
         assert_eq!(backslash.text, "a\nb", "backslash hard break");
+    }
+
+    #[test]
+    fn soft_break_click_maps_to_newline_not_paragraph_start() {
+        let source = "hello\nworld\n";
+        let layout = layout_for(source);
+        assert_eq!(layout.text, "hello world", "soft break paints as a space");
+        let space = layout.text.find(' ').expect("painted soft-break space");
+        let mapped = layout.source_for_visible(space);
+        assert_eq!(
+            source.as_bytes().get(mapped).copied(),
+            Some(b'\n'),
+            "click on the wrap space must be the source newline, got {mapped} {:?}",
+            source.get(mapped..mapped.saturating_add(1))
+        );
+        assert_ne!(
+            mapped, layout.block_start,
+            "soft break must not map onto the paragraph start"
+        );
+        let w = source.find("world").expect("world");
+        let vis_w = layout.visible_for_source(w);
+        assert_eq!(layout.source_for_visible(vis_w), w);
+    }
+
+    #[test]
+    fn hard_break_click_maps_to_break_not_paragraph_start() {
+        for source in ["a  \nb\n", "a\\\nb\n"] {
+            let layout = layout_for(source);
+            assert_eq!(layout.text, "a\nb", "{source:?}");
+            let vis_nl = layout.text.find('\n').expect("painted hard break");
+            let mapped = layout.source_for_visible(vis_nl);
+            assert_ne!(
+                mapped, layout.block_start,
+                "hard break must not map onto paragraph start, {source:?} got {mapped}"
+            );
+            assert_ne!(
+                mapped, 0,
+                "hard break click must not jump to `a`, {source:?}"
+            );
+            let b = source.find('b').expect("b");
+            assert!(
+                mapped < b,
+                "hard break must sit before `b`, {source:?} mapped={mapped}"
+            );
+            assert_eq!(
+                layout.source_for_visible(layout.visible_for_source(b)),
+                b,
+                "{source:?}"
+            );
+        }
     }
 
     #[test]

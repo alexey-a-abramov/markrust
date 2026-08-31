@@ -16,7 +16,7 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 
 - Block-preserving save is free: untouched blocks are untouched bytes. Default save writes the buffer verbatim.
 - Undo stays byte-based (`UndoStack`/`EditOperation` keep working for both modes).
-- Caret/selection stay source byte offsets; `RichEngine` provides delimiter-skipping snap/step and source↔visible mapping.
+- Caret/selection stay source byte offsets; `RichEngine` provides delimiter-skipping snap/step and source↔visible mapping. A markdown soft wrap (`hello\nworld`) and a hard break (`a  \nb`) paint a space / newline whose click/IME map onto the break bytes (`SoftBreak` / `HardBreak` `source_range`), not the paragraph start.
 - Fidelity layering: untouched blocks byte-exact automatically; touched blocks keep delimiter fidelity via captured attrs (`*` vs `_`, list markers, ATX/setext, fence char/len, break style) and `raw` slices on inline runs; explicit Normalize ignores fidelity.
 - Source-mode masking is a **projection of the same comrak AST**, not a second Markdown parser. tree-sitter-md is gone. Masking + `spans.rs` stay as the source-mode renderer; they are not the WYSIWYG primary.
 

@@ -212,7 +212,7 @@ mod tests {
                 } => format!("math:{}:{literal}", if *display { "$$" } else { "$" }),
                 Inline::WikiLink { target, label, .. } => format!("wiki:{target}:{label}"),
                 Inline::Emoji { name, glyph, .. } => format!("emoji:{name}:{glyph}"),
-                Inline::SoftBreak => "soft".into(),
+                Inline::SoftBreak { .. } => "soft".into(),
                 Inline::HardBreak { .. } => "hard".into(),
                 Inline::Image { alt, url, .. } => format!("img:{alt}:{url}"),
             })
@@ -803,11 +803,48 @@ mod tests {
             .inlines
             .iter()
             .filter_map(|i| match i {
-                Inline::HardBreak { style } => Some(*style),
+                Inline::HardBreak { style, .. } => Some(*style),
                 _ => None,
             })
             .collect();
         assert_eq!(breaks, vec![BreakStyle::TwoSpaces, BreakStyle::Backslash]);
+    }
+
+    #[test]
+    fn soft_and_hard_breaks_carry_source_range_on_the_break() {
+        let source = "hello\nworld\n";
+        let tree = import(source);
+        let soft = tree.blocks[0]
+            .inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::SoftBreak { source_range } => Some(source_range.clone()),
+                _ => None,
+            })
+            .expect("soft break");
+        assert_eq!(
+            source.get(soft.clone()).unwrap_or(""),
+            "\n",
+            "soft break range must be the newline, got {soft:?} {:?}",
+            source.get(soft.clone())
+        );
+
+        let hard_src = "a  \nb\n";
+        let hard = import(hard_src).blocks[0]
+            .inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::HardBreak { source_range, .. } => Some(source_range.clone()),
+                _ => None,
+            })
+            .expect("hard break");
+        let slice = hard_src.get(hard.clone()).unwrap_or("");
+        assert!(
+            slice.contains('\n') && slice.contains("  "),
+            "hard break range must cover two-space marker and newline, got {hard:?} {slice:?}"
+        );
+        assert_ne!(hard.start, 0, "hard break must not start at the paragraph");
+        assert_eq!(hard.start, 1, "two-space marker starts after `a`");
     }
 
     #[test]
