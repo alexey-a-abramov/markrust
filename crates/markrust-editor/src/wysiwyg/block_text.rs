@@ -13,7 +13,9 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     SharedString, Style, TextRun, TextStyle, UnderlineStyle, Window, WrappedLine,
 };
-use markrust_core::rich::{import_markdown, Block, BreakStyle, IdGen, Inline, MarkSet, NodeId};
+use markrust_core::rich::{
+    code_body_source_map, import_markdown, Block, BreakStyle, IdGen, Inline, MarkSet, NodeId,
+};
 
 use crate::theme::EditorTheme;
 
@@ -91,8 +93,8 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     );
     fn drag_overlay(&mut self, offset: usize, cx: &mut Context<Self>);
     fn end_overlay_drag(&mut self, cx: &mut Context<Self>);
-    fn report_widget_caret(&mut self, caret: Bounds<Pixels>);
     fn report_widget_bounds(&mut self, bounds: Bounds<Pixels>);
+    fn report_widget_caret(&mut self, caret: Bounds<Pixels>);
     fn report_leaf(
         &mut self,
         layout: Arc<LeafLayout>,
@@ -295,9 +297,11 @@ fn wiki_delim_run(text_style: &TextStyle, theme: &EditorTheme) -> TextRun {
 }
 
 /// Layout for a projected HTML block (tags stripped). `source_at` is relative
-/// to the HTML literal; `block_start` is the document offset of that literal.
-/// Inner Markdown (`**bold**`, links, code) is parsed so it does not paint as
-/// source chrome; HTML phrasing (`<mark>`, `<sub>`, …) is merged as marks.
+/// to the HTML literal; quote/list prefixes in `source` are skipped via
+/// [`code_body_source_map`] so a click on painted body text does not land on
+/// `>`. Inner Markdown (`**bold**`, links, code) is parsed so it does not
+/// paint as source chrome; HTML phrasing (`<mark>`, `<sub>`, …) is merged as
+/// marks.
 pub fn build_html_block_layout(
     text: &str,
     source_at: &[usize],
@@ -363,6 +367,25 @@ pub fn build_html_block_layout(
     layout
 }
 
+fn html_literal_source_map(source: &str, block: &Block) -> Vec<usize> {
+    let painted_len = match &block.kind {
+        markrust_core::rich::BlockKind::Opaque { raw } => raw.len(),
+        _ => block
+            .source_range
+            .end
+            .saturating_sub(block.source_range.start),
+    };
+    code_body_source_map(source, block, painted_len)
+}
+
+fn doc_offset_for_html_literal(literal_map: &[usize], html: usize, fallback: usize) -> usize {
+    literal_map
+        .get(html)
+        .copied()
+        .or_else(|| literal_map.last().copied())
+        .unwrap_or(fallback)
+}
+
 fn html_flow_layout(
     text: &str,
     source_at: &[usize],
@@ -411,19 +434,6 @@ fn html_flow_layout(
         source_at: mapped,
         block_start,
     }
-}
-
-fn html_literal_source_map(source: &str, block: &Block) -> Vec<usize> {
-    let body = block.code_body_range(source);
-    markrust_core::rich::code_body_source_map(source, block, body.len())
-}
-
-fn doc_offset_for_html_literal(literal_map: &[usize], html: usize, fallback: usize) -> usize {
-    literal_map
-        .get(html)
-        .copied()
-        .or_else(|| literal_map.last().copied())
-        .unwrap_or(fallback)
 }
 
 fn inlines_from_inner_markdown(source: &str) -> Vec<Inline> {
@@ -1009,6 +1019,18 @@ pub fn build_leaf_layout_inlines(
 }
 
 /// Layout for a fenced code body: 1:1 map from visible bytes to source.
+pub fn build_code_layout(
+    body: &str,
+    source_start: usize,
+    text_style: &TextStyle,
+    theme: &EditorTheme,
+) -> LeafLayout {
+    let source_at: Vec<usize> = (0..=body.len()).map(|i| source_start + i).collect();
+    finish_code_layout(body, source_at, source_start, text_style, theme)
+}
+
+/// Painted fence body with source offsets that skip quote/list prefixes
+/// (same map `character_index_for_point` and IME origin use).
 pub fn build_code_block_layout(
     body: &str,
     source: &str,
@@ -1016,7 +1038,7 @@ pub fn build_code_block_layout(
     text_style: &TextStyle,
     theme: &EditorTheme,
 ) -> LeafLayout {
-    let source_at = markrust_core::rich::code_body_source_map(source, block, body.len());
+    let source_at = code_body_source_map(source, block, body.len());
     let block_start = block.code_body_range(source).start;
     finish_code_layout(body, source_at, block_start, text_style, theme)
 }
@@ -1170,6 +1192,8 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
             ..self.layout.visible_for_source(selected.end);
 
         let line_height = px(self.line_height);
+        // Always locate the caret for IME, even when the blink hides the quad.
+        let caret_in_leaf = source_in_leaf(&self.layout, caret);
         let (selection, cursor, caret_bounds) = paint_carets(
             &lines,
             bounds,
@@ -1177,7 +1201,8 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
             vis_caret,
             vis_sel,
             self.layout.text.len(),
-            focused && caret_visible && source_in_leaf(&self.layout, caret),
+            caret_in_leaf,
+            focused && caret_visible && caret_in_leaf,
             selected.start != selected.end && ranges_touch_leaf(&self.layout, &selected),
             self.theme.caret,
             self.theme.selection,
@@ -1482,6 +1507,7 @@ fn paint_carets(
     vis_caret: usize,
     vis_sel: Range<usize>,
     text_len: usize,
+    locate_caret: bool,
     show_caret: bool,
     show_sel: bool,
     caret_color: gpui::Hsla,
@@ -1496,7 +1522,7 @@ fn paint_carets(
     for line in lines {
         let h = line.size(line_height).height.max(line_height);
         let line_end = offset + line.len();
-        if show_caret && vis_caret >= offset && vis_caret <= line_end {
+        if locate_caret && vis_caret >= offset && vis_caret <= line_end {
             if let Some(pos) =
                 line.position_for_index(vis_caret.saturating_sub(offset), line_height)
             {
@@ -1505,7 +1531,9 @@ fn paint_carets(
                     size(px(2.), line_height),
                 );
                 caret_bounds = Some(rect);
-                cursor = Some(fill(rect, caret_color));
+                if show_caret {
+                    cursor = Some(fill(rect, caret_color));
+                }
             }
         }
         if show_sel {
@@ -1663,6 +1691,7 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
             vis_caret,
             vis_sel,
             display.len(),
+            self.editing,
             self.editing && focused && caret_visible,
             show_sel,
             self.theme.caret,
@@ -1889,81 +1918,6 @@ fn overlay_leaf_layout(text: &str, style: TextStyle, italic: bool) -> LeafLayout
     }
 }
 
-/// Invisible overlay that reports its layout bounds for IME candidate placement
-/// while a chip / caption / frontmatter field is being edited.
-pub struct WidgetImeSink<H: WysiwygHost> {
-    pub editor: Entity<H>,
-}
-
-impl<H: WysiwygHost> IntoElement for WidgetImeSink<H> {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl<H: WysiwygHost> Element for WidgetImeSink<H> {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<gpui::ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let mut style = Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = relative(1.).into();
-        (window.request_layout(style, Vec::new(), cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        self.editor.update(cx, |host, _cx| {
-            host.report_widget_bounds(bounds);
-        });
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let focus = self.editor.read(cx).input_focus_handle();
-        window.handle_input(
-            &focus,
-            ElementInputHandler::new(bounds, self.editor.clone()),
-            cx,
-        );
-        self.editor.update(cx, |host, _cx| {
-            host.sync_ime_cursor(window);
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2018,6 +1972,23 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn overlay_draft_offset_matches_body_visible_index() {
+        assert_eq!(overlay_draft_offset(0, 2, 5, 5, 0), 2);
+        assert_eq!(overlay_draft_offset("Title: ".len(), 9, 5, 5, 0), 2);
+        assert_eq!(
+            overlay_draft_offset(0, 3, 4, 2, 2),
+            2,
+            "click inside preedit stays at the inner caret"
+        );
+        assert_eq!(overlay_draft_offset(0, 5, 4, 2, 2), 3);
+        assert_eq!(
+            overlay_draft_offset(0, 20, 3, 0, 0),
+            3,
+            "click past the draft clamps"
+        );
     }
 
     #[test]
@@ -2243,21 +2214,115 @@ mod tests {
             font_size: px(theme.font_size).into(),
             ..Default::default()
         };
-        let source = "```rust\nfn x() {}\n```\n";
-        let tree = markrust_core::rich::import_markdown(source, &mut IdGen::default());
-        let block = tree
-            .blocks
-            .iter()
-            .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
-            .expect("code block");
-        let layout = build_code_block_layout("fn x() {}", source, block, &style, &theme);
+        let layout = build_code_layout("fn x() {}", 10, &style, &theme);
         assert_eq!(layout.text, "fn x() {}");
-        assert!(layout.source_for_visible(0) >= block.code_body_range(source).start);
-        assert!(layout.contains_source(block.code_body_range(source).start + "fn".len()));
-        assert!(!layout.contains_source(0));
+        assert_eq!(layout.source_for_visible(0), 10);
+        assert_eq!(layout.source_for_visible(5), 15);
+        assert!(layout.contains_source(10));
+        assert!(layout.contains_source(19));
+        assert!(!layout.contains_source(9));
+        assert!(!layout.contains_source(20));
+    }
+
+    fn fenced_code_layout(source: &str) -> LeafLayout {
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let block = first_kind(&tree.blocks, |k| matches!(k, BlockKind::CodeBlock { .. }))
+            .expect("code block");
+        let body = match &block.kind {
+            BlockKind::CodeBlock { literal, .. } => {
+                literal.strip_suffix('\n').unwrap_or(literal).to_string()
+            }
+            _ => unreachable!(),
+        };
+        let theme = EditorTheme::dark();
+        let style = TextStyle {
+            color: theme.text,
+            font_family: theme.code_font_family.clone().into(),
+            font_size: px(theme.font_size).into(),
+            ..Default::default()
+        };
+        build_code_block_layout(&body, source, block, &style, &theme)
+    }
+
+    #[test]
+    fn quoted_fence_click_maps_past_quote_prefix() {
+        let source = "> ```\n> code\n> ```\n";
+        let layout = fenced_code_layout(source);
+        let c = source.find("code").expect("code");
+        let gt = source.find('>').expect(">");
+        assert_eq!(layout.text, "code");
+        assert_eq!(
+            layout.source_for_visible(0),
+            c,
+            "click x on the first painted body character"
+        );
+        assert_ne!(
+            layout.source_for_visible(0),
+            gt,
+            "must not equal the `>` byte"
+        );
+        assert_eq!(layout.visible_for_source(c), 0);
+        assert_eq!(&source[layout.source_for_visible(0)..][..1], "c");
+    }
+
+    #[test]
+    fn list_nested_fence_click_maps_past_indent() {
+        let source = "- item\n  ```\n  code\n  ```\n";
+        let layout = fenced_code_layout(source);
+        let c = source.find("code").expect("code");
+        let indent = source.find("  code").expect("indent");
+        assert_eq!(layout.text, "code");
+        assert_eq!(layout.source_for_visible(0), c);
+        assert_ne!(
+            layout.source_for_visible(0),
+            indent,
+            "click on painted `code` must not land on list indent"
+        );
+        assert_eq!(layout.visible_for_source(c), 0);
+    }
+
+    #[test]
+    fn unquoted_fence_click_stays_one_to_one() {
+        let source = "```\ncode\n```\n";
+        let layout = fenced_code_layout(source);
+        let c = source.find("code").expect("code");
+        assert_eq!(layout.text, "code");
+        assert_eq!(layout.source_for_visible(0), c);
+        assert_eq!(layout.source_for_visible(2), c + 2);
+        assert_eq!(layout.visible_for_source(c), 0);
+    }
+
+    #[test]
+    fn quoted_list_nested_fence_click_maps_past_quote_and_indent() {
+        let source = "> - item\n>   ```\n>   code\n>   ```\n";
+        let layout = fenced_code_layout(source);
+        let c = source.find("code").expect("code");
+        let gt = source.rfind(">   code").expect("quoted body line");
+        assert_eq!(layout.text, "code");
+        assert_eq!(layout.source_for_visible(0), c);
+        assert_ne!(layout.source_for_visible(0), gt);
+        assert_eq!(layout.visible_for_source(c), 0);
     }
 
     fn html_block_layout(raw: &str) -> LeafLayout {
+        let source = if raw.ends_with('\n') {
+            raw.to_string()
+        } else {
+            format!("{raw}\n")
+        };
+        html_block_layout_from_source(&source)
+    }
+
+    fn html_block_layout_from_source(source: &str) -> LeafLayout {
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let block = first_kind(&tree.blocks, |k| matches!(k, BlockKind::Opaque { .. }))
+            .expect("html block");
+        let raw = match &block.kind {
+            BlockKind::Opaque { raw } => raw.as_str(),
+            _ => unreachable!(),
+        };
         let theme = EditorTheme::dark();
         let style = TextStyle {
             color: theme.text,
@@ -2270,30 +2335,316 @@ mod tests {
                 text,
                 source_at,
                 runs,
-            } => build_html_block_layout(
-                &text,
-                &source_at,
-                &runs,
-                raw,
-                &mk_opaque_block(raw),
-                &style,
-                &theme,
-            ),
+            } => build_html_block_layout(&text, &source_at, &runs, source, block, &style, &theme),
             other => panic!("expected flow, got {other:?}"),
         }
     }
 
-    fn mk_opaque_block(raw: &str) -> Block {
-        Block {
-            id: NodeId(0),
-            kind: BlockKind::Opaque {
-                raw: raw.to_string(),
-            },
-            source_range: 0..raw.len(),
-            inlines: Vec::new(),
-            children: Vec::new(),
-            content_hash: 0,
-        }
+    #[test]
+    fn quoted_html_click_maps_past_quote_prefix() {
+        let source = "> <div>\n> x\n> </div>\n";
+        let layout = html_block_layout_from_source(source);
+        let x = source.find('x').expect("x");
+        let gt = source.find('>').expect(">");
+        assert!(
+            layout.text.contains('x'),
+            "HTML body must paint, got {:?}",
+            layout.text
+        );
+        assert!(
+            !layout.text.contains('>'),
+            "quote prefix must not paint, got {:?}",
+            layout.text
+        );
+        let vis = layout.visible_for_source(x);
+        assert_eq!(
+            layout.source_for_visible(vis),
+            x,
+            "click on painted `x` must map to the `x` byte"
+        );
+        assert_ne!(
+            layout.source_for_visible(0),
+            gt,
+            "first painted HTML body character must not be the `>` byte"
+        );
+        assert_eq!(&source[layout.source_for_visible(vis)..][..1], "x");
+    }
+
+    #[test]
+    fn unquoted_html_click_stays_on_body() {
+        let source = "<div>\nx\n</div>\n";
+        let layout = html_block_layout_from_source(source);
+        let x = source.find('x').expect("x");
+        let vis = layout.visible_for_source(x);
+        assert_eq!(layout.source_for_visible(vis), x);
+        assert_ne!(layout.source_for_visible(0), source.find('<').expect("<"));
+    }
+
+    #[test]
+    fn quoted_list_nested_html_click_maps_past_quote_and_indent() {
+        let source = "> - item\n>\n>   <div>\n>   x\n>   </div>\n";
+        let layout = html_block_layout_from_source(source);
+        let x = source.find('x').expect("x");
+        let gt = source.find('>').expect(">");
+        let vis = layout.visible_for_source(x);
+        assert_eq!(layout.source_for_visible(vis), x);
+        assert_ne!(
+            layout.source_for_visible(0),
+            gt,
+            "first painted HTML body character must not be the `>` byte"
+        );
+    }
+
+    #[test]
+    fn quoted_paragraph_click_maps_past_quote_prefix() {
+        let source = "> hello\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let para = first_paragraph(&tree.blocks[0]).expect("quote paragraph");
+        let layout = layout_of(para);
+        let h = source.find('h').expect("h");
+        let gt = source.find('>').expect(">");
+        assert_eq!(layout.text, "hello");
+        assert_eq!(
+            layout.source_for_visible(0),
+            h,
+            "click on first painted character must be `h`"
+        );
+        assert_ne!(layout.source_for_visible(0), gt);
+        assert_eq!(&source[layout.source_for_visible(0)..][..1], "h");
+    }
+
+    #[test]
+    fn quoted_wrapped_paragraph_click_skips_continuation_quote() {
+        let source = "> hello\n> world\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let para = first_paragraph(&tree.blocks[0]).expect("quote paragraph");
+        let layout = layout_of(para);
+        let w = source.find("world").expect("world");
+        let gt = source.rfind("> world").expect("continuation");
+        assert!(
+            layout.text.contains("hello") && layout.text.contains("world"),
+            "both lines must paint, got {:?}",
+            layout.text
+        );
+        let vis = layout.visible_for_source(w);
+        assert_eq!(
+            layout.source_for_visible(vis),
+            w,
+            "click on painted `w` must map to `w`, not `>`"
+        );
+        assert_ne!(layout.source_for_visible(vis), gt);
+    }
+
+    #[test]
+    fn list_item_click_maps_past_marker() {
+        let source = "- hello\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let para = first_paragraph(&tree.blocks[0]).expect("list paragraph");
+        let layout = layout_of(para);
+        let h = source.find('h').expect("h");
+        let dash = source.find('-').expect("-");
+        assert_eq!(layout.text, "hello");
+        assert_eq!(layout.source_for_visible(0), h);
+        assert_ne!(layout.source_for_visible(0), dash);
+    }
+
+    #[test]
+    fn quoted_list_click_maps_past_quote_and_marker() {
+        let source = "> - hello\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let para = first_paragraph(&tree.blocks[0]).expect("quoted list paragraph");
+        let layout = layout_of(para);
+        let h = source.find('h').expect("h");
+        assert_eq!(layout.text, "hello");
+        assert_eq!(layout.source_for_visible(0), h);
+        assert_ne!(&source[layout.source_for_visible(0)..][..1], ">");
+        assert_ne!(&source[layout.source_for_visible(0)..][..1], "-");
+    }
+
+    #[test]
+    fn nested_quote_click_maps_past_inner_marker() {
+        let source = "> > hello\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let para = first_paragraph(&tree.blocks[0]).expect("nested quote paragraph");
+        let layout = layout_of(para);
+        let h = source.find('h').expect("h");
+        assert_eq!(layout.text, "hello");
+        assert_eq!(
+            layout.source_for_visible(0),
+            h,
+            "first painted character must be `h`, not inner `>`"
+        );
+        assert_ne!(&source[layout.source_for_visible(0)..][..1], ">");
+    }
+
+    #[test]
+    fn ordered_list_click_maps_past_marker() {
+        let source = "1. hello\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let para = first_paragraph(&tree.blocks[0]).expect("ordered paragraph");
+        let layout = layout_of(para);
+        let h = source.find('h').expect("h");
+        assert_eq!(layout.text, "hello");
+        assert_eq!(layout.source_for_visible(0), h);
+        assert_ne!(&source[layout.source_for_visible(0)..][..1], "1");
+    }
+
+    #[test]
+    fn unchecked_task_click_maps_past_checkbox() {
+        let source = "- [ ] hello\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let para = first_paragraph(&tree.blocks[0]).expect("task paragraph");
+        let layout = layout_of(para);
+        let h = source.find('h').expect("h");
+        assert_eq!(layout.text, "hello");
+        assert_eq!(layout.source_for_visible(0), h);
+        assert_ne!(&source[layout.source_for_visible(0)..][..1], "-");
+        assert_ne!(&source[layout.source_for_visible(0)..][..1], "[");
+    }
+
+    #[test]
+    fn empty_quote_click_homes_after_prefix() {
+        let source = "> ";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let blank = tree.empty_prefix_homes.first().expect("empty quote home");
+        assert_eq!(blank.home, 2);
+        let layout = build_blank_gap_layout(blank.home..blank.home);
+        assert_eq!(layout.source_for_visible(0), 2);
+        assert_ne!(layout.source_for_visible(0), source.find('>').expect(">"));
+    }
+
+    #[test]
+    fn empty_list_click_homes_after_marker() {
+        let source = "- ";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let blank = tree.empty_prefix_homes.first().expect("empty list home");
+        assert_eq!(blank.home, 2);
+        let layout = build_blank_gap_layout(blank.home..blank.home);
+        assert_eq!(layout.source_for_visible(0), 2);
+        assert_ne!(layout.source_for_visible(0), source.find('-').expect("-"));
+    }
+
+    #[test]
+    fn wrapped_list_continuation_click_maps_to_world() {
+        let source = "- hello\n  world\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let para = first_paragraph(&tree.blocks[0]).expect("list paragraph");
+        let layout = layout_of(para);
+        let w = source.find("world").expect("world");
+        let vis = layout.visible_for_source(w);
+        assert_eq!(layout.source_for_visible(vis), w);
+        assert_ne!(
+            &source[layout.source_for_visible(vis)..][..1],
+            " ",
+            "click on painted `w` must not be continuation indent"
+        );
+    }
+
+    #[test]
+    fn unquoted_paragraph_click_stays_one_to_one() {
+        let layout = layout_for("hello\n");
+        assert_eq!(layout.text, "hello");
+        assert_eq!(layout.source_for_visible(0), 0);
+        assert_eq!(layout.source_for_visible(1), 1);
+        assert_eq!(layout.source_for_visible(4), 4);
+    }
+
+    #[test]
+    fn quoted_soft_break_click_maps_to_newline_not_quote() {
+        let source = "> hello\n> world\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let para = first_paragraph(&tree.blocks[0]).expect("quote paragraph");
+        let layout = layout_of(para);
+        assert!(
+            layout.text.contains("hello") && layout.text.contains("world"),
+            "both lines must paint, got {:?}",
+            layout.text
+        );
+        let space = layout.text.find(' ').expect("painted soft-break space");
+        let mapped = layout.source_for_visible(space);
+        assert_eq!(
+            source.as_bytes().get(mapped).copied(),
+            Some(b'\n'),
+            "click on the wrap space must be the newline, got {mapped} {:?}",
+            source.get(mapped..mapped.saturating_add(1))
+        );
+        assert_ne!(
+            &source[mapped..mapped + 1],
+            ">",
+            "soft break must not map onto `>`"
+        );
+        assert_ne!(
+            mapped, layout.block_start,
+            "soft break must not map onto the paragraph start"
+        );
+    }
+
+    #[test]
+    fn list_soft_break_click_maps_to_newline_not_marker() {
+        let source = "- hello\n  world\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let para = first_paragraph(&tree.blocks[0]).expect("list paragraph");
+        let layout = layout_of(para);
+        let space = layout.text.find(' ').expect("painted soft-break space");
+        let mapped = layout.source_for_visible(space);
+        assert_eq!(
+            source.as_bytes().get(mapped).copied(),
+            Some(b'\n'),
+            "click on the wrap space must be the newline, got {mapped} {:?}",
+            source.get(mapped..mapped.saturating_add(1))
+        );
+        assert_ne!(&source[mapped..mapped + 1], "-");
+        assert_ne!(mapped, layout.block_start);
+    }
+
+    #[test]
+    fn heading_click_maps_to_title_not_hash() {
+        let source = "# Title\n";
+        let layout = layout_for(source);
+        let t = source.find('T').expect("T");
+        assert_eq!(layout.text, "Title");
+        assert_eq!(layout.source_for_visible(0), t);
+        assert_ne!(&source[layout.source_for_visible(0)..][..1], "#");
+    }
+
+    #[test]
+    fn table_cell_click_stays_on_cell_text() {
+        let source = "| a | b |\n| - | - |\n| c | d |\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let cell = first_kind(&tree.blocks, |k| matches!(k, BlockKind::TableCell)).expect("cell");
+        let layout = layout_of(cell);
+        let a = source.find('a').expect("a");
+        assert_eq!(layout.text, "a");
+        assert_eq!(layout.source_for_visible(0), a);
+        assert!(!layout.text.contains('|'));
+    }
+
+    #[test]
+    fn indented_code_click_maps_past_indent() {
+        let source = "    code\n";
+        let layout = fenced_code_layout(source);
+        let c = source.find("code").expect("code");
+        let indent = source.find("    code").expect("indent");
+        assert_eq!(layout.text, "code");
+        assert_eq!(layout.source_for_visible(0), c);
+        assert_ne!(
+            layout.source_for_visible(0),
+            indent,
+            "click on painted `code` must not land on the indent"
+        );
     }
 
     #[test]
@@ -2711,6 +3062,240 @@ mod tests {
         let body = alert_body_layout(source, source.find("hello").unwrap());
         assert_eq!(body.text, "hello");
         assert!(!body.text.contains("[!NOTE]"));
+    }
+
+    /// GFM GOAL: WYSIWYG leaf text is the rendered body, not source chrome
+    /// (`#`, `- `, `[]()`, `|`, `[x]`, fences, `>`). Headings always hide
+    /// hashes (true WYSIWYG; `#` is block structure, not an inline delimiter).
+    #[test]
+    fn gfm_wysiwyg_hides_source_chrome() {
+        let atx = layout_for("# Title\n");
+        assert_eq!(atx.text, "Title", "ATX heading painted {:?}", atx.text);
+        assert!(
+            !atx.text.contains('#'),
+            "ATX hashes must not paint, got {:?}",
+            atx.text
+        );
+        let h2 = layout_for("## Sub\n");
+        assert_eq!(h2.text, "Sub");
+        assert!(!h2.text.contains('#'));
+        let closed = layout_for("# Title #\n");
+        assert_eq!(closed.text, "Title");
+        assert!(!closed.text.contains('#'));
+        let setext = layout_for("Title\n=====\n");
+        assert_eq!(setext.text, "Title");
+        assert!(!setext.text.contains('='));
+
+        let italic = layout_for("*hi*\n");
+        assert_eq!(italic.text, "hi");
+        assert!(!italic.text.contains('*'));
+        assert!(italic
+            .runs
+            .iter()
+            .any(|run| run.font.style == gpui::FontStyle::Italic));
+        let code = layout_for("`x`\n");
+        assert_eq!(code.text, "x");
+        assert!(!code.text.contains('`'));
+
+        let link = layout_for("[label](https://e.com)\n");
+        assert_eq!(link.text, "label");
+        assert!(
+            !link.text.contains('[') && !link.text.contains(']') && !link.text.contains('('),
+            "link chrome must not paint, got {:?}",
+            link.text
+        );
+        assert!(
+            link.runs
+                .iter()
+                .any(|run| run.underline.is_some() && run.color != EditorTheme::dark().text),
+            "expected link paint, runs={:?}",
+            link.runs
+        );
+
+        let mut ids = IdGen::default();
+        let list_tree = import_markdown("- item\n", &mut ids);
+        let list_para = first_paragraph(&list_tree.blocks[0]).expect("list paragraph");
+        let list = layout_of(list_para);
+        assert_eq!(list.text, "item");
+        assert!(
+            !list.text.contains('-'),
+            "list marker must not paint in the body, got {:?}",
+            list.text
+        );
+
+        let mut ids = IdGen::default();
+        let task_tree = import_markdown("- [x] done\n", &mut ids);
+        let task_para = first_paragraph(&task_tree.blocks[0]).expect("task paragraph");
+        let task = layout_of(task_para);
+        assert_eq!(task.text, "done");
+        assert!(
+            !task.text.contains('[') && !task.text.contains(']'),
+            "task checkbox syntax must not paint, got {:?}",
+            task.text
+        );
+
+        let mut ids = IdGen::default();
+        let table_tree = import_markdown("| a | b |\n|---|---|\n| 1 | 2 |\n", &mut ids);
+        let cell = first_kind(&table_tree.blocks, |k| matches!(k, BlockKind::TableCell))
+            .expect("table cell");
+        let cell_layout = layout_of(cell);
+        assert_eq!(cell_layout.text, "a");
+        assert!(
+            !cell_layout.text.contains('|') && !cell_layout.text.contains('-'),
+            "table pipes must not paint, got {:?}",
+            cell_layout.text
+        );
+
+        let mut ids = IdGen::default();
+        let fence_tree = import_markdown("```rust\nfn main() {}\n```\n", &mut ids);
+        match &fence_tree.blocks[0].kind {
+            BlockKind::CodeBlock { info, literal, .. } => {
+                assert_eq!(info, "rust");
+                assert_eq!(
+                    literal.strip_suffix('\n').unwrap_or(literal),
+                    "fn main() {}"
+                );
+                assert!(
+                    !literal.contains('`'),
+                    "fence ticks must not be in the body literal, got {literal:?}"
+                );
+            }
+            other => panic!("expected code block, got {other:?}"),
+        }
+        let fence_layout = layout_of(&fence_tree.blocks[0]);
+        assert_eq!(fence_layout.text, "fn main() {}");
+        assert!(!fence_layout.text.contains('`'));
+
+        let mut ids = IdGen::default();
+        let quote_tree = import_markdown("> quoted\n", &mut ids);
+        let quote_para = first_paragraph(&quote_tree.blocks[0]).expect("quote paragraph");
+        let quote = layout_of(quote_para);
+        assert_eq!(quote.text, "quoted");
+        assert!(
+            !quote.text.contains('>'),
+            "blockquote marker must not paint, got {:?}",
+            quote.text
+        );
+
+        let mut ids = IdGen::default();
+        let fm_tree = import_markdown("---\ntitle: X\n---\n\n# Hi\n", &mut ids);
+        assert!(
+            fm_tree.frontmatter.is_some(),
+            "frontmatter must not be a body block"
+        );
+        assert!(matches!(fm_tree.blocks[0].kind, BlockKind::Heading { .. }));
+        let after_fm = layout_of(&fm_tree.blocks[0]);
+        assert_eq!(after_fm.text, "Hi");
+        assert!(!after_fm.text.contains("---"));
+        assert!(!after_fm.text.contains('#'));
+    }
+
+    /// Click/IME on painted GFM inlines must land on the visible body, not
+    /// delimiter bytes (` `` `, `[`, `<`).
+    #[test]
+    fn gfm_inline_click_maps_past_chrome() {
+        let code_src = "`x`\n";
+        let code = layout_for(code_src);
+        assert_eq!(code.text, "x");
+        let mapped = code.source_for_visible(0);
+        assert_eq!(
+            code_src.as_bytes().get(mapped).copied(),
+            Some(b'x'),
+            "click on painted inline code must be `x`, not a backtick, got {mapped} {:?}",
+            code_src.get(mapped..mapped.saturating_add(1))
+        );
+        assert_ne!(
+            mapped,
+            code_src.find('`').expect("tick"),
+            "click must not land on the opening backtick"
+        );
+
+        let link_src = "[label](https://e.com)\n";
+        let link = layout_for(link_src);
+        assert_eq!(link.text, "label");
+        let mapped = link.source_for_visible(0);
+        assert_eq!(
+            link_src.as_bytes().get(mapped).copied(),
+            Some(b'l'),
+            "click on painted link text must be `l`, not `[`, got {mapped} {:?}",
+            link_src.get(mapped..mapped.saturating_add(1))
+        );
+
+        let auto_src = "<https://example.com>\n";
+        let auto = layout_for(auto_src);
+        assert!(auto.text.contains("https://example.com"));
+        assert!(
+            !auto.text.contains('<') && !auto.text.contains('>'),
+            "autolink `<>` must not paint, got {:?}",
+            auto.text
+        );
+        let mapped = auto.source_for_visible(0);
+        assert_ne!(
+            auto_src.as_bytes().get(mapped).copied(),
+            Some(b'<'),
+            "click on painted autolink must not land on `<`, got {mapped}"
+        );
+        assert_eq!(
+            auto_src.as_bytes().get(mapped).copied(),
+            Some(b'h'),
+            "click on painted autolink must be `h` of https, got {mapped} {:?}",
+            auto_src.get(mapped..mapped.saturating_add(1))
+        );
+
+        let email_src = "<user@example.com>\n";
+        let email = layout_for(email_src);
+        assert!(
+            email.text.contains("user@example.com"),
+            "email autolink visible text, got {:?}",
+            email.text
+        );
+        assert!(
+            !email.text.contains('<') && !email.text.contains('>'),
+            "email autolink `<>` must not paint, got {:?}",
+            email.text
+        );
+        let mapped = email.source_for_visible(0);
+        assert_ne!(
+            email_src.as_bytes().get(mapped).copied(),
+            Some(b'<'),
+            "click on painted email autolink must not land on `<`, got {mapped}"
+        );
+        assert_eq!(
+            email_src.as_bytes().get(mapped).copied(),
+            Some(b'u'),
+            "click on painted email autolink must be `u` of user, got {mapped} {:?}",
+            email_src.get(mapped..mapped.saturating_add(1))
+        );
+
+        let ref_src = "[label][ref]\n\n[ref]: https://e.com\n";
+        let ref_link = layout_for(ref_src);
+        assert_eq!(
+            ref_link.text, "label",
+            "reference link must paint the label, not `[ref]`, got {:?}",
+            ref_link.text
+        );
+        assert!(
+            !ref_link.text.contains('[') && !ref_link.text.contains(']'),
+            "reference chrome must not paint, got {:?}",
+            ref_link.text
+        );
+        let mapped = ref_link.source_for_visible(0);
+        assert_eq!(
+            ref_src.as_bytes().get(mapped).copied(),
+            Some(b'l'),
+            "click on a reference link must be `l`, got {mapped} {:?}",
+            ref_src.get(mapped..mapped.saturating_add(1))
+        );
+
+        let setext_src = "Title\n=====\n";
+        let setext = layout_for(setext_src);
+        assert_eq!(setext.text, "Title");
+        let mapped = setext.source_for_visible(0);
+        assert_eq!(
+            setext_src.as_bytes().get(mapped).copied(),
+            Some(b'T'),
+            "setext click must be `T`, got {mapped}"
+        );
     }
 
     #[test]

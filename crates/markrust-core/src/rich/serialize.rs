@@ -820,7 +820,7 @@ fn close_down_to(ser: &mut Ser, stack: &mut Vec<(MarkKey, String)>, keep: usize)
     }
 }
 
-/// Destination form for a link/image URL: wrap in <> when it needs it.
+/// Destination form for a link/image URL: wrap in `<>` when it needs it.
 ///
 /// An empty destination stays bare so Cmd-K serializes `[hello]()` (Typora),
 /// not `[hello](<>)`. A following title still needs `<>` so `"title"` is not

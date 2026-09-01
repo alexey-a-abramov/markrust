@@ -172,6 +172,9 @@ fn existing_link(source: &str, sel: &Range<usize>) -> Option<(Range<usize>, Stri
 }
 
 /// Indent every source line that overlaps `sel` by two spaces.
+///
+/// Quoted lines (`> …`) get the spaces after the `>` markers so Tab never
+/// produces a leading space before the quote (`  > item`).
 pub fn indent_selection(source: &str, sel: Range<usize>) -> WrapEdit {
     let sel = clamp_range(source, sel);
     let block = line_block(source, &sel);
@@ -184,7 +187,9 @@ pub fn indent_selection(source: &str, sel: Range<usize>) -> WrapEdit {
     }
 }
 
-/// Remove up to two leading spaces (or one tab) from each line in `sel`.
+/// Remove up to two indent spaces (or one tab) from each line in `sel`.
+/// Quoted lines lose spaces after the `>` markers (the reverse of
+/// [`indent_selection`]), never the `>` itself or a space before `>`.
 /// Top-level list markers with no indent become a paragraph.
 pub fn outdent_selection(source: &str, sel: Range<usize>) -> Option<WrapEdit> {
     let sel = clamp_range(source, sel);
@@ -203,10 +208,14 @@ pub fn outdent_selection(source: &str, sel: Range<usize>) -> Option<WrapEdit> {
         return None;
     }
     let shrink = slice.len().saturating_sub(text.len());
-    let new_start = sel
-        .start
-        .saturating_sub(indent.max(1).min(sel.start - block.start));
-    let new_end = sel.end.saturating_sub(shrink.min(sel.end - sel.start));
+    let start_rel = sel.start.saturating_sub(block.start);
+    let start_shrink = indent.max(1).min(start_rel);
+    let new_start = sel.start.saturating_sub(start_shrink);
+    let new_end = if sel.end == sel.start {
+        new_start
+    } else {
+        sel.end.saturating_sub(shrink.min(sel.end - sel.start))
+    };
     Some(WrapEdit {
         range: block,
         text,
@@ -227,9 +236,13 @@ fn prefix_lines(slice: &str, prefix: &str) -> String {
             out.push('\n');
         }
         if !line.is_empty() {
+            let quote = quote_prefix(line);
+            out.push_str(quote);
             out.push_str(prefix);
+            out.push_str(&line[quote.len()..]);
+        } else {
+            out.push_str(line);
         }
-        out.push_str(line);
     }
     if trailing_nl {
         out.push('\n');
@@ -253,6 +266,17 @@ fn unprefix_lines(slice: &str, n: usize) -> String {
 }
 
 fn strip_indent(line: &str, n: usize) -> String {
+    let quote = quote_prefix(line);
+    if !quote.is_empty() {
+        return format!("{quote}{}", strip_spaces(&line[quote.len()..], n));
+    }
+    if spaces_before_quote(line) {
+        return line.to_string();
+    }
+    strip_spaces(line, n)
+}
+
+fn strip_spaces(line: &str, n: usize) -> String {
     if let Some(rest) = line.strip_prefix('\t') {
         return rest.to_string();
     }
@@ -265,6 +289,15 @@ fn strip_indent(line: &str, n: usize) -> String {
         }
     }
     line[take..].to_string()
+}
+
+/// `  > item` is not source-mode indent; Tab puts spaces after `>`.
+fn spaces_before_quote(line: &str) -> bool {
+    let n = line
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count();
+    n > 0 && line[n..].starts_with('>')
 }
 
 fn strip_list_marker_line(slice: &str) -> Option<String> {
@@ -313,11 +346,32 @@ fn list_marker_width(line: &str) -> usize {
     take.min(line.len())
 }
 
+/// Leading `>` markers (optional space after each), so indent lands inside the quote.
+fn quote_prefix(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    if bytes.first() != Some(&b'>') {
+        return "";
+    }
+    let mut i = 0;
+    while bytes.get(i) == Some(&b'>') {
+        i += 1;
+        if bytes.get(i) == Some(&b' ') || bytes.get(i) == Some(&b'\t') {
+            i += 1;
+        }
+    }
+    &line[..i]
+}
+
 fn leading_indent_width(line: &str) -> usize {
-    if line.starts_with('\t') {
+    let quote = quote_prefix(line);
+    let after = &line[quote.len()..];
+    if quote.is_empty() && spaces_before_quote(line) {
+        return 0;
+    }
+    if after.starts_with('\t') {
         return 2;
     }
-    line.bytes().take_while(|b| *b == b' ').count()
+    after.bytes().take_while(|b| *b == b' ').count()
 }
 
 fn line_block(source: &str, sel: &Range<usize>) -> Range<usize> {
@@ -399,5 +453,71 @@ mod tests {
         assert!(out.text.starts_with("- hello"), "{:?}", out.text);
         let para = outdent_selection("- hello", 2..2).unwrap();
         assert_eq!(para.text.trim(), "hello");
+    }
+
+    #[test]
+    fn indent_quoted_line_does_not_prefix_the_marker() {
+        let quoted = indent_selection("> hello", 2..2);
+        assert_eq!(quoted.text, ">   hello");
+        assert!(
+            !quoted.text.starts_with("  >"),
+            "source indent must not put a space before >, got {:?}",
+            quoted.text
+        );
+        let nested = indent_selection("> > - item", 4..4);
+        assert_eq!(nested.text, "> >   - item");
+        assert!(
+            !nested.text.starts_with(' '),
+            "nested quote indent must stay after >, got {:?}",
+            nested.text
+        );
+        let list = indent_selection("- hello", 2..2);
+        assert_eq!(list.text, "  - hello");
+    }
+
+    #[test]
+    fn outdent_quoted_line_strips_indent_after_the_marker() {
+        let quoted = indent_selection("> hello", 2..2);
+        assert_eq!(quoted.text, ">   hello");
+        let out = outdent_selection(&quoted.text, quoted.selection.clone()).unwrap();
+        assert_eq!(out.text, "> hello");
+        assert!(
+            out.text.starts_with('>'),
+            "source outdent must not eat >, got {:?}",
+            out.text
+        );
+        assert!(
+            !out.text.starts_with("  >") && !out.text.starts_with(" >"),
+            "source outdent must not leave a space before >, got {:?}",
+            out.text
+        );
+
+        let nested = indent_selection("> > - item", 4..4);
+        assert_eq!(nested.text, "> >   - item");
+        let nested_out = outdent_selection(&nested.text, nested.selection.clone()).unwrap();
+        assert_eq!(nested_out.text, "> > - item");
+        assert!(
+            nested_out.text.starts_with("> >"),
+            "nested quote markers must stay, got {:?}",
+            nested_out.text
+        );
+
+        let list = indent_selection("> - item", 2..2);
+        assert_eq!(list.text, ">   - item");
+        let list_out = outdent_selection(&list.text, list.selection.clone()).unwrap();
+        assert_eq!(list_out.text, "> - item");
+
+        assert!(
+            outdent_selection("  > hello", 2..2).is_none(),
+            "spaces before > are not source-mode indent"
+        );
+        let no_indent = outdent_selection("> hello", 2..2);
+        assert!(
+            no_indent.is_none()
+                || no_indent
+                    .as_ref()
+                    .is_some_and(|e| e.text.starts_with('>') && e.text.contains("hello")),
+            "unindented quote must not eat >, got {no_indent:?}"
+        );
     }
 }

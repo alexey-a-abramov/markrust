@@ -50,8 +50,9 @@ pub fn escape_text(text: &str, ctx: EscapeContext) -> String {
             continue;
         }
         if ch == '\n' {
-            // A literal newline inside inline text (decoded &#10;) would
-            // split the block; re-encode it.
+            // Serialize-only: a decoded `&#10;` in an inline run must not
+            // become a real newline (that would split the block). InsertText
+            // paste never sends `\n` through this helper.
             out.push_str("&#10;");
             at_line_start = false;
             i += ch_len;
@@ -173,6 +174,11 @@ mod tests {
             at_line_start: false,
         };
         assert_eq!(escape_text("a|b", table), "a\\|b");
+    }
+
+    #[test]
+    fn newline_is_ncr_for_serialize_not_paste() {
+        assert_eq!(escape_text("a\nb", BODY), "a&#10;b");
     }
 
     #[test]

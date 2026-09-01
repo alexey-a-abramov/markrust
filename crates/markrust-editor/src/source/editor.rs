@@ -696,4 +696,14 @@ mod tests {
         assert_eq!(editor.content(), "alpha bet");
         assert_eq!(editor.word_count(), 2);
     }
+
+    #[test]
+    fn source_shift_enter_inserts_hard_line_break() {
+        let mut editor = HeadlessEditor::new("hello world");
+        editor.apply(EditorCommand::JumpTo("hello".len())).unwrap();
+        editor
+            .apply(EditorCommand::InsertText("\\\n".into()))
+            .unwrap();
+        assert_eq!(editor.content(), "hello\\\n world");
+    }
 }

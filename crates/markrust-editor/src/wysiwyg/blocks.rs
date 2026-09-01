@@ -17,11 +17,11 @@ use markrust_core::html_visual::{
 };
 use markrust_core::rich::{
     blank_caret_gap_after_last, blank_caret_gap_before, Block, BlockKind, ColumnAlign, Inline,
-    NodeId, RichTree,
+    NodeId, PrefixBlank, RichTree,
 };
 
 use super::block_text::{
-    build_blank_gap_layout, build_code_block_layout, build_html_block_layout,
+    build_blank_gap_layout, build_code_block_layout, build_code_layout, build_html_block_layout,
     build_leaf_layout_inlines, build_leaf_layout_revealed, BlockTextElement, OverlayTarget,
     RevealState, WidgetOverlay, WysiwygHost,
 };
@@ -96,6 +96,55 @@ fn blank_gap_element<H: WysiwygHost>(
         hug_width: false,
     }
     .into_any_element()
+}
+
+fn prefix_blanks_for<'a>(block: &Block, tree: &'a RichTree) -> Vec<&'a PrefixBlank> {
+    tree.empty_prefix_homes
+        .iter()
+        .filter(|blank| {
+            let h = blank.home;
+            h >= block.source_range.start
+                && h <= block.source_range.end
+                && !block
+                    .children
+                    .iter()
+                    .any(|c| c.source_range.start <= h && h <= c.source_range.end)
+        })
+        .collect()
+}
+
+fn prefix_blank_element<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    blank: &PrefixBlank,
+    editor: Entity<H>,
+) -> AnyElement {
+    let end = blank.home.max(blank.line.end);
+    blank_gap_element(snap, blank.home..end, editor)
+}
+
+fn with_prefix_blank_leaves<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    block: &Block,
+    editor: Entity<H>,
+) -> Vec<AnyElement> {
+    let mut slots: Vec<(usize, AnyElement)> = block
+        .children
+        .iter()
+        .map(|child| {
+            (
+                child.source_range.start,
+                render_block(snap, child, editor.clone()),
+            )
+        })
+        .collect();
+    for blank in prefix_blanks_for(block, &snap.tree) {
+        slots.push((
+            blank.home,
+            prefix_blank_element(snap, blank, editor.clone()),
+        ));
+    }
+    slots.sort_by_key(|(k, _)| *k);
+    slots.into_iter().map(|(_, el)| el).collect()
 }
 
 fn render_block<H: WysiwygHost>(
@@ -202,11 +251,7 @@ fn render_block<H: WysiwygHost>(
                 .into_any_element()
         }
         BlockKind::BlockQuote => {
-            let children: Vec<AnyElement> = block
-                .children
-                .iter()
-                .map(|child| render_block(snap, child, editor.clone()))
-                .collect();
+            let children = with_prefix_blank_leaves(snap, block, editor);
             div()
                 .my(px(2.))
                 .pl(px(12.))
@@ -221,11 +266,7 @@ fn render_block<H: WysiwygHost>(
             render_list(snap, block, editor).into_any_element()
         }
         BlockKind::ListItem { .. } => {
-            let children: Vec<AnyElement> = block
-                .children
-                .iter()
-                .map(|child| render_block(snap, child, editor.clone()))
-                .collect();
+            let children = with_prefix_blank_leaves(snap, block, editor);
             div().children(children).into_any_element()
         }
         BlockKind::Table { alignments } => render_table(snap, block, alignments, editor),
@@ -277,10 +318,9 @@ fn render_alert<H: WysiwygHost>(
         let slice = snap.source.get(chrome_range.clone()).unwrap_or("");
         let mut text_style = base_text_style(theme, theme.font_size * 0.85, FontWeight::SEMIBOLD);
         text_style.color = accent;
-        let layout = std::sync::Arc::new(build_code_block_layout(
+        let layout = std::sync::Arc::new(build_code_layout(
             slice,
-            &snap.source,
-            block,
+            chrome_range.start,
             &text_style,
             theme,
         ));
@@ -316,11 +356,7 @@ fn render_alert<H: WysiwygHost>(
             })
             .into_any_element()
     };
-    let children: Vec<AnyElement> = block
-        .children
-        .iter()
-        .map(|child| render_block(snap, child, editor.clone()))
-        .collect();
+    let children = with_prefix_blank_leaves(snap, block, editor);
     div()
         .my(px(4.))
         .pl(px(12.))
@@ -637,11 +673,16 @@ fn render_list<H: WysiwygHost>(
             };
             let item_id = item.id;
             let is_task = task.is_some();
-            let children: Vec<AnyElement> = item
+            let mut children: Vec<AnyElement> = item
                 .children
                 .iter()
                 .map(|child| render_block(snap, child, editor.clone()))
                 .collect();
+            if children.is_empty() {
+                for blank in prefix_blanks_for(item, &snap.tree) {
+                    children.push(prefix_blank_element(snap, blank, editor.clone()));
+                }
+            }
             let mut marker = div()
                 .id(("task", item_id.0))
                 .min_w(px(20.))

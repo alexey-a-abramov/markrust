@@ -8,23 +8,27 @@
 //!
 //! - **Pull:** GPUI asks [`EntityInputHandler::bounds_for_range`] (macOS
 //!   `firstRectForCharacterRange:`) for the OS candidate window.
-//! - **Push:** after a caret move or widget focus, the view calls
-//!   `Window::invalidate_character_coordinates` (GPUI's equivalent of
-//!   `set_ime_cursor_position`) so the OS re-queries that origin instead of
-//!   keeping a stale candidate window. Call it only after this frame's leaves
-//!   and widgets have reported — `ImeOriginState` is last-paint geometry, not
-//!   a live layout snapshot.
+//! - **Push:** after a caret move, widget focus, or composition change, the
+//!   view calls `Window::invalidate_character_coordinates` (GPUI's equivalent
+//!   of `set_ime_cursor_position`). That schedules a next-frame
+//!   `InputHandler::selected_bounds` → `PlatformWindow::update_ime_position`.
+//!   On macOS `update_ime_position` ignores the bounds and calls
+//!   `NSTextInputContext invalidateCharacterCoordinates`, after which the OS
+//!   pulls `firstRectForCharacterRange:`. Linux/Windows use the bounds.
+//!   GPUI's `TestWindow::update_ime_position` is a no-op, so tests assert the
+//!   payload via [`ImeOriginState::take_platform_push`] plus
+//!   [`gpui::PlatformInputHandler::compute_ime_candidate_bounds`].
 //!
 //! Leaves and chip/caption/frontmatter widgets report geometry as they paint;
 //! this module resolves that noise into **one** caret rect from the focused
 //! widget or the leaf that owns the document caret — not whichever text leaf
-//! happened to paint last.
+//! happened to paint last. Blink-off frames keep the last painted caret
+//! instead of jumping to the leaf origin.
 //!
 //! Composition tests drive the same [`gpui::EntityInputHandler`] methods the OS
 //! IME uses (`replace_and_mark_text_in_range`, `selected_text_range`,
 //! `bounds_for_range`, `replace_text_in_range`). That is not a real CJK
-//! candidate window: GPUI's test platform does not record
-//! `update_ime_position` / `set_ime_cursor_position`.
+//! candidate window.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -51,7 +55,8 @@ pub struct ImeLeafHit {
     pub caret_bounds: Option<Bounds<Pixels>>,
 }
 
-/// Per-frame IME geometry. Cleared at the start of each render.
+/// Per-frame IME geometry. Leaf/widget hits are cleared at the start of each
+/// render; sticky caret and generation persist across blink-off frames.
 #[derive(Default)]
 pub struct ImeOriginState {
     widget_focused: bool,
@@ -64,20 +69,40 @@ pub struct ImeOriginState {
     /// Non-text painted surfaces (standalone images, thematic rules) so a
     /// leftover click is below them rather than on them.
     painted_bounds: Vec<Bounds<Pixels>>,
-    /// Bumps when the caret source or widget-focus flag changes so a caret
-    /// move still pushes even if two surfaces happen to share a rectangle.
+    /// Preedit string this frame (`None` = not composing). A change bumps
+    /// [`Self::caret_generation`] so composition start/update/commit still
+    /// invalidates the platform IME even when the caret rect is unchanged.
+    composition: Option<String>,
+    /// Last painted caret of the focused leaf. Survives blink-off frames
+    /// that omit `caret_bounds` so the OS candidate origin does not jump to
+    /// the leaf top-left.
+    sticky_caret: Option<Bounds<Pixels>>,
+    /// Bumps when the caret source, widget-focus flag, or composition key
+    /// changes so a move still pushes even if two surfaces share a rectangle.
     caret_generation: u64,
     last_pushed_generation: Option<u64>,
     last_platform_origin: Option<Bounds<Pixels>>,
 }
 
 impl ImeOriginState {
-    pub fn begin_frame(&mut self, widget_focused: bool, caret_source: usize) {
-        if self.widget_focused != widget_focused || self.caret_source != caret_source {
+    pub fn begin_frame(
+        &mut self,
+        widget_focused: bool,
+        caret_source: usize,
+        composition: Option<&str>,
+    ) {
+        let caret_moved =
+            self.widget_focused != widget_focused || self.caret_source != caret_source;
+        let composition_changed = self.composition.as_deref() != composition;
+        if caret_moved || composition_changed {
             self.caret_generation = self.caret_generation.wrapping_add(1);
+        }
+        if caret_moved {
+            self.sticky_caret = None;
         }
         self.widget_focused = widget_focused;
         self.caret_source = caret_source;
+        self.composition = composition.map(str::to_string);
         self.widget_bounds = None;
         self.widget_caret = None;
         self.leaves.clear();
@@ -118,18 +143,30 @@ impl ImeOriginState {
     /// Caret rectangle the OS IME should follow.
     pub fn caret_rect(&self) -> Option<Bounds<Pixels>> {
         if self.widget_focused {
+            if let Some(inner) = self.widget_caret {
+                return Some(inner);
+            }
             return self.widget_bounds.map(widget_caret_rect);
         }
-        self.focused_leaf().map(leaf_caret_or_fallback)
+        let leaf = self.focused_leaf()?;
+        Some(
+            leaf.caret_bounds
+                .or(self.sticky_caret)
+                .unwrap_or_else(|| leaf_origin_fallback(leaf)),
+        )
     }
 
     /// Resolved origin to push to the platform IME cursor API.
     ///
     /// Returns `Some` when the origin changed since the last push (caret
-    /// move, widget focus, or a new painted rect). The view must call
-    /// [`gpui::Window::invalidate_character_coordinates`] with this — not only
-    /// wait for `bounds_for_range`.
+    /// move, widget focus, composition change, or a new painted rect). The
+    /// view must call [`gpui::Window::invalidate_character_coordinates`] —
+    /// not only wait for `bounds_for_range`. That is the GPUI equivalent of
+    /// `set_ime_cursor_position`; the test window does not record it.
     pub fn take_platform_push(&mut self) -> Option<Bounds<Pixels>> {
+        if let Some(painted) = self.focused_leaf().and_then(|leaf| leaf.caret_bounds) {
+            self.sticky_caret = Some(painted);
+        }
         let rect = self.caret_rect()?;
         let same_generation = self.last_pushed_generation == Some(self.caret_generation);
         let same_rect = self.last_platform_origin == Some(rect);
@@ -173,11 +210,11 @@ impl ImeOriginState {
     }
 }
 
-/// Trailing edge of the focused chip / caption / frontmatter overlay.
+/// Fallback origin: trailing edge of a chip / caption / frontmatter overlay.
 ///
-/// Widgets append a `|` at the end of the draft (including wrapped YAML), so
-/// the bottom-right of the overlay is the caret, not the top-left of a body
-/// text leaf painted later in the same frame.
+/// Used only when the overlay has not reported an inner `|` / caret quad yet.
+/// Production paint reports [`ImeOriginState::report_widget_caret`] so a
+/// mid-draft caret is not this right-edge rectangle.
 pub fn widget_caret_rect(widget: Bounds<Pixels>) -> Bounds<Pixels> {
     let h = widget.size.height.min(px(22.)).max(px(2.));
     Bounds {
@@ -248,12 +285,33 @@ pub(super) fn body_selected_text_range(
     }
 }
 
-pub(super) fn widget_selected_text_range(draft: &str, preedit: Option<&str>) -> UTF16Selection {
-    let content = format!("{}{}", draft, preedit.unwrap_or_default());
-    let n = offset_to_utf16(&content, content.len());
+pub(super) fn widget_selected_text_range(
+    draft: &str,
+    caret: usize,
+    anchor: usize,
+    preedit: Option<&str>,
+) -> UTF16Selection {
+    let mut at = caret.min(draft.len());
+    if !draft.is_char_boundary(at) {
+        at = draft.len();
+    }
+    let pre_len = offset_to_utf16(preedit.unwrap_or(""), preedit.unwrap_or("").len());
+    if pre_len > 0 {
+        let start = offset_to_utf16(draft, at);
+        return UTF16Selection {
+            range: start..start + pre_len,
+            reversed: false,
+        };
+    }
+    let mut from = anchor.min(draft.len());
+    if !draft.is_char_boundary(from) {
+        from = draft.len();
+    }
+    let start = offset_to_utf16(draft, at.min(from));
+    let end = offset_to_utf16(draft, at.max(from));
     UTF16Selection {
-        range: n..n,
-        reversed: false,
+        range: start..end,
+        reversed: at < from,
     }
 }
 
@@ -305,23 +363,29 @@ pub(super) fn apply_replace_range_to_selection(
 
 pub(super) fn replace_in_widget_draft(
     draft: &mut String,
+    caret: &mut usize,
     range_utf16: Option<Range<usize>>,
     new_text: &str,
+    fallback: Range<usize>,
 ) {
-    if let Some(range_utf16) = range_utf16 {
+    let (start, end) = if let Some(range_utf16) = range_utf16 {
         let content = draft.clone();
         let start = offset_from_utf16(&content, range_utf16.start).min(draft.len());
         let end = offset_from_utf16(&content, range_utf16.end)
             .min(draft.len())
             .max(start);
-        draft.replace_range(start..end, new_text);
+        (start, end)
     } else {
-        draft.push_str(new_text);
-    }
+        let start = fallback.start.min(draft.len());
+        let end = fallback.end.min(draft.len()).max(start);
+        (start, end)
+    };
+    draft.replace_range(start..end, new_text);
+    *caret = start + new_text.len();
 }
 
-fn leaf_caret_or_fallback(leaf: &ImeLeafHit) -> Bounds<Pixels> {
-    leaf.caret_bounds.unwrap_or_else(|| Bounds {
+fn leaf_origin_fallback(leaf: &ImeLeafHit) -> Bounds<Pixels> {
+    Bounds {
         origin: leaf.bounds.origin,
         size: size(
             px(2.),
@@ -329,7 +393,7 @@ fn leaf_caret_or_fallback(leaf: &ImeLeafHit) -> Bounds<Pixels> {
                 .min(leaf.bounds.size.height)
                 .max(px(2.)),
         ),
-    })
+    }
 }
 
 /// Pick the leaf that owns `caret`, ignoring paint order.
@@ -407,7 +471,7 @@ mod tests {
 
     fn body_frame(caret: usize, leaves: Vec<ImeLeafHit>) -> ImeOriginState {
         let mut ime = ImeOriginState::default();
-        ime.begin_frame(false, caret);
+        ime.begin_frame(false, caret, None);
         for leaf in leaves {
             ime.report_leaf(leaf);
         }
@@ -419,13 +483,71 @@ mod tests {
         decoy_leaves: Vec<ImeLeafHit>,
         caret_in_body: usize,
     ) -> ImeOriginState {
+        widget_frame_with_inner(widget, None, decoy_leaves, caret_in_body)
+    }
+
+    fn widget_frame_with_inner(
+        widget: Bounds<Pixels>,
+        inner: Option<Bounds<Pixels>>,
+        decoy_leaves: Vec<ImeLeafHit>,
+        caret_in_body: usize,
+    ) -> ImeOriginState {
         let mut ime = ImeOriginState::default();
-        ime.begin_frame(true, caret_in_body);
+        ime.begin_frame(true, caret_in_body, None);
         ime.report_widget(widget);
+        if let Some(caret) = inner {
+            ime.report_widget_caret(caret);
+        }
         for leaf in decoy_leaves {
             ime.report_leaf(leaf);
         }
         ime
+    }
+
+    /// Approximate inner `|` rect from a draft offset (headless; production
+    /// uses the shaped-glyph caret). Mid-draft is never the overlay right edge.
+    fn inner_widget_caret_rect(
+        widget: Bounds<Pixels>,
+        draft: &str,
+        caret: usize,
+    ) -> Bounds<Pixels> {
+        let h = widget.size.height.min(px(22.)).max(px(2.));
+        let at = caret.min(draft.len());
+        let before = &draft[..at];
+        let line_idx = before.matches('\n').count() as f32;
+        let col = before.rsplit('\n').next().unwrap_or("").chars().count() as f32;
+        let x = f32::from(widget.origin.x) + col * 8.0;
+        let y = f32::from(widget.origin.y) + line_idx * f32::from(h);
+        let right = f32::from(widget.origin.x + widget.size.width);
+        Bounds {
+            origin: point(
+                px(x.min(right - 2.0).max(f32::from(widget.origin.x))),
+                px(y),
+            ),
+            size: size(px(2.), h),
+        }
+    }
+
+    #[test]
+    fn widget_ime_insert_uses_inner_caret_not_append() {
+        let mut draft = "****".to_string();
+        let mut caret = 2usize;
+        let at = caret;
+        replace_in_widget_draft(&mut draft, &mut caret, None, "x", at..at);
+        assert_eq!(draft, "**x**");
+        assert_eq!(caret, 3);
+        let sel = widget_selected_text_range(&draft, caret, caret, None);
+        assert_eq!(sel.range.start, sel.range.end);
+        assert_eq!(sel.range.start, offset_to_utf16(&draft, 3));
+    }
+
+    #[test]
+    fn widget_ime_insert_replaces_inner_selection() {
+        let mut draft = "cat".to_string();
+        let mut caret = 3usize;
+        replace_in_widget_draft(&mut draft, &mut caret, None, "x", 1..3);
+        assert_eq!(draft, "cx");
+        assert_eq!(caret, 2);
     }
 
     #[test]
@@ -539,7 +661,7 @@ mod tests {
         let yaml = rect(24.0, 48.0, 360.0, 72.0);
         let later = rect(24.0, 900.0, 2.0, 22.0);
         let mut ime = ImeOriginState::default();
-        ime.begin_frame(true, 0);
+        ime.begin_frame(true, 0, None);
         ime.report_widget(yaml);
         ime.report_leaf(hit(
             "body after frontmatter",
@@ -554,12 +676,12 @@ mod tests {
     #[test]
     fn begin_frame_clears_stale_widget_when_focus_returns_to_body() {
         let mut ime = ImeOriginState::default();
-        ime.begin_frame(true, 0);
+        ime.begin_frame(true, 0, None);
         ime.report_widget(rect(24.0, 8.0, 100.0, 18.0));
         assert_eq!(ime.owner(), Some(ImeOwner::Widget));
 
         let body = rect(24.0, 96.0, 2.0, 22.0);
-        ime.begin_frame(false, 4);
+        ime.begin_frame(false, 4, None);
         ime.report_leaf(hit("Hello", 0, rect(24.0, 96.0, 400.0, 22.0), Some(body)));
         assert_eq!(ime.owner(), Some(ImeOwner::Leaf));
         assert_eq!(ime.caret_rect(), Some(body));
@@ -615,7 +737,7 @@ mod tests {
         let para = rect(8.0, 10.0, 200.0, 22.0);
         let image = rect(8.0, 40.0, 200.0, 80.0);
         let mut ime = ImeOriginState::default();
-        ime.begin_frame(false, 0);
+        ime.begin_frame(false, 0, None);
         ime.report_leaf(hit("hello", 0, para, None));
         ime.report_painted_bounds(image);
         assert!(
@@ -633,7 +755,7 @@ mod tests {
 
         let rule = rect(8.0, 40.0, 400.0, 1.0);
         let mut ime = ImeOriginState::default();
-        ime.begin_frame(false, 0);
+        ime.begin_frame(false, 0, None);
         ime.report_painted_bounds(rule);
         assert!(
             !ime.point_is_below_painted_content(point(px(20.0), px(40.5))),
@@ -653,6 +775,7 @@ mod tests {
             "newlines-only / unpainted document must accept a leftover click"
         );
     }
+
     fn first_code(blocks: &[markrust_core::rich::Block]) -> Option<&markrust_core::rich::Block> {
         for b in blocks {
             if matches!(b.kind, BlockKind::CodeBlock { .. }) {
@@ -992,10 +1115,15 @@ mod tests {
         engine: &markrust_core::rich::RichEngine,
         caret: usize,
         widget: Option<Bounds<Pixels>>,
+        widget_inner: Option<Bounds<Pixels>>,
+        composition: Option<&str>,
     ) {
-        ime.begin_frame(widget.is_some(), caret);
+        ime.begin_frame(widget.is_some(), caret, composition);
         if let Some(bounds) = widget {
             ime.report_widget(bounds);
+            if let Some(inner) = widget_inner {
+                ime.report_widget_caret(inner);
+            }
         }
         let mut y = 10.0;
         report_tree_leaves(ime, &engine.tree().blocks, caret, &mut y);
@@ -1005,7 +1133,7 @@ mod tests {
     fn platform_push_fires_once_per_origin_change() {
         let mut ime = ImeOriginState::default();
         let body = rect(10.0, 40.0, 2.0, 22.0);
-        ime.begin_frame(false, 3);
+        ime.begin_frame(false, 3, None);
         ime.report_leaf(hit("hello", 0, rect(8.0, 40.0, 200.0, 22.0), Some(body)));
         assert_eq!(ime.take_platform_push(), Some(body));
         assert_eq!(
@@ -1013,6 +1141,53 @@ mod tests {
             None,
             "same origin must not re-push"
         );
+    }
+
+    #[test]
+    fn blink_off_keeps_caret_origin_not_leaf_top_left() {
+        let mut ime = ImeOriginState::default();
+        let caret = rect(80.0, 40.0, 2.0, 22.0);
+        let leaf = rect(8.0, 40.0, 200.0, 22.0);
+        ime.begin_frame(false, 3, None);
+        ime.report_leaf(hit("hello", 0, leaf, Some(caret)));
+        assert_eq!(ime.take_platform_push(), Some(caret));
+
+        ime.begin_frame(false, 3, None);
+        ime.report_leaf(hit("hello", 0, leaf, None));
+        assert_eq!(
+            ime.caret_rect(),
+            Some(caret),
+            "blink-off must keep the last caret, not the leaf origin"
+        );
+        assert_eq!(ime.take_platform_push(), None);
+        assert_ne!(
+            ime.caret_rect(),
+            Some(rect(
+                f32::from(leaf.origin.x),
+                f32::from(leaf.origin.y),
+                2.0,
+                22.0
+            )),
+            "IME origin must not jump to the leaf top-left when the caret quad is hidden"
+        );
+    }
+
+    #[test]
+    fn composition_start_pushes_even_when_caret_rect_is_unchanged() {
+        let mut ime = ImeOriginState::default();
+        let body = rect(10.0, 40.0, 2.0, 22.0);
+        ime.begin_frame(false, 3, None);
+        ime.report_leaf(hit("hello", 0, rect(8.0, 40.0, 200.0, 22.0), Some(body)));
+        assert_eq!(ime.take_platform_push(), Some(body));
+
+        ime.begin_frame(false, 3, Some("ni"));
+        ime.report_leaf(hit("hello", 0, rect(8.0, 40.0, 200.0, 22.0), Some(body)));
+        assert_eq!(
+            ime.take_platform_push(),
+            Some(body),
+            "composition start must invalidate the platform IME even if the caret did not move"
+        );
+        assert_eq!(ime.take_platform_push(), None);
     }
 
     #[test]
@@ -1037,7 +1212,7 @@ mod tests {
         );
 
         let mut ime = ImeOriginState::default();
-        paint_engine_frame(&mut ime, &engine, body_caret, None);
+        paint_engine_frame(&mut ime, &engine, body_caret, None, None, None);
         let origin_body = ime.caret_rect().expect("body origin after edit");
         assert_eq!(ime.take_platform_push(), Some(origin_body));
         assert_eq!(ime.owner(), Some(ImeOwner::Leaf));
@@ -1066,7 +1241,7 @@ mod tests {
             .expect("caret must sit in a table cell after tab");
         assert_eq!(pos.col, 1, "TableTab should land in column b");
 
-        paint_engine_frame(&mut ime, &engine, cell_caret, None);
+        paint_engine_frame(&mut ime, &engine, cell_caret, None, None, None);
         let origin_cell = ime.caret_rect().expect("cell origin after caret move");
         assert_ne!(
             origin_cell, origin_body,
@@ -1107,15 +1282,28 @@ mod tests {
         let body_caret = caret.cursor();
 
         let mut ime = ImeOriginState::default();
-        paint_engine_frame(&mut ime, &engine, body_caret, None);
+        paint_engine_frame(&mut ime, &engine, body_caret, None, None, None);
         let origin_body = ime.caret_rect().expect("body origin after edit");
         assert_eq!(ime.take_platform_push(), Some(origin_body));
 
         let caption = rect(24.0, 260.0, 160.0, 16.0);
-        paint_engine_frame(&mut ime, &engine, body_caret, Some(caption));
+        let inner = inner_widget_caret_rect(caption, "cat", 1);
+        paint_engine_frame(
+            &mut ime,
+            &engine,
+            body_caret,
+            Some(caption),
+            Some(inner),
+            None,
+        );
         let origin_caption = ime.caret_rect().expect("caption origin");
         assert_eq!(ime.owner(), Some(ImeOwner::Widget));
-        assert_eq!(origin_caption, widget_caret_rect(caption));
+        assert_eq!(origin_caption, inner);
+        assert_ne!(
+            origin_caption,
+            widget_caret_rect(caption),
+            "caption IME origin must be the inner caret, not the overlay right edge"
+        );
         assert_ne!(
             origin_caption, origin_body,
             "IME origin must move to the caption overlay after the edit, not keep the body caret"
@@ -1133,12 +1321,44 @@ mod tests {
         rect(0.0, 0.0, 800.0, 600.0)
     }
 
+    /// In-repo stand-in for `PlatformWindow::update_ime_position`.
+    ///
+    /// GPUI's `TestWindow::update_ime_position` is a no-op (`_bounds` discarded),
+    /// so there is no `set_ime_cursor_position` readout. This spy records the
+    /// rectangle `Window::invalidate_character_coordinates` would pass on the
+    /// next frame: `InputHandler::selected_bounds` →
+    /// `compute_ime_candidate_bounds` → `bounds_for_range`.
+    #[derive(Default)]
+    struct PlatformImeSpy {
+        requested: Vec<Bounds<Pixels>>,
+    }
+
+    impl PlatformImeSpy {
+        fn record(&mut self, bounds: Bounds<Pixels>) {
+            self.requested.push(bounds);
+        }
+
+        fn last(&self) -> Option<Bounds<Pixels>> {
+            self.requested.last().copied()
+        }
+    }
+
+    fn gpui_update_ime_position_payload(
+        ime: &ImeOriginState,
+        marked: Option<std::ops::Range<usize>>,
+        selection: UTF16Selection,
+    ) -> Bounds<Pixels> {
+        gpui::PlatformInputHandler::compute_ime_candidate_bounds(marked, &selection, |_| {
+            Some(ime_origin_bounds(ime, decoy_element_bounds()))
+        })
+        .expect("GPUI selected_bounds / update_ime_position payload")
+    }
+
     /// Headless stand-in for [`gpui::EntityInputHandler`] on the WYSIWYG view.
     ///
-    /// GPUI's `TestWindow::update_ime_position` is a no-op, so there is no
-    /// `set_ime_cursor_position` readout. After paint we assert
-    /// [`ImeOriginState::take_platform_push`] — the value `sync_ime_cursor`
-    /// uses before `Window::invalidate_character_coordinates`.
+    /// After paint we assert [`ImeOriginState::take_platform_push`] (what
+    /// `sync_ime_cursor` uses before `invalidate_character_coordinates`) and
+    /// [`PlatformImeSpy`] (the rect GPUI would pass to `update_ime_position`).
     ///
     /// This simulates composition. It does not prove the OS candidate window.
     struct ImeHandlerProbe {
@@ -1149,10 +1369,11 @@ mod tests {
         marked_range: Option<std::ops::Range<usize>>,
         preedit: Option<String>,
         widget_draft: Option<String>,
+        widget_caret: usize,
         widget_preedit: Option<String>,
         widget_bounds: Option<Bounds<Pixels>>,
-        widget_caret: Option<Bounds<Pixels>>,
         ime: ImeOriginState,
+        platform_ime: PlatformImeSpy,
     }
 
     impl ImeHandlerProbe {
@@ -1168,10 +1389,11 @@ mod tests {
                 marked_range: None,
                 preedit: None,
                 widget_draft: None,
+                widget_caret: 0,
                 widget_preedit: None,
                 widget_bounds: None,
-                widget_caret: None,
                 ime: ImeOriginState::default(),
+                platform_ime: PlatformImeSpy::default(),
             }
         }
 
@@ -1185,6 +1407,14 @@ mod tests {
 
         fn source(&self) -> String {
             self.doc.buffer.content()
+        }
+
+        fn composition_key(&self) -> Option<&str> {
+            if self.widget_draft.is_some() {
+                self.widget_preedit.as_deref()
+            } else {
+                self.preedit.as_deref()
+            }
         }
 
         fn apply_rich(&mut self, command: RichCommand) {
@@ -1201,14 +1431,51 @@ mod tests {
 
         fn paint(&mut self) -> Option<Bounds<Pixels>> {
             let caret = self.cursor();
-            paint_engine_frame(&mut self.ime, &self.engine, caret, self.widget_bounds);
-            self.ime.take_platform_push()
+            let composition = self.composition_key().map(str::to_string);
+            let widget = self.widget_bounds;
+            let inner = self.widget_inner_caret();
+            paint_engine_frame(
+                &mut self.ime,
+                &self.engine,
+                caret,
+                widget,
+                inner,
+                composition.as_deref(),
+            );
+            let local = self.ime.take_platform_push()?;
+            let platform = self.candidate_bounds();
+            assert_eq!(
+                platform, local,
+                "GPUI selected_bounds (update_ime_position payload) must match the origin sync_ime_cursor asked to push"
+            );
+            assert_ne!(
+                platform,
+                decoy_element_bounds(),
+                "platform IME rect must not be the element fallback"
+            );
+            self.platform_ime.record(platform);
+            Some(platform)
+        }
+
+        fn widget_inner_caret(&self) -> Option<Bounds<Pixels>> {
+            let bounds = self.widget_bounds?;
+            let draft = self.widget_draft.as_deref().unwrap_or("");
+            Some(inner_widget_caret_rect(bounds, draft, self.widget_caret))
+        }
+
+        fn last_platform_request(&self) -> Option<Bounds<Pixels>> {
+            self.platform_ime.last()
         }
 
         /// `EntityInputHandler::selected_text_range`
         fn selected_text_range(&self) -> UTF16Selection {
             if let Some(draft) = self.widget_draft.as_deref() {
-                return widget_selected_text_range(draft, self.widget_preedit.as_deref());
+                return widget_selected_text_range(
+                    draft,
+                    self.widget_caret,
+                    self.widget_caret,
+                    self.widget_preedit.as_deref(),
+                );
             }
             let content = self.source();
             body_selected_text_range(
@@ -1241,7 +1508,14 @@ mod tests {
         ) {
             if let Some(draft) = self.widget_draft.as_mut() {
                 self.widget_preedit = None;
-                replace_in_widget_draft(draft, range_utf16, new_text);
+                let at = self.widget_caret;
+                replace_in_widget_draft(
+                    draft,
+                    &mut self.widget_caret,
+                    range_utf16,
+                    new_text,
+                    at..at,
+                );
                 return;
             }
             let content = self.source();
@@ -1274,13 +1548,11 @@ mod tests {
         ///
         /// Not `set_ime_cursor_position`: the test window does not record that.
         fn candidate_bounds(&self) -> Bounds<Pixels> {
-            let selection = self.selected_text_range();
-            gpui::PlatformInputHandler::compute_ime_candidate_bounds(
+            gpui_update_ime_position_payload(
+                &self.ime,
                 self.marked_text_range(),
-                &selection,
-                |range| Some(self.bounds_for_range(range)),
+                self.selected_text_range(),
             )
-            .expect("IME candidate origin from handler")
         }
 
         fn assert_preedit_origin(&self, expected: Bounds<Pixels>, label: &str) {
@@ -1302,15 +1574,11 @@ mod tests {
             );
         }
 
-        fn focus_widget(&mut self, bounds: Bounds<Pixels>, draft: &str) {
+        fn focus_widget_at(&mut self, bounds: Bounds<Pixels>, draft: &str, caret: usize) {
             self.widget_draft = Some(draft.to_string());
+            self.widget_caret = caret.min(draft.len());
             self.widget_preedit = None;
             self.widget_bounds = Some(bounds);
-        }
-
-        fn report_widget_caret(&mut self, caret: Bounds<Pixels>) {
-            self.widget_caret = Some(caret);
-            self.ime.report_widget_caret(caret);
         }
 
         fn jump_to(&mut self, caret: usize) {
@@ -1355,11 +1623,12 @@ mod tests {
         );
         assert!(ime.marked_text_range().is_some());
         ime.assert_preedit_origin(origin_after, "after insert");
-        assert_eq!(
-            ime.paint(),
-            None,
-            "same caret during preedit must not re-push"
-        );
+        let composed = ime
+            .paint()
+            .expect("composition start must request a platform IME rect");
+        assert_eq!(composed, origin_after);
+        assert_eq!(ime.last_platform_request(), Some(origin_after));
+        assert_eq!(ime.paint(), None, "unchanged preedit must not re-push");
         ime.assert_preedit_origin(origin_after, "after insert, still composing");
     }
 
@@ -1408,6 +1677,11 @@ mod tests {
             leaf.layout.contains_source(cell_caret),
             "origin leaf must own the cell caret during preedit"
         );
+        let composed = ime
+            .paint()
+            .expect("cell composition start must request a platform IME rect");
+        assert_eq!(composed, pushed_cell);
+        assert_eq!(ime.last_platform_request(), Some(pushed_cell));
         assert_eq!(ime.paint(), None);
     }
 
@@ -1421,12 +1695,18 @@ mod tests {
         ime.unmark_text();
 
         let caption = rect(24.0, 260.0, 160.0, 16.0);
-        ime.focus_widget(caption, "cat");
+        ime.focus_widget_at(caption, "cat", 1);
+        let inner = inner_widget_caret_rect(caption, "cat", 1);
         let pushed_caption = ime
             .paint()
             .expect("caption focus must push a new IME origin");
         assert_eq!(ime.ime.owner(), Some(ImeOwner::Widget));
-        assert_eq!(pushed_caption, widget_caret_rect(caption));
+        assert_eq!(pushed_caption, inner);
+        assert_ne!(
+            pushed_caption,
+            widget_caret_rect(caption),
+            "caption IME origin must not be the overlay right edge while the caret is mid-draft"
+        );
         assert_ne!(pushed_caption, pushed_body);
 
         let source_before = ime.source();
@@ -1437,6 +1717,11 @@ mod tests {
             "widget preedit is display-only"
         );
         ime.assert_preedit_origin(pushed_caption, "after caption focus");
+        let composed = ime
+            .paint()
+            .expect("caption composition start must request a platform IME rect");
+        assert_eq!(composed, pushed_caption);
+        assert_eq!(ime.last_platform_request(), Some(pushed_caption));
         assert_eq!(ime.paint(), None);
     }
 
@@ -1447,14 +1732,25 @@ mod tests {
         let pushed_body = ime.paint().expect("body origin after insert");
 
         let chip = rect(24.0, 120.0, 48.0, 18.0);
-        ime.focus_widget(chip, "rust");
+        ime.focus_widget_at(chip, "rust", 2);
+        let inner = inner_widget_caret_rect(chip, "rust", 2);
         let pushed_chip = ime.paint().expect("chip focus must push a new IME origin");
         assert_eq!(ime.ime.owner(), Some(ImeOwner::Widget));
-        assert_eq!(pushed_chip, widget_caret_rect(chip));
+        assert_eq!(pushed_chip, inner);
+        assert_ne!(
+            pushed_chip,
+            widget_caret_rect(chip),
+            "chip IME origin must not be the overlay right edge while the caret is mid-draft"
+        );
         assert_ne!(pushed_chip, pushed_body);
 
         ime.replace_and_mark_text_in_range("ni");
         ime.assert_preedit_origin(pushed_chip, "after language-chip focus");
+        let composed = ime
+            .paint()
+            .expect("chip composition start must request a platform IME rect");
+        assert_eq!(composed, pushed_chip);
+        assert_eq!(ime.last_platform_request(), Some(pushed_chip));
         assert_eq!(ime.paint(), None);
     }
 
@@ -1467,16 +1763,159 @@ mod tests {
         let pushed_body = ime.paint().expect("body origin after insert");
 
         let title = rect(24.0, 8.0, 220.0, 20.0);
-        ime.focus_widget(title, "Hi");
+        ime.focus_widget_at(title, "Hi", 1);
+        let inner = inner_widget_caret_rect(title, "Hi", 1);
         let pushed_fm = ime
             .paint()
             .expect("frontmatter focus must push a new IME origin");
         assert_eq!(ime.ime.owner(), Some(ImeOwner::Widget));
-        assert_eq!(pushed_fm, widget_caret_rect(title));
+        assert_eq!(pushed_fm, inner);
+        assert_ne!(
+            pushed_fm,
+            widget_caret_rect(title),
+            "frontmatter IME origin must not be the overlay right edge while the caret is mid-draft"
+        );
         assert_ne!(pushed_fm, pushed_body);
 
         ime.replace_and_mark_text_in_range("ni");
         ime.assert_preedit_origin(pushed_fm, "after frontmatter focus");
+        let composed = ime
+            .paint()
+            .expect("frontmatter composition start must request a platform IME rect");
+        assert_eq!(composed, pushed_fm);
+        assert_eq!(ime.last_platform_request(), Some(pushed_fm));
+        assert_eq!(ime.paint(), None);
+    }
+
+    #[test]
+    fn composition_after_yaml_frontmatter_tracks_inner_caret() {
+        let source = "---\ntitle: Hi\n---\n\nhello\n";
+        let caret = source.find("hello").expect("body") + 5;
+        let mut ime = ImeHandlerProbe::open(source, caret);
+        ime.replace_text_in_range(None, "!");
+        let pushed_body = ime.paint().expect("body origin after insert");
+
+        let yaml = rect(24.0, 48.0, 360.0, 72.0);
+        let draft = "title: Hi\nmore: wrapped";
+        ime.focus_widget_at(yaml, draft, draft.find("wrapped").expect("mid") + 3);
+        let inner = inner_widget_caret_rect(yaml, draft, draft.find("wrapped").expect("mid") + 3);
+        let pushed_yaml = ime.paint().expect("YAML focus must push a new IME origin");
+        assert_eq!(ime.ime.owner(), Some(ImeOwner::Widget));
+        assert_eq!(pushed_yaml, inner);
+        assert_ne!(
+            pushed_yaml,
+            widget_caret_rect(yaml),
+            "YAML IME origin must be the inner `|`, not the overlay right edge"
+        );
+        assert!(
+            f32::from(pushed_yaml.origin.y) > f32::from(yaml.origin.y),
+            "YAML inner caret must sit on the wrapped line, not the overlay top"
+        );
+        assert_ne!(pushed_yaml, pushed_body);
+        assert_eq!(ime.last_platform_request(), Some(pushed_yaml));
+
+        ime.replace_and_mark_text_in_range("ni");
+        ime.assert_preedit_origin(pushed_yaml, "after YAML focus");
+        let composed = ime
+            .paint()
+            .expect("YAML composition start must request a platform IME rect");
+        assert_eq!(composed, pushed_yaml);
+        assert_eq!(ime.paint(), None);
+    }
+
+    #[test]
+    fn widget_ime_origin_is_inner_caret_not_overlay_trailing_edge() {
+        let overlay = rect(24.0, 260.0, 160.0, 16.0);
+        let draft = "caption text";
+        let caret = 4; // mid-draft
+        let inner = inner_widget_caret_rect(overlay, draft, caret);
+        let trailing = widget_caret_rect(overlay);
+        assert!(
+            f32::from(inner.origin.x) < f32::from(overlay.origin.x + overlay.size.width),
+            "inner caret must sit inside the overlay, not on its right edge"
+        );
+        assert_ne!(inner, trailing);
+
+        let mut ime = ImeOriginState::default();
+        ime.begin_frame(true, 0, Some("ni"));
+        ime.report_widget(overlay);
+        ime.report_widget_caret(inner);
+        assert_eq!(ime.owner(), Some(ImeOwner::Widget));
+        assert_eq!(ime.caret_rect(), Some(inner));
+        assert_ne!(
+            ime.caret_rect(),
+            Some(trailing),
+            "must fail if origin is the overlay right edge while the caret is mid-draft"
+        );
+
+        let local = ime.take_platform_push().expect("inner origin push");
+        let payload = gpui_update_ime_position_payload(
+            &ime,
+            Some(4..6),
+            UTF16Selection {
+                range: 6..6,
+                reversed: false,
+            },
+        );
+        let mut spy = PlatformImeSpy::default();
+        spy.record(payload);
+        assert_eq!(local, inner);
+        assert_eq!(spy.last(), Some(inner));
+        assert_eq!(
+            payload, inner,
+            "compute_ime_candidate_bounds must follow the inner `|` rect"
+        );
+        assert_ne!(
+            payload, trailing,
+            "platform IME rect must not be the overlay right edge while the caret is mid-draft"
+        );
+        assert_ne!(payload, decoy_element_bounds());
+    }
+
+    #[test]
+    fn wrapped_line_platform_payload_is_second_line_caret() {
+        let mut ime = ImeOriginState::default();
+        let mut spy = PlatformImeSpy::default();
+        let leaf_bounds = rect(8.0, 10.0, 240.0, 66.0);
+        let second_line = rect(8.0, 32.0, 2.0, 22.0);
+        ime.begin_frame(false, 40, Some("ni"));
+        ime.report_leaf(hit(
+            "a long paragraph that wraps onto a second visual line here",
+            0,
+            leaf_bounds,
+            Some(second_line),
+        ));
+        let local = ime.take_platform_push().expect("wrapped origin");
+        let payload = gpui_update_ime_position_payload(
+            &ime,
+            Some(40..42),
+            UTF16Selection {
+                range: 42..42,
+                reversed: false,
+            },
+        );
+        spy.record(payload);
+        assert_eq!(local, second_line);
+        assert_eq!(spy.last(), Some(second_line));
+        assert!(
+            f32::from(payload.origin.y) > f32::from(leaf_bounds.origin.y),
+            "platform IME rect must sit on the wrapped line, not the leaf top"
+        );
+    }
+
+    #[test]
+    fn composition_update_re_requests_platform_ime_rect() {
+        let mut ime = ImeHandlerProbe::open("hello\n", 5);
+        let origin = ime.paint().expect("initial origin");
+        ime.replace_and_mark_text_in_range("ni");
+        assert_eq!(
+            ime.paint().expect("composition start"),
+            origin,
+            "start must push the caret origin to the platform"
+        );
+        ime.replace_and_mark_text_in_range("nihongo");
+        assert_eq!(ime.paint().expect("preedit update must re-push"), origin);
+        assert_eq!(ime.last_platform_request(), Some(origin));
         assert_eq!(ime.paint(), None);
     }
 

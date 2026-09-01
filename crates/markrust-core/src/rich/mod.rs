@@ -17,14 +17,13 @@ pub mod serialize;
 pub mod tree;
 
 pub use command::{
-    apply_rich_command, place_caret_for_click_below, table_select_all_range, BlockType, CaretState,
-    RichCommand, RichError, RichOutcome,
+    apply_rich_command, code_body_source_map, place_caret_for_click_below, table_select_all_range,
+    BlockType, CaretState, RichCommand, RichError, RichOutcome,
 };
 pub use emoji::{lookup_emoji, lookup_shortcode};
 pub use engine::{
     blank_caret_gap_after_last, blank_caret_gap_at, blank_caret_gap_before, blank_caret_gaps,
-    caret_for_click_below_content, code_body_source_map, Bias, BlockSpan, BlockSplice, RichEngine,
-    TablePos,
+    caret_for_click_below_content, Bias, BlockSpan, BlockSplice, RichEngine, TablePos,
 };
 pub use import::import_markdown;
 pub use input_rules::{

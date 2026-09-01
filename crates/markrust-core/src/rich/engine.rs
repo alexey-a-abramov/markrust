@@ -290,6 +290,7 @@ impl RichEngine {
     /// Comrak-less blank (leading newlines, a block separator, or a trailing
     /// blank after the last block) stay on that painted line (EOF on a
     /// trailing blank maps to the gap start, not into the last paragraph).
+    /// Empty `> ` / `- ` lines sit after the prefix (not on chrome).
     pub fn snap_caret(&self, byte: usize, bias: Bias) -> usize {
         let fm_end = frontmatter_body_start(&self.tree);
         if fm_end > 0 && byte < fm_end {
@@ -664,76 +665,6 @@ impl RichEngine {
         at
     }
 
-    /// `[` / `](url)` / `**` / ticks / autolink `<>` adjacent to a visible
-    /// run, including wrapping dest around a linked image. `inner.end`
-    /// (caret after the last visible letter) is not skipped so typing still
-    /// extends the label / marked text.
-    fn skip_inline_delimiter_chrome(&self, source: &str, byte: usize, bias: Bias) -> usize {
-        let mut at = byte.min(source.len());
-        for _ in 0..16 {
-            let next = self.inline_chrome_step(source, at, bias);
-            if next == at {
-                return at;
-            }
-            at = next.min(source.len());
-        }
-        at
-    }
-
-    fn inline_chrome_step(&self, source: &str, byte: usize, bias: Bias) -> usize {
-        let mut found: Option<(Range<usize>, Range<usize>)> = None;
-        walk_inline_inner_outer(&self.tree.blocks, source, &mut |inner, outer| {
-            if inner.start == outer.start && inner.end == outer.end {
-                return;
-            }
-            if (byte >= outer.start && byte < inner.start) || (byte > inner.end && byte < outer.end)
-            {
-                found = Some((inner, outer));
-            }
-        });
-        let Some((inner, outer)) = found else {
-            return byte;
-        };
-        match bias {
-            Bias::Right => {
-                if byte < inner.start {
-                    inner.start
-                } else {
-                    outer.end.min(source.len())
-                }
-            }
-            Bias::Left => {
-                if byte < inner.start {
-                    if outer.start == 0 {
-                        inner.start
-                    } else {
-                        outer.start - 1
-                    }
-                } else {
-                    inner.end
-                }
-            }
-        }
-    }
-
-    /// True when `byte` is markdown chrome around a visible run (`[`, `](url)`,
-    /// `**`, ticks, autolink `<>`). Includes the byte at `inner.end` (`]`) so
-    /// Backspace/Delete do not nibble dest / closers.
-    pub(crate) fn byte_is_inline_chrome(&self, source: &str, byte: usize) -> bool {
-        let mut hit = false;
-        walk_inline_inner_outer(&self.tree.blocks, source, &mut |inner, outer| {
-            if inner.start == outer.start && inner.end == outer.end {
-                return;
-            }
-            if (byte >= outer.start && byte < inner.start)
-                || (byte >= inner.end && byte < outer.end)
-            {
-                hit = true;
-            }
-        });
-        hit
-    }
-
     /// Move `delta` visual lines (`+` down, `-` up). A painted blank gap
     /// between blocks is one line even when the source has extra `\n`s.
     pub fn vertical_caret(&self, source: &str, cursor: usize, delta: i32) -> usize {
@@ -875,6 +806,9 @@ impl RichEngine {
         self.tree.outline()
     }
 
+    /// Expand a WYSIWYG visual selection so Copy emits source markdown
+    /// (Typora), not only the painted inner text. A collapsed caret expands
+    /// to the current block (`# ` / `- ` / `>` / fence ticks / paragraph /
     /// `![…](url)`). Table `|` is never included (collapsed caret copies the
     /// cell text). Fenced/HTML bodies keep their ticks/tags.
     pub fn expand_markdown_selection(&self, source: &str, range: Range<usize>) -> Range<usize> {
@@ -922,7 +856,9 @@ fn word_kind_at(source: &str, at: usize) -> WordCharKind {
         .unwrap_or(WordCharKind::Whitespace)
 }
 
-/// Byte ranges of caret-valid inline content within a leaf block.
+/// Byte where body editing may start. YAML is the frontmatter panel, not a
+/// body block. Comrak's FrontMatter sourcepos is often empty (`0..0`); fall
+/// back to the captured `raw` length when the fences sit at document start.
 pub(crate) fn frontmatter_body_start(tree: &RichTree) -> usize {
     let Some(fm) = &tree.frontmatter else {
         return 0;
@@ -1032,89 +968,6 @@ fn blank_between(lo: usize, hi: usize, leading: bool) -> Option<Range<usize>> {
     Some(start..hi)
 }
 
-/// Byte ranges of caret-valid inline content within a leaf block. Quote and
-/// list containers with no inlines of their own use their descendants so
-/// `>` / `- ` are not caret homes (Home / snap land on painted body).
-fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
-    match &block.kind {
-        BlockKind::CodeBlock { .. } => {
-            if let Some(Inline::Run { source_range, .. }) = block.inlines.first() {
-                vec![source_range.clone()]
-            } else {
-                vec![block.source_range.clone()]
-            }
-        }
-        BlockKind::Opaque { .. } => vec![block.source_range.clone()],
-        BlockKind::Alert { chrome_range, .. } => {
-            let mut out = Vec::new();
-            if chrome_range.start < chrome_range.end {
-                out.push(chrome_range.clone());
-            }
-            for child in &block.children {
-                out.extend(inline_ranges(child));
-            }
-            if out.is_empty() {
-                out.push(block.source_range.clone());
-            }
-            out
-        }
-        BlockKind::Table { .. } | BlockKind::TableRow { .. } => {
-            vec![block.source_range.clone()]
-        }
-        _ if block.inlines.is_empty() && !block.children.is_empty() => {
-            let mut out = Vec::new();
-            for child in &block.children {
-                out.extend(inline_ranges(child));
-            }
-            if out.is_empty() {
-                out.push(block.source_range.clone());
-            }
-            out
-        }
-        _ => leaf_inline_ranges(block),
-    }
-}
-
-/// Markdown `![alt](url)` and safe HTML `<img>` are one caret/selection step
-/// (pixels in WYSIWYG, not `!` / `[` / `)`).
-fn atomic_image_range(inline: &Inline) -> Option<Range<usize>> {
-    match inline {
-        Inline::Image { source_range, .. } => Some(source_range.clone()),
-        Inline::OpaqueInline {
-            raw, source_range, ..
-        } if crate::html_visual::html_inline_image(raw).is_some() => Some(source_range.clone()),
-        _ => None,
-    }
-}
-
-fn range_is_atomic_image(block: &Block, range: &Range<usize>) -> bool {
-    fn walk(block: &Block, range: &Range<usize>) -> bool {
-        if block
-            .inlines
-            .iter()
-            .any(|inline| atomic_image_range(inline).as_ref() == Some(range))
-        {
-            return true;
-        }
-        block.children.iter().any(|child| walk(child, range))
-    }
-    walk(block, range)
-}
-
-fn step_left_caret(source: &str, block: &Block, range: &Range<usize>, byte: usize) -> usize {
-    if range_is_atomic_image(block, range) && byte > range.start {
-        return range.start;
-    }
-    step_left_in_slice(source, range.start, byte)
-}
-
-fn step_right_caret(source: &str, block: &Block, byte: usize, range: &Range<usize>) -> usize {
-    if range_is_atomic_image(block, range) && byte < range.end {
-        return range.end;
-    }
-    step_right_in_slice(source, byte, range.end)
-}
-
 fn raw_leaf_at(engine: &RichEngine, offset: usize) -> Option<&Block> {
     let id = engine.block_at(offset)?;
     let block = engine.block(id)?;
@@ -1123,6 +976,20 @@ fn raw_leaf_at(engine: &RichEngine, offset: usize) -> Option<&Block> {
         BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. }
     )
     .then_some(block)
+}
+
+/// Drop `|` separators that comrak sometimes includes at a cell's edges.
+fn trim_cell_pipes(source: &str, range: Range<usize>) -> Range<usize> {
+    let bytes = source.as_bytes();
+    let mut start = range.start.min(source.len());
+    let mut end = range.end.min(source.len());
+    while start < end && bytes[start] == b'|' {
+        start += 1;
+    }
+    while end > start && bytes[end - 1] == b'|' {
+        end -= 1;
+    }
+    start..end
 }
 
 /// Editable inner range: fence body between ticks, else the whole raw block.
@@ -1415,49 +1282,87 @@ fn map_visible_skipping_prefix(
     source_at
 }
 
-/// Inline-run sources of a leaf block (delimiter gaps are not caret homes).
-fn leaf_inline_ranges(block: &Block) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
-    for inline in &block.inlines {
-        match inline {
-            Inline::Run { source_range, .. }
-            | Inline::Image { source_range, .. }
-            | Inline::Math { source_range, .. }
-            | Inline::WikiLink { source_range, .. }
-            | Inline::Emoji { source_range, .. } => {
-                out.push(source_range.clone());
-            }
-            Inline::OpaqueInline {
-                source_range, raw, ..
-            } => {
-                if !crate::html_visual::opaque_inline_is_caret_chrome(raw) {
-                    out.push(source_range.clone());
-                }
-            }
-            Inline::SoftBreak { .. } | Inline::HardBreak { .. } => {
-                // Not extra caret homes. WYSIWYG maps the painted space / newline
-                // onto `source_range.start`, which sits at the previous run's end.
+/// Byte ranges of caret-valid inline content within a leaf block. Quote and
+/// list containers with no inlines of their own use their descendants so
+/// `>` / `- ` are not caret homes (Home / snap land on painted body).
+fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
+    match &block.kind {
+        BlockKind::CodeBlock { .. } => {
+            if let Some(Inline::Run { source_range, .. }) = block.inlines.first() {
+                vec![source_range.clone()]
+            } else {
+                vec![block.source_range.clone()]
             }
         }
+        BlockKind::Opaque { .. } => vec![block.source_range.clone()],
+        BlockKind::Alert { chrome_range, .. } => {
+            let mut out = Vec::new();
+            if chrome_range.start < chrome_range.end {
+                out.push(chrome_range.clone());
+            }
+            for child in &block.children {
+                out.extend(inline_ranges(child));
+            }
+            if out.is_empty() {
+                out.push(block.source_range.clone());
+            }
+            out
+        }
+        BlockKind::Table { .. } | BlockKind::TableRow { .. } => {
+            vec![block.source_range.clone()]
+        }
+        _ if block.inlines.is_empty() && !block.children.is_empty() => {
+            let mut out = Vec::new();
+            for child in &block.children {
+                out.extend(inline_ranges(child));
+            }
+            if out.is_empty() {
+                out.push(block.source_range.clone());
+            }
+            out
+        }
+        _ => leaf_inline_ranges(block),
     }
-    if out.is_empty() {
-        out.push(block.source_range.clone());
-    }
-    out
 }
 
-/// Drop `|` separators that comrak sometimes includes at a cell's edges.
-fn trim_cell_pipes(source: &str, range: Range<usize>) -> Range<usize> {
-    let bytes = source.as_bytes();
-    let mut start = range.start.min(source.len());
-    let mut end = range.end.min(source.len());
-    while start < end && bytes[start] == b'|' {
-        start += 1;
+/// Markdown `![alt](url)` and safe HTML `<img>` are one caret/selection step
+/// (pixels in WYSIWYG, not `!` / `[` / `)`).
+fn atomic_image_range(inline: &Inline) -> Option<Range<usize>> {
+    match inline {
+        Inline::Image { source_range, .. } => Some(source_range.clone()),
+        Inline::OpaqueInline {
+            raw, source_range, ..
+        } if crate::html_visual::html_inline_image(raw).is_some() => Some(source_range.clone()),
+        _ => None,
     }
-    while end > start && bytes[end - 1] == b'|' {
-        end -= 1;
+}
+
+fn range_is_atomic_image(block: &Block, range: &Range<usize>) -> bool {
+    fn walk(block: &Block, range: &Range<usize>) -> bool {
+        if block
+            .inlines
+            .iter()
+            .any(|inline| atomic_image_range(inline).as_ref() == Some(range))
+        {
+            return true;
+        }
+        block.children.iter().any(|child| walk(child, range))
     }
-    start..end
+    walk(block, range)
+}
+
+fn step_left_caret(source: &str, block: &Block, range: &Range<usize>, byte: usize) -> usize {
+    if range_is_atomic_image(block, range) && byte > range.start {
+        return range.start;
+    }
+    step_left_in_slice(source, range.start, byte)
+}
+
+fn step_right_caret(source: &str, block: &Block, byte: usize, range: &Range<usize>) -> usize {
+    if range_is_atomic_image(block, range) && byte < range.end {
+        return range.end;
+    }
+    step_right_in_slice(source, byte, range.end)
 }
 
 fn expand_markdown_selection(
@@ -1865,6 +1770,108 @@ fn walk_inline_inner_outer(
     }
 }
 
+impl RichEngine {
+    /// `[` / `](url)` / `**` / ticks / autolink `<>` adjacent to a visible
+    /// run, including wrapping dest around a linked image. `inner.end`
+    /// (caret after the last visible letter) is not skipped so typing still
+    /// extends the label / marked text.
+    fn skip_inline_delimiter_chrome(&self, source: &str, byte: usize, bias: Bias) -> usize {
+        let mut at = byte.min(source.len());
+        for _ in 0..16 {
+            let next = self.inline_chrome_step(source, at, bias);
+            if next == at {
+                return at;
+            }
+            at = next.min(source.len());
+        }
+        at
+    }
+
+    fn inline_chrome_step(&self, source: &str, byte: usize, bias: Bias) -> usize {
+        let mut found: Option<(Range<usize>, Range<usize>)> = None;
+        walk_inline_inner_outer(&self.tree.blocks, source, &mut |inner, outer| {
+            if inner.start == outer.start && inner.end == outer.end {
+                return;
+            }
+            if (byte >= outer.start && byte < inner.start) || (byte > inner.end && byte < outer.end)
+            {
+                found = Some((inner, outer));
+            }
+        });
+        let Some((inner, outer)) = found else {
+            return byte;
+        };
+        match bias {
+            Bias::Right => {
+                if byte < inner.start {
+                    inner.start
+                } else {
+                    outer.end.min(source.len())
+                }
+            }
+            Bias::Left => {
+                if byte < inner.start {
+                    if outer.start == 0 {
+                        inner.start
+                    } else {
+                        outer.start - 1
+                    }
+                } else {
+                    inner.end
+                }
+            }
+        }
+    }
+
+    /// True when `byte` is markdown chrome around a visible run (`[`, `](url)`,
+    /// `**`, ticks, autolink `<>`). Includes the byte at `inner.end` (`]`) so
+    /// Backspace/Delete do not nibble dest / closers.
+    pub(crate) fn byte_is_inline_chrome(&self, source: &str, byte: usize) -> bool {
+        let mut hit = false;
+        walk_inline_inner_outer(&self.tree.blocks, source, &mut |inner, outer| {
+            if inner.start == outer.start && inner.end == outer.end {
+                return;
+            }
+            if (byte >= outer.start && byte < inner.start)
+                || (byte >= inner.end && byte < outer.end)
+            {
+                hit = true;
+            }
+        });
+        hit
+    }
+}
+
+fn leaf_inline_ranges(block: &Block) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for inline in &block.inlines {
+        match inline {
+            Inline::Run { source_range, .. }
+            | Inline::Image { source_range, .. }
+            | Inline::Math { source_range, .. }
+            | Inline::WikiLink { source_range, .. }
+            | Inline::Emoji { source_range, .. } => {
+                out.push(source_range.clone());
+            }
+            Inline::OpaqueInline {
+                source_range, raw, ..
+            } => {
+                if !crate::html_visual::opaque_inline_is_caret_chrome(raw) {
+                    out.push(source_range.clone());
+                }
+            }
+            Inline::SoftBreak { .. } | Inline::HardBreak { .. } => {
+                // Not extra caret homes. WYSIWYG maps the painted space / newline
+                // onto `source_range.start`, which sits at the previous run's end.
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(block.source_range.clone());
+    }
+    out
+}
+
 /// Preserve NodeIds of top-level blocks whose source slice is unchanged
 /// (common prefix/suffix match, like a diff), and report the changed window.
 fn reconcile_ids(old: &RichTree, new: &mut RichTree, new_source: &str) -> BlockSplice {
@@ -1911,8 +1918,7 @@ pub(crate) fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
-/// Step one grapheme-ish unit left within [start, byte); backslash escapes
-/// ("\\X") are atomic.
+/// One source-line step, preserving column when the target line is long enough.
 fn adjacent_source_line_offset(source: &str, cursor: usize, down: bool) -> usize {
     let cursor = cursor.min(source.len());
     let line_start = source[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -1945,6 +1951,8 @@ fn adjacent_source_line_offset(source: &str, cursor: usize, down: bool) -> usize
     (start + col).min(end)
 }
 
+/// Step one grapheme-ish unit left within [start, byte); backslash escapes
+/// ("\\X") are atomic.
 fn step_left_in_slice(source: &str, start: usize, byte: usize) -> usize {
     let slice = &source[start..byte];
     let Some(last) = slice.char_indices().last() else {
@@ -1977,6 +1985,7 @@ pub(crate) fn step_right_in_slice(source: &str, byte: usize, end: usize) -> usiz
 mod tests {
     use super::*;
     use crate::document::Document;
+    use std::ops::Range;
 
     fn engine_for(source: &str) -> (Document, RichEngine) {
         let doc = Document::new(source);
@@ -2051,6 +2060,231 @@ mod tests {
         let close = source.find("**ated").unwrap_or(6);
         let snapped_left = engine.snap_caret(close + 1, Bias::Left);
         assert_eq!(snapped_left, 6);
+    }
+
+    #[test]
+    fn snap_caret_skips_inline_code_backticks() {
+        let source = "`code` tail\n";
+        let (_doc, engine) = engine_for(source);
+        let c = source.find('c').expect("c");
+        let tick = source.find('`').expect("tick");
+        assert_eq!(
+            engine.snap_caret(tick, Bias::Right),
+            c,
+            "snap on the opening backtick must land on `c`, got {}",
+            ch_at(source, engine.snap_caret(tick, Bias::Right))
+        );
+        let close = source.rfind('`').expect("close tick");
+        assert_eq!(
+            engine.snap_caret(close, Bias::Left),
+            c + "code".len(),
+            "snap on the closing backtick must land at the end of `code`"
+        );
+        assert_ne!(
+            ch_at(source, engine.snap_caret(tick, Bias::Right)),
+            '`',
+            "backticks are not caret homes"
+        );
+    }
+
+    #[test]
+    fn next_caret_skips_markdown_link_dest() {
+        let source = "see [label](https://e.com) now\n";
+        let (_doc, engine) = engine_for(source);
+        let end_label = source.find("label").unwrap() + "label".len();
+        let now = source.find("now").expect("now");
+        let next = engine.next_caret(source, end_label);
+        assert_ne!(ch_at(source, next), ']');
+        assert_ne!(ch_at(source, next), '(');
+        assert!(
+            next <= now,
+            "Right at the end of a link label must skip `](url)`, got {} {:?}",
+            next,
+            ch_at(source, next)
+        );
+        let l = source.find('l').expect("l");
+        let prev = engine.prev_caret(source, l);
+        assert_ne!(ch_at(source, prev), '[', "Left at the label must skip `[`");
+        assert_eq!(
+            ch_at(source, prev),
+            ' ',
+            "Left from the label must land on the previous visible space, got {} {:?}",
+            prev,
+            ch_at(source, prev)
+        );
+    }
+
+    #[test]
+    fn prev_caret_skips_email_autolink_brackets() {
+        let source = "see <user@example.com> now\n";
+        let (_doc, engine) = engine_for(source);
+        let u = source.find("user").expect("user");
+        let prev = engine.prev_caret(source, u);
+        assert_ne!(
+            ch_at(source, prev),
+            '<',
+            "Left at an email autolink must skip `<`"
+        );
+        assert_eq!(
+            ch_at(source, prev),
+            ' ',
+            "Left from the email must land on the previous visible space, got {} {:?}",
+            prev,
+            ch_at(source, prev)
+        );
+        let end = u + "user@example.com".len();
+        let next = engine.next_caret(source, end);
+        assert_ne!(ch_at(source, next), '>');
+    }
+
+    #[test]
+    fn prev_caret_skips_wrapping_dest_on_linked_image() {
+        let source = "see [![cat](a.png)](https://e.com) now\n";
+        let (_doc, engine) = engine_for(source);
+        let img = first_image_range(&engine);
+        let prev = engine.prev_caret(source, img.start);
+        assert_ne!(
+            ch_at(source, prev),
+            '[',
+            "Left at a linked image must skip wrapping `[`"
+        );
+        assert_eq!(
+            ch_at(source, prev),
+            ' ',
+            "Left from a linked image must land on the previous visible space, got {} {:?}",
+            prev,
+            ch_at(source, prev)
+        );
+        let next = engine.next_caret(source, img.end);
+        assert_ne!(ch_at(source, next), ']');
+        assert_ne!(ch_at(source, next), '(');
+    }
+
+    #[test]
+    fn word_caret_skips_bold_delimiters_and_punctuation() {
+        let source = "**hello** world";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        let w = source.find('w').expect("w");
+        let end_hello = engine.next_word_caret(source, h);
+        assert_eq!(
+            end_hello,
+            source.find(' ').expect("space"),
+            "WordRight from `hello` lands on the visible space, not `*`"
+        );
+        assert_eq!(
+            engine.next_word_caret(source, end_hello),
+            w + "world".len(),
+            "next WordRight is the end of `world`"
+        );
+        assert_eq!(
+            engine.prev_word_caret(source, source.len()),
+            w,
+            "WordLeft from EOF is the start of `world`"
+        );
+        assert_eq!(
+            engine.prev_word_caret(source, w),
+            h,
+            "WordLeft from `world` skips `**` onto `hello`"
+        );
+
+        let punct = "one, two";
+        let (_doc, engine) = engine_for(punct);
+        assert_eq!(engine.next_word_caret(punct, 0), 3, "end of `one`");
+        assert_eq!(
+            engine.next_word_caret(punct, 3),
+            4,
+            "comma is its own visible run"
+        );
+        assert_eq!(engine.next_word_caret(punct, 4), punct.len());
+        assert_eq!(engine.prev_word_caret(punct, punct.len()), 5);
+        assert_eq!(engine.prev_word_caret(punct, 5), 3);
+        assert_eq!(engine.prev_word_caret(punct, 3), 0);
+    }
+
+    #[test]
+    fn document_home_skips_frontmatter_yaml() {
+        let source = "---\ntitle: Hello\n---\n\n# Body\n";
+        let (_doc, engine) = engine_for(source);
+        let fm_end = frontmatter_body_start(engine.tree());
+        let home = engine.clamp_raw_prefix(source, engine.snap_caret(0, Bias::Right), Bias::Right);
+        assert!(
+            home >= fm_end,
+            "Cmd-Up / document start must sit after YAML, got {home} fm_end={fm_end}"
+        );
+        let body = source.find("Body").expect("Body");
+        assert!(
+            home <= body,
+            "document start must not overshoot `# Body`, got {home} body={body}"
+        );
+        let title = source.find("Hello").expect("title");
+        assert!(
+            home > title,
+            "document start must not land in the YAML title, home={home} title={title}"
+        );
+        let end = engine.clamp_raw_prefix(
+            source,
+            engine.snap_caret(source.len(), Bias::Left),
+            Bias::Left,
+        );
+        assert!(end >= body, "document end must stay in the body, got {end}");
+    }
+
+    #[test]
+    fn snap_caret_skips_frontmatter() {
+        let source = "---\ntitle: Hello\n---\n\n# Body\n";
+        let (_doc, engine) = engine_for(source);
+        let fm_end = frontmatter_body_start(engine.tree());
+        assert!(
+            fm_end > 0,
+            "YAML fences must occupy a positive prefix, range={:?} raw_len={}",
+            engine.tree().frontmatter.as_ref().map(|f| &f.source_range),
+            engine
+                .tree()
+                .frontmatter
+                .as_ref()
+                .map(|f| f.raw.len())
+                .unwrap_or(0)
+        );
+        let snapped = engine.snap_caret(0, Bias::Right);
+        assert!(
+            snapped >= fm_end,
+            "caret at 0 must sit after YAML, got {snapped} fm_end={fm_end}"
+        );
+        let title = source.find("Hello").expect("title");
+        assert!(
+            snapped > title,
+            "body caret must not land inside the YAML title, snapped={snapped} title={title}"
+        );
+    }
+
+    #[test]
+    fn snap_caret_skips_fenced_code_chrome() {
+        let source = "```\ncode\n```\n";
+        let (_doc, engine) = engine_for(source);
+        let body = source.find("code").expect("code");
+        assert_eq!(
+            engine.snap_caret(0, Bias::Right),
+            body,
+            "opening ticks must snap into the body"
+        );
+        assert_eq!(
+            engine.snap_caret(1, Bias::Left),
+            body,
+            "caret must not sit on fence ticks"
+        );
+        let close = source.rfind("```").expect("close");
+        let body_end = body + "code".len();
+        assert_eq!(
+            engine.snap_caret(close, Bias::Left),
+            body_end,
+            "closing ticks must snap to the end of the body"
+        );
+        assert!(engine.in_raw_context(body));
+        assert!(
+            engine.in_raw_context(0),
+            "fence bytes still belong to the code block"
+        );
     }
 
     #[test]
@@ -2460,46 +2694,521 @@ mod tests {
         assert_eq!(&outline[2].2, "Quoted");
     }
 
+    fn first_raw(blocks: &[Block], pred: impl Fn(&BlockKind) -> bool + Copy) -> Option<&Block> {
+        for b in blocks {
+            if pred(&b.kind) {
+                return Some(b);
+            }
+            if let Some(found) = first_raw(&b.children, pred) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn ch_at(source: &str, off: usize) -> char {
+        source
+            .as_bytes()
+            .get(off)
+            .copied()
+            .map(|b| b as char)
+            .unwrap_or('∅')
+    }
+
     #[test]
-    fn word_caret_skips_bold_delimiters_and_punctuation() {
-        let source = "**hello** world";
+    fn quoted_paragraph_arrows_skip_quote_prefix() {
+        let source = "> hello\n";
         let (_doc, engine) = engine_for(source);
         let h = source.find('h').expect("h");
-        let w = source.find('w').expect("w");
-        let end_hello = engine.next_word_caret(source, h);
+        let gt = source.find('>').expect(">");
+        let home = engine.clamp_raw_prefix(source, engine.snap_caret(0, Bias::Right), Bias::Right);
         assert_eq!(
-            end_hello,
-            source.find(' ').expect("space"),
-            "WordRight from `hello` lands on the visible space, not `*`"
-        );
-        assert_eq!(
-            engine.next_word_caret(source, end_hello),
-            w + "world".len(),
-            "next WordRight is the end of `world`"
-        );
-        assert_eq!(
-            engine.prev_word_caret(source, source.len()),
-            w,
-            "WordLeft from EOF is the start of `world`"
-        );
-        assert_eq!(
-            engine.prev_word_caret(source, w),
+            home,
             h,
-            "WordLeft from `world` skips `**` onto `hello`"
+            "Home/click line-start must be `h`, got {}",
+            ch_at(source, home)
         );
+        assert_ne!(home, gt);
+        assert_eq!(engine.snap_caret(0, Bias::Right), h);
+        assert_eq!(engine.next_caret(source, h), h + 1);
+        assert_ne!(engine.next_caret(source, h), gt);
+        let prev = engine.prev_caret(source, h);
+        assert_ne!(prev, gt, "Left at visible start must not sit on `>`");
+        assert_ne!(ch_at(source, prev), '>');
+    }
 
-        let punct = "one, two";
-        let (_doc, engine) = engine_for(punct);
-        assert_eq!(engine.next_word_caret(punct, 0), 3, "end of `one`");
+    #[test]
+    fn quoted_wrapped_paragraph_right_skips_continuation_quote() {
+        let source = "> hello\n> world\n";
+        let (_doc, engine) = engine_for(source);
+        let o = source.find("hello").unwrap() + 4;
+        let w = source.find("world").expect("world");
+        let gt = source.rfind("> world").expect("continuation");
+        let after_o = engine.next_caret(source, o);
+        let onto_w = if ch_at(source, after_o) == 'w' {
+            after_o
+        } else {
+            engine.next_caret(source, after_o)
+        };
         assert_eq!(
-            engine.next_word_caret(punct, 3),
-            4,
-            "comma is its own visible run"
+            onto_w,
+            w,
+            "Right at the wrap must skip `>` onto `w`, got {} {:?}",
+            onto_w,
+            ch_at(source, onto_w)
         );
-        assert_eq!(engine.next_word_caret(punct, 4), punct.len());
-        assert_eq!(engine.prev_word_caret(punct, punct.len()), 5);
-        assert_eq!(engine.prev_word_caret(punct, 5), 3);
-        assert_eq!(engine.prev_word_caret(punct, 3), 0);
+        assert_ne!(onto_w, gt);
+        assert_ne!(ch_at(source, onto_w), '>');
+        let prev = engine.prev_caret(source, w);
+        assert_ne!(
+            ch_at(source, prev),
+            '>',
+            "Left from `w` must not sit on `>`"
+        );
+        let down = engine.vertical_caret(source, source.find('h').unwrap(), 1);
+        assert_eq!(
+            down,
+            w,
+            "Down from `h` must land on `w`, got {}",
+            ch_at(source, down)
+        );
+    }
+
+    #[test]
+    fn list_item_arrows_skip_marker() {
+        let source = "- hello\n";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        let dash = source.find('-').expect("-");
+        let home = engine.clamp_raw_prefix(source, engine.snap_caret(0, Bias::Right), Bias::Right);
+        assert_eq!(home, h, "Home must be `h`, got {}", ch_at(source, home));
+        assert_ne!(home, dash);
+        assert_eq!(engine.snap_caret(0, Bias::Right), h);
+        assert_eq!(engine.next_caret(source, h), h + 1);
+        let prev = engine.prev_caret(source, h);
+        assert_ne!(
+            ch_at(source, prev),
+            '-',
+            "Left at visible start must not sit on `-`"
+        );
+    }
+
+    #[test]
+    fn quoted_list_item_arrows_skip_quote_and_marker() {
+        let source = "> - hello\n";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        let home = engine.clamp_raw_prefix(source, engine.snap_caret(0, Bias::Right), Bias::Right);
+        assert_eq!(
+            home,
+            h,
+            "Home must skip `> - ` onto `h`, got {}",
+            ch_at(source, home)
+        );
+        assert_ne!(ch_at(source, home), '>');
+        assert_ne!(ch_at(source, home), '-');
+        assert_eq!(engine.snap_caret(0, Bias::Right), h);
+        let prev = engine.prev_caret(source, h);
+        assert_ne!(ch_at(source, prev), '>');
+        assert_ne!(ch_at(source, prev), '-');
+    }
+
+    #[test]
+    fn task_item_arrows_skip_checkbox_marker() {
+        let source = "- [x] done\n";
+        let (_doc, engine) = engine_for(source);
+        let d = source.find('d').expect("d");
+        let home = engine.clamp_raw_prefix(source, engine.snap_caret(0, Bias::Right), Bias::Right);
+        assert_eq!(
+            home,
+            d,
+            "Home must skip `- [x] ` onto `d`, got {}",
+            ch_at(source, home)
+        );
+        assert_eq!(engine.snap_caret(0, Bias::Right), d);
+    }
+
+    #[test]
+    fn unquoted_paragraph_arrows_stay_one_to_one() {
+        let source = "hello\n";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        assert_eq!(engine.snap_caret(0, Bias::Right), h);
+        assert_eq!(engine.next_caret(source, h), h + 1);
+        assert_eq!(engine.next_caret(source, h + 1), h + 2);
+        assert_eq!(engine.prev_caret(source, h + 2), h + 1);
+        assert_eq!(
+            engine.clamp_raw_prefix(source, h, Bias::Right),
+            h,
+            "unquoted body must stay 1:1"
+        );
+    }
+
+    #[test]
+    fn quoted_heading_home_skips_quote_and_hashes() {
+        let source = "> # Title\n";
+        let (_doc, engine) = engine_for(source);
+        let t = source.find('T').expect("T");
+        let home = engine.clamp_raw_prefix(source, engine.snap_caret(0, Bias::Right), Bias::Right);
+        assert_eq!(
+            home,
+            t,
+            "quoted heading Home must be `T`, got {}",
+            ch_at(source, home)
+        );
+        assert_eq!(engine.snap_caret(0, Bias::Right), t);
+    }
+
+    #[test]
+    fn heading_home_still_skips_hashes() {
+        let source = "# Title\n";
+        let (_doc, engine) = engine_for(source);
+        let t = source.find('T').expect("T");
+        assert_eq!(engine.snap_caret(0, Bias::Right), t);
+        assert_eq!(engine.next_caret(source, t), t + 1);
+    }
+
+    #[test]
+    fn left_at_quote_body_start_leaves_the_block() {
+        let source = "foo\n\n> hello\n";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        let prev = engine.prev_caret(source, h);
+        assert!(prev < h, "Left from `h` must leave the quote, got {prev}");
+        assert_ne!(ch_at(source, prev), '>');
+        assert_ne!(
+            engine.snap_caret(prev, Bias::Left),
+            h,
+            "must not bounce back onto `hello`"
+        );
+    }
+
+    #[test]
+    fn left_at_list_body_start_leaves_the_item() {
+        let source = "foo\n\n- hello\n";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find("hello").expect("hello");
+        let prev = engine.prev_caret(source, h);
+        assert!(prev < h, "Left from `h` must leave the item, got {prev}");
+        assert_ne!(ch_at(source, prev), '-');
+    }
+
+    #[test]
+    fn quoted_fence_arrows_skip_quote_prefix() {
+        let source = "> ```\n> ab\n> cd\n> ```\n";
+        let (_doc, engine) = engine_for(source);
+        let a = source.find("ab").expect("ab");
+        let b = a + 1;
+        let c = source.find("cd").expect("cd");
+        let gt = source.find('>').expect(">");
+        assert_eq!(engine.next_caret(source, a), b);
+        assert_ne!(engine.next_caret(source, a), gt);
+        assert_eq!(engine.prev_caret(source, b), a);
+        assert_ne!(engine.prev_caret(source, a), gt);
+        let after_b = engine.next_caret(source, b);
+        let after_nl = engine.next_caret(source, after_b);
+        assert_eq!(
+            after_nl, c,
+            "Right at end of `ab` must skip `>` onto `c`, got {after_nl}"
+        );
+        assert_ne!(&source[after_nl..after_nl + 1], ">");
+        assert_eq!(engine.prev_caret(source, c), after_b);
+        let down = engine.vertical_caret(source, a, 1);
+        assert_eq!(
+            down, c,
+            "Down from `a` must land on `c`, not `>`, got {down}"
+        );
+        let up = engine.vertical_caret(source, c, -1);
+        assert_eq!(up, a, "Up from `c` must land on `a`, got {up}");
+    }
+
+    #[test]
+    fn unquoted_fence_arrows_stay_one_to_one() {
+        let source = "```\ncode\n```\n";
+        let (_doc, engine) = engine_for(source);
+        let c = source.find("code").expect("code");
+        assert_eq!(engine.next_caret(source, c), c + 1);
+        assert_eq!(engine.next_caret(source, c + 1), c + 2);
+        assert_eq!(engine.prev_caret(source, c + 2), c + 1);
+        assert_eq!(engine.prev_caret(source, c + 1), c);
+    }
+
+    #[test]
+    fn quoted_html_arrows_skip_quote_prefix() {
+        let source = "> <div>\n> x\n> </div>\n";
+        let (_doc, engine) = engine_for(source);
+        let x = source.find('x').expect("x");
+        let gt = source.find('>').expect(">");
+        let block = first_raw(&engine.tree().blocks, |k| {
+            matches!(k, BlockKind::Opaque { .. })
+        })
+        .expect("html");
+        let start = engine.clamp_raw_prefix(source, block.source_range.start, Bias::Right);
+        assert_ne!(start, gt);
+        assert_ne!(&source[start..start + 1], ">");
+        assert_ne!(
+            &source[start..start + 1],
+            "<",
+            "HTML tag bytes must skip like quote prefix, start={start}"
+        );
+        let next = engine.next_caret(source, x);
+        assert_ne!(next, gt);
+        assert_ne!(
+            &source[next.min(source.len().saturating_sub(1))..][..1],
+            ">"
+        );
+        let prev = engine.prev_caret(source, x);
+        assert_ne!(prev, gt, "Left from `x` must not land on `>`");
+        assert!(
+            source.as_bytes().get(prev) != Some(&b'>'),
+            "Left from `x` landed on `>` at {prev}"
+        );
+    }
+
+    #[test]
+    fn quoted_list_nested_fence_arrows_skip_prefix() {
+        let source = "> - item\n>   ```\n>   code\n>   ```\n";
+        let (_doc, engine) = engine_for(source);
+        let c = source.find("code").expect("code");
+        let gt = source.rfind(">   code").expect("quoted body");
+        assert_eq!(engine.next_caret(source, c), c + 1);
+        assert_ne!(engine.prev_caret(source, c), gt);
+        assert_ne!(
+            engine.clamp_raw_prefix(source, gt, Bias::Right),
+            gt,
+            "caret on the body line must skip `>`"
+        );
+        assert_eq!(engine.clamp_raw_prefix(source, gt, Bias::Right), c);
+    }
+
+    #[test]
+    fn empty_quoted_paragraph_caret_homes_after_prefix() {
+        let source = "> ";
+        let (_doc, engine) = engine_for(source);
+        let home = engine.snap_caret(0, Bias::Right);
+        assert_eq!(
+            home,
+            2,
+            "Home/click on empty `> ` must sit after the prefix, got {}",
+            ch_at(source, home)
+        );
+        assert_ne!(ch_at(source, home), '>');
+        assert_eq!(engine.snap_caret(0, Bias::Left), 2);
+        assert_eq!(engine.clamp_raw_prefix(source, 0, Bias::Right), 2);
+        let prev = engine.prev_caret(source, home);
+        assert_ne!(ch_at(source, prev), '>');
+    }
+
+    #[test]
+    fn empty_list_item_caret_homes_after_marker() {
+        let source = "- ";
+        let (_doc, engine) = engine_for(source);
+        let home = engine.snap_caret(0, Bias::Right);
+        assert_eq!(
+            home,
+            2,
+            "Home on empty `- ` must sit after the marker, got {}",
+            ch_at(source, home)
+        );
+        assert_ne!(ch_at(source, home), '-');
+        assert_eq!(engine.snap_caret(0, Bias::Left), 2);
+    }
+
+    #[test]
+    fn empty_ordered_item_caret_homes_after_marker() {
+        let source = "1. ";
+        let (_doc, engine) = engine_for(source);
+        let home = engine.snap_caret(0, Bias::Right);
+        assert_eq!(
+            home,
+            3,
+            "Home on empty `1. ` must sit after the marker, got {}",
+            ch_at(source, home)
+        );
+        assert_ne!(ch_at(source, home), '1');
+    }
+
+    #[test]
+    fn empty_task_item_caret_homes_after_checkbox() {
+        let source = "- [ ] ";
+        let (_doc, engine) = engine_for(source);
+        let home = engine.snap_caret(0, Bias::Right);
+        assert_eq!(
+            home,
+            source.len(),
+            "Home on empty task must sit after `- [ ] `, got {}",
+            ch_at(source, home)
+        );
+        assert_ne!(ch_at(source, home.min(source.len().saturating_sub(1))), '-');
+        assert_ne!(ch_at(source, engine.snap_caret(0, Bias::Left)), '-');
+    }
+
+    #[test]
+    fn empty_quoted_line_after_body_is_a_caret_home() {
+        let source = "> hello\n> ";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        let end = h + 5;
+        let home = engine.next_caret(source, end);
+        assert_eq!(
+            home,
+            source.len(),
+            "Right from `hello` must sit on the empty quoted line, got {} {:?}",
+            home,
+            ch_at(source, home)
+        );
+        assert_ne!(ch_at(source, home.min(source.len().saturating_sub(1))), '>');
+        assert_eq!(
+            engine.snap_caret(source.find('>').unwrap() + 8, Bias::Right),
+            home
+        );
+        let prev = engine.prev_caret(source, home);
+        assert!(
+            prev <= end,
+            "Left from the empty quoted line must leave it, got {prev}"
+        );
+        assert_ne!(ch_at(source, prev), '>');
+    }
+
+    #[test]
+    fn empty_quoted_line_between_paragraphs_is_a_caret_home() {
+        let source = "> hello\n>\n> world\n";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find("hello").unwrap() + 5;
+        let w = source.find("world").expect("world");
+        let mid = engine.next_caret(source, h);
+        assert!(
+            mid > h && mid < w,
+            "Right from `hello` must sit on the empty `>` line before `world`, got {mid}"
+        );
+        assert_ne!(ch_at(source, mid), '>');
+        assert_eq!(
+            engine.snap_caret(source.find(">\n").expect("empty"), Bias::Right),
+            mid
+        );
+        let onto_w = engine.next_caret(source, mid);
+        assert_eq!(
+            onto_w, w,
+            "Right from the empty quote line must land on `w`"
+        );
+        let back = engine.prev_caret(source, w);
+        assert_eq!(
+            back,
+            mid,
+            "Left from `w` must sit on the empty quote line, got {}",
+            ch_at(source, back)
+        );
+        let down = engine.vertical_caret(source, source.find('h').unwrap(), 1);
+        assert_eq!(
+            down,
+            mid,
+            "Down from `h` must land on the empty quoted line, got {}",
+            ch_at(source, down)
+        );
+    }
+
+    #[test]
+    fn nested_quote_arrows_skip_inner_marker() {
+        let source = "> > hello\n";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        let home = engine.snap_caret(0, Bias::Right);
+        assert_eq!(
+            home,
+            h,
+            "nested quote Home must be `h`, got {}",
+            ch_at(source, home)
+        );
+        assert_ne!(ch_at(source, home), '>');
+        let prev = engine.prev_caret(source, h);
+        assert_ne!(
+            ch_at(source, prev),
+            '>',
+            "Left at start must not sit on `>`"
+        );
+        assert!(
+            prev <= h,
+            "Left at innermost body start must not walk onto chrome, got {prev}"
+        );
+    }
+
+    #[test]
+    fn nested_quote_after_paragraph_left_leaves_the_body() {
+        let source = "foo\n\n> > hello\n";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        let prev = engine.prev_caret(source, h);
+        assert!(
+            prev < h,
+            "Left from `h` must leave the nested quote, got {prev}"
+        );
+        assert_ne!(ch_at(source, prev), '>');
+        assert_ne!(engine.snap_caret(prev, Bias::Left), h);
+    }
+
+    #[test]
+    fn ordered_list_arrows_skip_marker() {
+        let source = "1. hello\n";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        let home = engine.snap_caret(0, Bias::Right);
+        assert_eq!(home, h, "Home must be `h`, got {}", ch_at(source, home));
+        assert_ne!(ch_at(source, home), '1');
+        let prev = engine.prev_caret(source, h);
+        assert_ne!(ch_at(source, prev), '1');
+        assert_ne!(ch_at(source, prev), '.');
+    }
+
+    #[test]
+    fn unchecked_task_arrows_skip_checkbox_marker() {
+        let source = "- [ ] hello\n";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        let home = engine.snap_caret(0, Bias::Right);
+        assert_eq!(
+            home,
+            h,
+            "Home must skip `- [ ] ` onto `h`, got {}",
+            ch_at(source, home)
+        );
+        assert_eq!(engine.snap_caret(0, Bias::Right), h);
+        let prev = engine.prev_caret(source, h);
+        assert_ne!(ch_at(source, prev), '-');
+        assert_ne!(ch_at(source, prev), '[');
+    }
+
+    #[test]
+    fn wrapped_list_continuation_right_skips_indent() {
+        let source = "- hello\n  world\n";
+        let (_doc, engine) = engine_for(source);
+        let end = source.find("hello").unwrap() + 5;
+        let w = source.find("world").expect("world");
+        let onto_w = engine.next_caret(source, end);
+        assert_eq!(
+            onto_w,
+            w,
+            "Right from end of `hello` must skip continuation spaces onto `w`, got {} {:?}",
+            onto_w,
+            ch_at(source, onto_w)
+        );
+        assert_ne!(ch_at(source, onto_w), ' ');
+        let space = source.find("  world").expect("indent");
+        assert_eq!(
+            engine.snap_caret(space, Bias::Right),
+            w,
+            "snap on continuation indent must land on `w`"
+        );
+        assert_eq!(
+            engine.clamp_raw_prefix(source, space, Bias::Right),
+            w,
+            "clamp must skip continuation indent"
+        );
+        let prev = engine.prev_caret(source, w);
+        assert_ne!(
+            ch_at(source, prev),
+            ' ',
+            "Left from `w` must not sit on indent"
+        );
     }
 
     fn first_image_range(engine: &RichEngine) -> Range<usize> {
@@ -2734,33 +3443,5 @@ mod tests {
             !copied.contains('|'),
             "cell copy must not include `|`, got {copied:?}"
         );
-    }
-
-    #[test]
-    fn document_home_skips_frontmatter_yaml() {
-        let source = "---\ntitle: Hello\n---\n\n# Body\n";
-        let (_doc, engine) = engine_for(source);
-        let fm_end = frontmatter_body_start(engine.tree());
-        let home = engine.clamp_raw_prefix(source, engine.snap_caret(0, Bias::Right), Bias::Right);
-        assert!(
-            home >= fm_end,
-            "Cmd-Up / document start must sit after YAML, got {home} fm_end={fm_end}"
-        );
-        let body = source.find("Body").expect("Body");
-        assert!(
-            home <= body,
-            "document start must not overshoot `# Body`, got {home} body={body}"
-        );
-        let title = source.find("Hello").expect("title");
-        assert!(
-            home > title,
-            "document start must not land in the YAML title, home={home} title={title}"
-        );
-        let end = engine.clamp_raw_prefix(
-            source,
-            engine.snap_caret(source.len(), Bias::Left),
-            Bias::Left,
-        );
-        assert!(end >= body, "document end must stay in the body, got {end}");
     }
 }

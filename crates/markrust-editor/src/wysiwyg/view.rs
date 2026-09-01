@@ -17,8 +17,9 @@ use gpui::{
     UTF16Selection, Window,
 };
 use markrust_core::rich::{
-    apply_rich_command, caret_for_click_below_content, place_caret_for_click_below, Bias,
-    table_select_all_range, CaretState, MarkSet, NodeId, RichCommand, RichEngine, RichOutcome,
+    apply_rich_command, caret_for_click_below_content, place_caret_for_click_below,
+    table_select_all_range, Bias, CaretState, MarkSet, NodeId, RichCommand, RichEngine,
+    RichOutcome,
 };
 use markrust_core::Document;
 
@@ -28,7 +29,10 @@ use super::image::{
     cache_path_for_url, collect_remote_image_urls, default_image_cache_dir, fetch_remote_image,
 };
 use super::ime::{ImeLeafHit, ImeOriginState};
-use crate::headless::{next_word_end, prev_word_start, CaretMove, EditorCommand, EditorOutcome};
+use crate::headless::{
+    next_boundary, next_word_end, prev_word_start, previous_boundary, CaretMove, EditorCommand,
+    EditorOutcome,
+};
 use crate::theme::EditorTheme;
 use crate::wrap::{wrap_selection, WrapKind};
 
@@ -78,16 +82,6 @@ impl WidgetEdit {
         }
     }
 
-    fn draft_mut(&mut self) -> Option<&mut String> {
-        match self {
-            Self::Idle => None,
-            Self::CodeInfo { draft, .. }
-            | Self::ImageAlt { draft, .. }
-            | Self::Frontmatter { draft, .. }
-            | Self::FrontmatterYaml { draft, .. } => Some(draft),
-        }
-    }
-
     fn allows_newline(&self) -> bool {
         matches!(self, Self::FrontmatterYaml { .. })
     }
@@ -125,9 +119,9 @@ fn widget_owns_tab(edit: &WidgetEdit) -> bool {
     !matches!(edit, WidgetEdit::Idle)
 }
 
-/// Left/Right/Home/End/Up/Down (and Delete) stay inside the overlay; they
-/// must not move or mutate the document body. Cmd+A / Undo / Redo use the
-/// same gate.
+/// Left/Right/word/Home/End/document/page (and Delete / word-delete / line-delete)
+/// stay inside the overlay; they must not move or mutate the document body.
+/// Cmd+A / Undo / Redo use the same gate.
 fn widget_owns_caret(edit: &WidgetEdit) -> bool {
     !matches!(edit, WidgetEdit::Idle)
 }
@@ -165,6 +159,10 @@ fn apply_wrap_to_widget(edit: &mut WidgetEdit, kind: WrapKind) -> WidgetWrapResu
     if !widget_wraps_draft(edit) {
         return WidgetWrapResult::Ignored;
     }
+    // Overlay click/drag places an inner caret (body-quality hit-test). Wrap
+    // still targets the whole draft. Empty Cmd+B becomes `****` with the caret
+    // between the marks so the next insert is `**x**`, not `****x`. IME origin
+    // is the inner `|` / caret rect, not the overlay's trailing edge.
     if let Some((draft, caret)) = edit.draft_caret_mut() {
         let wrapped = wrap_selection(draft, 0..draft.len(), kind);
         *draft = wrapped.text;
@@ -263,6 +261,72 @@ fn delete_after_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
         .map(|c| c.len_utf8())
         .unwrap_or(0);
     draft.replace_range(at..at + next, "");
+}
+
+fn delete_toward_in_widget(
+    edit: &mut WidgetEdit,
+    anchor: &mut usize,
+    target_of: impl Fn(&str, usize) -> usize,
+) {
+    let Some((draft, caret)) = edit.draft_caret_mut() else {
+        return;
+    };
+    let range = widget_range(*caret, *anchor, draft.len());
+    let (start, end) = if range.start != range.end {
+        (range.start, range.end)
+    } else {
+        let at = range.start;
+        let target = target_of(draft, at).min(draft.len());
+        if target <= at {
+            (target, at)
+        } else {
+            (at, target)
+        }
+    };
+    if start == end {
+        return;
+    }
+    if !draft.is_char_boundary(start) || !draft.is_char_boundary(end) {
+        return;
+    }
+    draft.replace_range(start..end, "");
+    *caret = start;
+    *anchor = start;
+}
+
+fn delete_word_before_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
+    delete_toward_in_widget(edit, anchor, prev_word_start);
+}
+
+fn delete_word_after_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
+    delete_toward_in_widget(edit, anchor, next_word_end);
+}
+
+fn delete_to_line_start_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
+    delete_toward_in_widget(edit, anchor, overlay_line_start);
+}
+
+fn delete_to_line_end_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
+    delete_toward_in_widget(edit, anchor, overlay_line_end);
+}
+
+fn overlay_line_start(draft: &str, at: usize) -> usize {
+    let at = at.min(draft.len());
+    if !draft.is_char_boundary(at) {
+        return at;
+    }
+    draft[..at].rfind('\n').map(|i| i + 1).unwrap_or(0)
+}
+
+fn overlay_line_end(draft: &str, at: usize) -> usize {
+    let at = at.min(draft.len());
+    if !draft.is_char_boundary(at) {
+        return at;
+    }
+    draft[at..]
+        .find('\n')
+        .map(|i| at + i)
+        .unwrap_or(draft.len())
 }
 
 /// Cmd+A selects the overlay draft. The document body is not touched.
@@ -404,52 +468,6 @@ fn vertical_in_draft(draft: &str, at: usize, down: bool) -> usize {
     dest_end
 }
 
-/// Byte offset of the previous char boundary (or the preceding boundary when
-/// `at` is already inside a multi-byte char).
-fn prev_char_boundary(draft: &str, at: usize) -> usize {
-    let at = at.min(draft.len());
-    if at == 0 {
-        return 0;
-    }
-    if draft.is_char_boundary(at) {
-        draft[..at]
-            .chars()
-            .next_back()
-            .map(|c| at - c.len_utf8())
-            .unwrap_or(0)
-    } else {
-        draft
-            .char_indices()
-            .map(|(i, _)| i)
-            .take_while(|i| *i < at)
-            .last()
-            .unwrap_or(0)
-    }
-}
-
-/// Byte offset of the next char boundary (or the following boundary when
-/// `at` is already inside a multi-byte char).
-fn next_char_boundary(draft: &str, at: usize) -> usize {
-    let at = at.min(draft.len());
-    if at >= draft.len() {
-        return draft.len();
-    }
-    if draft.is_char_boundary(at) {
-        draft[at..]
-            .chars()
-            .next()
-            .map(|c| at + c.len_utf8())
-            .unwrap_or(at)
-    } else {
-        draft
-            .char_indices()
-            .map(|(i, _)| i)
-            .skip_while(|i| *i <= at)
-            .next()
-            .unwrap_or(draft.len())
-    }
-}
-
 /// Move or extend the overlay caret. Returns false when no overlay is
 /// focused so the body caret can run. The body selection is never touched.
 fn move_in_widget(
@@ -471,14 +489,14 @@ fn move_in_widget(
             if !extend && has_sel {
                 at.min(*anchor)
             } else {
-                prev_char_boundary(draft, at)
+                previous_boundary(draft, at)
             }
         }
         CaretMove::Right => {
             if !extend && has_sel {
                 at.max(*anchor)
             } else {
-                next_char_boundary(draft, at)
+                next_boundary(draft, at)
             }
         }
         CaretMove::Home => draft[..at].rfind('\n').map(|i| i + 1).unwrap_or(0),
@@ -513,16 +531,6 @@ fn move_in_widget(
     true
 }
 
-fn wrap_kind_from_rich(command: &RichCommand) -> Option<WrapKind> {
-    match command {
-        RichCommand::ToggleMark(mark) if *mark == MarkSet::BOLD => Some(WrapKind::Bold),
-        RichCommand::ToggleMark(mark) if *mark == MarkSet::ITALIC => Some(WrapKind::Italic),
-        RichCommand::ToggleMark(mark) if *mark == MarkSet::CODE => Some(WrapKind::Code),
-        RichCommand::ToggleLink => Some(WrapKind::Link),
-        _ => None,
-    }
-}
-
 /// Keep `anchor` and move the caret to `target` (Shift-arrows / Shift-Home).
 fn extend_selection_range(
     selected: Range<usize>,
@@ -541,6 +549,16 @@ fn extend_selection_range(
     }
 }
 
+fn wrap_kind_from_rich(command: &RichCommand) -> Option<WrapKind> {
+    match command {
+        RichCommand::ToggleMark(mark) if *mark == MarkSet::BOLD => Some(WrapKind::Bold),
+        RichCommand::ToggleMark(mark) if *mark == MarkSet::ITALIC => Some(WrapKind::Italic),
+        RichCommand::ToggleMark(mark) if *mark == MarkSet::CODE => Some(WrapKind::Code),
+        RichCommand::ToggleLink => Some(WrapKind::Link),
+        _ => None,
+    }
+}
+
 pub struct RichEditorView {
     document: Entity<Document>,
     pub theme: EditorTheme,
@@ -550,6 +568,8 @@ pub struct RichEditorView {
     synced_revision: Option<u64>,
     pub selected_range: Range<usize>,
     pub selection_reversed: bool,
+    /// Cell body selected by the last Cmd-A. Empty cells are collapsed, so
+    /// a second Cmd-A cannot be detected from the range alone.
     table_select_all_cell: Option<Range<usize>>,
     marked_range: Option<Range<usize>>,
     preedit: Option<String>,
@@ -713,28 +733,36 @@ impl RichEditorView {
                 }
             }
             EditorCommand::DeleteWordLeft => {
-                if self.apply_rich(RichCommand::DeleteWordLeft, cx) == RichOutcome::Noop {
+                if self.widget_delete_span(prev_word_start, delete_word_before_in_widget, cx) {
+                    EditorOutcome::Changed
+                } else if self.apply_rich(RichCommand::DeleteWordLeft, cx) == RichOutcome::Noop {
                     EditorOutcome::Noop
                 } else {
                     EditorOutcome::Changed
                 }
             }
             EditorCommand::DeleteWordRight => {
-                if self.apply_rich(RichCommand::DeleteWordRight, cx) == RichOutcome::Noop {
+                if self.widget_delete_span(next_word_end, delete_word_after_in_widget, cx) {
+                    EditorOutcome::Changed
+                } else if self.apply_rich(RichCommand::DeleteWordRight, cx) == RichOutcome::Noop {
                     EditorOutcome::Noop
                 } else {
                     EditorOutcome::Changed
                 }
             }
             EditorCommand::DeleteToLineStart => {
-                if self.apply_rich(RichCommand::DeleteToLineStart, cx) == RichOutcome::Noop {
+                if self.widget_delete_span(overlay_line_start, delete_to_line_start_in_widget, cx) {
+                    EditorOutcome::Changed
+                } else if self.apply_rich(RichCommand::DeleteToLineStart, cx) == RichOutcome::Noop {
                     EditorOutcome::Noop
                 } else {
                     EditorOutcome::Changed
                 }
             }
             EditorCommand::DeleteToLineEnd => {
-                if self.apply_rich(RichCommand::DeleteToLineEnd, cx) == RichOutcome::Noop {
+                if self.widget_delete_span(overlay_line_end, delete_to_line_end_in_widget, cx) {
+                    EditorOutcome::Changed
+                } else if self.apply_rich(RichCommand::DeleteToLineEnd, cx) == RichOutcome::Noop {
                     EditorOutcome::Noop
                 } else {
                     EditorOutcome::Changed
@@ -861,45 +889,24 @@ impl RichEditorView {
             }
             EditorCommand::Indent => {
                 // Widget overlays own Tab: commit, do not indent the body.
+                // IndentList owns table Tab (cell nav) vs list indent.
                 if widget_owns_tab(&self.widget_edit) {
                     self.commit_widget_edit(cx);
                     EditorOutcome::Changed
+                } else if self.apply_rich(RichCommand::IndentList, cx) == RichOutcome::Noop {
+                    EditorOutcome::Noop
                 } else {
-                    self.engine.sync(self.document.read(cx));
-                    if self.engine.in_table(self.cursor_offset()) {
-                        if self.apply_rich(RichCommand::TableTab { reverse: false }, cx)
-                            == RichOutcome::Noop
-                        {
-                            EditorOutcome::Noop
-                        } else {
-                            EditorOutcome::Changed
-                        }
-                    } else if self.apply_rich(RichCommand::IndentList, cx) == RichOutcome::Noop {
-                        EditorOutcome::Noop
-                    } else {
-                        EditorOutcome::Changed
-                    }
+                    EditorOutcome::Changed
                 }
             }
             EditorCommand::Outdent => {
                 if widget_owns_tab(&self.widget_edit) {
                     self.commit_widget_edit(cx);
                     EditorOutcome::Changed
+                } else if self.apply_rich(RichCommand::OutdentList, cx) == RichOutcome::Noop {
+                    EditorOutcome::Noop
                 } else {
-                    self.engine.sync(self.document.read(cx));
-                    if self.engine.in_table(self.cursor_offset()) {
-                        if self.apply_rich(RichCommand::TableTab { reverse: true }, cx)
-                            == RichOutcome::Noop
-                        {
-                            EditorOutcome::Noop
-                        } else {
-                            EditorOutcome::Changed
-                        }
-                    } else if self.apply_rich(RichCommand::OutdentList, cx) == RichOutcome::Noop {
-                        EditorOutcome::Noop
-                    } else {
-                        EditorOutcome::Changed
-                    }
+                    EditorOutcome::Changed
                 }
             }
         }
@@ -1049,21 +1056,14 @@ impl RichEditorView {
 
     fn move_to(&mut self, offset: usize, extend: bool, cx: &mut Context<Self>) {
         self.table_select_all_cell = None;
-        // While an overlay is editing, keep jumps inside the draft.
-        if !matches!(self.widget_edit, WidgetEdit::Idle) {
-            self.widget_edit.set_caret(offset);
-            if !extend {
-                self.widget_anchor = self.widget_edit.caret();
-            }
-            self.reset_blink(cx);
-            cx.notify();
-            return;
-        }
         let len = self.document.read(cx).buffer.len_bytes();
         let source = self.document.read(cx).buffer.content();
         self.engine.sync(self.document.read(cx));
-        let offset = self.engine.snap_caret(offset.min(len), Bias::Left);
-        let offset = self.engine.clamp_raw_prefix(&source, offset, Bias::Left);
+        let offset = self.engine.clamp_raw_prefix(
+            &source,
+            self.engine.snap_caret(offset.min(len), Bias::Left),
+            Bias::Left,
+        );
         if extend {
             let anchor = if self.selection_reversed {
                 self.selected_range.end
@@ -1086,7 +1086,6 @@ impl RichEditorView {
             self.selected_range = offset..offset;
             self.selection_reversed = false;
         }
-        let _ = source;
         self.reset_blink(cx);
         cx.notify();
     }
@@ -1112,14 +1111,22 @@ impl RichEditorView {
             }
             CaretMove::Home => {
                 let start = source[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                self.engine.snap_caret(start, Bias::Right)
+                self.engine.clamp_raw_prefix(
+                    &source,
+                    self.engine.snap_caret(start, Bias::Right),
+                    Bias::Right,
+                )
             }
             CaretMove::End => {
                 let end = source[cursor..]
                     .find('\n')
                     .map(|i| cursor + i)
                     .unwrap_or(source.len());
-                self.engine.snap_caret(end, Bias::Left)
+                self.engine.clamp_raw_prefix(
+                    &source,
+                    self.engine.snap_caret(end, Bias::Left),
+                    Bias::Left,
+                )
             }
             CaretMove::WordLeft => self.engine.prev_word_caret(&source, cursor),
             CaretMove::WordRight => self.engine.next_word_caret(&source, cursor),
@@ -1194,7 +1201,7 @@ impl RichEditorView {
             }
         }
         let widget_only = self.synced_revision == Some(revision) && self.snapshot.is_none();
-        let (base_dir, source, old_count) = {
+        let (base_dir, source, old_real) = {
             let doc = self.document.read(cx);
             let base_dir = doc
                 .path
@@ -1202,20 +1209,23 @@ impl RichEditorView {
                 .and_then(|p| p.parent())
                 .map(|p| p.to_path_buf());
             let source = doc.buffer.content();
-            let old_count = self.engine.tree().blocks.len();
+            let old_real = self.engine.tree().blocks.len();
             self.engine.sync(doc);
-            (base_dir, source, old_count)
+            (base_dir, source, old_real)
         };
-        let new_count = self.engine.tree().blocks.len();
+        let new_real = self.engine.tree().blocks.len();
+        let new_count = new_real.max(1);
         if !widget_only {
             match self.engine.last_splice() {
-                Some(splice) if self.synced_revision.is_some() => {
+                Some(splice) if self.synced_revision.is_some() && old_real > 0 && new_real > 0 => {
                     self.list_state
                         .splice(splice.range.clone(), splice.new_count);
                 }
                 _ => {
-                    self.list_state
-                        .splice(0..old_count.min(new_count.max(old_count)), new_count);
+                    self.list_state.splice(
+                        0..old_real.max(1).min(new_count.max(old_real.max(1))),
+                        new_count,
+                    );
                     self.list_state = ListState::new(new_count, ListAlignment::Top, px(512.));
                 }
             }
@@ -1368,8 +1378,38 @@ impl RichEditorView {
         true
     }
 
-    fn widget_draft_mut(&mut self) -> Option<&mut String> {
-        self.widget_edit.draft_mut()
+    fn widget_delete_span(
+        &mut self,
+        target_of: impl Fn(&str, usize) -> usize,
+        apply: fn(&mut WidgetEdit, &mut usize),
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if matches!(self.widget_edit, WidgetEdit::Idle) {
+            return false;
+        }
+        if let Some(snap) = widget_snap(&self.widget_edit, self.widget_anchor) {
+            let range = widget_range(snap.caret, snap.anchor, snap.draft.len());
+            let (start, end) = if range.start != range.end {
+                (range.start, range.end)
+            } else {
+                let at = range.start;
+                let target = target_of(&snap.draft, at).min(snap.draft.len());
+                if target <= at {
+                    (target, at)
+                } else {
+                    (at, target)
+                }
+            };
+            if start == end {
+                return true;
+            }
+        }
+        self.record_widget_edit();
+        self.widget_preedit = None;
+        apply(&mut self.widget_edit, &mut self.widget_anchor);
+        self.snapshot = None;
+        cx.notify();
+        true
     }
 
     fn widget_display(&self) -> Option<(String, Option<String>)> {
@@ -1443,6 +1483,7 @@ impl RichEditorView {
             self.commit_widget_edit(cx)
         }
     }
+
     /// Click in leftover viewport below the last painted leaf or non-text
     /// widget (or anywhere on an unpainted / newlines-only document). Opens a
     /// trailing blank if the file has none, then places the caret there —
@@ -1583,13 +1624,12 @@ impl WysiwygHost for RichEditorView {
 
     fn edit_image_alt(&mut self, source_range: Range<usize>, alt: &str, cx: &mut Context<Self>) {
         self.commit_widget_edit(cx);
-        let caret = alt.len();
         self.widget_edit = WidgetEdit::ImageAlt {
             range: source_range,
             draft: alt.to_string(),
-            caret,
+            caret: alt.len(),
         };
-        self.widget_anchor = caret;
+        self.widget_anchor = alt.len();
         self.widget_selecting = false;
         self.widget_preedit = None;
         self.snapshot = None;
@@ -1598,13 +1638,12 @@ impl WysiwygHost for RichEditorView {
 
     fn edit_frontmatter_field(&mut self, key: &'static str, current: &str, cx: &mut Context<Self>) {
         self.commit_widget_edit(cx);
-        let caret = current.len();
         self.widget_edit = WidgetEdit::Frontmatter {
             key,
             draft: current.to_string(),
-            caret,
+            caret: current.len(),
         };
-        self.widget_anchor = caret;
+        self.widget_anchor = current.len();
         self.widget_selecting = false;
         self.widget_preedit = None;
         self.snapshot = None;
@@ -1613,12 +1652,11 @@ impl WysiwygHost for RichEditorView {
 
     fn edit_frontmatter_yaml(&mut self, current: &str, cx: &mut Context<Self>) {
         self.commit_widget_edit(cx);
-        let caret = current.len();
         self.widget_edit = WidgetEdit::FrontmatterYaml {
             draft: current.to_string(),
-            caret,
+            caret: current.len(),
         };
-        self.widget_anchor = caret;
+        self.widget_anchor = current.len();
         self.widget_selecting = false;
         self.widget_preedit = None;
         self.snapshot = None;
@@ -1741,6 +1779,9 @@ impl WysiwygHost for RichEditorView {
     }
 
     fn sync_ime_cursor(&mut self, window: &mut Window) {
+        // GPUI: invalidate_character_coordinates → next frame selected_bounds
+        // → PlatformWindow::update_ime_position. TestWindow swallows that
+        // call; take_platform_push is the in-repo record of the request.
         if self.ime.take_platform_push().is_some() {
             window.invalidate_character_coordinates();
         }
@@ -1787,6 +1828,8 @@ impl EntityInputHandler for RichEditorView {
         if let Some((draft, preedit)) = self.widget_display() {
             return Some(super::ime::widget_selected_text_range(
                 &draft,
+                self.widget_edit.caret(),
+                self.widget_anchor,
                 preedit.as_deref(),
             ));
         }
@@ -1822,10 +1865,13 @@ impl EntityInputHandler for RichEditorView {
         cx: &mut Context<Self>,
     ) {
         if !matches!(self.widget_edit, WidgetEdit::Idle) {
+            self.record_widget_edit();
             self.widget_preedit = None;
-            if let Some(draft) = self.widget_draft_mut() {
-                super::ime::replace_in_widget_draft(draft, range_utf16, new_text);
+            let sel = self.widget_sel();
+            if let Some((draft, caret)) = self.widget_edit.draft_caret_mut() {
+                super::ime::replace_in_widget_draft(draft, caret, range_utf16, new_text, sel);
             }
+            self.widget_anchor = self.widget_edit.caret();
             self.snapshot = None;
             cx.notify();
             return;
@@ -1881,7 +1927,10 @@ impl EntityInputHandler for RichEditorView {
         if self.ime.widget_focused() {
             if let Some((draft, preedit)) = self.widget_display() {
                 let content = format!("{}{}", draft, preedit.unwrap_or_default());
-                return Some(Self::offset_to_utf16(&content, content.len()));
+                return Some(Self::offset_to_utf16(
+                    &content,
+                    self.widget_edit.caret().min(content.len()),
+                ));
             }
         }
         let theme = self.theme.clone();
@@ -1916,9 +1965,19 @@ impl EntityInputHandler for RichEditorView {
 
 impl Render for RichEditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let composing = if matches!(self.widget_edit, WidgetEdit::Idle) {
+            self.preedit.as_deref()
+        } else {
+            self.widget_preedit.as_deref()
+        };
         self.ime.begin_frame(
             !matches!(self.widget_edit, WidgetEdit::Idle),
-            self.cursor_offset(),
+            if matches!(self.widget_edit, WidgetEdit::Idle) {
+                self.cursor_offset()
+            } else {
+                self.widget_edit.caret()
+            },
+            composing,
         );
         let snapshot = self.sync_snapshot(cx);
         let theme = self.theme.clone();
@@ -2259,6 +2318,7 @@ impl Render for RichEditorView {
                 move |_: &crate::editor::Enter, _, cx| {
                     editor.update(cx, |e, cx| {
                         if !e.consume_widget_newline(cx) {
+                            // SplitBlock owns table Enter (`<br>`) vs paragraph split.
                             e.apply_rich(RichCommand::SplitBlock, cx);
                         }
                     });
@@ -2424,6 +2484,15 @@ impl Render for RichEditorView {
                     )
             })
     }
+}
+
+#[cfg(test)]
+fn widget_draft_with_caret(draft: &str, caret: usize, preedit: &str) -> String {
+    let mut at = caret.min(draft.len());
+    if !draft.is_char_boundary(at) {
+        at = draft.len();
+    }
+    format!("{}{}|{}", &draft[..at], preedit, &draft[at..])
 }
 
 fn frontmatter_panel(
@@ -2703,4 +2772,1001 @@ fn table_toolbar(
                 })),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use markrust_core::rich::NodeId;
+
+    fn chip() -> WidgetEdit {
+        WidgetEdit::CodeInfo {
+            id: NodeId(1),
+            draft: "rust".into(),
+            caret: 4,
+        }
+    }
+
+    fn caption() -> WidgetEdit {
+        WidgetEdit::ImageAlt {
+            range: 0..8,
+            draft: "cat".into(),
+            caret: 3,
+        }
+    }
+
+    fn empty_caption() -> WidgetEdit {
+        WidgetEdit::ImageAlt {
+            range: 0..8,
+            draft: String::new(),
+            caret: 0,
+        }
+    }
+
+    fn frontmatter_title() -> WidgetEdit {
+        WidgetEdit::Frontmatter {
+            key: "title",
+            draft: "Hi".into(),
+            caret: 2,
+        }
+    }
+
+    fn yaml() -> WidgetEdit {
+        WidgetEdit::FrontmatterYaml {
+            draft: "title: Hi".into(),
+            caret: 9,
+        }
+    }
+
+    #[test]
+    fn tab_in_chip_caption_frontmatter_commits_instead_of_indenting_body() {
+        assert!(
+            !widget_owns_tab(&WidgetEdit::Idle),
+            "body Tab still runs IndentList"
+        );
+        for (edit, label) in [
+            (chip(), "language chip"),
+            (caption(), "image caption"),
+            (frontmatter_title(), "frontmatter field"),
+            (yaml(), "frontmatter YAML"),
+        ] {
+            assert!(
+                widget_owns_tab(&edit),
+                "Tab in {label} must commit the overlay and not IndentList the body"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_shortcuts_target_widget_text_not_the_body() {
+        assert!(
+            !widget_owns_wrap(&WidgetEdit::Idle),
+            "body Cmd/Ctrl+B still toggles the document"
+        );
+        assert!(
+            !widget_wraps_draft(&chip()),
+            "language chip is an identifier, not a wrap target"
+        );
+        for (edit, label) in [
+            (caption(), "image caption"),
+            (frontmatter_title(), "frontmatter field"),
+            (yaml(), "frontmatter YAML"),
+        ] {
+            assert!(
+                widget_owns_wrap(&edit) && widget_wraps_draft(&edit),
+                "{label} must own wrap and apply it to the draft"
+            );
+        }
+        assert!(
+            widget_owns_wrap(&chip()) && !widget_wraps_draft(&chip()),
+            "language chip owns wrap as a no-op so the body is not bolded"
+        );
+
+        let mut chip_edit = chip();
+        let before = match &chip_edit {
+            WidgetEdit::CodeInfo { draft, .. } => draft.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            apply_wrap_to_widget(&mut chip_edit, WrapKind::Bold),
+            WidgetWrapResult::Ignored
+        );
+        match &chip_edit {
+            WidgetEdit::CodeInfo { draft, .. } => {
+                assert_eq!(draft, &before, "chip draft must not gain **")
+            }
+            other => panic!("chip edit must stay CodeInfo, got {other:?}"),
+        }
+
+        let mut caption_edit = caption();
+        assert_eq!(
+            apply_wrap_to_widget(&mut caption_edit, WrapKind::Bold),
+            WidgetWrapResult::Applied
+        );
+        match &caption_edit {
+            WidgetEdit::ImageAlt { draft, .. } => {
+                assert_eq!(draft, "**cat**", "caption must wrap, got {draft:?}")
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+        assert_eq!(
+            apply_wrap_to_widget(&mut caption_edit, WrapKind::Bold),
+            WidgetWrapResult::Applied
+        );
+        match &caption_edit {
+            WidgetEdit::ImageAlt { draft, .. } => {
+                assert_eq!(draft, "cat", "second bold unwraps, got {draft:?}")
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+
+        let mut title = frontmatter_title();
+        assert_eq!(
+            apply_wrap_to_widget(&mut title, WrapKind::Italic),
+            WidgetWrapResult::Applied
+        );
+        match &title {
+            WidgetEdit::Frontmatter { draft, .. } => {
+                assert_eq!(draft, "*Hi*", "title italic, got {draft:?}")
+            }
+            other => panic!("expected Frontmatter, got {other:?}"),
+        }
+
+        let mut yaml_edit = yaml();
+        assert_eq!(
+            apply_wrap_to_widget(&mut yaml_edit, WrapKind::Code),
+            WidgetWrapResult::Applied
+        );
+        match &yaml_edit {
+            WidgetEdit::FrontmatterYaml { draft, .. } => {
+                assert_eq!(draft, "`title: Hi`", "YAML code wrap, got {draft:?}")
+            }
+            other => panic!("expected FrontmatterYaml, got {other:?}"),
+        }
+
+        let mut link_caption = caption();
+        assert_eq!(
+            apply_wrap_to_widget(&mut link_caption, WrapKind::Link),
+            WidgetWrapResult::Applied
+        );
+        match &link_caption {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(draft, "[cat]()", "caption link wrap, got {draft:?}");
+                assert_eq!(
+                    *caret,
+                    "[cat](".len(),
+                    "Cmd-K on a caption selection must leave the caret in the URL, got {caret}"
+                );
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+
+        assert_eq!(
+            apply_wrap_to_widget(&mut WidgetEdit::Idle, WrapKind::Bold),
+            WidgetWrapResult::NotFocused
+        );
+    }
+
+    #[test]
+    fn empty_caption_wrap_types_inside_the_marks() {
+        let mut edit = empty_caption();
+        assert_eq!(
+            apply_wrap_to_widget(&mut edit, WrapKind::Bold),
+            WidgetWrapResult::Applied
+        );
+        match &edit {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(draft, "****", "empty bold wrap, got {draft:?}");
+                assert_eq!(*caret, 2, "caret must sit between the marks, got {caret}");
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+        let mut wrap_anchor = edit.caret();
+        insert_into_widget(&mut edit, &mut wrap_anchor, "x");
+        match &edit {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(
+                    draft, "**x**",
+                    "typing after empty wrap must go inside the marks, not after closers; got {draft:?}"
+                );
+                assert_eq!(*caret, 3);
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+
+        let mut empty_fm = WidgetEdit::Frontmatter {
+            key: "title",
+            draft: String::new(),
+            caret: 0,
+        };
+        assert_eq!(
+            apply_wrap_to_widget(&mut empty_fm, WrapKind::Bold),
+            WidgetWrapResult::Applied
+        );
+        let mut fm_anchor = empty_fm.caret();
+        insert_into_widget(&mut empty_fm, &mut fm_anchor, "Hi");
+        match &empty_fm {
+            WidgetEdit::Frontmatter { draft, .. } => {
+                assert_eq!(
+                    draft, "**Hi**",
+                    "empty frontmatter wrap types inside, got {draft:?}"
+                )
+            }
+            other => panic!("expected Frontmatter, got {other:?}"),
+        }
+
+        // Overlay click/drag places this inner offset; wrap of a non-empty
+        // draft still covers the whole field (not a body selection).
+        let mut wrapped = caption();
+        apply_wrap_to_widget(&mut wrapped, WrapKind::Bold);
+        match &wrapped {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(draft, "**cat**");
+                assert_eq!(
+                    *caret, 5,
+                    "whole-draft wrap leaves the insert offset before the closers"
+                );
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_click_places_inner_caret_without_moving_body() {
+        let mut edit = caption();
+        let body = 12..12;
+        edit.set_caret(1);
+        assert_eq!(edit.caret(), 1, "click x must land mid-caption");
+        assert_eq!(body, 12..12, "overlay click must not move the body caret");
+
+        let mut chip_edit = chip();
+        chip_edit.set_caret(2);
+        assert_eq!(chip_edit.caret(), 2);
+
+        let mut title = frontmatter_title();
+        title.set_caret(1);
+        assert_eq!(title.caret(), 1);
+
+        let mut yaml_edit = yaml();
+        yaml_edit.set_caret(3);
+        assert_eq!(yaml_edit.caret(), 3);
+    }
+
+    #[test]
+    fn overlay_drag_extends_inner_caret() {
+        let mut edit = caption();
+        edit.set_caret(1);
+        let anchor = edit.caret();
+        edit.set_caret(3);
+        let caret = edit.caret();
+        assert_eq!(anchor.min(caret)..anchor.max(caret), 1..3);
+        assert_eq!(edit.caret(), 3);
+    }
+
+    #[test]
+    fn overlay_arrows_move_inner_caret_not_body() {
+        assert!(
+            !widget_owns_caret(&WidgetEdit::Idle),
+            "body Left still moves the document caret"
+        );
+        for (edit, label) in [
+            (chip(), "language chip"),
+            (caption(), "image caption"),
+            (frontmatter_title(), "frontmatter field"),
+            (yaml(), "frontmatter YAML"),
+        ] {
+            assert!(
+                widget_owns_caret(&edit),
+                "Left/Right in {label} must own the inner caret"
+            );
+        }
+
+        let mut edit = caption();
+        let body = 12..12;
+        edit.set_caret(1);
+        let mut anchor = edit.caret();
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::Left,
+            false
+        ));
+        assert_eq!(edit.caret(), 0, "Left must step the inner offset");
+        assert_eq!(anchor, 0);
+        assert_eq!(body, 12..12, "overlay Left must not move the body caret");
+
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::Right,
+            false
+        ));
+        assert_eq!(edit.caret(), 1);
+        assert_eq!(body, 12..12);
+
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::End,
+            false
+        ));
+        assert_eq!(edit.caret(), 3);
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::Home,
+            false
+        ));
+        assert_eq!(edit.caret(), 0);
+        assert_eq!(body, 12..12);
+
+        let mut chip_edit = chip();
+        chip_edit.set_caret(2);
+        let mut chip_anchor = 2;
+        assert!(move_in_widget(
+            &mut chip_edit,
+            &mut chip_anchor,
+            CaretMove::Left,
+            false
+        ));
+        assert_eq!(chip_edit.caret(), 1);
+
+        let mut title = frontmatter_title();
+        title.set_caret(1);
+        let mut title_anchor = 1;
+        assert!(move_in_widget(
+            &mut title,
+            &mut title_anchor,
+            CaretMove::Right,
+            false
+        ));
+        assert_eq!(title.caret(), 2);
+
+        let mut yaml_edit = WidgetEdit::FrontmatterYaml {
+            draft: "ab\ncd".into(),
+            caret: 4,
+        };
+        let mut yaml_anchor = 4;
+        assert!(move_in_widget(
+            &mut yaml_edit,
+            &mut yaml_anchor,
+            CaretMove::Home,
+            false
+        ));
+        assert_eq!(yaml_edit.caret(), 3, "YAML Home is the wrapped line start");
+        assert!(move_in_widget(
+            &mut yaml_edit,
+            &mut yaml_anchor,
+            CaretMove::End,
+            false
+        ));
+        assert_eq!(yaml_edit.caret(), 5);
+
+        let mut unused = 0;
+        assert!(!move_in_widget(
+            &mut WidgetEdit::Idle,
+            &mut unused,
+            CaretMove::Left,
+            false
+        ));
+    }
+
+    #[test]
+    fn overlay_shift_arrows_extend_inner_selection() {
+        let mut edit = caption();
+        edit.set_caret(3);
+        let mut anchor = 3;
+        let body = 12..12;
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::Left,
+            true
+        ));
+        assert_eq!(edit.caret(), 2);
+        assert_eq!(anchor, 3, "Shift-Left must keep the inner anchor");
+        assert_eq!(edit.caret().min(anchor)..edit.caret().max(anchor), 2..3);
+        assert_eq!(body, 12..12, "Shift-Left must not move the body caret");
+
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::Right,
+            true
+        ));
+        assert_eq!(edit.caret(), 3);
+        assert_eq!(anchor, 3);
+
+        edit.set_caret(1);
+        anchor = 3;
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::Left,
+            false
+        ));
+        assert_eq!(
+            edit.caret(),
+            1,
+            "Left with an inner selection collapses to the start"
+        );
+        assert_eq!(anchor, 1);
+        assert_eq!(body, 12..12);
+    }
+
+    #[test]
+    fn overlay_shift_up_down_home_end_extend_yaml_selection() {
+        let mut edit = WidgetEdit::FrontmatterYaml {
+            draft: "alpha\nbeta".into(),
+            caret: 6,
+        };
+        let mut anchor = 6;
+        assert!(move_in_widget(&mut edit, &mut anchor, CaretMove::Up, true));
+        assert_eq!(edit.caret(), 0, "Shift-Up from `beta` lands on `alpha`");
+        assert_eq!(anchor, 6, "Shift-Up must keep the inner YAML anchor");
+        assert_eq!(edit.caret().min(anchor)..edit.caret().max(anchor), 0..6);
+
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::Down,
+            true
+        ));
+        assert_eq!(edit.caret(), 6);
+        assert_eq!(anchor, 6);
+
+        edit.set_caret(8);
+        anchor = 8;
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::Home,
+            true
+        ));
+        assert_eq!(edit.caret(), 6, "Shift-Home is line-local in YAML");
+        assert_eq!(anchor, 8);
+        assert!(move_in_widget(&mut edit, &mut anchor, CaretMove::End, true));
+        assert_eq!(edit.caret(), 10);
+        assert_eq!(anchor, 8);
+    }
+
+    #[test]
+    fn overlay_word_and_document_keys_move_inner_draft() {
+        let mut edit = WidgetEdit::FrontmatterYaml {
+            draft: "alpha beta\ngamma".into(),
+            caret: "alpha beta\ngamma".len(),
+        };
+        let mut anchor = edit.caret();
+        let body = 12..12;
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::WordLeft,
+            false
+        ));
+        assert_eq!(
+            edit.caret(),
+            "alpha beta\n".len(),
+            "WordLeft is start of `gamma`"
+        );
+        assert_eq!(anchor, edit.caret());
+        assert_eq!(
+            body,
+            12..12,
+            "overlay WordLeft must not move the body caret"
+        );
+
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::WordLeft,
+            false
+        ));
+        assert_eq!(edit.caret(), "alpha ".len());
+
+        edit.set_caret("alpha ".len());
+        anchor = edit.caret();
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::WordRight,
+            true
+        ));
+        assert_eq!(
+            edit.caret(),
+            "alpha beta".len(),
+            "Shift-WordRight extends to the end of `beta`"
+        );
+        assert_eq!(anchor, "alpha ".len());
+
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::DocumentHome,
+            false
+        ));
+        assert_eq!(edit.caret(), 0);
+        assert_eq!(anchor, 0);
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::DocumentEnd,
+            true
+        ));
+        assert_eq!(edit.caret(), "alpha beta\ngamma".len());
+        assert_eq!(anchor, 0, "Cmd-Shift-Down keeps the overlay draft anchor");
+        assert_eq!(body, 12..12);
+    }
+
+    #[test]
+    fn overlay_word_and_line_delete_stay_in_the_draft() {
+        let mut edit = WidgetEdit::FrontmatterYaml {
+            draft: "alpha beta".into(),
+            caret: "alpha beta".len(),
+        };
+        let mut anchor = edit.caret();
+        let body = 12..12;
+        delete_word_before_in_widget(&mut edit, &mut anchor);
+        match &edit {
+            WidgetEdit::FrontmatterYaml { draft, caret } => {
+                assert_eq!(
+                    draft, "alpha ",
+                    "overlay Option-Backspace must delete the previous word, got {draft:?}"
+                );
+                assert_eq!(*caret, "alpha ".len());
+            }
+            other => panic!("expected FrontmatterYaml, got {other:?}"),
+        }
+        assert_eq!(anchor, "alpha ".len());
+        assert_eq!(
+            body, 12..12,
+            "overlay word-delete must not mutate the body"
+        );
+
+        let mut yaml = WidgetEdit::FrontmatterYaml {
+            draft: "alpha beta\ngamma extra".into(),
+            caret: "alpha beta\ngamma extra".len(),
+        };
+        let mut yaml_anchor = yaml.caret();
+        delete_to_line_start_in_widget(&mut yaml, &mut yaml_anchor);
+        match &yaml {
+            WidgetEdit::FrontmatterYaml { draft, caret } => {
+                assert_eq!(
+                    draft, "alpha beta\n",
+                    "overlay Cmd-Backspace is the current YAML line, got {draft:?}"
+                );
+                assert_eq!(*caret, "alpha beta\n".len());
+            }
+            other => panic!("expected FrontmatterYaml, got {other:?}"),
+        }
+
+        let mut selected = caption();
+        selected.set_caret(1);
+        let mut sel_anchor = 3;
+        delete_word_before_in_widget(&mut selected, &mut sel_anchor);
+        match &selected {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(
+                    draft, "c",
+                    "word-delete on a non-empty overlay selection deletes the range"
+                );
+                assert_eq!(*caret, 1);
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+
+        let mut forward = WidgetEdit::FrontmatterYaml {
+            draft: "alpha beta".into(),
+            caret: 0,
+        };
+        let mut fwd_anchor = 0;
+        delete_word_after_in_widget(&mut forward, &mut fwd_anchor);
+        match &forward {
+            WidgetEdit::FrontmatterYaml { draft, .. } => {
+                assert_eq!(
+                    draft, " beta",
+                    "overlay Option-Delete removes the next word, got {draft:?}"
+                );
+            }
+            other => panic!("expected FrontmatterYaml, got {other:?}"),
+        }
+        assert_eq!(body, 12..12);
+    }
+
+    #[test]
+    fn shift_up_extends_body_selection_across_paragraphs() {
+        let source = "hello\n\nworld";
+        let mut engine = RichEngine::new();
+        let doc = Document::new(source);
+        engine.sync(&doc);
+        let w = source.find('w').expect("w");
+        let up = engine.vertical_caret(source, w, -1);
+        assert!(
+            up < w,
+            "Up from `world` must leave the second paragraph, got {up}"
+        );
+        let (sel, reversed) = extend_selection_range(w..w, false, up);
+        assert!(reversed, "Shift-Up moves the caret before the anchor");
+        assert_eq!(sel, up..w);
+        assert!(
+            source.get(sel.clone()).is_some_and(|s| s.contains('\n')),
+            "Shift-Up must select across the block gap, got {:?}",
+            source.get(sel)
+        );
+        let r = source.find('r').expect("r in world");
+        let line_start = source[..r].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let home = engine.clamp_raw_prefix(
+            source,
+            engine.snap_caret(line_start, markrust_core::rich::Bias::Right),
+            markrust_core::rich::Bias::Right,
+        );
+        assert_eq!(home, w, "Home on `world` is the first painted letter");
+        let (to_home, reversed_home) = extend_selection_range(r..r, false, home);
+        assert!(reversed_home);
+        assert_eq!(
+            to_home,
+            home..r,
+            "Shift-Home from inside `world` must select back to the line start"
+        );
+    }
+
+    #[test]
+    fn word_and_document_keys_extend_body_selection() {
+        let source = "**hello** world\n\nnext";
+        let mut engine = RichEngine::new();
+        let doc = Document::new(source);
+        engine.sync(&doc);
+        let h = source.find('h').expect("h");
+        let w = source.find('w').expect("w");
+        let n = source.find("next").expect("next");
+        let end_hello = engine.next_word_caret(source, h);
+        assert_eq!(
+            source.as_bytes().get(end_hello),
+            Some(&b' '),
+            "WordRight from bold `hello` lands on the painted space"
+        );
+        let (sel, reversed) = extend_selection_range(h..h, false, end_hello);
+        assert!(!reversed);
+        assert_eq!(sel, h..end_hello);
+
+        let start_next = engine.prev_word_caret(source, source.len());
+        assert_eq!(start_next, n, "WordLeft from EOF is the start of `next`");
+        let start_world = engine.prev_word_caret(source, start_next);
+        assert_eq!(
+            start_world, w,
+            "WordLeft from `next` skips the gap onto `world`"
+        );
+        let (to_world, rev_world) = extend_selection_range(n..n, false, start_world);
+        assert!(rev_world);
+        assert_eq!(to_world, w..n);
+
+        let home = engine.clamp_raw_prefix(
+            source,
+            engine.snap_caret(0, markrust_core::rich::Bias::Right),
+            markrust_core::rich::Bias::Right,
+        );
+        assert_eq!(
+            home, h,
+            "Cmd-Up / document start is the first painted letter"
+        );
+        let end = engine.clamp_raw_prefix(
+            source,
+            engine.snap_caret(source.len(), markrust_core::rich::Bias::Left),
+            markrust_core::rich::Bias::Left,
+        );
+        assert!(
+            end >= n,
+            "Cmd-Down / document end must reach the last paragraph, got {end}"
+        );
+        let (to_end, reversed_end) = extend_selection_range(h..h, false, end);
+        assert!(!reversed_end);
+        assert_eq!(to_end, h..end);
+        let (to_home, reversed_home) = extend_selection_range(n..n, false, home);
+        assert!(reversed_home);
+        assert_eq!(to_home, home..n);
+    }
+
+    #[test]
+    fn overlay_delete_edits_the_draft_not_the_body() {
+        assert!(
+            !widget_owns_caret(&WidgetEdit::Idle),
+            "body Delete still deletes in the document"
+        );
+        let mut edit = caption();
+        edit.set_caret(1);
+        let mut anchor = edit.caret();
+        let body = "hello";
+        delete_after_in_widget(&mut edit, &mut anchor);
+        match &edit {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(draft, "ct", "Delete must remove the inner grapheme");
+                assert_eq!(*caret, 1);
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+        assert_eq!(body, "hello", "overlay Delete must not mutate the body");
+
+        delete_after_in_widget(&mut edit, &mut anchor);
+        match &edit {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(draft, "c");
+                assert_eq!(*caret, 1);
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+        delete_after_in_widget(&mut edit, &mut anchor);
+        match &edit {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(draft, "c", "Delete at end of overlay is a no-op");
+                assert_eq!(*caret, 1);
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_select_all_selects_the_draft_not_the_body() {
+        let body = 0..80;
+        for (mut edit, label) in [
+            (chip(), "language chip"),
+            (caption(), "image caption"),
+            (frontmatter_title(), "frontmatter field"),
+            (yaml(), "frontmatter YAML"),
+        ] {
+            let len = match &edit {
+                WidgetEdit::CodeInfo { draft, .. }
+                | WidgetEdit::ImageAlt { draft, .. }
+                | WidgetEdit::Frontmatter { draft, .. }
+                | WidgetEdit::FrontmatterYaml { draft, .. } => draft.len(),
+                WidgetEdit::Idle => panic!("expected overlay"),
+            };
+            let mut anchor = edit.caret();
+            assert!(
+                select_all_in_widget(&mut edit, &mut anchor),
+                "Cmd+A in {label} must select the draft"
+            );
+            assert_eq!(anchor, 0, "{label} SelectAll anchor");
+            assert_eq!(edit.caret(), len, "{label} SelectAll caret");
+            assert_eq!(body, 0..80, "{label} must not SelectAll the document");
+        }
+        let mut unused = 0;
+        assert!(
+            !select_all_in_widget(&mut WidgetEdit::Idle, &mut unused),
+            "body Cmd+A is not consumed by an overlay (tables select the cell first)"
+        );
+        assert_eq!(body, 0..80);
+    }
+
+    #[test]
+    fn overlay_empty_caret_copy_is_the_whole_draft() {
+        assert_eq!(
+            overlay_copy_text("rust", 4..4).as_deref(),
+            Some("rust"),
+            "empty caret in the language chip copies the draft"
+        );
+        assert_eq!(
+            overlay_copy_text("cat", 3..3).as_deref(),
+            Some("cat"),
+            "empty caret in the caption copies the draft"
+        );
+        assert_eq!(
+            overlay_copy_text("Hi", 2..2).as_deref(),
+            Some("Hi"),
+            "empty caret in frontmatter copies the draft"
+        );
+        assert_eq!(
+            overlay_copy_text("title: Hi", 0..0).as_deref(),
+            Some("title: Hi")
+        );
+        assert_eq!(
+            overlay_copy_text("hello", 0..5).as_deref(),
+            Some("hello"),
+            "non-empty overlay selection still copies the slice"
+        );
+        assert_eq!(overlay_copy_text("hello", 1..4).as_deref(), Some("ell"));
+        assert_eq!(
+            overlay_copy_text("", 0..0),
+            None,
+            "empty overlay draft copies nothing"
+        );
+    }
+
+    #[test]
+    fn body_table_select_all_selects_the_cell_not_the_document() {
+        use markrust_core::rich::{table_select_all_range, RichEngine};
+        use markrust_core::Document;
+
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let doc = Document::new(source);
+        let mut engine = RichEngine::new();
+        engine.sync(&doc);
+        let a = source.find('a').expect("header a");
+        let cell = table_select_all_range(&engine, source, &(a..a), None).expect("first Cmd-A");
+        assert_eq!(
+            cell,
+            engine.cell_edit_range(a, source).expect("cell a"),
+            "body Cmd+A in a table must select the cell, like overlay Cmd+A selects the draft"
+        );
+        assert_ne!(cell, 0..source.len(), "must not SelectAll the document");
+        assert!(
+            !source[cell.clone()].contains('|'),
+            "cell SelectAll must not include `|`"
+        );
+        assert!(
+            table_select_all_range(&engine, source, &cell, None).is_none(),
+            "second Cmd-A falls through to the document"
+        );
+    }
+
+    #[test]
+    fn overlay_insert_and_backspace_respect_inner_selection() {
+        let mut edit = caption();
+        edit.set_caret(1);
+        let mut anchor = 3;
+        let body = "hello";
+        insert_into_widget(&mut edit, &mut anchor, "x");
+        match &edit {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(draft, "cx", "typing must replace the inner selection");
+                assert_eq!(*caret, 2);
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+        assert_eq!(anchor, 2);
+        assert_eq!(body, "hello");
+
+        let mut selected = caption();
+        selected.set_caret(1);
+        let mut sel_anchor = 3;
+        delete_before_in_widget(&mut selected, &mut sel_anchor);
+        match &selected {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(
+                    draft, "c",
+                    "Backspace on a non-empty inner selection must delete the range"
+                );
+                assert_eq!(*caret, 1);
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+        assert_eq!(sel_anchor, 1);
+        assert_eq!(body, "hello");
+
+        let mut del = caption();
+        del.set_caret(0);
+        let mut del_anchor = 2;
+        delete_after_in_widget(&mut del, &mut del_anchor);
+        match &del {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(
+                    draft, "t",
+                    "Delete on a non-empty inner selection must delete the range"
+                );
+                assert_eq!(*caret, 0);
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+
+        let mut collapsed = caption();
+        collapsed.set_caret(3);
+        let mut col_anchor = 3;
+        delete_before_in_widget(&mut collapsed, &mut col_anchor);
+        match &collapsed {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(draft, "ca", "collapsed Backspace still deletes one char");
+                assert_eq!(*caret, 2);
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_undo_rewinds_draft_not_the_body() {
+        let mut edit = caption();
+        let mut anchor = edit.caret();
+        let mut undo = Vec::new();
+        let mut redo = Vec::new();
+        let body = "hello";
+        push_widget_history(&edit, anchor, &mut undo, &mut redo);
+        insert_into_widget(&mut edit, &mut anchor, "!");
+        match &edit {
+            WidgetEdit::ImageAlt { draft, .. } => assert_eq!(draft, "cat!"),
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+        assert!(undo_widget_history(
+            &mut edit,
+            &mut anchor,
+            &mut undo,
+            &mut redo
+        ));
+        match &edit {
+            WidgetEdit::ImageAlt { draft, caret, .. } => {
+                assert_eq!(draft, "cat", "overlay undo must restore the draft");
+                assert_eq!(*caret, 3);
+            }
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+        assert_eq!(body, "hello", "overlay undo must not mutate the body");
+        assert!(
+            !undo_widget_history(&mut edit, &mut anchor, &mut undo, &mut redo),
+            "empty overlay undo must not fall through to the document"
+        );
+        assert!(redo_widget_history(
+            &mut edit,
+            &mut anchor,
+            &mut undo,
+            &mut redo
+        ));
+        match &edit {
+            WidgetEdit::ImageAlt { draft, .. } => assert_eq!(draft, "cat!"),
+            other => panic!("expected ImageAlt, got {other:?}"),
+        }
+
+        let mut idle_anchor = 0;
+        let mut idle_undo = Vec::new();
+        let mut idle_redo = Vec::new();
+        assert!(!undo_widget_history(
+            &mut WidgetEdit::Idle,
+            &mut idle_anchor,
+            &mut idle_undo,
+            &mut idle_redo
+        ));
+    }
+
+    #[test]
+    fn overlay_yaml_up_down_moves_between_lines() {
+        let mut edit = WidgetEdit::FrontmatterYaml {
+            draft: "ab\ncd".into(),
+            caret: 4,
+        };
+        let mut anchor = 4;
+        let body = 12..12;
+        assert!(move_in_widget(&mut edit, &mut anchor, CaretMove::Up, false));
+        assert_eq!(edit.caret(), 1, "YAML Up stays on the same column");
+        assert_eq!(anchor, 1);
+        assert_eq!(body, 12..12, "overlay Up must not move the body caret");
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::Down,
+            false
+        ));
+        assert_eq!(edit.caret(), 4);
+        assert_eq!(body, 12..12);
+
+        let mut caption_edit = caption();
+        let mut cap_anchor = 3;
+        assert!(move_in_widget(
+            &mut caption_edit,
+            &mut cap_anchor,
+            CaretMove::Up,
+            false
+        ));
+        assert_eq!(caption_edit.caret(), 3, "single-line overlay Up is a no-op");
+    }
+
+    #[test]
+    fn overlay_click_does_not_match_idle_as_focused() {
+        assert!(!WidgetEdit::Idle.matches_overlay(&OverlayTarget::CodeInfo(NodeId(1))));
+        assert!(chip().matches_overlay(&OverlayTarget::CodeInfo(NodeId(1))));
+        assert!(caption().matches_overlay(&OverlayTarget::ImageAlt {
+            range: 0..8,
+            stored: "cat".into(),
+        }));
+        assert!(
+            frontmatter_title().matches_overlay(&OverlayTarget::Frontmatter {
+                key: "title",
+                stored: "Hi".into(),
+            })
+        );
+        assert!(yaml().matches_overlay(&OverlayTarget::FrontmatterYaml {
+            stored: "title: Hi".into(),
+        }));
+    }
+
+    #[test]
+    fn widget_draft_with_caret_paints_bar_at_inner_offset() {
+        assert_eq!(widget_draft_with_caret("****", 2, ""), "**|**");
+        assert_eq!(widget_draft_with_caret("cat", 3, "x"), "catx|");
+    }
 }
