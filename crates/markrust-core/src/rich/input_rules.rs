@@ -32,20 +32,62 @@ pub fn match_input_rule(
     typed: &str,
     in_raw: bool,
 ) -> Option<InputRule> {
+    match_input_rule_with(source, caret, typed, in_raw, false)
+}
+
+/// Like [`match_input_rule`], with `in_table` suppressing block-open / fence
+/// rewrites that would smash a GFM row. Mark auto-close still runs unless the
+/// splice would insert a newline or `|`.
+pub fn match_input_rule_with(
+    source: &str,
+    caret: usize,
+    typed: &str,
+    in_raw: bool,
+    in_table: bool,
+) -> Option<InputRule> {
     if in_raw || typed.is_empty() || typed.contains('\n') {
         return None;
     }
     let caret = caret.min(source.len());
-    if let Some(rule) = match_fence_or_break(source, caret, typed) {
-        return Some(rule);
-    }
-    if let Some(rule) = match_block_space(source, caret, typed) {
-        return Some(rule);
+    if !in_table {
+        if let Some(rule) = match_fence_or_break(source, caret, typed) {
+            return Some(rule);
+        }
+        if let Some(rule) = match_block_space(source, caret, typed) {
+            return Some(rule);
+        }
     }
     if let Some(rule) = match_auto_close(source, caret, typed) {
-        return Some(rule);
+        if !(in_table && input_rule_breaks_table(&rule)) {
+            return Some(rule);
+        }
     }
-    match_pending_opener(source, caret, typed)
+    match_pending_opener(source, caret, typed, in_table)
+        .filter(|rule| !(in_table && input_rule_breaks_table(rule)))
+}
+
+/// True when applying `rule` inside a GFM table cell would rewrite the row
+/// (heading / list / quote / fence) or splice a newline or `|`.
+pub fn input_rule_breaks_table(rule: &InputRule) -> bool {
+    let insert = match rule {
+        InputRule::InsertRaw(text) => text.as_str(),
+        InputRule::Replace { insert, .. } => insert.as_str(),
+    };
+    insert.contains('\n') || insert.contains('|') || is_block_marker_space(insert)
+}
+
+fn is_block_marker_space(insert: &str) -> bool {
+    let Some(marker) = insert.strip_suffix(' ') else {
+        return false;
+    };
+    if marker.is_empty() || marker.bytes().any(|b| b == b' ' || b == b'\t') {
+        return false;
+    }
+    let hashes = marker.bytes().take_while(|&b| b == b'#').count();
+    if (1..=6).contains(&hashes) && marker.len() == hashes {
+        return true;
+    }
+    matches!(marker, "-" | "*" | "+" | ">") || ordered_marker(marker).is_some()
 }
 
 fn match_block_space(source: &str, caret: usize, typed: &str) -> Option<InputRule> {
@@ -202,7 +244,12 @@ fn close_pair(
     })
 }
 
-fn match_pending_opener(source: &str, caret: usize, typed: &str) -> Option<InputRule> {
+fn match_pending_opener(
+    source: &str,
+    caret: usize,
+    typed: &str,
+    in_table: bool,
+) -> Option<InputRule> {
     if typed.len() != 1 {
         return None;
     }
@@ -212,14 +259,26 @@ fn match_pending_opener(source: &str, caret: usize, typed: &str) -> Option<Input
     let continues = continues_opener(source, caret, ch);
 
     match ch {
-        b'#' | b'>' | b'+' | b'-' if at_start => Some(InputRule::InsertRaw(typed.to_string())),
+        // Block openers stay escaped / literal in a cell so `# ` / `- ` / `> `
+        // cannot rewrite the GFM row. `*` / `_` / `` ` `` / `~` at a physical
+        // line start would start a list / fence / break (italic still
+        // InsertRaw when not at `content_start`).
+        b'#' | b'>' | b'+' | b'-' if at_start && !in_table => {
+            Some(InputRule::InsertRaw(typed.to_string()))
+        }
+        b'*' | b'_' | b'`' | b'~' if in_table && at_start => None,
         b'*' | b'_' | b'`' | b'~' if left_flank || continues => {
             Some(InputRule::InsertRaw(typed.to_string()))
         }
-        b'.' | b')' if at_start || follows_content_start_digits(source, caret) => {
+        b'.' | b')' if in_table && follows_content_start_digits(source, caret) => {
+            Some(InputRule::InsertRaw(format!("\\{typed}")))
+        }
+        b'.' | b')' if !in_table && (at_start || follows_content_start_digits(source, caret)) => {
             Some(InputRule::InsertRaw(typed.to_string()))
         }
-        b if b.is_ascii_digit() && at_start => Some(InputRule::InsertRaw(typed.to_string())),
+        b if b.is_ascii_digit() && at_start && !in_table => {
+            Some(InputRule::InsertRaw(typed.to_string()))
+        }
         // Brackets and HTML would otherwise be backslash-escaped on every
         // keystroke, so task lists, links, images, and raw HTML could not
         // be typed in WYSIWYG.
@@ -624,6 +683,53 @@ mod tests {
         assert_eq!(out, "[text]");
         let (out, _) = apply("", 0, "<");
         assert_eq!(out, "<");
+    }
+
+    #[test]
+    fn block_rules_do_not_match_inside_a_table() {
+        assert!(match_input_rule_with("#", 1, " ", false, true).is_none());
+        assert!(match_input_rule_with("-", 1, " ", false, true).is_none());
+        assert!(match_input_rule_with("*", 1, " ", false, true).is_none());
+        assert!(match_input_rule_with(">", 1, " ", false, true).is_none());
+        assert!(match_input_rule_with("1.", 2, " ", false, true).is_none());
+        assert!(match_input_rule_with("``", 2, "`", false, true).is_none());
+        assert!(match_input_rule_with("--", 2, "-", false, true).is_none());
+        assert!(
+            matches!(
+                match_input_rule_with("1", 1, ".", false, true),
+                Some(InputRule::InsertRaw(ref s)) if s == "\\."
+            ),
+            "ordered-list `.` in a cell at line start must stay escaped"
+        );
+        assert!(
+            matches!(
+                match_input_rule_with("*hello", 6, "*", false, true),
+                Some(InputRule::InsertRaw(ref s)) if s == "*"
+            ),
+            "italic auto-close must still run in a cell"
+        );
+        let across_pipe = match_input_rule_with("| *foo | bar", 12, "*", false, true);
+        assert!(
+            across_pipe.is_none()
+                || match &across_pipe {
+                    Some(InputRule::InsertRaw(s)) => !s.contains('|') && !s.contains('\n'),
+                    Some(InputRule::Replace { insert, .. }) => {
+                        !insert.contains('|') && !insert.contains('\n')
+                    }
+                    None => true,
+                },
+            "auto-close must not splice `|` across cells: {across_pipe:?}"
+        );
+    }
+
+    #[test]
+    fn input_rule_breaks_table_detects_block_open_and_newlines() {
+        let heading = match_input_rule("#", 1, " ", false).expect("heading");
+        assert!(input_rule_breaks_table(&heading));
+        let fence = match_input_rule("``", 2, "`", false).expect("fence");
+        assert!(input_rule_breaks_table(&fence));
+        let italic = match_input_rule("*hello", 6, "*", false).expect("italic");
+        assert!(!input_rule_breaks_table(&italic));
     }
 
     #[test]

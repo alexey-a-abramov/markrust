@@ -18,7 +18,7 @@ use gpui::{
 };
 use markrust_core::rich::{
     apply_rich_command, caret_for_click_below_content, place_caret_for_click_below, Bias,
-    CaretState, MarkSet, NodeId, RichCommand, RichEngine, RichOutcome,
+    table_select_all_range, CaretState, MarkSet, NodeId, RichCommand, RichEngine, RichOutcome,
 };
 use markrust_core::Document;
 
@@ -550,6 +550,7 @@ pub struct RichEditorView {
     synced_revision: Option<u64>,
     pub selected_range: Range<usize>,
     pub selection_reversed: bool,
+    table_select_all_cell: Option<Range<usize>>,
     marked_range: Option<Range<usize>>,
     preedit: Option<String>,
     is_selecting: bool,
@@ -594,6 +595,7 @@ impl RichEditorView {
             synced_revision: None,
             selected_range: 0..0,
             selection_reversed: false,
+            table_select_all_cell: None,
             marked_range: None,
             preedit: None,
             is_selecting: false,
@@ -645,6 +647,7 @@ impl RichEditorView {
     }
 
     fn restore_caret(&mut self, caret: CaretState) {
+        self.table_select_all_cell = None;
         self.selected_range = caret.range;
         self.selection_reversed = caret.reversed;
     }
@@ -757,6 +760,7 @@ impl RichEditorView {
             }
             EditorCommand::SetSelection { start, end } => {
                 let len = self.document.read(cx).buffer.len_bytes();
+                self.table_select_all_cell = None;
                 self.selected_range = start.min(len)..end.min(len);
                 self.selection_reversed = start > end;
                 cx.notify();
@@ -764,13 +768,32 @@ impl RichEditorView {
             }
             EditorCommand::SelectAll => {
                 if select_all_in_widget(&mut self.widget_edit, &mut self.widget_anchor) {
+                    self.table_select_all_cell = None;
                     self.reset_blink(cx);
                     self.snapshot = None;
                     cx.notify();
                     EditorOutcome::CaretMoved
                 } else {
-                    let len = self.document.read(cx).buffer.len_bytes();
-                    self.selected_range = 0..len;
+                    let source = self.document.read(cx).buffer.content();
+                    self.engine.sync(self.document.read(cx));
+                    // Typora: first Cmd-A in a table selects the cell. A
+                    // second Cmd-A (already that cell, including an empty
+                    // collapsed body) takes the document.
+                    match table_select_all_range(
+                        &self.engine,
+                        &source,
+                        &self.selected_range,
+                        self.table_select_all_cell.as_ref(),
+                    ) {
+                        Some(cell) => {
+                            self.table_select_all_cell = Some(cell.clone());
+                            self.selected_range = cell;
+                        }
+                        None => {
+                            self.table_select_all_cell = None;
+                            self.selected_range = 0..source.len();
+                        }
+                    }
                     self.selection_reversed = false;
                     cx.notify();
                     EditorOutcome::CaretMoved
@@ -941,6 +964,7 @@ impl RichEditorView {
             }
         });
         if let Some(snap) = restored {
+            self.table_select_all_cell = None;
             self.selected_range = snap.range();
             self.selection_reversed = snap.reversed;
             self.engine.invalidate();
@@ -962,6 +986,7 @@ impl RichEditorView {
             }
         });
         if let Some(snap) = restored {
+            self.table_select_all_cell = None;
             self.selected_range = snap.range();
             self.selection_reversed = snap.reversed;
             self.engine.invalidate();
@@ -1023,6 +1048,7 @@ impl RichEditorView {
     }
 
     fn move_to(&mut self, offset: usize, extend: bool, cx: &mut Context<Self>) {
+        self.table_select_all_cell = None;
         // While an overlay is editing, keep jumps inside the draft.
         if !matches!(self.widget_edit, WidgetEdit::Idle) {
             self.widget_edit.set_caret(offset);
@@ -1039,6 +1065,16 @@ impl RichEditorView {
         let offset = self.engine.snap_caret(offset.min(len), Bias::Left);
         let offset = self.engine.clamp_raw_prefix(&source, offset, Bias::Left);
         if extend {
+            let anchor = if self.selection_reversed {
+                self.selected_range.end
+            } else {
+                self.selected_range.start
+            };
+            let offset = if let Some(cell) = self.engine.cell_edit_range(anchor, &source) {
+                offset.clamp(cell.start, cell.end)
+            } else {
+                offset
+            };
             let (range, reversed) = extend_selection_range(
                 self.selected_range.clone(),
                 self.selection_reversed,

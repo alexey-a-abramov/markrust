@@ -17,8 +17,8 @@ pub mod serialize;
 pub mod tree;
 
 pub use command::{
-    apply_rich_command, place_caret_for_click_below, BlockType, CaretState, RichCommand, RichError,
-    RichOutcome,
+    apply_rich_command, place_caret_for_click_below, table_select_all_range, BlockType, CaretState,
+    RichCommand, RichError, RichOutcome,
 };
 pub use emoji::{lookup_emoji, lookup_shortcode};
 pub use engine::{
@@ -27,7 +27,9 @@ pub use engine::{
     TablePos,
 };
 pub use import::import_markdown;
-pub use input_rules::{match_input_rule, InputRule};
+pub use input_rules::{
+    input_rule_breaks_table, match_input_rule, match_input_rule_with, InputRule,
+};
 pub use save::{save_candidates, DiffHunk, SaveCandidates};
 pub use serialize::{serialize_block, serialize_tree, SerializeMode};
 pub use tree::{

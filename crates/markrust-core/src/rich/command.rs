@@ -12,11 +12,11 @@ use crate::undo::{SelectionSnapshot, TransactionKind};
 
 pub use super::engine::code_body_source_map;
 use super::engine::{
-    blank_caret_gap_after_last, caret_for_click_below_content, expand_mark_delimiters, RichEngine,
-    TablePos,
+    blank_caret_gap_after_last, caret_for_click_below_content, expand_mark_delimiters,
+    frontmatter_body_start, RichEngine, TablePos,
 };
 use super::escape::{escape_text, EscapeContext};
-use super::input_rules::{match_input_rule, InputRule};
+use super::input_rules::{input_rule_breaks_table, match_input_rule_with, InputRule};
 use super::serialize::serialize_block;
 use super::tree::{
     Block, BlockKind, ColumnAlign, Frontmatter, HeadingStyle, Inline, LinkAttrs, MarkSet, NodeId,
@@ -258,9 +258,10 @@ fn insert_text(
     let raw = engine.in_raw_context(offset);
     let in_table = engine.in_table(offset);
     if !raw {
-        if let Some(rule) = match_input_rule(&source, offset, text, false) {
-            // Newlines from fences / thematic breaks would split a GFM table row.
-            if !(in_table && input_rule_inserts_newline(&rule)) {
+        if let Some(rule) = match_input_rule_with(&source, offset, text, false, in_table) {
+            // Headings / lists / quotes / fences would rewrite a GFM row;
+            // splices that insert a newline or `|` would too.
+            if !(in_table && input_rule_breaks_table(&rule)) {
                 return apply_input_rule(doc, engine, caret, rule);
             }
         }
@@ -344,13 +345,6 @@ fn is_coalescable_insert(text: &str) -> bool {
     crate::undo::is_typing_burst(text)
 }
 
-fn input_rule_inserts_newline(rule: &InputRule) -> bool {
-    match rule {
-        InputRule::InsertRaw(text) => text.contains('\n'),
-        InputRule::Replace { insert, .. } => insert.contains('\n'),
-    }
-}
-
 fn backspace(
     doc: &mut Document,
     engine: &mut RichEngine,
@@ -361,6 +355,10 @@ fn backspace(
     }
     let source = doc.buffer.content();
     let to = caret.cursor();
+    let fm_end = frontmatter_body_start(engine.tree());
+    if fm_end > 0 && to <= fm_end {
+        return Ok(RichOutcome::Noop);
+    }
     if to == 0 {
         return Ok(RichOutcome::Noop);
     }
@@ -473,10 +471,12 @@ fn extend_empty_mark_wrappers(source: &str, engine: &RichEngine, range: &mut Ran
 
 fn delete_range(
     doc: &mut Document,
-    _engine: &mut RichEngine,
+    engine: &mut RichEngine,
     caret: &mut CaretState,
     kind: TransactionKind,
 ) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    clamp_selection_to_table_cell(engine, caret, &source);
     let start = caret.range.start;
     let end = caret.range.end;
     if start == end {
@@ -536,6 +536,125 @@ fn delete_to_bound(
     caret.range = range;
     caret.reversed = reversed;
     delete_range(doc, engine, caret, TransactionKind::Command)
+}
+
+/// Drag-select across GFM `|` must not merge cells. Clamp the range to the
+/// cell that contains the start (or the caret), or collapse if the range is
+/// only separators.
+fn clamp_selection_to_table_cell(engine: &RichEngine, caret: &mut CaretState, source: &str) {
+    if caret.range.is_empty() {
+        return;
+    }
+    let Some(slice) = source.get(caret.range.clone()) else {
+        return;
+    };
+    if !slice.contains('|') {
+        return;
+    }
+    let end_probe = caret.range.end.saturating_sub(1).max(caret.range.start);
+    if !engine.in_table(caret.range.start)
+        && !engine.in_table(end_probe)
+        && !engine.in_table(caret.cursor())
+    {
+        return;
+    }
+    let Some(cell) = engine
+        .cell_edit_range(caret.range.start, source)
+        .or_else(|| engine.cell_edit_range(caret.cursor(), source))
+        .or_else(|| engine.cell_edit_range(end_probe, source))
+    else {
+        caret.collapse_to(caret.range.start);
+        return;
+    };
+    let start = caret.range.start.clamp(cell.start, cell.end);
+    let end = caret.range.end.clamp(cell.start, cell.end);
+    if start >= end {
+        caret.collapse_to(start);
+    } else {
+        caret.range = start..end;
+    }
+}
+
+/// Editable cell containing `byte`, or the cell next to a GFM `|` the caret
+/// is sitting on (pipes are not themselves editable).
+fn cell_edit_range_near(engine: &RichEngine, source: &str, byte: usize) -> Option<Range<usize>> {
+    engine.cell_edit_range(byte, source).or_else(|| {
+        if source.as_bytes().get(byte) != Some(&b'|') {
+            return None;
+        }
+        engine
+            .cell_edit_range(byte.saturating_add(1).min(source.len()), source)
+            .or_else(|| engine.cell_edit_range(byte.saturating_sub(1), source))
+    })
+}
+
+/// Wrap (ToggleMark / ToggleLink) must not splice delimiters across GFM `|`.
+///
+/// Only when the caret or selection *starts* in a table — a document-wide
+/// selection that merely overlaps a table (Cmd-A from a paragraph) still
+/// wraps the paragraph, not a cell. Returns `false` when wrap should no-op
+/// (in a table but not in an editable cell).
+fn clamp_wrap_to_table_cell(engine: &RichEngine, caret: &mut CaretState, source: &str) -> bool {
+    if !engine.in_table(caret.range.start) && !engine.in_table(caret.cursor()) {
+        return true;
+    }
+    let Some(cell) = cell_edit_range_near(engine, source, caret.range.start)
+        .or_else(|| cell_edit_range_near(engine, source, caret.cursor()))
+    else {
+        return false;
+    };
+    if caret.range.is_empty() {
+        caret.collapse_to(caret.cursor().clamp(cell.start, cell.end));
+        return true;
+    }
+    let start = caret.range.start.clamp(cell.start, cell.end);
+    let end = caret.range.end.clamp(cell.start, cell.end);
+    if start >= end {
+        caret.collapse_to(start);
+    } else {
+        caret.range = start..end;
+    }
+    true
+}
+
+/// First Cmd-A in a table selects the current cell's editable text (Typora).
+/// Already selecting that cell, already selecting the whole document, or not
+/// in a table: `None` so the caller can take the document.
+///
+/// `prior_cell` is the range the previous Cmd-A selected (if it was a cell).
+/// Empty cells need it: their body range is collapsed and equals the caret,
+/// so range equality alone cannot tell first Cmd-A ("select the cell") from
+/// second Cmd-A (document).
+pub fn table_select_all_range(
+    engine: &RichEngine,
+    source: &str,
+    current: &Range<usize>,
+    prior_cell: Option<&Range<usize>>,
+) -> Option<Range<usize>> {
+    if current.start == 0 && current.end == source.len() && !current.is_empty() {
+        return None;
+    }
+    let start = current.start.min(source.len());
+    let end = current.end.min(source.len());
+    let end_inside = end.saturating_sub(1).max(start);
+    if !engine.in_table(start) && !engine.in_table(end_inside) && !engine.in_table(end) {
+        return None;
+    }
+    let cell = cell_edit_range_near(engine, source, start)
+        .or_else(|| cell_edit_range_near(engine, source, end_inside))
+        .or_else(|| cell_edit_range_near(engine, source, end))?;
+    // Non-empty cell already selected, or empty cell latched by the last Cmd-A.
+    if prior_cell == Some(&cell) || (*current == cell && !current.is_empty()) {
+        None
+    } else {
+        Some(cell)
+    }
+}
+
+/// True when the caret or the selection start sits in a GFM table.
+/// Heading/list/quote have no cell-local meaning and must not rewrite `|`.
+fn selection_in_table(engine: &RichEngine, caret: &CaretState) -> bool {
+    engine.in_table(caret.range.start) || engine.in_table(caret.cursor())
 }
 
 fn split_block(
@@ -719,6 +838,10 @@ fn toggle_mark(
     caret: &mut CaretState,
     mark: MarkSet,
 ) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    if !clamp_wrap_to_table_cell(engine, caret, &source) {
+        return Ok(RichOutcome::Noop);
+    }
     let sel = if caret.range.is_empty() {
         // Toggle the run containing the caret.
         let Some(id) = engine.block_at(caret.cursor()) else {
@@ -865,6 +988,10 @@ fn set_block_type(
     caret: &mut CaretState,
     kind: BlockType,
 ) -> Result<RichOutcome, RichError> {
+    if selection_in_table(engine, caret) {
+        // GFM cells are not headings; rewriting the table eats `|`.
+        return Ok(RichOutcome::Noop);
+    }
     let Some(top) = engine.top_level_at(caret.cursor()).cloned() else {
         return Ok(RichOutcome::Noop);
     };
@@ -891,6 +1018,9 @@ fn toggle_blockquote(
     engine: &mut RichEngine,
     caret: &mut CaretState,
 ) -> Result<RichOutcome, RichError> {
+    if selection_in_table(engine, caret) {
+        return Ok(RichOutcome::Noop);
+    }
     let Some(top) = engine.top_level_at(caret.cursor()).cloned() else {
         return Ok(RichOutcome::Noop);
     };
@@ -926,6 +1056,9 @@ fn toggle_list(
     caret: &mut CaretState,
     ordered: bool,
 ) -> Result<RichOutcome, RichError> {
+    if selection_in_table(engine, caret) {
+        return Ok(RichOutcome::Noop);
+    }
     let Some(top) = engine.top_level_at(caret.cursor()).cloned() else {
         return Ok(RichOutcome::Noop);
     };
@@ -1047,6 +1180,10 @@ fn toggle_link(
     engine: &mut RichEngine,
     caret: &mut CaretState,
 ) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    if !clamp_wrap_to_table_cell(engine, caret, &source) {
+        return Ok(RichOutcome::Noop);
+    }
     if caret.range.is_empty() {
         let source = doc.buffer.content();
         let word = word_range(&source, caret.cursor());
@@ -3226,6 +3363,294 @@ mod tests {
         assert_eq!(
             expanded.start, expanded.end,
             "empty-caret table Cut must stay a no-op"
+        );
+    }
+
+    fn table_source() -> &'static str {
+        "| a | b |\n|---|---|\n| 1 | 2 |\n"
+    }
+
+    fn assert_gfm_table_survives(engine: &RichEngine, after: &str, label: &str) {
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "{label}: table must survive, got {after:?}"
+        );
+        assert_eq!(
+            engine.tree().blocks[0].children[0].children.len(),
+            2,
+            "{label}: header must keep two cells, got {after:?}"
+        );
+        let header = after.lines().next().unwrap_or("");
+        assert!(
+            header.matches('|').count() >= 3,
+            "{label}: header must keep GFM pipes, got {after:?}"
+        );
+        assert!(
+            after.contains('b'),
+            "{label}: the other cell must remain, got {after:?}"
+        );
+        assert!(
+            !after.contains("**|")
+                && !after.contains("|**")
+                && !after.contains("*|")
+                && !after.contains("|*")
+                && !after.contains("`|")
+                && !after.contains("|`")
+                && !after.contains("[|"),
+            "{label}: wrap must not splice delimiters onto `|`, got {after:?}"
+        );
+    }
+
+    fn first_empty_cell_body(engine: &RichEngine, source: &str) -> Range<usize> {
+        fn walk(blocks: &[Block], engine: &RichEngine, source: &str) -> Option<Range<usize>> {
+            for b in blocks {
+                if matches!(b.kind, BlockKind::TableCell) {
+                    for probe in b.source_range.start..=b.source_range.end.min(source.len()) {
+                        if let Some(cell) = engine.cell_edit_range(probe, source) {
+                            if cell.is_empty() {
+                                return Some(cell);
+                            }
+                        }
+                    }
+                }
+                if let Some(found) = walk(&b.children, engine, source) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(&engine.tree().blocks, engine, source).expect("empty table cell")
+    }
+
+    #[test]
+    fn block_commands_no_op_in_table() {
+        let source = table_source();
+        let a = source.find('a').expect("header a");
+        let cmds: [(RichCommand, &str); 5] = [
+            (RichCommand::ToggleList { ordered: false }, "ToggleList"),
+            (
+                RichCommand::ToggleList { ordered: true },
+                "ToggleList ordered",
+            ),
+            (RichCommand::ToggleBlockquote, "ToggleBlockquote"),
+            (
+                RichCommand::SetBlockType(BlockType::Heading(1)),
+                "SetBlockType heading",
+            ),
+            (
+                RichCommand::SetBlockType(BlockType::Paragraph),
+                "SetBlockType paragraph",
+            ),
+        ];
+        for (cmd, label) in cmds {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(a);
+            let outcome =
+                apply_rich_command(&mut doc, &mut engine, &mut caret, cmd.clone()).expect(label);
+            assert_eq!(
+                outcome,
+                RichOutcome::Noop,
+                "{label}: in-cell block command must no-op, got {}",
+                doc.buffer.content()
+            );
+            let after = doc.buffer.content();
+            engine.sync(&doc);
+            assert_gfm_table_survives(&engine, &after, label);
+            assert_eq!(after, source, "{label}: source bytes must stay the table");
+
+            // Selection start in the table (cursor may sit past `|`).
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.range = a..source.len();
+            caret.reversed = false;
+            apply_rich_command(&mut doc, &mut engine, &mut caret, cmd.clone()).expect(label);
+            let after = doc.buffer.content();
+            engine.sync(&doc);
+            assert_gfm_table_survives(&engine, &after, &format!("{label} selection start"));
+        }
+    }
+
+    #[test]
+    fn wrap_commands_clamp_to_table_cell() {
+        let source = table_source();
+        for (cmd, label) in [
+            (RichCommand::ToggleMark(MarkSet::BOLD), "bold"),
+            (RichCommand::ToggleMark(MarkSet::ITALIC), "italic"),
+            (RichCommand::ToggleMark(MarkSet::CODE), "code"),
+        ] {
+            // A document-wide selection that starts in the table stays in the cell.
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(source.find('a').expect("header a"));
+            caret.range = 0..source.len();
+            caret.reversed = false;
+            apply(&mut doc, &mut engine, &mut caret, cmd.clone());
+            let after = doc.buffer.content();
+            engine.sync(&doc);
+            assert_gfm_table_survives(&engine, &after, label);
+        }
+
+        // Cmd-K on a document-wide selection starting in a table stays in the cell.
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('a').expect("header a"));
+        caret.range = 0..source.len();
+        caret.reversed = false;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert_gfm_table_survives(&engine, &after, "link");
+        assert!(
+            after.contains("[a]") || after.contains("[ a ]") || after.contains("[ a]"),
+            "Cmd-K must wrap the cell text, not the row, got {after:?}"
+        );
+
+        // In-cell selection still wraps that cell.
+        let a = source.find('a').expect("header a");
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.range = a..a + 1;
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert_gfm_table_survives(&engine, &after, "in-cell bold");
+        assert!(
+            after.contains("**a**") || after.contains("__a__"),
+            "in-cell Cmd-B must still wrap the cell text, got {after:?}"
+        );
+
+        // Selecting the whole doc from a paragraph still wraps that paragraph.
+        let mixed = "hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(mixed);
+        caret.range = 0..mixed.len();
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert!(
+            after.contains("**hello**") || after.contains("__hello__"),
+            "Cmd-A from a paragraph must still wrap that paragraph, got {after:?}"
+        );
+        let table = engine
+            .tree()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+            .expect("table must survive");
+        assert_eq!(
+            table.children[0].children.len(),
+            2,
+            "wrapping the paragraph must not collapse the table, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn select_all_in_empty_table_cell_selects_that_cell() {
+        let source = table_source();
+        let (_doc, engine, _) = setup(source);
+        let a = source.find('a').expect("header a");
+        let cell = engine.cell_edit_range(a, source).expect("cell a");
+        let first = table_select_all_range(&engine, source, &(a..a), None).expect("first Cmd-A");
+        assert_eq!(
+            first, cell,
+            "first SelectAll must be the cell, got {first:?}"
+        );
+        assert!(
+            !source[first.clone()].contains('|'),
+            "cell SelectAll must not include `|`, got {:?}",
+            &source[first.clone()]
+        );
+        assert!(
+            table_select_all_range(&engine, source, &cell, None).is_none(),
+            "second SelectAll (already the cell) must fall through to the document"
+        );
+        assert!(
+            table_select_all_range(&engine, source, &(0..source.len()), None).is_none(),
+            "SelectAll must not shrink a whole-document selection back to a cell"
+        );
+
+        let mixed = "hello\n\n| a | b |\n|---|---|\n";
+        let (_doc, engine, _) = setup(mixed);
+        assert!(
+            table_select_all_range(&engine, mixed, &(0..0), None).is_none(),
+            "SelectAll in a paragraph must still take the document"
+        );
+
+        // Empty cell: collapsed body range equals the caret, so the prior-cell
+        // latch decides first vs second Cmd-A.
+        let empty = "|| b |\n|---|---|\n| 1 | 2 |\n";
+        let (_doc, engine, _) = setup(empty);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "fixture must parse as a table, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        let cell = first_empty_cell_body(&engine, empty);
+        assert!(
+            cell.is_empty(),
+            "empty header cell body must be collapsed, got {cell:?}"
+        );
+        let first = table_select_all_range(&engine, empty, &cell, None)
+            .expect("first Cmd-A on an empty cell must still select the cell");
+        assert_eq!(first, cell, "first SelectAll must be the empty cell body");
+        assert!(
+            table_select_all_range(&engine, empty, &first, Some(&first)).is_none(),
+            "second SelectAll (empty cell already latched) must fall through to the document"
+        );
+        assert!(
+            table_select_all_range(&engine, empty, &(0..empty.len()), Some(&first)).is_none(),
+            "SelectAll must not shrink a whole-document selection back to a cell"
+        );
+    }
+
+    #[test]
+    fn drag_select_across_pipe_clamps_to_cell() {
+        let source = table_source();
+        let a = source.find('a').expect("header a");
+        let after_b = source.find('b').expect("header b") + 1;
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.range = a..after_b;
+        caret.reversed = false;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "cross-cell Backspace must keep a table, got {after:?}"
+        );
+        assert_eq!(
+            engine.tree().blocks[0].children[0].children.len(),
+            2,
+            "deleting a selection across `|` must not merge header cells, got {after:?}"
+        );
+        assert!(
+            after.contains('|'),
+            "column pipes must survive, got {after:?}"
+        );
+        let header = after.lines().next().unwrap_or("");
+        assert!(
+            header.matches('|').count() >= 3,
+            "header must keep GFM pipes, got {after:?}"
+        );
+        assert!(
+            after.contains('b'),
+            "clamp to the start cell must not delete the other cell, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.range = a..after_b;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert_eq!(
+            engine.tree().blocks[0].children[0].children.len(),
+            2,
+            "cross-cell Delete must not merge header cells, got {after:?}"
         );
     }
 }
