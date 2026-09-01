@@ -144,6 +144,7 @@ fn desktop_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-x", markrust_editor::Cut, None),
         KeyBinding::new("ctrl-x", markrust_editor::Cut, None),
         KeyBinding::new("enter", markrust_editor::Enter, None),
+        KeyBinding::new("shift-enter", markrust_editor::InsertLineBreak, None),
         KeyBinding::new("cmd-b", markrust_editor::ToggleBold, None),
         KeyBinding::new("ctrl-b", markrust_editor::ToggleBold, None),
         KeyBinding::new("cmd-i", markrust_editor::ToggleItalic, None),
@@ -172,6 +173,30 @@ mod tests {
     #[test]
     fn gpui_rev_is_non_empty() {
         assert_eq!(GPUI_GIT_REV.len(), 40);
+    }
+
+    #[test]
+    fn shift_enter_binds_insert_line_break() {
+        let bindings = desktop_key_bindings();
+        let typed = Keystroke::parse("shift-enter").expect("shift-enter parses");
+        let hit = bindings
+            .iter()
+            .find(|binding| binding.match_keystrokes(std::slice::from_ref(&typed)) == Some(false))
+            .expect("shift-enter must be bound");
+        assert_eq!(
+            hit.action().name(),
+            markrust_editor::InsertLineBreak::name_for_type(),
+            "Shift-Enter is Typora's hard line break"
+        );
+        let enter = Keystroke::parse("enter").expect("enter parses");
+        let enter_hit = bindings
+            .iter()
+            .find(|binding| binding.match_keystrokes(std::slice::from_ref(&enter)) == Some(false))
+            .expect("enter must stay bound");
+        assert_eq!(
+            enter_hit.action().name(),
+            markrust_editor::Enter::name_for_type()
+        );
     }
 
     #[test]

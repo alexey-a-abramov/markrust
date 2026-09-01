@@ -76,7 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Drag-select and Backspace/Delete across GFM table `|` no longer collapse header cells or merge columns. The selection is clamped to the current cell (separator-only ranges are refused). Table Tab/Enter `<br>` is unchanged.
 - Cmd/Ctrl+B/I/E/K on an empty image caption or frontmatter field inserts wrap marks with the caret inside, so typing becomes `**x**` rather than `****x`.
 - Cmd/Ctrl+B/I/E/K while an image caption or frontmatter field is focused wrap that field instead of committing and toggling the document body. The fenced-code language chip ignores wrap (does not bold the body).
+- Enter in a WYSIWYG table cell now inserts `<br>` (a line break in the cell) instead of splitting the GFM row into a new paragraph. `InsertLineBreak` uses the same path so a bound Shift-Enter cannot splice `\\\n` into the row.
 - Tab in a fenced-code language chip, image caption, or frontmatter overlay commits that field and no longer indents the document body.
+- Shift-Enter inserts a Markdown hard line break (`InsertLineBreak`; `<br>` in table cells). Bound like Enter (same on Cmd and Ctrl platforms).
 - Opening a Markdown file no longer freezes the window: the folder watcher no longer blocks GPUI's UI thread, and Markdown parse stays on the background worker.
 - Empty list-item Enter outdents or exits the list instead of inserting a blank paragraph in place.
 - Source-mode line height for a heading vs body line is derived from syntax spans, not mask visibility.

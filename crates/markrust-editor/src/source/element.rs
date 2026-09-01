@@ -988,6 +988,12 @@ impl Render for MarkdownEditorView {
                     editor.update(cx, |e, cx| e.outdent(action, window, cx))
                 }
             })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::InsertLineBreak, window, cx| {
+                    editor.update(cx, |e, cx| e.insert_line_break(action, window, cx))
+                }
+            })
             .child(EditorElement::new(editor))
     }
 }

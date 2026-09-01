@@ -2266,6 +2266,16 @@ impl Render for RichEditorView {
             })
             .on_action({
                 let editor = editor.clone();
+                move |_: &crate::editor::InsertLineBreak, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        if !e.consume_widget_newline(cx) {
+                            e.apply_rich(RichCommand::InsertLineBreak, cx);
+                        }
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
                 move |_: &crate::editor::Escape, _, cx| {
                     editor.update(cx, |e, cx| {
                         let _ = e.cancel_widget_edit(cx);

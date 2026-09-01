@@ -58,6 +58,7 @@ actions!(
         ToggleCode,
         ToggleLink,
         Indent,
+        InsertLineBreak,
         Outdent,
         Escape
     ]
@@ -485,6 +486,15 @@ impl MarkdownEditor {
 
     pub fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
         self.apply_command(EditorCommand::Outdent, cx);
+    }
+
+    pub fn insert_line_break(
+        &mut self,
+        _: &InsertLineBreak,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_command(EditorCommand::InsertText("\\\n".into()), cx);
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {

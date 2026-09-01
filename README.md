@@ -101,6 +101,7 @@ bash scripts/release.sh
 | `Cmd/Ctrl+Shift+T` | Toggle light/dark theme |
 | `Cmd/Ctrl+C` / `X` | Copy / cut as Markdown (empty caret copies/cuts the current block) |
 | `Cmd/Ctrl+B` / `I` / `E` / `K` | Bold / italic / code / link |
+| `Shift+Enter` | Hard line break; `<br>` in table cells |
 | `Option+Left` / `Right` (or `Ctrl+Left` / `Right`) | Move by word |
 | `Option+Shift+Left` / `Right` (or `Ctrl+Shift+Left` / `Right`) | Select by word |
 | `Option+Backspace` / `Delete` (or `Ctrl+Backspace` / `Delete`) | Delete by word |

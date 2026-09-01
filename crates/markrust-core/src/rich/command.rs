@@ -863,11 +863,27 @@ fn insert_line_break(
         engine.sync(doc);
     }
     let offset = caret.cursor();
+    if engine.in_table(offset) {
+        return table_cell_break(doc, engine, caret);
+    }
     if in_raw_block(engine, offset) {
         let source = doc.buffer.content();
         return insert_raw_newline(doc, engine, caret, &source, offset);
     }
     splice(doc, caret, offset, offset, "\\\n", TransactionKind::Command);
+    engine.sync(doc);
+    Ok(RichOutcome::Changed)
+}
+
+/// GFM table cells cannot contain a source newline. Typora encodes an
+/// in-cell line break as HTML `<br>` so the row stays one line.
+fn table_cell_break(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    let offset = caret.cursor();
+    splice(doc, caret, offset, offset, "<br>", TransactionKind::Command);
     engine.sync(doc);
     Ok(RichOutcome::Changed)
 }
@@ -4851,6 +4867,53 @@ mod tests {
         assert!(
             still_one_fence(&after) && every_line_quoted(&after) && !after.contains('\\'),
             "Shift-Enter must keep quoted fence lines, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_line_break_in_paragraph_is_backslash_newline() {
+        let (mut doc, mut engine, mut caret) = setup("hello world\n");
+        caret.collapse_to("hello".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertLineBreak,
+        );
+        assert!(
+            after.contains("hello\\\n world") || after.contains("hello\\\nworld"),
+            "Shift-Enter outside a table must insert a markdown hard break, got {after:?}"
+        );
+        assert!(
+            !after.contains("<br>"),
+            "paragraph hard break is not HTML <br>: {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_line_break_in_table_is_br_not_backslash_newline() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('a').expect("header a") + 1);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertLineBreak,
+        );
+        assert!(
+            after.contains("<br>"),
+            "Shift-Enter in a table cell must insert <br>, got {after:?}"
+        );
+        assert!(
+            !after.contains("\\\n"),
+            "backslash-newline would split the GFM row: {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "{:?}",
+            engine.tree().blocks[0].kind
         );
     }
 

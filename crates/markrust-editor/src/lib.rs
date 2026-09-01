@@ -25,11 +25,11 @@ pub use highlight::{highlight_code_block, HighlightKind, HighlightSpan};
 pub use source::editor::MarkdownEditor;
 pub use source::editor::{
     Backspace, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordLeft,
-    DeleteWordRight, DocumentEnd, DocumentHome, Down, End, Enter, Escape, Home, Indent, Left,
-    Outdent, PageDown, PageUp, Right, SelectAll, SelectDocumentEnd, SelectDocumentHome, SelectDown,
-    SelectEnd, SelectHome, SelectLeft, SelectPageDown, SelectPageUp, SelectRight, SelectUp,
-    SelectWordLeft, SelectWordRight, ToggleBold, ToggleCode, ToggleItalic, ToggleLink, Up,
-    WordLeft, WordRight,
+    DeleteWordRight, DocumentEnd, DocumentHome, Down, End, Enter, Escape, Home,
+    Indent, InsertLineBreak, Left, Outdent, PageDown, PageUp, Right, SelectAll, SelectDocumentEnd,
+    SelectDocumentHome, SelectDown, SelectEnd, SelectHome, SelectLeft, SelectPageDown,
+    SelectPageUp, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, ToggleBold, ToggleCode,
+    ToggleItalic, ToggleLink, Up, WordLeft, WordRight,
 };
 pub use source::element::{EditorElement, MarkdownEditorView};
 pub use source::layout::{
