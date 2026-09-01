@@ -1409,6 +1409,24 @@ impl WysiwygHost for RichEditorView {
         self.move_to(source, extend, cx);
     }
 
+    fn select_source_range(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_widget_edit(cx);
+        self.is_selecting = false;
+        self.focus_handle.focus(window, cx);
+        self.apply_editor_command(
+            EditorCommand::SetSelection {
+                start: range.start,
+                end: range.end,
+            },
+            cx,
+        );
+    }
+
     fn drag_source(&mut self, source: usize, cx: &mut Context<Self>) {
         if self.is_selecting {
             self.move_to(source, true, cx);

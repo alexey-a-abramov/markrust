@@ -54,6 +54,12 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
         window: &mut Window,
         cx: &mut Context<Self>,
     );
+    fn select_source_range(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
     fn drag_source(&mut self, source: usize, cx: &mut Context<Self>);
     fn end_drag(&mut self, cx: &mut Context<Self>);
     fn selected_range(&self) -> Range<usize>;

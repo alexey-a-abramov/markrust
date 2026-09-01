@@ -938,7 +938,6 @@ fn render_image<H: WysiwygHost>(
     let editor_away = editor.clone();
     let editor_click = editor.clone();
     let alt_for_edit = alt.to_string();
-    let caret_at = image_range.start;
     let fallback_label = if alt.is_empty() {
         "Missing image".to_string()
     } else {
@@ -998,7 +997,7 @@ fn render_image<H: WysiwygHost>(
         source
             .on_click(move |_, window, cx| {
                 editor_click.update(cx, |host, cx| {
-                    host.click_source(caret_at, false, window, cx);
+                    host.select_source_range(click_range.clone(), window, cx);
                     if edit_on_click {
                         host.edit_image_alt(click_range.clone(), &alt_for_edit, cx);
                     }
@@ -1018,7 +1017,7 @@ fn render_image<H: WysiwygHost>(
             .cursor(CursorStyle::PointingHand)
             .on_click(move |_, window, cx| {
                 editor_click.update(cx, |host, cx| {
-                    host.click_source(caret_at, false, window, cx);
+                    host.select_source_range(click_range.clone(), window, cx);
                     if edit_on_click {
                         host.edit_image_alt(click_range.clone(), &alt_for_edit, cx);
                     }

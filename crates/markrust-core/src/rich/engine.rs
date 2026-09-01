@@ -308,6 +308,12 @@ impl RichEngine {
         }
         for r in &ranges {
             if r.start <= byte && byte <= r.end {
+                if range_is_atomic_image(block, r) && byte > r.start && byte < r.end {
+                    return match bias {
+                        Bias::Left => r.start,
+                        Bias::Right => r.end,
+                    };
+                }
                 return byte;
             }
         }
@@ -349,10 +355,10 @@ impl RichEngine {
             return byte;
         };
         let stepped = if byte > ranges[idx].start {
-            step_left_in_slice(source, ranges[idx].start, byte)
+            step_left_caret(source, block, &ranges[idx], byte)
         } else if idx > 0 {
             let prev = &ranges[idx - 1];
-            step_left_in_slice(source, prev.start, prev.end)
+            step_left_caret(source, block, prev, prev.end.max(byte))
         } else if let Some(home) = self.prev_prefix_blank_home(byte, block.source_range.start) {
             home
         } else if let Some(gap) = blank_caret_gap_ending_at(&self.tree, block.source_range.start) {
@@ -418,10 +424,12 @@ impl RichEngine {
             return byte;
         };
         let stepped = if byte < ranges[idx].end {
-            step_right_in_slice(source, byte, ranges[idx].end)
+            step_right_caret(source, block, byte, &ranges[idx])
         } else if idx + 1 < ranges.len() {
             let next = &ranges[idx + 1];
-            if next.start > byte {
+            if range_is_atomic_image(block, next) && byte <= next.start {
+                next.end
+            } else if next.start > byte {
                 // Gap is quote/list chrome (`\n>` / `- `), not a caret stop.
                 // Continuation indent (`  world`) is also skipped so Right
                 // from `hello` lands on `w`.
@@ -431,7 +439,7 @@ impl RichEngine {
                     self.clamp_raw_prefix(source, next.start, Bias::Right)
                 }
             } else {
-                step_right_in_slice(source, byte.max(next.start), next.end)
+                step_right_caret(source, block, byte.max(next.start), next)
             }
         } else if let Some(home) = self.next_prefix_blank_home(
             byte,
@@ -1034,6 +1042,46 @@ fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
         }
         _ => leaf_inline_ranges(block),
     }
+}
+
+/// Markdown `![alt](url)` and safe HTML `<img>` are one caret/selection step
+/// (pixels in WYSIWYG, not `!` / `[` / `)`).
+fn atomic_image_range(inline: &Inline) -> Option<Range<usize>> {
+    match inline {
+        Inline::Image { source_range, .. } => Some(source_range.clone()),
+        Inline::OpaqueInline {
+            raw, source_range, ..
+        } if crate::html_visual::html_inline_image(raw).is_some() => Some(source_range.clone()),
+        _ => None,
+    }
+}
+
+fn range_is_atomic_image(block: &Block, range: &Range<usize>) -> bool {
+    fn walk(block: &Block, range: &Range<usize>) -> bool {
+        if block
+            .inlines
+            .iter()
+            .any(|inline| atomic_image_range(inline).as_ref() == Some(range))
+        {
+            return true;
+        }
+        block.children.iter().any(|child| walk(child, range))
+    }
+    walk(block, range)
+}
+
+fn step_left_caret(source: &str, block: &Block, range: &Range<usize>, byte: usize) -> usize {
+    if range_is_atomic_image(block, range) && byte > range.start {
+        return range.start;
+    }
+    step_left_in_slice(source, range.start, byte)
+}
+
+fn step_right_caret(source: &str, block: &Block, byte: usize, range: &Range<usize>) -> usize {
+    if range_is_atomic_image(block, range) && byte < range.end {
+        return range.end;
+    }
+    step_right_in_slice(source, byte, range.end)
 }
 
 fn raw_leaf_at(engine: &RichEngine, offset: usize) -> Option<&Block> {
@@ -2121,6 +2169,58 @@ mod tests {
         assert_eq!(engine.prev_word_caret(punct, punct.len()), 5);
         assert_eq!(engine.prev_word_caret(punct, 5), 3);
         assert_eq!(engine.prev_word_caret(punct, 3), 0);
+    }
+
+    fn first_image_range(engine: &RichEngine) -> Range<usize> {
+        fn walk(blocks: &[Block]) -> Option<Range<usize>> {
+            for b in blocks {
+                for inline in &b.inlines {
+                    if let Some(r) = super::atomic_image_range(inline) {
+                        return Some(r);
+                    }
+                }
+                if let Some(r) = walk(&b.children) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        walk(&engine.tree().blocks).expect("image")
+    }
+
+    #[test]
+    fn image_is_one_caret_step() {
+        let source = "hello ![cat](a.png) world\n";
+        let (_doc, engine) = engine_for(source);
+        let img = first_image_range(&engine);
+        let after_hello = source.find('!').expect("image");
+        assert_eq!(img.start, after_hello);
+        assert_eq!(
+            engine.next_caret(source, img.start),
+            img.end,
+            "Right at the image must skip `![…](url)` in one step"
+        );
+        assert_eq!(
+            engine.prev_caret(source, img.end),
+            img.start,
+            "Left after the image must skip `![…](url)` in one step"
+        );
+        let mid = img.start + 3;
+        assert_eq!(
+            engine.snap_caret(mid, Bias::Right),
+            img.end,
+            "caret inside image markdown must snap out"
+        );
+        assert_eq!(engine.snap_caret(mid, Bias::Left), img.start);
+    }
+
+    #[test]
+    fn standalone_image_arrows_skip_the_markdown() {
+        let source = "![cat](a.png)\n";
+        let (_doc, engine) = engine_for(source);
+        let img = first_image_range(&engine);
+        assert_eq!(engine.next_caret(source, img.start), img.end);
+        assert_eq!(engine.prev_caret(source, img.end), img.start);
     }
 
     #[test]
