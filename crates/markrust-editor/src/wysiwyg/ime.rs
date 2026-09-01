@@ -58,6 +58,9 @@ pub struct ImeOriginState {
     widget_bounds: Option<Bounds<Pixels>>,
     caret_source: usize,
     leaves: Vec<ImeLeafHit>,
+    /// Non-text painted surfaces (standalone images, thematic rules) so a
+    /// leftover click is below them rather than on them.
+    painted_bounds: Vec<Bounds<Pixels>>,
     /// Bumps when the caret source or widget-focus flag changes so a caret
     /// move still pushes even if two surfaces happen to share a rectangle.
     caret_generation: u64,
@@ -74,6 +77,7 @@ impl ImeOriginState {
         self.caret_source = caret_source;
         self.widget_bounds = None;
         self.leaves.clear();
+        self.painted_bounds.clear();
     }
 
     pub fn widget_focused(&self) -> bool {
@@ -86,6 +90,10 @@ impl ImeOriginState {
 
     pub fn report_leaf(&mut self, leaf: ImeLeafHit) {
         self.leaves.push(leaf);
+    }
+
+    pub fn report_painted_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.painted_bounds.push(bounds);
     }
 
     #[cfg(test)]
@@ -131,6 +139,29 @@ impl ImeOriginState {
 
     pub fn leaf_at_point(&self, point: Point<Pixels>) -> Option<&ImeLeafHit> {
         self.leaves.iter().find(|leaf| leaf.bounds.contains(&point))
+    }
+
+    /// True when `point` is in leftover viewport below the last painted leaf
+    /// or non-text widget (standalone image, thematic rule). Clicks on a
+    /// leaf, those widgets, or a focused overlay are not leftover.
+    pub fn point_is_below_painted_content(&self, point: Point<Pixels>) -> bool {
+        if self.widget_bounds.is_some_and(|b| b.contains(&point)) {
+            return false;
+        }
+        if self.leaves.iter().any(|leaf| leaf.bounds.contains(&point)) {
+            return false;
+        }
+        if self.painted_bounds.iter().any(|b| b.contains(&point)) {
+            return false;
+        }
+        let leaf_bottom = self.leaves.iter().map(|leaf| leaf.bounds.bottom()).max();
+        let extra_bottom = self.painted_bounds.iter().map(|b| b.bottom()).max();
+        match (leaf_bottom, extra_bottom) {
+            (None, None) => true,
+            (Some(a), Some(b)) => point.y >= a.max(b),
+            (Some(a), None) => point.y >= a,
+            (None, Some(b)) => point.y >= b,
+        }
     }
 }
 
@@ -543,6 +574,74 @@ mod tests {
             .leaf_at_point(point(px(20.0), px(48.0)))
             .expect("second leaf");
         assert_eq!(leaf.layout.text, "world");
+    }
+
+    #[test]
+    fn leftover_viewport_below_last_leaf_is_below_painted_content() {
+        let last = rect(8.0, 40.0, 200.0, 22.0);
+        let ime = body_frame(
+            0,
+            vec![
+                hit("hello", 0, rect(8.0, 10.0, 200.0, 22.0), None),
+                hit("world", 10, last, None),
+            ],
+        );
+        assert!(
+            !ime.point_is_below_painted_content(point(px(20.0), px(48.0))),
+            "click on the last leaf is not leftover viewport"
+        );
+        assert!(
+            ime.point_is_below_painted_content(point(px(20.0), px(80.0))),
+            "click below the last painted line is leftover viewport"
+        );
+        assert!(
+            !ime.point_is_below_painted_content(point(px(20.0), px(14.0))),
+            "click on an earlier leaf is not leftover"
+        );
+    }
+
+    #[test]
+    fn leftover_click_on_last_image_or_rule_is_not_below_content() {
+        let para = rect(8.0, 10.0, 200.0, 22.0);
+        let image = rect(8.0, 40.0, 200.0, 80.0);
+        let mut ime = ImeOriginState::default();
+        ime.begin_frame(false, 0);
+        ime.report_leaf(hit("hello", 0, para, None));
+        ime.report_painted_bounds(image);
+        assert!(
+            !ime.point_is_below_painted_content(point(px(20.0), px(70.0))),
+            "click on a standalone image must not be leftover"
+        );
+        assert!(
+            ime.point_is_below_painted_content(point(px(20.0), px(140.0))),
+            "click below the image is leftover"
+        );
+        assert!(
+            !ime.point_is_below_painted_content(point(px(20.0), px(14.0))),
+            "click on the paragraph above is not leftover"
+        );
+
+        let rule = rect(8.0, 40.0, 400.0, 1.0);
+        let mut ime = ImeOriginState::default();
+        ime.begin_frame(false, 0);
+        ime.report_painted_bounds(rule);
+        assert!(
+            !ime.point_is_below_painted_content(point(px(20.0), px(40.5))),
+            "click on a thematic rule must not be leftover"
+        );
+        assert!(
+            ime.point_is_below_painted_content(point(px(20.0), px(60.0))),
+            "click below the rule is leftover"
+        );
+    }
+
+    #[test]
+    fn empty_paint_treats_any_point_as_below_content() {
+        let ime = body_frame(0, vec![]);
+        assert!(
+            ime.point_is_below_painted_content(point(px(40.0), px(200.0))),
+            "newlines-only / unpainted document must accept a leftover click"
+        );
     }
 
     fn hit_for_range(

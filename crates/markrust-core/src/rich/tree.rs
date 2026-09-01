@@ -36,6 +36,12 @@ pub struct RichTree {
     /// YAML frontmatter is document metadata, not a block (panel edits it).
     pub frontmatter: Option<Frontmatter>,
     pub blocks: Vec<Block>,
+    /// Source byte length at import.
+    pub source_len: usize,
+    /// Comrak-less blank after the last block when the file ends with a
+    /// blank line (`hello\n\n`). `None` when the last line has content or
+    /// only a terminator `\n`. Extra unused newlines share this one range.
+    pub trailing_blank: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -393,6 +399,29 @@ impl RichTree {
         walk(&self.blocks, &mut out);
         out
     }
+}
+
+/// Trailing empty line(s) at EOF. A lone terminator `\n` after the last
+/// content line is not a blank; `hello\n\n` / extra `\n`s are.
+pub(crate) fn trailing_blank_gap(source: &str) -> Option<Range<usize>> {
+    let bytes = source.as_bytes();
+    if bytes.last().is_none_or(|b| *b != b'\n') {
+        return None;
+    }
+    let last_nl = source.len() - 1;
+    let last_line_start = source[..last_nl].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    if !source[last_line_start..last_nl].trim().is_empty() {
+        return None;
+    }
+    let mut start = last_line_start;
+    while start > 0 && bytes[start - 1] == b'\n' {
+        let prev_start = source[..start - 1].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if !source[prev_start..start - 1].trim().is_empty() {
+            break;
+        }
+        start = prev_start;
+    }
+    Some(start..source.len())
 }
 
 fn heading_plain_text(inlines: &[Inline]) -> String {

@@ -16,9 +16,15 @@ pub mod save;
 pub mod serialize;
 pub mod tree;
 
-pub use command::{apply_rich_command, BlockType, CaretState, RichCommand, RichError, RichOutcome};
+pub use command::{
+    apply_rich_command, place_caret_for_click_below, BlockType, CaretState, RichCommand, RichError,
+    RichOutcome,
+};
 pub use emoji::{lookup_emoji, lookup_shortcode};
-pub use engine::{Bias, BlockSpan, BlockSplice, RichEngine, TablePos};
+pub use engine::{
+    blank_caret_gap_after_last, blank_caret_gap_at, blank_caret_gap_before, blank_caret_gaps,
+    caret_for_click_below_content, Bias, BlockSpan, BlockSplice, RichEngine, TablePos,
+};
 pub use import::import_markdown;
 pub use input_rules::{match_input_rule, InputRule};
 pub use save::{save_candidates, DiffHunk, SaveCandidates};

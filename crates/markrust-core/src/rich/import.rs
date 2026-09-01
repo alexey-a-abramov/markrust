@@ -15,9 +15,9 @@ use comrak::nodes::{
 use comrak::{parse_document, Arena, Options};
 
 use super::tree::{
-    find_alert_chrome, is_toc_marker, AlertKind, Block, BlockKind, BreakStyle, ColumnAlign,
-    FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs, MarkFidelity, MarkSet,
-    RichTree,
+    find_alert_chrome, is_toc_marker, trailing_blank_gap, AlertKind, Block, BlockKind, BreakStyle,
+    ColumnAlign, FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs, MarkFidelity,
+    MarkSet, RichTree,
 };
 
 /// Parse options shared with `export::markdown_to_html_gfm` (parse-relevant
@@ -114,6 +114,8 @@ pub fn import_markdown(source: &str, ids: &mut IdGen) -> RichTree {
     RichTree {
         frontmatter,
         blocks,
+        source_len: source.len(),
+        trailing_blank: trailing_blank_gap(source),
     }
 }
 

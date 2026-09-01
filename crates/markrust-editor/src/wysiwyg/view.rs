@@ -11,12 +11,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    div, list, prelude::*, px, App, Bounds, Context, CursorStyle, Entity, EntityInputHandler,
-    FocusHandle, Focusable, ListAlignment, ListState, Pixels, Render, SharedString, Subscription,
-    Task, UTF16Selection, Window,
+    canvas, div, list, prelude::*, px, App, Bounds, Context, CursorStyle, Entity,
+    EntityInputHandler, FocusHandle, Focusable, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, MouseMoveEvent, Pixels, Render, SharedString, Subscription, Task,
+    UTF16Selection, Window,
 };
 use markrust_core::rich::{
-    apply_rich_command, Bias, CaretState, MarkSet, NodeId, RichCommand, RichEngine, RichOutcome,
+    apply_rich_command, caret_for_click_below_content, place_caret_for_click_below, Bias,
+    CaretState, MarkSet, NodeId, RichCommand, RichEngine, RichOutcome,
 };
 use markrust_core::Document;
 
@@ -397,41 +399,13 @@ impl RichEditorView {
                     .unwrap_or(source.len());
                 self.engine.snap_caret(end, Bias::Left)
             }
-            CaretMove::Up => self.vertical(&source, cursor, -1),
-            CaretMove::Down => self.vertical(&source, cursor, 1),
-            CaretMove::Vertical { delta_lines } => self.vertical(&source, cursor, delta_lines),
+            CaretMove::Up => self.engine.vertical_caret(&source, cursor, -1),
+            CaretMove::Down => self.engine.vertical_caret(&source, cursor, 1),
+            CaretMove::Vertical { delta_lines } => {
+                self.engine.vertical_caret(&source, cursor, delta_lines)
+            }
         };
         self.move_to(target, extend, cx);
-    }
-
-    fn vertical(&self, source: &str, cursor: usize, delta: i32) -> usize {
-        if delta == 0 {
-            return cursor;
-        }
-        let line_start = source[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let col = cursor - line_start;
-        let mut line = 0i32;
-        let mut idx = 0usize;
-        let mut starts = vec![0usize];
-        for (i, b) in source.bytes().enumerate() {
-            if b == b'\n' {
-                starts.push(i + 1);
-                if i < cursor {
-                    line += 1;
-                }
-                idx = i;
-            }
-            let _ = idx;
-        }
-        let target_line = (line + delta).clamp(0, starts.len().saturating_sub(1) as i32) as usize;
-        let start = starts[target_line];
-        let end = starts
-            .get(target_line + 1)
-            .copied()
-            .unwrap_or(source.len())
-            .saturating_sub(1)
-            .max(start);
-        self.engine.snap_caret((start + col).min(end), Bias::Left)
     }
 
     fn start_blink(&mut self, cx: &mut Context<Self>) {
@@ -666,6 +640,42 @@ impl RichEditorView {
             }
         }
     }
+    /// Click in leftover viewport below the last painted leaf or non-text
+    /// widget (or anywhere on an unpainted / newlines-only document). Opens a
+    /// trailing blank if the file has none, then places the caret there —
+    /// never a no-op and never a hit-test onto the last paragraph.
+    fn click_below_painted_content(
+        &mut self,
+        point: gpui::Point<Pixels>,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.ime.point_is_below_painted_content(point) {
+            return false;
+        }
+        self.commit_widget_edit(cx);
+        self.engine.sync(self.document.read(cx));
+        if !extend {
+            let mut caret = self.caret_state();
+            let mut outcome = RichOutcome::Noop;
+            self.document.update(cx, |doc, cx| {
+                outcome = place_caret_for_click_below(doc, &mut self.engine, &mut caret);
+                if outcome != RichOutcome::Noop {
+                    cx.notify();
+                }
+            });
+            self.restore_caret(caret);
+            if outcome != RichOutcome::Noop {
+                self.reset_blink(cx);
+                self.snapshot = None;
+                self.synced_revision = None;
+            }
+        }
+        let source = caret_for_click_below_content(self.engine.tree());
+        self.click_source(source, extend, window, cx);
+        true
+    }
 }
 
 impl WysiwygHost for RichEditorView {
@@ -819,6 +829,10 @@ impl WysiwygHost for RichEditorView {
         });
     }
 
+    fn report_painted_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.ime.report_painted_bounds(bounds);
+    }
+
     fn sync_ime_cursor(&mut self, window: &mut Window) {
         if self.ime.take_platform_push().is_some() {
             window.invalidate_character_coordinates();
@@ -964,23 +978,32 @@ impl EntityInputHandler for RichEditorView {
             }
         }
         let theme = self.theme.clone();
-        let leaf = self.ime.leaf_at_point(point)?;
-        let layout = leaf.layout.clone();
-        let bounds = leaf.bounds;
-        let font_size = leaf.font_size;
-        let line_height = leaf.line_height;
-        let vis = hit_test_leaf(
-            &layout,
-            bounds,
-            point,
-            window,
-            font_size,
-            line_height,
-            &theme,
-        );
-        let src = layout.source_for_visible(vis);
-        let content = self.document.read(cx).buffer.content();
-        Some(Self::offset_to_utf16(&content, src))
+        let leaf = self.ime.leaf_at_point(point);
+        if let Some(leaf) = leaf {
+            let layout = leaf.layout.clone();
+            let bounds = leaf.bounds;
+            let font_size = leaf.font_size;
+            let line_height = leaf.line_height;
+            let vis = hit_test_leaf(
+                &layout,
+                bounds,
+                point,
+                window,
+                font_size,
+                line_height,
+                &theme,
+            );
+            let src = layout.source_for_visible(vis);
+            let content = self.document.read(cx).buffer.content();
+            return Some(Self::offset_to_utf16(&content, src));
+        }
+        if self.ime.point_is_below_painted_content(point) {
+            self.engine.sync(self.document.read(cx));
+            let src = caret_for_click_below_content(self.engine.tree());
+            let content = self.document.read(cx).buffer.content();
+            return Some(Self::offset_to_utf16(&content, src));
+        }
+        None
     }
 }
 
@@ -1190,14 +1213,87 @@ impl Render for RichEditorView {
             .when(in_table, |root| {
                 root.child(table_toolbar(editor.clone(), &theme))
             })
-            .child(
-                list(self.list_state.clone(), move |index, _window, _cx| {
-                    render_top_block(&snapshot, index, editor.clone())
-                })
-                .flex_1()
-                .size_full()
-                .py(px(16.)),
-            )
+            .child({
+                let editor = editor.clone();
+                let catcher = editor.clone();
+                div()
+                    .id("wysiwyg-body")
+                    .flex_1()
+                    .size_full()
+                    .relative()
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _cx| {
+                                let editor = catcher.clone();
+                                window.on_mouse_event({
+                                    let editor = editor.clone();
+                                    move |event: &MouseDownEvent, phase, window, cx| {
+                                        if !phase.bubble() || event.button != MouseButton::Left {
+                                            return;
+                                        }
+                                        if !bounds.contains(&event.position) {
+                                            return;
+                                        }
+                                        let placed = editor.update(cx, |view, cx| {
+                                            view.click_below_painted_content(
+                                                event.position,
+                                                event.modifiers.shift,
+                                                window,
+                                                cx,
+                                            )
+                                        });
+                                        if placed {
+                                            window.prevent_default();
+                                        }
+                                    }
+                                });
+                                window.on_mouse_event({
+                                    let editor = editor.clone();
+                                    move |event: &MouseMoveEvent, phase, _window, cx| {
+                                        if !phase.bubble() {
+                                            return;
+                                        }
+                                        if !bounds.contains(&event.position) {
+                                            return;
+                                        }
+                                        editor.update(cx, |view, cx| {
+                                            if !view.is_selecting {
+                                                return;
+                                            }
+                                            if !event
+                                                .pressed_button
+                                                .is_some_and(|b| b == MouseButton::Left)
+                                            {
+                                                return;
+                                            }
+                                            if !view
+                                                .ime
+                                                .point_is_below_painted_content(event.position)
+                                            {
+                                                return;
+                                            }
+                                            view.engine.sync(view.document.read(cx));
+                                            let source =
+                                                caret_for_click_below_content(view.engine.tree());
+                                            view.drag_source(source, cx);
+                                        });
+                                    }
+                                });
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(
+                        list(self.list_state.clone(), move |index, _window, _cx| {
+                            render_top_block(&snapshot, index, editor.clone())
+                        })
+                        .flex_1()
+                        .size_full()
+                        .py(px(16.)),
+                    )
+            })
     }
 }
 

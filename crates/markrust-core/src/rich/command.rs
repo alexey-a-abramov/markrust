@@ -10,7 +10,9 @@ use std::ops::Range;
 use crate::document::Document;
 use crate::undo::{SelectionSnapshot, TransactionKind};
 
-use super::engine::{RichEngine, TablePos};
+use super::engine::{
+    blank_caret_gap_after_last, caret_for_click_below_content, RichEngine, TablePos,
+};
 use super::escape::{escape_text, EscapeContext};
 use super::input_rules::{match_input_rule, InputRule};
 use super::serialize::serialize_block;
@@ -183,6 +185,40 @@ pub fn apply_rich_command(
         RichCommand::DeleteTableRow => delete_table_row(doc, engine, caret),
         RichCommand::DeleteTableColumn => delete_table_column(doc, engine, caret),
     }
+}
+
+pub fn place_caret_for_click_below(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> RichOutcome {
+    engine.sync(doc);
+    caret.clamp(doc.buffer.len_bytes());
+    if blank_caret_gap_after_last(engine.tree()).is_some() {
+        caret.collapse_to(caret_for_click_below_content(engine.tree()));
+        return RichOutcome::Noop;
+    }
+    let source = doc.buffer.content();
+    let at = source.len();
+    let (insert, caret_after) = if source.ends_with('\n') {
+        ("\n", at)
+    } else {
+        ("\n\n", at + 1)
+    };
+    let before = caret.snapshot();
+    let after = CaretState::collapsed(caret_after);
+    doc.replace_range_tx(
+        at,
+        at,
+        insert,
+        TransactionKind::Command,
+        before,
+        after.snapshot(),
+    );
+    *caret = after;
+    engine.sync(doc);
+    caret.collapse_to(caret_for_click_below_content(engine.tree()));
+    RichOutcome::Changed
 }
 
 fn insert_text(
@@ -1668,7 +1704,10 @@ fn empty_cell() -> Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rich::blank_caret_gap_after_last;
+    use crate::rich::blank_caret_gap_before;
     use crate::rich::engine::RichEngine;
+    use crate::rich::place_caret_for_click_below;
     use crate::Document;
 
     fn setup(source: &str) -> (Document, RichEngine, CaretState) {
@@ -1835,6 +1874,174 @@ mod tests {
         assert!(
             after.contains("\n- ") && !after.contains("  - "),
             "expected outdent to top-level item, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_in_standard_separator_creates_paragraph_not_heading_chrome() {
+        let source = "hello\n\n# Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let gap = blank_caret_gap_before(engine.tree(), 1).expect("separator gap");
+        caret.collapse_to(gap.start);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("hello") && typed.contains("# Title"),
+            "surrounding blocks must remain, got {typed:?}"
+        );
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            typed_line_is_paragraph(x_line) && !x_line.contains('#'),
+            "typing in the gap must be a new paragraph, not heading chrome, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn insert_in_trailing_blank_appends_paragraph_not_into_last_block() {
+        let source = "hello\n\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let gap = blank_caret_gap_after_last(engine.tree()).expect("trailing gap");
+        caret.collapse_to(gap.start);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("hello"),
+            "last paragraph must remain, got {typed:?}"
+        );
+        let hello_line = typed
+            .lines()
+            .find(|line| line.contains("hello"))
+            .expect("hello line");
+        assert!(
+            !hello_line.contains('x'),
+            "typing must not prepend into the last paragraph, got {typed:?}"
+        );
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            typed_line_is_paragraph(x_line) && x_line.trim() == "x",
+            "typing below the last block must append a new paragraph, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn insert_in_newlines_only_document_types_a_paragraph() {
+        for source in ["", "\n", "\n\n"] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            let gap = blank_caret_gap_after_last(engine.tree()).expect("caret home");
+            caret.collapse_to(gap.start);
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("x".into()),
+            );
+            let typed = doc.buffer.content();
+            assert!(
+                typed.contains('x'),
+                "typing in a newlines-only document must insert, {source:?} got {typed:?}"
+            );
+            let x_line = typed
+                .lines()
+                .find(|line| line.contains('x'))
+                .expect("typed x");
+            assert!(
+                typed_line_is_paragraph(x_line) && x_line.trim() == "x",
+                "must be a paragraph, {source:?} got {typed:?}"
+            );
+        }
+    }
+
+    fn typed_line_is_paragraph(line: &str) -> bool {
+        line.contains('x')
+    }
+
+    fn leftover_click_then_type(source: &str) -> String {
+        let (mut doc, mut engine, mut caret) = setup(source);
+        place_caret_for_click_below(&mut doc, &mut engine, &mut caret);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        )
+    }
+
+    #[test]
+    fn insert_at_click_below_content_appends_paragraph() {
+        for source in [
+            "hello\n\n",
+            "hello",
+            "hello\n",
+            "# Title",
+            "![cat](pic.png)",
+            "---",
+        ] {
+            let typed = leftover_click_then_type(source);
+            assert!(
+                typed.lines().any(|line| line.trim() == "x"),
+                "leftover click + type must be a new paragraph, {source:?} got {typed:?}"
+            );
+            assert!(
+                !typed.contains("hellox")
+                    && !typed.contains("Titlex")
+                    && !typed.contains("png)x")
+                    && !typed.contains("---x"),
+                "must not continue the last block, {source:?} got {typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn click_below_without_trailing_blank_opens_blank_not_eof() {
+        for (source, opened) in [("hello", "hello\n\n"), ("hello\n", "hello\n\n")] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            assert_eq!(
+                place_caret_for_click_below(&mut doc, &mut engine, &mut caret),
+                RichOutcome::Changed
+            );
+            assert_eq!(doc.buffer.content(), opened);
+            let gap = blank_caret_gap_after_last(engine.tree()).expect("opened trailing blank");
+            assert_eq!(caret.cursor(), gap.start);
+            assert_eq!(
+                place_caret_for_click_below(&mut doc, &mut engine, &mut caret),
+                RichOutcome::Noop,
+                "second leftover click must reuse the trailing blank, {source:?}"
+            );
+            assert_eq!(doc.buffer.content(), opened);
+        }
+    }
+
+    #[test]
+    fn insert_at_eof_on_last_line_still_continues_paragraph() {
+        let source = "hello";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            "hellox",
+            "click on the last line (EOF in the paragraph) must still continue it"
         );
     }
 

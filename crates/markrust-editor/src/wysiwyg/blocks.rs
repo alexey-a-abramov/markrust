@@ -9,16 +9,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    div, img, prelude::*, px, AnyElement, CursorStyle, Entity, FontWeight, MouseButton, ObjectFit,
-    SharedString, StyledText, TextStyle,
+    canvas, div, img, prelude::*, px, AnyElement, CursorStyle, Entity, FontWeight, MouseButton,
+    ObjectFit, SharedString, StyledText, TextStyle,
 };
 use markrust_core::html_visual::{
     definition_list_items, footnote_definition, project_html_block, to_superscript, HtmlBlockVisual,
 };
-use markrust_core::rich::{Block, BlockKind, ColumnAlign, Inline, NodeId, RichTree};
+use markrust_core::rich::{
+    blank_caret_gap_after_last, blank_caret_gap_before, Block, BlockKind, ColumnAlign, Inline,
+    NodeId, RichTree,
+};
 
 use super::block_text::{
-    build_code_layout, build_html_block_layout, build_leaf_layout_inlines,
+    build_blank_gap_layout, build_code_layout, build_html_block_layout, build_leaf_layout_inlines,
     build_leaf_layout_revealed, BlockTextElement, RevealState, WidgetImeSink, WysiwygHost,
 };
 use super::image::{resolve_image_source, ResolvedImage};
@@ -49,14 +52,50 @@ pub fn render_top_block<H: WysiwygHost>(
     index: usize,
     editor: Entity<H>,
 ) -> AnyElement {
+    if snap.tree.blocks.is_empty() {
+        let gap = blank_caret_gap_after_last(&snap.tree).unwrap_or(0..snap.tree.source_len);
+        return div()
+            .px(px(24.))
+            .py(px(4.))
+            .child(blank_gap_element(snap, gap, editor))
+            .into_any_element();
+    }
     let Some(block) = snap.tree.blocks.get(index) else {
         return div().into_any_element();
     };
-    div()
-        .px(px(24.))
-        .py(px(4.))
-        .child(render_block(snap, block, editor))
-        .into_any_element()
+    let mut root = div().px(px(24.)).py(px(4.));
+    if let Some(gap) = blank_caret_gap_before(&snap.tree, index) {
+        root = root.child(blank_gap_element(snap, gap, editor.clone()));
+    }
+    let trailing = (index + 1 == snap.tree.blocks.len())
+        .then(|| blank_caret_gap_after_last(&snap.tree))
+        .flatten();
+    if let Some(gap) = trailing {
+        root = root.child(render_block(snap, block, editor.clone()));
+        root = root.child(blank_gap_element(snap, gap, editor));
+    } else {
+        root = root.child(render_block(snap, block, editor));
+    }
+    root.into_any_element()
+}
+
+fn blank_gap_element<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    gap: Range<usize>,
+    editor: Entity<H>,
+) -> AnyElement {
+    let theme = &snap.theme;
+    let font_size = theme.font_size;
+    let line_height = theme.line_height_for_font_size(font_size);
+    BlockTextElement {
+        editor,
+        layout: Arc::new(build_blank_gap_layout(gap)),
+        font_size,
+        line_height,
+        theme: theme.clone(),
+        hug_width: false,
+    }
+    .into_any_element()
 }
 
 fn render_block<H: WysiwygHost>(
@@ -205,7 +244,7 @@ fn render_block<H: WysiwygHost>(
         }
         BlockKind::Table { alignments } => render_table(snap, block, alignments, editor),
         BlockKind::TableRow { .. } | BlockKind::TableCell => div().into_any_element(),
-        BlockKind::ThematicBreak => thematic_rule(theme),
+        BlockKind::ThematicBreak => thematic_rule(theme, editor),
         BlockKind::FootnoteDefinition { label } => {
             render_footnote_def_nested(snap, block, label, editor)
         }
@@ -370,13 +409,25 @@ fn render_toc<H: WysiwygHost>(
         .into_any_element()
 }
 
-fn thematic_rule(theme: &EditorTheme) -> AnyElement {
+fn thematic_rule<H: WysiwygHost>(theme: &EditorTheme, editor: Entity<H>) -> AnyElement {
     div()
         .w_full()
         .my(px(16.))
-        .h(px(1.))
-        .bg(theme.table_delimiter)
+        .relative()
+        .child(painted_bounds_hit(editor))
+        .child(div().w_full().h(px(1.)).bg(theme.table_delimiter))
         .into_any_element()
+}
+
+fn painted_bounds_hit<H: WysiwygHost>(editor: Entity<H>) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, _, cx| {
+            editor.update(cx, |host, _cx| host.report_painted_bounds(bounds));
+        },
+    )
+    .absolute()
+    .inset_0()
 }
 
 fn render_opaque<H: WysiwygHost>(
@@ -394,7 +445,7 @@ fn render_opaque<H: WysiwygHost>(
     }
     match project_html_block(raw) {
         HtmlBlockVisual::Hidden => div().into_any_element(),
-        HtmlBlockVisual::ThematicBreak => thematic_rule(theme),
+        HtmlBlockVisual::ThematicBreak => thematic_rule(theme, editor),
         HtmlBlockVisual::Image { url, alt } => render_image(
             snap,
             &alt,
@@ -1036,7 +1087,13 @@ fn render_image<H: WysiwygHost>(
     });
     match role {
         ImageRole::Inline => {
-            let mut el = div().flex_none().flex().flex_col().child(pixels);
+            let mut el = div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .relative()
+                .child(painted_bounds_hit(editor.clone()))
+                .child(pixels);
             if show_caption {
                 el = el.child(caption_row);
             }
@@ -1047,6 +1104,8 @@ fn render_image<H: WysiwygHost>(
             .flex()
             .flex_col()
             .gap(px(2.))
+            .relative()
+            .child(painted_bounds_hit(editor))
             .child(pixels)
             .child(caption_row)
             .into_any_element(),

@@ -52,6 +52,7 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
         line_height: f32,
         caret_bounds: Option<Bounds<Pixels>>,
     );
+    fn report_painted_bounds(&mut self, bounds: Bounds<Pixels>);
     /// Push the resolved IME origin to the platform (not only `bounds_for_range`).
     fn sync_ime_cursor(&mut self, window: &mut Window);
 }
@@ -953,6 +954,20 @@ pub fn build_code_layout(
     }
 }
 
+/// One visual empty line for a Comrak-less blank (leading newlines or a
+/// standard / extra block separator). Click and caret map onto `range`
+/// (exclusive of the following block).
+pub fn build_blank_gap_layout(range: Range<usize>) -> LeafLayout {
+    let start = range.start;
+    let last = range.end.saturating_sub(1).max(start);
+    LeafLayout {
+        text: String::new(),
+        runs: Vec::new(),
+        source_at: vec![start, last],
+        block_start: start,
+    }
+}
+
 pub fn hit_test_leaf(
     layout: &LeafLayout,
     bounds: Bounds<Pixels>,
@@ -1499,7 +1514,10 @@ impl<H: WysiwygHost> Element for WidgetImeSink<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use markrust_core::rich::{import_markdown, AlertKind, Block, BlockKind, IdGen};
+    use markrust_core::rich::{
+        blank_caret_gap_after_last, blank_caret_gap_before, import_markdown, AlertKind, Block,
+        BlockKind, IdGen,
+    };
 
     fn layout_for(source: &str) -> LeafLayout {
         let mut ids = IdGen::default();
@@ -2215,5 +2233,123 @@ mod tests {
         let body = alert_body_layout(source, source.find("hello").unwrap());
         assert_eq!(body.text, "hello");
         assert!(!body.text.contains("[!NOTE]"));
+    }
+
+    #[test]
+    fn blank_gap_layout_hosts_caret_before_heading() {
+        let source = "\n\n# Title";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let gap = blank_caret_gap_before(&tree, 0).expect("leading blank above heading");
+        let layout = build_blank_gap_layout(gap);
+        assert!(
+            layout.contains_source(0),
+            "caret on inserted newlines must paint on the blank, source_at={:?}",
+            layout.source_at
+        );
+        let title = source.find("Title").expect("Title");
+        assert!(
+            !layout.contains_source(title),
+            "blank layout must not claim `# Title`"
+        );
+        let heading = layout_of(&tree.blocks[0]);
+        assert_eq!(heading.text, "Title");
+        assert!(
+            !heading.contains_source(0),
+            "heading leaf must not steal the blank caret"
+        );
+        assert!(heading.contains_source(title));
+    }
+
+    #[test]
+    fn blank_gap_layout_hosts_caret_between_paragraph_and_heading() {
+        let source = "hello\n\n# Title";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let gap = blank_caret_gap_before(&tree, 1).expect("standard separator before heading");
+        let layout = build_blank_gap_layout(gap.clone());
+        assert!(
+            layout.contains_source(gap.start),
+            "click on the separator must map onto the gap, source_at={:?} gap={gap:?}",
+            layout.source_at
+        );
+        let title = source.find("Title").expect("Title");
+        assert!(
+            !layout.contains_source(title),
+            "separator layout must not claim `# Title`"
+        );
+        let heading = layout_of(&tree.blocks[1]);
+        assert_eq!(heading.text, "Title");
+        assert!(
+            !heading.contains_source(gap.start),
+            "heading leaf must not steal the separator caret"
+        );
+        assert!(heading.contains_source(title));
+        assert!(
+            blank_caret_gap_before(&tree, 0).is_none(),
+            "must not paint a leading blank when the document starts with a paragraph"
+        );
+    }
+
+    #[test]
+    fn blank_gap_layout_hosts_caret_after_last_block() {
+        let source = "hello\n\n";
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let gap = blank_caret_gap_after_last(&tree).expect("trailing blank after last block");
+        let layout = build_blank_gap_layout(gap.clone());
+        assert!(
+            layout.contains_source(gap.start),
+            "click below the last block must map onto the trailing gap, source_at={:?} gap={gap:?}",
+            layout.source_at
+        );
+        let hello = source.find("hello").expect("hello");
+        assert!(
+            !layout.contains_source(hello),
+            "trailing layout must not claim the last paragraph"
+        );
+        let para = layout_of(&tree.blocks[0]);
+        assert_eq!(para.text, "hello");
+        assert!(
+            !para.contains_source(gap.start),
+            "last paragraph must not steal the trailing caret"
+        );
+        assert!(para.contains_source(hello));
+    }
+
+    #[test]
+    fn blank_gap_layout_hosts_caret_on_newlines_only_document() {
+        for source in ["", "\n", "\n\n"] {
+            let mut ids = IdGen::default();
+            let tree = import_markdown(source, &mut ids);
+            assert!(
+                tree.blocks.is_empty(),
+                "newlines-only has no blocks, {source:?}"
+            );
+            let gap = blank_caret_gap_after_last(&tree)
+                .expect("newlines-only document must paint a caret home");
+            let layout = build_blank_gap_layout(gap.clone());
+            assert!(
+                layout.contains_source(0),
+                "empty/newlines document must host a caret at 0, source_at={:?} {source:?}",
+                layout.source_at
+            );
+            assert!(
+                layout.contains_source(gap.start),
+                "layout must cover the gap start, {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_gap_layout_does_not_invent_trailing_without_blank() {
+        for source in ["hello", "hello\n", "# Title"] {
+            let mut ids = IdGen::default();
+            let tree = import_markdown(source, &mut ids);
+            assert!(
+                blank_caret_gap_after_last(&tree).is_none(),
+                "must not invent a trailing blank, {source:?}"
+            );
+        }
     }
 }

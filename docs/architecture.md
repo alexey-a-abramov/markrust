@@ -80,7 +80,7 @@ tree-sitter-md is not used. Source-mode `SyntaxNodeSpan`s are extracted from the
 | **Source** | `cmd-shift-m` | Existing delimiter-masking editor; spans from comrak |
 | **Split** | cycle `cmd-shift-m` again | Source left, Rich right; shared `Document` |
 
-Caret/selection are source byte offsets. `RichEngine` provides delimiter-skipping snap/step for WYSIWYG.
+Caret/selection are source byte offsets. `RichEngine` provides delimiter-skipping snap/step for WYSIWYG, including a clickable blank on a standard `\n\n` between top-level blocks and on a trailing blank after the last block (`hello\n\n`). Clicking leftover viewport below the last painted line places the caret on that trailing blank, or opens one when the file has none (`hello` then type `x` is two paragraphs). Click on the last line of the last block still sits in that paragraph. A document that is only newlines still hosts a caret. A lone terminator `\n` is not an empty paragraph.
 
 ## Save and external edits
 

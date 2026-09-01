@@ -109,6 +109,9 @@ impl RichEngine {
 
     /// Top-level block containing `byte`.
     pub fn top_level_at(&self, byte: usize) -> Option<&Block> {
+        if blank_caret_gap_at(&self.tree, byte).is_some() {
+            return None;
+        }
         let mut best = None;
         for b in &self.tree.blocks {
             if b.source_range.start <= byte && byte <= b.source_range.end {
@@ -234,8 +237,18 @@ impl RichEngine {
         walk(&self.tree.blocks, byte)
     }
 
-    /// Deepest leaf block containing `byte` (falls back to the nearest block).
+    /// Deepest leaf block containing `byte`.
+    ///
+    /// Comrak has no empty-paragraph node, so leading newlines, blank lines
+    /// between top-level blocks (a standard `\n\n` separator, plus extras),
+    /// and a trailing blank after the last block are not inside any range.
+    /// Those offsets stay unmapped (Typora: caret on the blank) instead of
+    /// snapping to a neighbor. Other positions after the last block still
+    /// fall back to nearest.
     pub fn block_at(&self, byte: usize) -> Option<NodeId> {
+        if blank_caret_gap_at(&self.tree, byte).is_some() {
+            return None;
+        }
         fn descend(blocks: &[Block], byte: usize) -> Option<NodeId> {
             let mut best: Option<&Block> = None;
             for b in blocks {
@@ -246,22 +259,38 @@ impl RichEngine {
             let b = best?;
             descend(&b.children, byte).or(Some(b.id))
         }
-        descend(&self.tree.blocks, byte).or_else(|| {
-            // Nearest block: last one starting before `byte`, else first.
-            let mut prev = None;
-            for b in &self.tree.blocks {
-                if b.source_range.start <= byte {
-                    prev = Some(b.id);
-                }
+        if let Some(id) = descend(&self.tree.blocks, byte) {
+            return Some(id);
+        }
+        // Nearest block: last one starting before `byte`, else first.
+        let mut prev = None;
+        for b in &self.tree.blocks {
+            if b.source_range.start <= byte {
+                prev = Some(b.id);
             }
-            prev.or_else(|| self.tree.blocks.first().map(|b| b.id))
-        })
+        }
+        prev.or_else(|| self.tree.blocks.first().map(|b| b.id))
     }
 
     /// Valid WYSIWYG caret positions in a leaf block are the bytes covered by
     /// its inline runs (delimiters are not editable positions). Snap `byte`
-    /// to the nearest valid position in the given direction.
+    /// to the nearest valid position in the given direction. Offsets on a
+    /// Comrak-less blank (leading newlines, a block separator, or a trailing
+    /// blank after the last block) stay on that painted line (EOF on a
+    /// trailing blank maps to the gap start, not into the last paragraph).
     pub fn snap_caret(&self, byte: usize, bias: Bias) -> usize {
+        let fm_end = frontmatter_body_start(&self.tree);
+        if fm_end > 0 && byte < fm_end {
+            return self.snap_caret(fm_end, bias);
+        }
+        if let Some(gap) = blank_caret_gap_at(&self.tree, byte) {
+            // One painted line: extra trailing `\n`s share the gap start
+            // (EOF must not snap into the last paragraph).
+            if gap.end == self.tree.source_len {
+                return gap.start;
+            }
+            return byte;
+        }
         let Some(id) = self.block_at(byte) else {
             return byte;
         };
@@ -293,9 +322,13 @@ impl RichEngine {
     }
 
     /// One visible-grapheme step left from `byte`, skipping delimiter gaps
-    /// between runs and treating backslash escapes as atomic.
+    /// between runs and treating backslash escapes as atomic. A blank gap
+    /// between blocks is one stop (extra unused newlines are not extra steps).
     pub fn prev_caret(&self, source: &str, byte: usize) -> usize {
         let byte = self.snap_caret(byte, Bias::Left);
+        if let Some(gap) = blank_caret_gap_at(&self.tree, byte) {
+            return self.snap_caret(gap.start.saturating_sub(1), Bias::Left);
+        }
         let Some(block) = self.block_at(byte).and_then(|id| self.block(id)) else {
             return byte.saturating_sub(1);
         };
@@ -310,7 +343,10 @@ impl RichEngine {
             let prev = &ranges[idx - 1];
             return step_left_in_slice(source, prev.start, prev.end);
         }
-        // Cross to the previous block.
+        // Cross to the previous block (a blank gap before this block is one stop).
+        if let Some(gap) = blank_caret_gap_ending_at(&self.tree, block.source_range.start) {
+            return gap.start;
+        }
         let prev_block = self.block_before(block.id);
         match prev_block {
             Some(pb) => {
@@ -324,6 +360,9 @@ impl RichEngine {
     /// One visible-grapheme step right from `byte` (mirror of `prev_caret`).
     pub fn next_caret(&self, source: &str, byte: usize) -> usize {
         let byte = self.snap_caret(byte, Bias::Right);
+        if let Some(gap) = blank_caret_gap_at(&self.tree, byte) {
+            return self.snap_caret(gap.end.min(source.len()), Bias::Right);
+        }
         let Some(block) = self.block_at(byte).and_then(|id| self.block(id)) else {
             return (byte + 1).min(source.len());
         };
@@ -340,14 +379,78 @@ impl RichEngine {
         }
         match self.block_after(block.id) {
             Some(nb) => {
-                let nranges = inline_ranges(nb);
-                nranges
-                    .first()
-                    .map(|r| r.start)
-                    .unwrap_or(nb.source_range.start)
+                if let Some(gap) = blank_caret_gap_ending_at(&self.tree, nb.source_range.start) {
+                    gap.start
+                } else {
+                    let nranges = inline_ranges(nb);
+                    nranges
+                        .first()
+                        .map(|r| r.start)
+                        .unwrap_or(nb.source_range.start)
+                }
             }
-            None => byte,
+            None => blank_caret_gap_after_last(&self.tree)
+                .map(|gap| gap.start)
+                .unwrap_or(byte),
         }
+    }
+
+    /// Move `delta` visual lines (`+` down, `-` up). A painted blank gap
+    /// between blocks is one line even when the source has extra `\n`s.
+    pub fn vertical_caret(&self, source: &str, cursor: usize, delta: i32) -> usize {
+        if delta == 0 {
+            return cursor;
+        }
+        let down = delta > 0;
+        let mut pos = cursor.min(source.len());
+        let mut left = delta.unsigned_abs() as usize;
+        let guard = source.len().saturating_add(4);
+        for _ in 0..guard {
+            if left == 0 {
+                break;
+            }
+            if let Some(gap) = blank_caret_gap_at(&self.tree, pos) {
+                let next = if down {
+                    self.snap_caret(gap.end.min(source.len()), Bias::Right)
+                } else {
+                    self.snap_caret(gap.start.saturating_sub(1), Bias::Left)
+                };
+                if next == pos {
+                    break;
+                }
+                pos = next;
+                left -= 1;
+                continue;
+            }
+            let next = adjacent_source_line_offset(source, pos, down);
+            if next == pos {
+                break;
+            }
+            if let Some(gap) = blank_caret_gap_at(&self.tree, next) {
+                pos = gap.start;
+                left -= 1;
+                continue;
+            }
+            let snapped = self.snap_caret(next, Bias::Left);
+            // Fence ticks (and similar chrome) are not painted lines. Snap
+            // would land back on the body; step to the next/prev caret home
+            // instead (trailing blank, previous block).
+            let moved = if snapped == pos {
+                if down {
+                    self.next_caret(source, pos)
+                } else {
+                    self.prev_caret(source, pos)
+                }
+            } else {
+                snapped
+            };
+            if moved == pos {
+                break;
+            }
+            pos = moved;
+            left -= 1;
+        }
+        pos
     }
 
     /// Leaf block immediately before `id` in document order.
@@ -429,6 +532,115 @@ impl RichEngine {
 }
 
 /// Byte ranges of caret-valid inline content within a leaf block.
+pub(crate) fn frontmatter_body_start(tree: &RichTree) -> usize {
+    let Some(fm) = &tree.frontmatter else {
+        return 0;
+    };
+    let from_range = fm.source_range.end;
+    let from_raw = fm.source_range.start.saturating_add(fm.raw.len());
+    from_range.max(from_raw).min(tree.source_len)
+}
+
+/// Comrak has no empty-paragraph node. Leading newlines before the first
+/// top-level block, a standard `\n\n` separator between blocks, extra blanks
+/// beyond that, a trailing blank after the last block, and a document that
+/// is only newlines (no blocks), are still valid Typora caret homes (click
+/// the gap, Enter at start of a heading, leftover click below the last
+/// painted line). One source separator is one painted line. A lone
+/// terminator `\n` after the last block is not an empty paragraph.
+pub fn blank_caret_gaps(tree: &RichTree) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let fm_end = frontmatter_body_start(tree);
+    for (i, block) in tree.blocks.iter().enumerate() {
+        let lo = if i == 0 {
+            fm_end
+        } else {
+            tree.blocks[i - 1].source_range.end
+        };
+        let hi = block.source_range.start;
+        if let Some(gap) = blank_between(lo, hi, i == 0 && fm_end == 0) {
+            out.push(gap);
+        }
+    }
+    if let Some(gap) = blank_caret_gap_after_last(tree) {
+        out.push(gap);
+    }
+    out
+}
+
+/// Empty-paragraph slot painted/clicked immediately before top-level `index`.
+pub fn blank_caret_gap_before(tree: &RichTree, index: usize) -> Option<Range<usize>> {
+    let hi = tree.blocks.get(index)?.source_range.start;
+    blank_caret_gaps(tree).into_iter().find(|gap| gap.end == hi)
+}
+
+/// Empty-paragraph slot after the last top-level block when the file ends
+/// with a blank line (`hello\n\n`). A single trailing `\n` is the last
+/// block's terminator, not a painted line. Detected from source bytes so
+/// lists/fences that include their terminator still get a gap.
+///
+/// A document with no blocks (empty, or only newlines) still hosts a caret
+/// so the user can type. Frontmatter-only files sit after the YAML.
+pub fn blank_caret_gap_after_last(tree: &RichTree) -> Option<Range<usize>> {
+    if tree.blocks.is_empty() {
+        let start = frontmatter_body_start(tree).min(tree.source_len);
+        if let Some(gap) = &tree.trailing_blank {
+            if gap.start >= start {
+                return Some(gap.clone());
+            }
+        }
+        return Some(start..tree.source_len);
+    }
+    tree.trailing_blank.clone()
+}
+
+/// Caret home for leftover viewport below the last painted block (and any
+/// trailing blank-gap leaf). Trailing blank if one exists, else document
+/// end — never a hit-test onto the last paragraph (that would insert
+/// mid-line).
+///
+/// A leftover **mouse click** (not this query) must call
+/// `place_caret_for_click_below` first so a document with no trailing blank
+/// (`hello`) opens an empty paragraph. This query is the home after that,
+/// and the IME/drag mapping (which must not mutate).
+pub fn caret_for_click_below_content(tree: &RichTree) -> usize {
+    blank_caret_gap_after_last(tree)
+        .map(|gap| gap.start)
+        .unwrap_or(tree.source_len)
+}
+
+/// Byte lives on a Comrak-less blank (leading, between top-level blocks, or
+/// a trailing blank after the last block — including EOF on that line).
+pub fn blank_caret_gap_at(tree: &RichTree, byte: usize) -> Option<Range<usize>> {
+    blank_caret_gaps(tree).into_iter().find(|gap| {
+        (byte >= gap.start && byte < gap.end)
+            || (gap.end == tree.source_len && byte == tree.source_len)
+    })
+}
+
+fn blank_caret_gap_ending_at(tree: &RichTree, end: usize) -> Option<Range<usize>> {
+    blank_caret_gaps(tree)
+        .into_iter()
+        .find(|gap| gap.end == end)
+}
+
+/// Bytes between `lo` (previous block end or frontmatter) and `hi` (next
+/// block start or source end) that paint as one empty line.
+fn blank_between(lo: usize, hi: usize, leading: bool) -> Option<Range<usize>> {
+    if hi <= lo {
+        return None;
+    }
+    // Non-leading: skip the previous block's inclusive end (its line
+    // terminator). The empty line starts at the next byte.
+    // A lone `\n` (ATX interrupting a paragraph, or a block terminator
+    // at EOF) is not a blank line.
+    let start = if leading { lo } else { (lo + 1).min(hi) };
+    if start >= hi {
+        return None;
+    }
+    Some(start..hi)
+}
+
 fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     match &block.kind {
@@ -519,6 +731,38 @@ pub(crate) fn hash_str(s: &str) -> u64 {
 
 /// Step one grapheme-ish unit left within [start, byte); backslash escapes
 /// ("\\X") are atomic.
+fn adjacent_source_line_offset(source: &str, cursor: usize, down: bool) -> usize {
+    let cursor = cursor.min(source.len());
+    let line_start = source[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col = cursor - line_start;
+    let mut starts = vec![0usize];
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    let line = match starts.binary_search(&line_start) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    };
+    let target_line = if down {
+        (line + 1).min(starts.len().saturating_sub(1))
+    } else {
+        line.saturating_sub(1)
+    };
+    if target_line == line {
+        return cursor;
+    }
+    let start = starts[target_line];
+    let end = starts
+        .get(target_line + 1)
+        .copied()
+        .unwrap_or(source.len())
+        .saturating_sub(1)
+        .max(start);
+    (start + col).min(end)
+}
+
 fn step_left_in_slice(source: &str, start: usize, byte: usize) -> usize {
     let slice = &source[start..byte];
     let Some(last) = slice.char_indices().last() else {
@@ -657,6 +901,333 @@ mod tests {
         let body = source.find("body").unwrap();
         assert_eq!(engine.snap_caret(body, Bias::Right), body);
         assert!(!engine.in_raw_context(body));
+    }
+
+    #[test]
+    fn snap_caret_stays_on_leading_blank_before_heading() {
+        let source = "\n\n# Title";
+        let (_doc, engine) = engine_for(source);
+        let title = source.find("Title").expect("Title");
+        assert_eq!(engine.snap_caret(0, Bias::Left), 0);
+        assert_eq!(engine.snap_caret(0, Bias::Right), 0);
+        assert_ne!(
+            engine.snap_caret(0, Bias::Left),
+            title,
+            "leading blank must not snap onto `# Title`"
+        );
+        assert!(
+            engine.block_at(0).is_none(),
+            "Comrak has no empty paragraph"
+        );
+        let heading_start = engine.tree().blocks[0].source_range.start;
+        let body = engine.snap_caret(heading_start, Bias::Right);
+        let up = engine.prev_caret(source, body);
+        assert!(
+            up < heading_start,
+            "arrow-up/left from the heading must sit on the blank, got {up} heading_start={heading_start} body={body}"
+        );
+        assert_eq!(engine.snap_caret(up, Bias::Left), up);
+        assert!(
+            !source[up..].starts_with("# Title") && !source[up..].starts_with("Title"),
+            "blank caret must not land on the heading text, offset {up} in {source:?}"
+        );
+    }
+
+    #[test]
+    fn snap_caret_stays_on_extra_blank_between_paragraph_and_heading() {
+        let source = "hello\n\n\n\n# Title";
+        let (_doc, engine) = engine_for(source);
+        let title = source.find("Title").expect("Title");
+        let heading_start = engine.tree().blocks[1].source_range.start;
+        let gap = blank_caret_gap_before(engine.tree(), 1).expect("extra blank before heading");
+        assert!(
+            gap.start < heading_start && gap.end == heading_start,
+            "extra blank {gap:?} must abut the heading at {heading_start}"
+        );
+        let caret = gap.start;
+        assert_eq!(engine.snap_caret(caret, Bias::Left), caret);
+        assert_eq!(engine.snap_caret(caret, Bias::Right), caret);
+        assert_ne!(engine.snap_caret(caret, Bias::Left), title);
+        let body = engine.snap_caret(heading_start, Bias::Right);
+        let up = engine.prev_caret(source, body);
+        assert!(
+            gap.start <= up && up < gap.end,
+            "arrow-up from heading must sit in {gap:?}, got {up} body={body}"
+        );
+    }
+
+    fn last_block_end_caret(engine: &RichEngine, source: &str, block_index: usize) -> usize {
+        let end = engine.tree().blocks[block_index].source_range.end;
+        let mut pos = engine.snap_caret(end.min(source.len()), Bias::Left);
+        if blank_caret_gap_at(engine.tree(), pos).is_some() {
+            pos = engine.snap_caret(end.saturating_sub(1).min(source.len()), Bias::Left);
+        }
+        pos
+    }
+
+    #[test]
+    fn standard_block_separator_is_a_clickable_blank() {
+        let source = "hello\n\n# Title";
+        let (_doc, engine) = engine_for(source);
+        let heading_start = engine.tree().blocks[1].source_range.start;
+        let gaps = blank_caret_gaps(engine.tree());
+        assert_eq!(
+            gaps.len(),
+            1,
+            "one `\\n\\n` is one gap, not two, got {gaps:?}"
+        );
+        let gap = blank_caret_gap_before(engine.tree(), 1).expect("separator before heading");
+        assert_eq!(gap.end, heading_start);
+        assert!(
+            gap.start < heading_start,
+            "gap {gap:?} must sit before the heading at {heading_start}"
+        );
+        assert!(
+            engine.block_at(gap.start).is_none(),
+            "separator offset must not belong to a Comrak node"
+        );
+        assert_eq!(engine.snap_caret(gap.start, Bias::Left), gap.start);
+        assert_eq!(engine.snap_caret(gap.start, Bias::Right), gap.start);
+        let title = source.find("Title").expect("Title");
+        assert_ne!(engine.snap_caret(gap.start, Bias::Left), title);
+        assert!(
+            !source[gap.start..].starts_with("# Title")
+                && !source[gap.start..].starts_with("Title"),
+            "separator caret must not land on heading chrome, offset {} in {source:?}",
+            gap.start
+        );
+
+        let hello = last_block_end_caret(&engine, source, 0);
+        let down1 = engine.vertical_caret(source, hello, 1);
+        assert!(
+            gap.start <= down1 && down1 < gap.end,
+            "Down from the paragraph must land on the gap {gap:?}, got {down1} from {hello}"
+        );
+        let down2 = engine.vertical_caret(source, down1, 1);
+        assert!(
+            down2 >= heading_start,
+            "second Down must leave the gap for the heading, got {down2} heading_start={heading_start}"
+        );
+        let down3 = engine.vertical_caret(source, down2, 1);
+        assert_eq!(
+            down3, down2,
+            "no extra unused-newline step after the heading, got {down3} after {down2}"
+        );
+
+        let n1 = engine.next_caret(source, hello);
+        assert!(
+            gap.start <= n1 && n1 < gap.end,
+            "Right from the paragraph must land on the gap, got {n1}"
+        );
+        let n2 = engine.next_caret(source, n1);
+        assert!(
+            n2 >= heading_start,
+            "Right from the gap must enter the heading, got {n2}"
+        );
+        let up = engine.prev_caret(source, engine.snap_caret(heading_start, Bias::Right));
+        assert!(
+            gap.start <= up && up < gap.end,
+            "Left from the heading must sit on the gap, got {up}"
+        );
+    }
+
+    #[test]
+    fn extra_newlines_collapse_to_one_blank_step() {
+        let source = "hello\n\n\n\n# Title";
+        let (_doc, engine) = engine_for(source);
+        let heading_start = engine.tree().blocks[1].source_range.start;
+        let gaps = blank_caret_gaps(engine.tree());
+        assert_eq!(
+            gaps.len(),
+            1,
+            "extra newlines stay one painted gap, got {gaps:?}"
+        );
+        let gap = blank_caret_gap_before(engine.tree(), 1).expect("extra blank");
+        let hello = last_block_end_caret(&engine, source, 0);
+        let down1 = engine.vertical_caret(source, hello, 1);
+        assert!(
+            gap.start <= down1 && down1 < gap.end,
+            "Down from the paragraph lands on the gap, got {down1}"
+        );
+        let down2 = engine.vertical_caret(source, down1, 1);
+        assert!(
+            down2 >= heading_start,
+            "extra unused newlines must not be extra Down steps, got {down2} heading_start={heading_start} gap={gap:?}"
+        );
+        let n1 = engine.next_caret(source, hello);
+        let n2 = engine.next_caret(source, n1);
+        assert!(
+            n2 >= heading_start,
+            "Right must skip unused newlines after one gap stop, got {n2} via {n1}"
+        );
+    }
+
+    #[test]
+    fn no_invented_blank_after_last_block() {
+        for source in ["hello", "hello\n", "# Title"] {
+            let (_doc, engine) = engine_for(source);
+            assert!(
+                blank_caret_gaps(engine.tree()).is_empty(),
+                "no trailing gap without a blank line, {source:?} gaps={:?}",
+                blank_caret_gaps(engine.tree())
+            );
+            assert!(
+                blank_caret_gap_after_last(engine.tree()).is_none(),
+                "single trailing `\\n` is the block terminator, {source:?}"
+            );
+        }
+        let source = "hello\n\n# Title";
+        let (_doc, engine) = engine_for(source);
+        assert!(
+            blank_caret_gap_before(engine.tree(), 0).is_none(),
+            "first block has no leading gap"
+        );
+        assert!(blank_caret_gap_before(engine.tree(), 1).is_some());
+        assert!(
+            blank_caret_gap_after_last(engine.tree()).is_none(),
+            "must not invent a trailing gap when the file does not end with a blank"
+        );
+        assert_eq!(
+            blank_caret_gaps(engine.tree()).len(),
+            1,
+            "one `\\n\\n` between blocks is one gap, not a trailing extra"
+        );
+    }
+
+    #[test]
+    fn trailing_blank_after_last_block_is_a_clickable_blank() {
+        for source in [
+            "hello\n\n",
+            "hello\n\n\n\n",
+            "# Title\n\n",
+            "- item\n\n",
+            "```\ncode\n```\n\n",
+        ] {
+            let (_doc, engine) = engine_for(source);
+            let gap = blank_caret_gap_after_last(engine.tree())
+                .unwrap_or_else(|| panic!("trailing blank must paint a gap, {source:?}"));
+            assert_eq!(
+                gap.end,
+                source.len(),
+                "trailing gap must run to EOF, {source:?} gap={gap:?}"
+            );
+            assert!(
+                engine.block_at(gap.start).is_none(),
+                "trailing offset must not belong to a Comrak node, {source:?}"
+            );
+            assert_eq!(engine.snap_caret(gap.start, Bias::Left), gap.start);
+            assert_eq!(engine.snap_caret(gap.start, Bias::Right), gap.start);
+            assert_eq!(
+                engine.snap_caret(source.len(), Bias::Left),
+                gap.start,
+                "click/EOF on the trailing blank must not snap into the last block, {source:?}"
+            );
+            let last = last_block_end_caret(&engine, source, engine.tree().blocks.len() - 1);
+            assert!(
+                blank_caret_gap_at(engine.tree(), last).is_none()
+                    && engine.block_at(last).is_some(),
+                "end caret must sit in the last block, {source:?} last={last} gap={gap:?}"
+            );
+            let down1 = engine.vertical_caret(source, last, 1);
+            assert!(
+                gap.start <= down1 && down1 < gap.end,
+                "Down from the last block must land on the trailing gap {gap:?}, got {down1} from {last} in {source:?}"
+            );
+            let down2 = engine.vertical_caret(source, down1, 1);
+            assert_eq!(
+                down2, down1,
+                "extra unused trailing newlines must not be extra Down steps, {source:?} gap={gap:?}"
+            );
+            let n1 = engine.next_caret(source, last);
+            assert!(
+                gap.start <= n1 && n1 < gap.end,
+                "Right from the last block must land on the trailing gap, got {n1} in {source:?}"
+            );
+            let up = engine.prev_caret(source, n1);
+            assert_eq!(
+                up, last,
+                "Left from the trailing gap must return to the last block, got {up} last={last} in {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_blank_does_not_double_between_block_gap() {
+        let source = "hello\n\n# Title\n\n";
+        let (_doc, engine) = engine_for(source);
+        let between = blank_caret_gap_before(engine.tree(), 1).expect("separator");
+        let trailing = blank_caret_gap_after_last(engine.tree()).expect("trailing");
+        assert!(
+            between.end <= trailing.start,
+            "between {between:?} and trailing {trailing:?} must not overlap"
+        );
+        assert_eq!(blank_caret_gaps(engine.tree()).len(), 2);
+        let hello = last_block_end_caret(&engine, source, 0);
+        let down1 = engine.vertical_caret(source, hello, 1);
+        assert!(
+            between.start <= down1 && down1 < between.end,
+            "Down from hello is the between gap, got {down1}"
+        );
+        let heading_start = engine.tree().blocks[1].source_range.start;
+        let down2 = engine.vertical_caret(source, down1, 1);
+        assert!(
+            down2 >= heading_start && down2 < trailing.start,
+            "second Down is the heading, got {down2}"
+        );
+        let down3 = engine.vertical_caret(source, down2, 1);
+        assert!(
+            trailing.start <= down3 && down3 < trailing.end,
+            "third Down is the trailing blank, got {down3}"
+        );
+    }
+
+    #[test]
+    fn newlines_only_document_hosts_a_caret() {
+        for source in ["", "\n", "\n\n", "\n\n\n"] {
+            let (_doc, engine) = engine_for(source);
+            assert!(
+                engine.tree().blocks.is_empty(),
+                "newlines-only must have no Comrak blocks, {source:?}"
+            );
+            let gap = blank_caret_gap_after_last(engine.tree()).unwrap_or_else(|| {
+                panic!("newlines-only document must host a caret gap, {source:?}")
+            });
+            assert_eq!(
+                gap.start, 0,
+                "caret home is the start, {source:?} gap={gap:?}"
+            );
+            assert_eq!(gap.end, source.len());
+            assert_eq!(engine.snap_caret(0, Bias::Left), 0);
+            assert_eq!(engine.snap_caret(source.len(), Bias::Left), 0);
+            assert!(engine.block_at(0).is_none());
+            assert_eq!(
+                caret_for_click_below_content(engine.tree()),
+                gap.start,
+                "leftover click on an empty document sits on the blank, {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn click_below_content_uses_trailing_blank_else_eof() {
+        let (_doc, engine) = engine_for("hello\n\n");
+        let gap = blank_caret_gap_after_last(engine.tree()).expect("trailing blank");
+        assert_eq!(caret_for_click_below_content(engine.tree()), gap.start);
+        assert_ne!(
+            caret_for_click_below_content(engine.tree()),
+            engine.tree().blocks[0].source_range.end,
+            "leftover click must not snap into the last paragraph"
+        );
+
+        for source in ["hello", "hello\n", "# Title"] {
+            let (_doc, engine) = engine_for(source);
+            assert!(blank_caret_gap_after_last(engine.tree()).is_none());
+            assert_eq!(
+                caret_for_click_below_content(engine.tree()),
+                source.len(),
+                "no trailing blank: query is document end (click opens a blank), {source:?}"
+            );
+        }
     }
 
     #[test]
