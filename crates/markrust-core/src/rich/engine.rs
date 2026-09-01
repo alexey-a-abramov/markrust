@@ -12,7 +12,9 @@ use std::ops::Range;
 use crate::document::Document;
 
 use super::import::import_markdown;
-use super::tree::{Block, BlockKind, IdGen, Inline, MarkSet, NodeId, PrefixBlank, RichTree};
+use super::tree::{
+    Block, BlockKind, IdGen, Inline, LinkAttrs, MarkSet, NodeId, PrefixBlank, RichTree,
+};
 
 /// Caret snapping direction when a byte falls on delimiter bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -637,7 +639,81 @@ impl RichEngine {
         if matches!(block.kind, BlockKind::Opaque { .. }) {
             at = clamp_html_tag(source, at, body, bias);
         }
+        let skipped = self.skip_inline_delimiter_chrome(source, at, bias);
+        if skipped != at {
+            return self.clamp_raw_prefix(source, skipped, bias);
+        }
         at
+    }
+
+    /// `[` / `](url)` / `**` / ticks / autolink `<>` adjacent to a visible
+    /// run, including wrapping dest around a linked image. `inner.end`
+    /// (caret after the last visible letter) is not skipped so typing still
+    /// extends the label / marked text.
+    fn skip_inline_delimiter_chrome(&self, source: &str, byte: usize, bias: Bias) -> usize {
+        let mut at = byte.min(source.len());
+        for _ in 0..16 {
+            let next = self.inline_chrome_step(source, at, bias);
+            if next == at {
+                return at;
+            }
+            at = next.min(source.len());
+        }
+        at
+    }
+
+    fn inline_chrome_step(&self, source: &str, byte: usize, bias: Bias) -> usize {
+        let mut found: Option<(Range<usize>, Range<usize>)> = None;
+        walk_inline_inner_outer(&self.tree.blocks, source, &mut |inner, outer| {
+            if inner.start == outer.start && inner.end == outer.end {
+                return;
+            }
+            if (byte >= outer.start && byte < inner.start) || (byte > inner.end && byte < outer.end)
+            {
+                found = Some((inner, outer));
+            }
+        });
+        let Some((inner, outer)) = found else {
+            return byte;
+        };
+        match bias {
+            Bias::Right => {
+                if byte < inner.start {
+                    inner.start
+                } else {
+                    outer.end.min(source.len())
+                }
+            }
+            Bias::Left => {
+                if byte < inner.start {
+                    if outer.start == 0 {
+                        inner.start
+                    } else {
+                        outer.start - 1
+                    }
+                } else {
+                    inner.end
+                }
+            }
+        }
+    }
+
+    /// True when `byte` is markdown chrome around a visible run (`[`, `](url)`,
+    /// `**`, ticks, autolink `<>`). Includes the byte at `inner.end` (`]`) so
+    /// Backspace/Delete do not nibble dest / closers.
+    pub(crate) fn byte_is_inline_chrome(&self, source: &str, byte: usize) -> bool {
+        let mut hit = false;
+        walk_inline_inner_outer(&self.tree.blocks, source, &mut |inner, outer| {
+            if inner.start == outer.start && inner.end == outer.end {
+                return;
+            }
+            if (byte >= outer.start && byte < inner.start)
+                || (byte >= inner.end && byte < outer.end)
+            {
+                hit = true;
+            }
+        });
+        hit
     }
 
     /// Move `delta` visual lines (`+` down, `-` up). A painted blank gap
@@ -1289,6 +1365,150 @@ fn leaf_inline_ranges(block: &Block) -> Vec<Range<usize>> {
         out.push(block.source_range.clone());
     }
     out
+}
+
+/// ASCII mark delimiters immediately outside `inner` (`*`, `_`, ticks, `~`, `=`, `^`).
+pub(crate) fn expand_mark_delimiters(
+    source: &str,
+    block: &Block,
+    inner: &Range<usize>,
+) -> Range<usize> {
+    let lo = block.source_range.start;
+    let hi = block.source_range.end.min(source.len());
+    let mut start = inner.start;
+    let mut end = inner.end;
+    while start > lo {
+        let b = source.as_bytes()[start - 1];
+        if matches!(b, b'*' | b'_' | b'`' | b'~' | b'=' | b'^') {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    while end < hi {
+        let b = source.as_bytes()[end];
+        if matches!(b, b'*' | b'_' | b'`' | b'~' | b'=' | b'^') {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    start..end
+}
+
+fn expand_around_link(source: &str, mut range: Range<usize>) -> Range<usize> {
+    if range.start > 0 && source.as_bytes()[range.start - 1] == b'[' {
+        range.start -= 1;
+    }
+    if range.end < source.len() && source.as_bytes()[range.end] == b']' {
+        range.end += 1;
+        if range.end < source.len() && source.as_bytes()[range.end] == b'(' {
+            range.end += 1;
+            let mut depth = 1i32;
+            while range.end < source.len() && depth > 0 {
+                match source.as_bytes()[range.end] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                range.end += 1;
+            }
+        } else if range.end < source.len() && source.as_bytes()[range.end] == b'[' {
+            // GFM reference: `[label][ref]` / collapsed `[label][]`.
+            let open = range.end;
+            range.end += 1;
+            while range.end < source.len() && source.as_bytes()[range.end] != b']' {
+                range.end += 1;
+            }
+            if range.end < source.len() && source.as_bytes()[range.end] == b']' {
+                range.end += 1;
+            } else {
+                range.end = open;
+            }
+        }
+    }
+    range
+}
+
+fn expand_around_autolink(source: &str, mut range: Range<usize>) -> Range<usize> {
+    if range.start > 0
+        && source.as_bytes()[range.start - 1] == b'<'
+        && range.end < source.len()
+        && source.as_bytes()[range.end] == b'>'
+    {
+        range.start -= 1;
+        range.end += 1;
+    }
+    range
+}
+
+/// `<>` around an autolink, else `[…](url)` / `[…][ref]`. Email autolinks
+/// often have `autolink: false` (comrak child text is the address without
+/// `mailto:`); wrapping `<>` is still dest chrome.
+fn expand_link_chrome(source: &str, range: Range<usize>, link: &LinkAttrs) -> Range<usize> {
+    let auto = expand_around_autolink(source, range.clone());
+    if link.autolink || auto != range {
+        auto
+    } else {
+        expand_around_link(source, range)
+    }
+}
+
+fn inline_inner_outer(
+    source: &str,
+    block: &Block,
+    inline: &Inline,
+) -> Option<(Range<usize>, Range<usize>)> {
+    match inline {
+        Inline::Run {
+            source_range,
+            marks,
+            link,
+            ..
+        } => {
+            let inner = source_range.clone();
+            let mut outer = inner.clone();
+            if !marks.is_empty() {
+                outer = expand_mark_delimiters(source, block, &inner);
+            }
+            if let Some(link) = link {
+                outer = expand_link_chrome(source, outer, link);
+            }
+            Some((inner, outer))
+        }
+        Inline::Image {
+            source_range,
+            marks,
+            link,
+            ..
+        } => {
+            let inner = source_range.clone();
+            let mut outer = inner.clone();
+            if !marks.is_empty() {
+                outer = expand_mark_delimiters(source, block, &inner);
+            }
+            if let Some(link) = link {
+                outer = expand_link_chrome(source, outer, link);
+            }
+            Some((inner, outer))
+        }
+        _ => None,
+    }
+}
+
+fn walk_inline_inner_outer(
+    blocks: &[Block],
+    source: &str,
+    f: &mut impl FnMut(Range<usize>, Range<usize>),
+) {
+    for block in blocks {
+        for inline in &block.inlines {
+            if let Some((inner, outer)) = inline_inner_outer(source, block, inline) {
+                f(inner, outer);
+            }
+        }
+        walk_inline_inner_outer(&block.children, source, f);
+    }
 }
 
 /// Preserve NodeIds of top-level blocks whose source slice is unchanged

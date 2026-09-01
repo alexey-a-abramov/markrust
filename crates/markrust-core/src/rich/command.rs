@@ -12,7 +12,8 @@ use crate::undo::{SelectionSnapshot, TransactionKind};
 
 pub use super::engine::code_body_source_map;
 use super::engine::{
-    blank_caret_gap_after_last, caret_for_click_below_content, RichEngine, TablePos,
+    blank_caret_gap_after_last, caret_for_click_below_content, expand_mark_delimiters, RichEngine,
+    TablePos,
 };
 use super::escape::{escape_text, EscapeContext};
 use super::input_rules::{match_input_rule, InputRule};
@@ -374,7 +375,10 @@ fn backspace(
     if del_start >= del_end {
         return Ok(RichOutcome::Noop);
     }
-    let mut range = del_start..del_end;
+    let mut range = trim_inline_chrome(engine, &source, del_start..del_end);
+    if range.start >= range.end {
+        return Ok(RichOutcome::Noop);
+    }
     extend_empty_mark_wrappers(&source, engine, &mut range);
     caret.range = range.clone();
     caret.reversed = true;
@@ -398,11 +402,26 @@ fn delete_forward(
     if to <= from {
         return Ok(RichOutcome::Noop);
     }
-    let mut range = from..to;
+    let mut range = trim_inline_chrome(engine, &source, from..to);
+    if range.start >= range.end {
+        return Ok(RichOutcome::Noop);
+    }
     extend_empty_mark_wrappers(&source, engine, &mut range);
     caret.range = range;
     caret.reversed = false;
     delete_range(doc, engine, caret, TransactionKind::Command)
+}
+
+/// Drop `[` / `](url)` / `**` / ticks from a delete range so Backspace at the
+/// start of a link label (or Delete at the end) does not nibble dest chrome.
+fn trim_inline_chrome(engine: &RichEngine, source: &str, mut range: Range<usize>) -> Range<usize> {
+    while range.start < range.end && engine.byte_is_inline_chrome(source, range.start) {
+        range.start += 1;
+    }
+    while range.end > range.start && engine.byte_is_inline_chrome(source, range.end - 1) {
+        range.end -= 1;
+    }
+    range
 }
 
 /// If a deletion empties a marked run, swallow the surrounding delimiters too.
@@ -413,6 +432,14 @@ fn extend_empty_mark_wrappers(source: &str, engine: &RichEngine, range: &mut Ran
     let Some(block) = engine.block(id) else {
         return;
     };
+    // Fenced-code inlines carry CODE marks; swallowing surrounding backticks
+    // would delete the fence when the last body character is removed.
+    if matches!(
+        block.kind,
+        BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. }
+    ) {
+        return;
+    }
     for inline in &block.inlines {
         let Inline::Run {
             source_range,
@@ -437,27 +464,10 @@ fn extend_empty_mark_wrappers(source: &str, engine: &RichEngine, range: &mut Ran
         if remaining > 0 {
             continue;
         }
-        // Expand to include ASCII delimiter runs immediately outside the text.
-        let mut start = source_range.start;
-        while start > block.source_range.start {
-            let b = source.as_bytes()[start - 1];
-            if matches!(b, b'*' | b'_' | b'`' | b'~') {
-                start -= 1;
-            } else {
-                break;
-            }
-        }
-        let mut end = source_range.end;
-        while end < block.source_range.end.min(source.len()) {
-            let b = source.as_bytes()[end];
-            if matches!(b, b'*' | b'_' | b'`' | b'~') {
-                end += 1;
-            } else {
-                break;
-            }
-        }
-        range.start = range.start.min(start);
-        range.end = range.end.max(end);
+        // Same delimiter set as caret chrome (`=` / `~~` / `^`, not only `*` / ticks).
+        let expanded = expand_mark_delimiters(source, block, source_range);
+        range.start = range.start.min(expanded.start);
+        range.end = range.end.max(expanded.end);
     }
 }
 
@@ -519,7 +529,11 @@ fn delete_to_bound(
     if start >= end {
         return Ok(RichOutcome::Noop);
     }
-    caret.range = start..end;
+    let range = trim_inline_chrome(engine, &source, start..end);
+    if range.start >= range.end {
+        return Ok(RichOutcome::Noop);
+    }
+    caret.range = range;
     caret.reversed = reversed;
     delete_range(doc, engine, caret, TransactionKind::Command)
 }
@@ -2123,6 +2137,196 @@ mod tests {
         assert!(
             after.contains("[hello]("),
             "expected markdown link, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_link_label_does_not_eat_bracket() {
+        let source = "see [label](https://e.com) now\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('l').expect("label"));
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("[label](https://e.com)"),
+            "Backspace at the start of a link label must not nibble `[`, got {after:?}"
+        );
+        assert!(
+            after.contains("see[label]") || after.contains("see [label]"),
+            "expected the previous visible character to be deleted, got {after:?}"
+        );
+        assert!(
+            !after.contains("see label]("),
+            "broken dest leftover `label](` means `[` was eaten, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_at_end_of_link_label_does_not_eat_dest() {
+        let source = "see [label](https://e.com) now\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let end_label = source.find("label").unwrap() + "label".len();
+        caret.collapse_to(end_label);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("[label](https://e.com)"),
+            "Delete at the end of a link label must not swallow `](url)`, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_bold_does_not_eat_delimiter() {
+        let source = "hello **bold**\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('b').expect("bold"));
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("**bold**"),
+            "Backspace at the start of bold must not nibble `*`, got {after:?}"
+        );
+        assert!(
+            !after.contains("hello *bold**") && !after.contains("hello **bold*"),
+            "unbalanced emphasis after Backspace, got {after:?}"
+        );
+    }
+
+    /// Emptying the last inner character of `==highlight==` / `~~strike~~` /
+    /// `**bold**` must unwrap the marks, not leave `====` / `~~~~` / `****`
+    /// painted as chrome. Empty Cmd-B inserting `****` is a different path.
+    #[test]
+    fn backspace_emptying_highlight_or_strike_unwraps_marks() {
+        for (source, inner, leftover) in [
+            ("==m==", "m", "===="),
+            ("~~x~~", "x", "~~~~"),
+            ("**b**", "b", "****"),
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(source.find(inner).expect(inner) + inner.len());
+            apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+            let after = doc.buffer.content();
+            assert!(
+                !after.contains(leftover),
+                "Backspace emptying {source:?} must not leave {leftover:?}, got {after:?}"
+            );
+            assert!(
+                after.trim().is_empty(),
+                "Backspace emptying {source:?} must unwrap to an empty paragraph, got {after:?}"
+            );
+
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(source.find(inner).expect(inner));
+            apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+            let after = doc.buffer.content();
+            assert!(
+                !after.contains(leftover),
+                "Delete emptying {source:?} must not leave {leftover:?}, got {after:?}"
+            );
+            assert!(
+                after.trim().is_empty(),
+                "Delete emptying {source:?} must unwrap to an empty paragraph, got {after:?}"
+            );
+        }
+
+        let source = "==hello==";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('o').expect("o") + 1);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("==hell=="),
+            "partial highlight delete must keep the marks, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_email_autolink_does_not_eat_bracket() {
+        let source = "see <user@example.com> now\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("user").expect("user"));
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("<user@example.com>"),
+            "Backspace at the start of an email autolink must not nibble `<`, got {after:?}"
+        );
+        assert!(
+            !after.contains("see user@example.com>"),
+            "broken leftover `user@example.com>` means `<` was eaten, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("user@example.com").unwrap() + "user@example.com".len());
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("<user@example.com>"),
+            "Delete at the end of an email autolink must not swallow `>`, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_linked_image_does_not_eat_wrapping_dest() {
+        let source = "see [![cat](a.png)](https://e.com) now\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let img = engine.tree().blocks[0]
+            .inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::Image { source_range, .. } => Some(source_range.clone()),
+                _ => None,
+            })
+            .expect("linked image");
+        caret.collapse_to(img.start);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("[![cat](a.png)](https://e.com)"),
+            "Backspace at a linked inline image must not nibble wrapping `[`, got {after:?}"
+        );
+        assert!(
+            !after.contains("see ![cat](a.png)]("),
+            "broken dest leftover `![…](url)](…)` means wrapping `[` was eaten, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let img = engine.tree().blocks[0]
+            .inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::Image { source_range, .. } => Some(source_range.clone()),
+                _ => None,
+            })
+            .expect("linked image");
+        caret.collapse_to(img.end);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("[![cat](a.png)](https://e.com)"),
+            "Delete after a linked inline image must not swallow wrapping `](url)`, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn word_delete_at_start_of_link_label_does_not_eat_bracket() {
+        let source = "see [label](https://e.com) now\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("label").expect("label"));
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("[label](https://e.com)"),
+            "Option-Backspace at a link label must not nibble `[`, got {after:?}"
+        );
+        assert!(
+            !after.starts_with("label]"),
+            "broken dest leftover `label](` means `[` was eaten, got {after:?}"
         );
     }
 
