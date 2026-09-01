@@ -22,7 +22,7 @@ use markrust_core::rich::{
 };
 use markrust_core::Document;
 
-use super::block_text::{hit_test_leaf, LeafLayout, WidgetImeSink, WysiwygHost};
+use super::block_text::{hit_test_leaf, LeafLayout, OverlayTarget, WidgetOverlay, WysiwygHost};
 use super::blocks::{render_top_block, RenderSnapshot};
 use super::image::{
     cache_path_for_url, collect_remote_image_urls, default_image_cache_dir, fetch_remote_image,
@@ -30,6 +30,7 @@ use super::image::{
 use super::ime::{ImeLeafHit, ImeOriginState};
 use crate::headless::{CaretMove, EditorCommand, EditorOutcome};
 use crate::theme::EditorTheme;
+use crate::wrap::{wrap_selection, WrapKind};
 
 #[derive(Debug, Clone, Default)]
 enum WidgetEdit {
@@ -38,33 +39,501 @@ enum WidgetEdit {
     CodeInfo {
         id: NodeId,
         draft: String,
+        caret: usize,
     },
     ImageAlt {
         range: Range<usize>,
         draft: String,
+        caret: usize,
     },
     Frontmatter {
         key: &'static str,
         draft: String,
+        caret: usize,
     },
     FrontmatterYaml {
         draft: String,
+        caret: usize,
     },
 }
 
 impl WidgetEdit {
+    fn caret(&self) -> usize {
+        match self {
+            Self::Idle => 0,
+            Self::CodeInfo { caret, .. }
+            | Self::ImageAlt { caret, .. }
+            | Self::Frontmatter { caret, .. }
+            | Self::FrontmatterYaml { caret, .. } => *caret,
+        }
+    }
+
+    fn draft_caret_mut(&mut self) -> Option<(&mut String, &mut usize)> {
+        match self {
+            Self::Idle => None,
+            Self::CodeInfo { draft, caret, .. }
+            | Self::ImageAlt { draft, caret, .. }
+            | Self::Frontmatter { draft, caret, .. }
+            | Self::FrontmatterYaml { draft, caret } => Some((draft, caret)),
+        }
+    }
+
     fn draft_mut(&mut self) -> Option<&mut String> {
         match self {
             Self::Idle => None,
             Self::CodeInfo { draft, .. }
             | Self::ImageAlt { draft, .. }
             | Self::Frontmatter { draft, .. }
-            | Self::FrontmatterYaml { draft } => Some(draft),
+            | Self::FrontmatterYaml { draft, .. } => Some(draft),
         }
     }
 
     fn allows_newline(&self) -> bool {
         matches!(self, Self::FrontmatterYaml { .. })
+    }
+
+    fn set_caret(&mut self, offset: usize) {
+        if let Some((draft, caret)) = self.draft_caret_mut() {
+            let mut at = offset.min(draft.len());
+            if at > 0 && !draft.is_char_boundary(at) {
+                at = draft
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .take_while(|i| *i <= at)
+                    .last()
+                    .unwrap_or(0);
+            }
+            *caret = at;
+        }
+    }
+
+    fn matches_overlay(&self, target: &OverlayTarget) -> bool {
+        match (self, target) {
+            (Self::CodeInfo { id, .. }, OverlayTarget::CodeInfo(tid)) => id == tid,
+            (Self::ImageAlt { range, .. }, OverlayTarget::ImageAlt { range: r, .. }) => range == r,
+            (Self::Frontmatter { key, .. }, OverlayTarget::Frontmatter { key: k, .. }) => key == k,
+            (Self::FrontmatterYaml { .. }, OverlayTarget::FrontmatterYaml { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Tab / Shift-Tab while a language chip, image caption, or frontmatter
+/// overlay is focused commits that overlay. The document body must not run
+/// `IndentList` / `OutdentList`.
+fn widget_owns_tab(edit: &WidgetEdit) -> bool {
+    !matches!(edit, WidgetEdit::Idle)
+}
+
+/// Left/Right/Home/End/Up/Down (and Delete) stay inside the overlay; they
+/// must not move or mutate the document body. Cmd+A / Undo / Redo use the
+/// same gate.
+fn widget_owns_caret(edit: &WidgetEdit) -> bool {
+    !matches!(edit, WidgetEdit::Idle)
+}
+
+/// Cmd/Ctrl+B/I/E/K while a widget overlay is focused must not commit and
+/// toggle marks on the document body.
+fn widget_owns_wrap(edit: &WidgetEdit) -> bool {
+    !matches!(edit, WidgetEdit::Idle)
+}
+
+/// Caption and frontmatter are real text buffers; the language chip is not.
+fn widget_wraps_draft(edit: &WidgetEdit) -> bool {
+    matches!(
+        edit,
+        WidgetEdit::ImageAlt { .. }
+            | WidgetEdit::Frontmatter { .. }
+            | WidgetEdit::FrontmatterYaml { .. }
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WidgetWrapResult {
+    /// No overlay; wrap the body.
+    NotFocused,
+    /// Overlay consumed the shortcut without changing the draft (language chip).
+    Ignored,
+    /// Draft was wrapped (or unwrapped).
+    Applied,
+}
+
+fn apply_wrap_to_widget(edit: &mut WidgetEdit, kind: WrapKind) -> WidgetWrapResult {
+    if matches!(edit, WidgetEdit::Idle) {
+        return WidgetWrapResult::NotFocused;
+    }
+    if !widget_wraps_draft(edit) {
+        return WidgetWrapResult::Ignored;
+    }
+    if let Some((draft, caret)) = edit.draft_caret_mut() {
+        let wrapped = wrap_selection(draft, 0..draft.len(), kind);
+        *draft = wrapped.text;
+        *caret = wrapped.selection.end.min(draft.len());
+    }
+    WidgetWrapResult::Applied
+}
+
+fn widget_range(caret: usize, anchor: usize, len: usize) -> Range<usize> {
+    let a = caret.min(anchor).min(len);
+    let b = caret.max(anchor).min(len);
+    a..b
+}
+
+/// Overlay Copy: a non-empty inner selection copies that slice; an empty
+/// caret copies the whole draft (language chip / caption / frontmatter).
+fn overlay_copy_text(draft: &str, sel: Range<usize>) -> Option<String> {
+    let text = if sel.start < sel.end {
+        let end = sel.end.min(draft.len());
+        let start = sel.start.min(end);
+        draft.get(start..end).filter(|s| !s.is_empty())?
+    } else if draft.is_empty() {
+        return None;
+    } else {
+        draft
+    };
+    Some(text.to_string())
+}
+
+fn insert_into_widget(edit: &mut WidgetEdit, anchor: &mut usize, text: &str) {
+    let Some((draft, caret)) = edit.draft_caret_mut() else {
+        return;
+    };
+    let range = widget_range(*caret, *anchor, draft.len());
+    if !draft.is_char_boundary(range.start) || !draft.is_char_boundary(range.end) {
+        return;
+    }
+    let start = range.start;
+    draft.replace_range(range, text);
+    *caret = start + text.len();
+    *anchor = *caret;
+}
+
+fn delete_before_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
+    let Some((draft, caret)) = edit.draft_caret_mut() else {
+        return;
+    };
+    let range = widget_range(*caret, *anchor, draft.len());
+    if range.start != range.end {
+        if !draft.is_char_boundary(range.start) || !draft.is_char_boundary(range.end) {
+            return;
+        }
+        let start = range.start;
+        draft.replace_range(range, "");
+        *caret = start;
+        *anchor = start;
+        return;
+    }
+    let at = range.start;
+    if at == 0 {
+        return;
+    }
+    let prev = draft[..at]
+        .chars()
+        .next_back()
+        .map(|c| c.len_utf8())
+        .unwrap_or(0);
+    let start = at - prev;
+    draft.replace_range(start..at, "");
+    *caret = start;
+    *anchor = start;
+}
+
+fn delete_after_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
+    let Some((draft, caret)) = edit.draft_caret_mut() else {
+        return;
+    };
+    let range = widget_range(*caret, *anchor, draft.len());
+    if range.start != range.end {
+        if !draft.is_char_boundary(range.start) || !draft.is_char_boundary(range.end) {
+            return;
+        }
+        let start = range.start;
+        draft.replace_range(range, "");
+        *caret = start;
+        *anchor = start;
+        return;
+    }
+    let at = range.start;
+    if at >= draft.len() {
+        return;
+    }
+    let next = draft[at..]
+        .chars()
+        .next()
+        .map(|c| c.len_utf8())
+        .unwrap_or(0);
+    draft.replace_range(at..at + next, "");
+}
+
+/// Cmd+A selects the overlay draft. The document body is not touched.
+fn select_all_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) -> bool {
+    let Some((draft, caret)) = edit.draft_caret_mut() else {
+        return false;
+    };
+    *anchor = 0;
+    *caret = draft.len();
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WidgetDraftSnap {
+    draft: String,
+    caret: usize,
+    anchor: usize,
+}
+
+fn widget_snap(edit: &WidgetEdit, anchor: usize) -> Option<WidgetDraftSnap> {
+    match edit {
+        WidgetEdit::Idle => None,
+        WidgetEdit::CodeInfo { draft, caret, .. }
+        | WidgetEdit::ImageAlt { draft, caret, .. }
+        | WidgetEdit::Frontmatter { draft, caret, .. }
+        | WidgetEdit::FrontmatterYaml { draft, caret, .. } => Some(WidgetDraftSnap {
+            draft: draft.clone(),
+            caret: *caret,
+            anchor,
+        }),
+    }
+}
+
+fn apply_widget_snap(edit: &mut WidgetEdit, snap: &WidgetDraftSnap, anchor: &mut usize) {
+    if let Some((draft, caret)) = edit.draft_caret_mut() {
+        *draft = snap.draft.clone();
+        let mut at = snap.caret.min(draft.len());
+        if at > 0 && !draft.is_char_boundary(at) {
+            at = draft.len();
+        }
+        *caret = at;
+    }
+    *anchor = snap.anchor.min(snap.draft.len());
+}
+
+const WIDGET_UNDO_LIMIT: usize = 64;
+
+fn push_widget_history(
+    edit: &WidgetEdit,
+    anchor: usize,
+    undo: &mut Vec<WidgetDraftSnap>,
+    redo: &mut Vec<WidgetDraftSnap>,
+) {
+    let Some(snap) = widget_snap(edit, anchor) else {
+        return;
+    };
+    if undo.len() >= WIDGET_UNDO_LIMIT {
+        undo.remove(0);
+    }
+    undo.push(snap);
+    redo.clear();
+}
+
+fn undo_widget_history(
+    edit: &mut WidgetEdit,
+    anchor: &mut usize,
+    undo: &mut Vec<WidgetDraftSnap>,
+    redo: &mut Vec<WidgetDraftSnap>,
+) -> bool {
+    let Some(prev) = undo.pop() else {
+        return false;
+    };
+    if let Some(current) = widget_snap(edit, *anchor) {
+        redo.push(current);
+    }
+    apply_widget_snap(edit, &prev, anchor);
+    true
+}
+
+fn redo_widget_history(
+    edit: &mut WidgetEdit,
+    anchor: &mut usize,
+    undo: &mut Vec<WidgetDraftSnap>,
+    redo: &mut Vec<WidgetDraftSnap>,
+) -> bool {
+    let Some(next) = redo.pop() else {
+        return false;
+    };
+    if let Some(current) = widget_snap(edit, *anchor) {
+        if undo.len() >= WIDGET_UNDO_LIMIT {
+            undo.remove(0);
+        }
+        undo.push(current);
+    }
+    apply_widget_snap(edit, &next, anchor);
+    true
+}
+
+/// Byte offset on the previous/next `\n` line, same character column.
+fn vertical_in_draft(draft: &str, at: usize, down: bool) -> usize {
+    let mut at = at.min(draft.len());
+    if at > 0 && !draft.is_char_boundary(at) {
+        at = draft
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|i| *i <= at)
+            .last()
+            .unwrap_or(0);
+    }
+    let line_start = draft[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col = draft[line_start..at].chars().count();
+    let (dest_start, dest_end) = if down {
+        let line_end = draft[at..]
+            .find('\n')
+            .map(|i| at + i)
+            .unwrap_or(draft.len());
+        if line_end >= draft.len() {
+            return at;
+        }
+        let next_start = line_end + 1;
+        let next_end = draft[next_start..]
+            .find('\n')
+            .map(|i| next_start + i)
+            .unwrap_or(draft.len());
+        (next_start, next_end)
+    } else if line_start == 0 {
+        return at;
+    } else {
+        let prev_end = line_start - 1;
+        let prev_start = draft[..prev_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        (prev_start, prev_end)
+    };
+    let line = &draft[dest_start..dest_end];
+    for (n, (i, _)) in line.char_indices().enumerate() {
+        if n == col {
+            return dest_start + i;
+        }
+    }
+    dest_end
+}
+
+/// Byte offset of the previous char boundary (or the preceding boundary when
+/// `at` is already inside a multi-byte char).
+fn prev_char_boundary(draft: &str, at: usize) -> usize {
+    let at = at.min(draft.len());
+    if at == 0 {
+        return 0;
+    }
+    if draft.is_char_boundary(at) {
+        draft[..at]
+            .chars()
+            .next_back()
+            .map(|c| at - c.len_utf8())
+            .unwrap_or(0)
+    } else {
+        draft
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|i| *i < at)
+            .last()
+            .unwrap_or(0)
+    }
+}
+
+/// Byte offset of the next char boundary (or the following boundary when
+/// `at` is already inside a multi-byte char).
+fn next_char_boundary(draft: &str, at: usize) -> usize {
+    let at = at.min(draft.len());
+    if at >= draft.len() {
+        return draft.len();
+    }
+    if draft.is_char_boundary(at) {
+        draft[at..]
+            .chars()
+            .next()
+            .map(|c| at + c.len_utf8())
+            .unwrap_or(at)
+    } else {
+        draft
+            .char_indices()
+            .map(|(i, _)| i)
+            .skip_while(|i| *i <= at)
+            .next()
+            .unwrap_or(draft.len())
+    }
+}
+
+/// Move or extend the overlay caret. Returns false when no overlay is
+/// focused so the body caret can run. The body selection is never touched.
+fn move_in_widget(
+    edit: &mut WidgetEdit,
+    anchor: &mut usize,
+    movement: CaretMove,
+    extend: bool,
+) -> bool {
+    if matches!(edit, WidgetEdit::Idle) {
+        return false;
+    }
+    let Some((draft, caret)) = edit.draft_caret_mut() else {
+        return false;
+    };
+    let has_sel = *caret != *anchor;
+    let at = (*caret).min(draft.len());
+    let target = match movement {
+        CaretMove::Left => {
+            if !extend && has_sel {
+                at.min(*anchor)
+            } else {
+                prev_char_boundary(draft, at)
+            }
+        }
+        CaretMove::Right => {
+            if !extend && has_sel {
+                at.max(*anchor)
+            } else {
+                next_char_boundary(draft, at)
+            }
+        }
+        CaretMove::Home => draft[..at].rfind('\n').map(|i| i + 1).unwrap_or(0),
+        CaretMove::End => draft[at..]
+            .find('\n')
+            .map(|i| at + i)
+            .unwrap_or(draft.len()),
+        CaretMove::Up => vertical_in_draft(draft, at, false),
+        CaretMove::Down => vertical_in_draft(draft, at, true),
+        CaretMove::Vertical { delta_lines } => {
+            let mut pos = at;
+            if delta_lines > 0 {
+                for _ in 0..delta_lines {
+                    pos = vertical_in_draft(draft, pos, true);
+                }
+            } else {
+                for _ in 0..delta_lines.unsigned_abs() {
+                    pos = vertical_in_draft(draft, pos, false);
+                }
+            }
+            pos
+        }
+    };
+    *caret = target.min(draft.len());
+    if !extend {
+        *anchor = *caret;
+    }
+    true
+}
+
+fn wrap_kind_from_rich(command: &RichCommand) -> Option<WrapKind> {
+    match command {
+        RichCommand::ToggleMark(mark) if *mark == MarkSet::BOLD => Some(WrapKind::Bold),
+        RichCommand::ToggleMark(mark) if *mark == MarkSet::ITALIC => Some(WrapKind::Italic),
+        RichCommand::ToggleMark(mark) if *mark == MarkSet::CODE => Some(WrapKind::Code),
+        RichCommand::ToggleLink => Some(WrapKind::Link),
+        _ => None,
+    }
+}
+
+/// Keep `anchor` and move the caret to `target` (Shift-arrows / Shift-Home).
+fn extend_selection_range(
+    selected: Range<usize>,
+    reversed: bool,
+    target: usize,
+) -> (Range<usize>, bool) {
+    let anchor = if reversed {
+        selected.end
+    } else {
+        selected.start
+    };
+    if target < anchor {
+        (target..anchor, true)
+    } else {
+        (anchor..target, false)
     }
 }
 
@@ -80,11 +549,15 @@ pub struct RichEditorView {
     marked_range: Option<Range<usize>>,
     preedit: Option<String>,
     is_selecting: bool,
+    widget_selecting: bool,
+    widget_anchor: usize,
     cursor_visible: bool,
     focus_handle: FocusHandle,
     ime: ImeOriginState,
     widget_edit: WidgetEdit,
     widget_preedit: Option<String>,
+    widget_undo: Vec<WidgetDraftSnap>,
+    widget_redo: Vec<WidgetDraftSnap>,
     remote_pending: HashSet<String>,
     remote_failed: HashSet<String>,
     _blink_task: Task<()>,
@@ -120,11 +593,15 @@ impl RichEditorView {
             marked_range: None,
             preedit: None,
             is_selecting: false,
+            widget_selecting: false,
+            widget_anchor: 0,
             cursor_visible: true,
             focus_handle,
             ime: ImeOriginState::default(),
             widget_edit: WidgetEdit::Idle,
             widget_preedit: None,
+            widget_undo: Vec::new(),
+            widget_redo: Vec::new(),
             remote_pending: HashSet::new(),
             remote_failed: HashSet::new(),
             _blink_task: Task::ready(()),
@@ -173,6 +650,8 @@ impl RichEditorView {
             if self.widget_insert(text, cx) {
                 return RichOutcome::Changed;
             }
+        } else if let Some(outcome) = self.widget_try_wrap(&command, cx) {
+            return outcome;
         } else {
             self.commit_widget_edit(cx);
         }
@@ -218,14 +697,28 @@ impl RichEditorView {
                 }
             }
             EditorCommand::Delete => {
-                if self.apply_rich(RichCommand::Delete, cx) == RichOutcome::Noop {
+                if self.widget_delete(cx) {
+                    EditorOutcome::Changed
+                } else if self.apply_rich(RichCommand::Delete, cx) == RichOutcome::Noop {
                     EditorOutcome::Noop
                 } else {
                     EditorOutcome::Changed
                 }
             }
-            EditorCommand::Undo => self.undo(cx),
-            EditorCommand::Redo => self.redo(cx),
+            EditorCommand::Undo => {
+                if widget_owns_caret(&self.widget_edit) {
+                    self.undo_widget(cx)
+                } else {
+                    self.undo(cx)
+                }
+            }
+            EditorCommand::Redo => {
+                if widget_owns_caret(&self.widget_edit) {
+                    self.redo_widget(cx)
+                } else {
+                    self.redo(cx)
+                }
+            }
             EditorCommand::JumpTo(offset) => {
                 self.move_to(offset, false, cx);
                 EditorOutcome::CaretMoved
@@ -238,63 +731,120 @@ impl RichEditorView {
                 EditorOutcome::CaretMoved
             }
             EditorCommand::SelectAll => {
-                let len = self.document.read(cx).buffer.len_bytes();
-                self.selected_range = 0..len;
-                self.selection_reversed = false;
-                cx.notify();
-                EditorOutcome::CaretMoved
+                if select_all_in_widget(&mut self.widget_edit, &mut self.widget_anchor) {
+                    self.reset_blink(cx);
+                    self.snapshot = None;
+                    cx.notify();
+                    EditorOutcome::CaretMoved
+                } else {
+                    let len = self.document.read(cx).buffer.len_bytes();
+                    self.selected_range = 0..len;
+                    self.selection_reversed = false;
+                    cx.notify();
+                    EditorOutcome::CaretMoved
+                }
             }
             EditorCommand::Move(movement) => {
-                self.move_caret(movement, false, cx);
-                EditorOutcome::CaretMoved
+                if move_in_widget(
+                    &mut self.widget_edit,
+                    &mut self.widget_anchor,
+                    movement,
+                    false,
+                ) {
+                    self.reset_blink(cx);
+                    self.snapshot = None;
+                    cx.notify();
+                    EditorOutcome::CaretMoved
+                } else {
+                    self.move_caret(movement, false, cx);
+                    EditorOutcome::CaretMoved
+                }
             }
             EditorCommand::Select(movement) => {
-                self.move_caret(movement, true, cx);
-                EditorOutcome::CaretMoved
+                if move_in_widget(
+                    &mut self.widget_edit,
+                    &mut self.widget_anchor,
+                    movement,
+                    true,
+                ) {
+                    self.reset_blink(cx);
+                    self.snapshot = None;
+                    cx.notify();
+                    EditorOutcome::CaretMoved
+                } else {
+                    self.move_caret(movement, true, cx);
+                    EditorOutcome::CaretMoved
+                }
             }
             EditorCommand::Wrap(kind) => {
-                let cmd = match kind {
-                    crate::wrap::WrapKind::Bold => RichCommand::ToggleMark(MarkSet::BOLD),
-                    crate::wrap::WrapKind::Italic => RichCommand::ToggleMark(MarkSet::ITALIC),
-                    crate::wrap::WrapKind::Code => RichCommand::ToggleMark(MarkSet::CODE),
-                    crate::wrap::WrapKind::Link => RichCommand::ToggleLink,
-                };
-                if self.apply_rich(cmd, cx) == RichOutcome::Noop {
-                    EditorOutcome::Noop
-                } else {
-                    EditorOutcome::Changed
+                if widget_wraps_draft(&self.widget_edit) {
+                    self.record_widget_edit();
+                }
+                match apply_wrap_to_widget(&mut self.widget_edit, kind) {
+                    WidgetWrapResult::NotFocused => {
+                        let cmd = match kind {
+                            WrapKind::Bold => RichCommand::ToggleMark(MarkSet::BOLD),
+                            WrapKind::Italic => RichCommand::ToggleMark(MarkSet::ITALIC),
+                            WrapKind::Code => RichCommand::ToggleMark(MarkSet::CODE),
+                            WrapKind::Link => RichCommand::ToggleLink,
+                        };
+                        if self.apply_rich(cmd, cx) == RichOutcome::Noop {
+                            EditorOutcome::Noop
+                        } else {
+                            EditorOutcome::Changed
+                        }
+                    }
+                    WidgetWrapResult::Ignored => EditorOutcome::Noop,
+                    WidgetWrapResult::Applied => {
+                        self.widget_preedit = None;
+                        self.widget_anchor = self.widget_edit.caret();
+                        self.snapshot = None;
+                        cx.notify();
+                        EditorOutcome::Changed
+                    }
                 }
             }
             EditorCommand::Indent => {
-                self.engine.sync(self.document.read(cx));
-                if self.engine.in_table(self.cursor_offset()) {
-                    if self.apply_rich(RichCommand::TableTab { reverse: false }, cx)
-                        == RichOutcome::Noop
-                    {
+                // Widget overlays own Tab: commit, do not indent the body.
+                if widget_owns_tab(&self.widget_edit) {
+                    self.commit_widget_edit(cx);
+                    EditorOutcome::Changed
+                } else {
+                    self.engine.sync(self.document.read(cx));
+                    if self.engine.in_table(self.cursor_offset()) {
+                        if self.apply_rich(RichCommand::TableTab { reverse: false }, cx)
+                            == RichOutcome::Noop
+                        {
+                            EditorOutcome::Noop
+                        } else {
+                            EditorOutcome::Changed
+                        }
+                    } else if self.apply_rich(RichCommand::IndentList, cx) == RichOutcome::Noop {
                         EditorOutcome::Noop
                     } else {
                         EditorOutcome::Changed
                     }
-                } else if self.apply_rich(RichCommand::IndentList, cx) == RichOutcome::Noop {
-                    EditorOutcome::Noop
-                } else {
-                    EditorOutcome::Changed
                 }
             }
             EditorCommand::Outdent => {
-                self.engine.sync(self.document.read(cx));
-                if self.engine.in_table(self.cursor_offset()) {
-                    if self.apply_rich(RichCommand::TableTab { reverse: true }, cx)
-                        == RichOutcome::Noop
-                    {
+                if widget_owns_tab(&self.widget_edit) {
+                    self.commit_widget_edit(cx);
+                    EditorOutcome::Changed
+                } else {
+                    self.engine.sync(self.document.read(cx));
+                    if self.engine.in_table(self.cursor_offset()) {
+                        if self.apply_rich(RichCommand::TableTab { reverse: true }, cx)
+                            == RichOutcome::Noop
+                        {
+                            EditorOutcome::Noop
+                        } else {
+                            EditorOutcome::Changed
+                        }
+                    } else if self.apply_rich(RichCommand::OutdentList, cx) == RichOutcome::Noop {
                         EditorOutcome::Noop
                     } else {
                         EditorOutcome::Changed
                     }
-                } else if self.apply_rich(RichCommand::OutdentList, cx) == RichOutcome::Noop {
-                    EditorOutcome::Noop
-                } else {
-                    EditorOutcome::Changed
                 }
             }
         }
@@ -342,7 +892,65 @@ impl RichEditorView {
         }
     }
 
+    fn undo_widget(&mut self, cx: &mut Context<Self>) -> EditorOutcome {
+        if undo_widget_history(
+            &mut self.widget_edit,
+            &mut self.widget_anchor,
+            &mut self.widget_undo,
+            &mut self.widget_redo,
+        ) {
+            self.widget_preedit = None;
+            self.reset_blink(cx);
+            self.snapshot = None;
+            cx.notify();
+            EditorOutcome::Changed
+        } else {
+            EditorOutcome::Noop
+        }
+    }
+
+    fn redo_widget(&mut self, cx: &mut Context<Self>) -> EditorOutcome {
+        if redo_widget_history(
+            &mut self.widget_edit,
+            &mut self.widget_anchor,
+            &mut self.widget_undo,
+            &mut self.widget_redo,
+        ) {
+            self.widget_preedit = None;
+            self.reset_blink(cx);
+            self.snapshot = None;
+            cx.notify();
+            EditorOutcome::Changed
+        } else {
+            EditorOutcome::Noop
+        }
+    }
+
+    fn record_widget_edit(&mut self) {
+        push_widget_history(
+            &self.widget_edit,
+            self.widget_anchor,
+            &mut self.widget_undo,
+            &mut self.widget_redo,
+        );
+    }
+
+    fn clear_widget_history(&mut self) {
+        self.widget_undo.clear();
+        self.widget_redo.clear();
+    }
+
     fn move_to(&mut self, offset: usize, extend: bool, cx: &mut Context<Self>) {
+        // While an overlay is editing, keep jumps inside the draft.
+        if !matches!(self.widget_edit, WidgetEdit::Idle) {
+            self.widget_edit.set_caret(offset);
+            if !extend {
+                self.widget_anchor = self.widget_edit.caret();
+            }
+            self.reset_blink(cx);
+            cx.notify();
+            return;
+        }
         let len = self.document.read(cx).buffer.len_bytes();
         let source = self.document.read(cx).buffer.content();
         self.engine.sync(self.document.read(cx));
@@ -494,14 +1102,13 @@ impl RichEditorView {
             theme: self.theme.clone(),
             base_dir,
             editing_code: match &self.widget_edit {
-                WidgetEdit::CodeInfo { id, draft } => Some((*id, draft.clone())),
+                WidgetEdit::CodeInfo { id, draft, .. } => Some((*id, draft.clone())),
                 _ => None,
             },
             editing_image: match &self.widget_edit {
-                WidgetEdit::ImageAlt { range, draft } => Some((range.clone(), draft.clone())),
+                WidgetEdit::ImageAlt { range, draft, .. } => Some((range.clone(), draft.clone())),
                 _ => None,
             },
-            widget_preedit: self.widget_preedit.clone(),
             caret,
             selected_range,
         });
@@ -550,6 +1157,40 @@ impl RichEditorView {
         super::ime::offset_to_utf16(content, offset)
     }
 
+    fn widget_try_wrap(
+        &mut self,
+        command: &RichCommand,
+        cx: &mut Context<Self>,
+    ) -> Option<RichOutcome> {
+        if !widget_owns_wrap(&self.widget_edit) {
+            return None;
+        }
+        if !matches!(
+            command,
+            RichCommand::ToggleMark(_) | RichCommand::ToggleLink
+        ) {
+            return None;
+        }
+        let Some(kind) = wrap_kind_from_rich(command) else {
+            // Other marks (strike, …): consume so the body is not rewritten.
+            return Some(RichOutcome::Noop);
+        };
+        if widget_wraps_draft(&self.widget_edit) {
+            self.record_widget_edit();
+        }
+        match apply_wrap_to_widget(&mut self.widget_edit, kind) {
+            WidgetWrapResult::NotFocused => None,
+            WidgetWrapResult::Ignored => Some(RichOutcome::Noop),
+            WidgetWrapResult::Applied => {
+                self.widget_preedit = None;
+                self.widget_anchor = self.widget_edit.caret();
+                self.snapshot = None;
+                cx.notify();
+                Some(RichOutcome::Changed)
+            }
+        }
+    }
+
     fn widget_insert(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         if matches!(self.widget_edit, WidgetEdit::Idle) {
             return false;
@@ -558,10 +1199,9 @@ impl RichEditorView {
             self.commit_widget_edit(cx);
             return true;
         }
+        self.record_widget_edit();
         self.widget_preedit = None;
-        if let Some(draft) = self.widget_edit.draft_mut() {
-            draft.push_str(text);
-        }
+        insert_into_widget(&mut self.widget_edit, &mut self.widget_anchor, text);
         self.snapshot = None;
         cx.notify();
         true
@@ -571,10 +1211,33 @@ impl RichEditorView {
         if matches!(self.widget_edit, WidgetEdit::Idle) {
             return false;
         }
-        self.widget_preedit = None;
-        if let Some(draft) = self.widget_edit.draft_mut() {
-            draft.pop();
+        if let Some(snap) = widget_snap(&self.widget_edit, self.widget_anchor) {
+            let range = widget_range(snap.caret, snap.anchor, snap.draft.len());
+            if range.start == range.end && range.start == 0 {
+                return true;
+            }
         }
+        self.record_widget_edit();
+        self.widget_preedit = None;
+        delete_before_in_widget(&mut self.widget_edit, &mut self.widget_anchor);
+        self.snapshot = None;
+        cx.notify();
+        true
+    }
+
+    fn widget_delete(&mut self, cx: &mut Context<Self>) -> bool {
+        if !widget_owns_caret(&self.widget_edit) {
+            return false;
+        }
+        if let Some(snap) = widget_snap(&self.widget_edit, self.widget_anchor) {
+            let range = widget_range(snap.caret, snap.anchor, snap.draft.len());
+            if range.start == range.end && range.end == snap.draft.len() {
+                return true;
+            }
+        }
+        self.record_widget_edit();
+        self.widget_preedit = None;
+        delete_after_in_widget(&mut self.widget_edit, &mut self.widget_anchor);
         self.snapshot = None;
         cx.notify();
         true
@@ -590,7 +1253,7 @@ impl RichEditorView {
             WidgetEdit::CodeInfo { draft, .. }
             | WidgetEdit::ImageAlt { draft, .. }
             | WidgetEdit::Frontmatter { draft, .. }
-            | WidgetEdit::FrontmatterYaml { draft } => draft.clone(),
+            | WidgetEdit::FrontmatterYaml { draft, .. } => draft.clone(),
         };
         Some((draft, self.widget_preedit.clone()))
     }
@@ -601,6 +1264,8 @@ impl RichEditorView {
         }
         self.widget_edit = WidgetEdit::Idle;
         self.widget_preedit = None;
+        self.widget_selecting = false;
+        self.clear_widget_history();
         self.snapshot = None;
         cx.notify();
         true
@@ -608,14 +1273,16 @@ impl RichEditorView {
 
     fn commit_widget_edit(&mut self, cx: &mut Context<Self>) -> bool {
         self.widget_preedit = None;
+        self.widget_selecting = false;
+        self.clear_widget_history();
         let edit = std::mem::take(&mut self.widget_edit);
         match edit {
             WidgetEdit::Idle => false,
-            WidgetEdit::CodeInfo { id, draft } => {
+            WidgetEdit::CodeInfo { id, draft, .. } => {
                 self.apply_rich(RichCommand::SetCodeInfo { id, info: draft }, cx);
                 true
             }
-            WidgetEdit::ImageAlt { range, draft } => {
+            WidgetEdit::ImageAlt { range, draft, .. } => {
                 self.apply_rich(
                     RichCommand::SetImageAlt {
                         source_range: range,
@@ -625,7 +1292,7 @@ impl RichEditorView {
                 );
                 true
             }
-            WidgetEdit::Frontmatter { key, draft } => {
+            WidgetEdit::Frontmatter { key, draft, .. } => {
                 self.apply_rich(
                     RichCommand::SetFrontmatterField {
                         key: key.to_string(),
@@ -635,10 +1302,20 @@ impl RichEditorView {
                 );
                 true
             }
-            WidgetEdit::FrontmatterYaml { draft } => {
+            WidgetEdit::FrontmatterYaml { draft, .. } => {
                 self.apply_rich(RichCommand::SetFrontmatter { raw: draft }, cx);
                 true
             }
+        }
+    }
+
+    /// Enter / Shift-Enter in YAML inserts a draft newline; other overlays commit.
+    /// Returns true when the widget consumed the key (do not run a body command).
+    fn consume_widget_newline(&mut self, cx: &mut Context<Self>) -> bool {
+        if matches!(self.widget_edit, WidgetEdit::FrontmatterYaml { .. }) {
+            self.widget_insert("\n", cx)
+        } else {
+            self.commit_widget_edit(cx)
         }
     }
     /// Click in leftover viewport below the last painted leaf or non-text
@@ -752,7 +1429,10 @@ impl WysiwygHost for RichEditorView {
                 _ => None,
             })
             .unwrap_or_default();
-        self.widget_edit = WidgetEdit::CodeInfo { id, draft };
+        let caret = draft.len();
+        self.widget_edit = WidgetEdit::CodeInfo { id, draft, caret };
+        self.widget_anchor = caret;
+        self.widget_selecting = false;
         self.widget_preedit = None;
         self.snapshot = None;
         cx.notify();
@@ -760,10 +1440,14 @@ impl WysiwygHost for RichEditorView {
 
     fn edit_image_alt(&mut self, source_range: Range<usize>, alt: &str, cx: &mut Context<Self>) {
         self.commit_widget_edit(cx);
+        let caret = alt.len();
         self.widget_edit = WidgetEdit::ImageAlt {
             range: source_range,
             draft: alt.to_string(),
+            caret,
         };
+        self.widget_anchor = caret;
+        self.widget_selecting = false;
         self.widget_preedit = None;
         self.snapshot = None;
         cx.notify();
@@ -771,10 +1455,14 @@ impl WysiwygHost for RichEditorView {
 
     fn edit_frontmatter_field(&mut self, key: &'static str, current: &str, cx: &mut Context<Self>) {
         self.commit_widget_edit(cx);
+        let caret = current.len();
         self.widget_edit = WidgetEdit::Frontmatter {
             key,
             draft: current.to_string(),
+            caret,
         };
+        self.widget_anchor = caret;
+        self.widget_selecting = false;
         self.widget_preedit = None;
         self.snapshot = None;
         cx.notify();
@@ -782,9 +1470,13 @@ impl WysiwygHost for RichEditorView {
 
     fn edit_frontmatter_yaml(&mut self, current: &str, cx: &mut Context<Self>) {
         self.commit_widget_edit(cx);
+        let caret = current.len();
         self.widget_edit = WidgetEdit::FrontmatterYaml {
             draft: current.to_string(),
+            caret,
         };
+        self.widget_anchor = caret;
+        self.widget_selecting = false;
         self.widget_preedit = None;
         self.snapshot = None;
         cx.notify();
@@ -803,6 +1495,77 @@ impl WysiwygHost for RichEditorView {
 
     fn report_widget_bounds(&mut self, bounds: Bounds<Pixels>) {
         self.ime.report_widget(bounds);
+    }
+
+    fn report_widget_caret(&mut self, caret: Bounds<Pixels>) {
+        self.ime.report_widget_caret(caret);
+    }
+
+    fn overlay_preedit(&self) -> Option<&str> {
+        self.widget_preedit.as_deref()
+    }
+
+    fn widget_caret_offset(&self) -> usize {
+        self.widget_edit.caret()
+    }
+
+    fn widget_sel(&self) -> Range<usize> {
+        let c = self.widget_edit.caret();
+        let a = self.widget_anchor.min(c);
+        let b = self.widget_anchor.max(c);
+        a..b
+    }
+
+    fn is_widget_selecting(&self) -> bool {
+        self.widget_selecting
+    }
+
+    fn click_overlay(
+        &mut self,
+        target: OverlayTarget,
+        offset: usize,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window, cx);
+        if !self.widget_edit.matches_overlay(&target) {
+            match &target {
+                OverlayTarget::CodeInfo(id) => self.edit_code_info(*id, cx),
+                OverlayTarget::ImageAlt { range, stored } => {
+                    self.edit_image_alt(range.clone(), stored, cx);
+                }
+                OverlayTarget::Frontmatter { key, stored } => {
+                    self.edit_frontmatter_field(key, stored, cx);
+                }
+                OverlayTarget::FrontmatterYaml { stored } => {
+                    self.edit_frontmatter_yaml(stored, cx);
+                }
+            }
+        }
+        let at = offset;
+        if extend {
+            self.widget_edit.set_caret(at);
+        } else {
+            self.widget_edit.set_caret(at);
+            self.widget_anchor = self.widget_edit.caret();
+        }
+        self.widget_selecting = true;
+        self.snapshot = None;
+        cx.notify();
+    }
+
+    fn drag_overlay(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if !self.widget_selecting {
+            return;
+        }
+        self.widget_edit.set_caret(offset);
+        self.snapshot = None;
+        cx.notify();
+    }
+
+    fn end_overlay_drag(&mut self, _cx: &mut Context<Self>) {
+        self.widget_selecting = false;
     }
 
     fn preedit(&self) -> Option<&str> {
@@ -1020,14 +1783,13 @@ impl Render for RichEditorView {
         let focus = self.focus_handle.clone();
         let fm_info = markrust_core::parse_frontmatter(&snapshot.source);
         let editing_fm = match &self.widget_edit {
-            WidgetEdit::Frontmatter { key, draft } => Some((*key, draft.clone())),
+            WidgetEdit::Frontmatter { key, draft, .. } => Some((*key, draft.clone())),
             _ => None,
         };
         let editing_yaml = match &self.widget_edit {
-            WidgetEdit::FrontmatterYaml { draft } => Some(draft.clone()),
+            WidgetEdit::FrontmatterYaml { draft, .. } => Some(draft.clone()),
             _ => None,
         };
-        let widget_preedit = self.widget_preedit.clone();
         let in_table = self.engine.table_pos(self.cursor_offset()).is_some();
         div()
             .size_full()
@@ -1137,9 +1899,7 @@ impl Render for RichEditorView {
                 let editor = editor.clone();
                 move |_: &crate::editor::Enter, _, cx| {
                     editor.update(cx, |e, cx| {
-                        if matches!(e.widget_edit, WidgetEdit::FrontmatterYaml { .. }) {
-                            let _ = e.widget_insert("\n", cx);
-                        } else if !e.commit_widget_edit(cx) {
+                        if !e.consume_widget_newline(cx) {
                             e.apply_rich(RichCommand::SplitBlock, cx);
                         }
                     });
@@ -1189,7 +1949,7 @@ impl Render for RichEditorView {
                 let editor = editor.clone();
                 move |_: &crate::editor::Indent, _, cx| {
                     editor.update(cx, |e, cx| {
-                        e.apply_rich(RichCommand::IndentList, cx);
+                        e.apply_editor_command(EditorCommand::Indent, cx);
                     });
                 }
             })
@@ -1197,7 +1957,7 @@ impl Render for RichEditorView {
                 let editor = editor.clone();
                 move |_: &crate::editor::Outdent, _, cx| {
                     editor.update(cx, |e, cx| {
-                        e.apply_rich(RichCommand::OutdentList, cx);
+                        e.apply_editor_command(EditorCommand::Outdent, cx);
                     });
                 }
             })
@@ -1208,7 +1968,6 @@ impl Render for RichEditorView {
                     &info,
                     editing_fm.as_ref().map(|(k, d)| (*k, d.as_str())),
                     editing_yaml.as_deref(),
-                    widget_preedit.as_deref(),
                 )
             }))
             .when(in_table, |root| {
@@ -1304,12 +2063,10 @@ fn frontmatter_panel(
     info: &markrust_core::FrontmatterInfo,
     editing_fm: Option<(&'static str, &str)>,
     editing_yaml: Option<&str>,
-    widget_preedit: Option<&str>,
 ) -> gpui::AnyElement {
-    let pre = widget_preedit.unwrap_or("");
     let field = |key: &'static str, placeholder: &str, stored: Option<&str>| -> String {
         match editing_fm {
-            Some((k, draft)) if k == key => format!("{draft}{pre}|"),
+            Some((k, draft)) if k == key => draft.to_string(),
             _ => stored
                 .filter(|s| !s.is_empty())
                 .unwrap_or(placeholder)
@@ -1325,7 +2082,7 @@ fn frontmatter_panel(
     let tags_value = field("tags", "Add tags", info.tags.as_deref());
     let yaml_editing = editing_yaml.is_some();
     let yaml_value = match editing_yaml {
-        Some(draft) => format!("{draft}{pre}|"),
+        Some(draft) => draft.to_string(),
         None => {
             let body = info.yaml_body.trim();
             if body.is_empty() {
@@ -1424,32 +2181,36 @@ fn frontmatter_field_row(field: FmField<'_>) -> gpui::AnyElement {
         editing,
         color,
     } = field;
-    let editor_click = editor.clone();
-    let row = div()
-        .id(id)
-        .text_sm()
-        .text_color(color)
-        .cursor(CursorStyle::PointingHand)
-        .when(editing, |el| el.border_b_1().border_color(theme.accent))
-        .child(SharedString::from(format!("{label}: {display}")))
-        .on_click(move |_, _, cx| {
-            editor_click.update(cx, |host, cx| {
-                host.edit_frontmatter_field(key, &current, cx);
-            });
-        });
+    let editor_away = editor.clone();
+    let font_size = theme.font_size * 0.875;
+    let line_height = theme.line_height_for_font_size(font_size);
     div()
+        .id(id)
         .relative()
-        .child(row)
+        .cursor(CursorStyle::PointingHand)
         .when(editing, |el| {
-            el.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .child(WidgetImeSink { editor }),
-            )
+            el.border_b_1()
+                .border_color(theme.accent)
+                .on_mouse_down_out(move |_, _, cx| {
+                    editor_away.update(cx, |host, cx| host.finish_widget(cx));
+                })
+        })
+        .child(WidgetOverlay {
+            editor,
+            prefix: format!("{label}: "),
+            text: display,
+            editing,
+            font_size,
+            line_height,
+            theme: theme.clone(),
+            color,
+            italic: false,
+            monospace: false,
+            hug_width: false,
+            target: OverlayTarget::Frontmatter {
+                key,
+                stored: current,
+            },
         })
         .into_any_element()
 }
@@ -1461,22 +2222,21 @@ fn frontmatter_yaml_row(
     current: String,
     editing: bool,
 ) -> gpui::AnyElement {
-    let editor_click = editor.clone();
-    let lines: Vec<gpui::AnyElement> = display
-        .lines()
-        .map(|line| {
-            div()
-                .child(SharedString::from(line.to_string()))
-                .into_any_element()
-        })
-        .collect();
-    let block = div()
+    let editor_away = editor.clone();
+    let font_size = theme.font_size * 0.75;
+    let line_height = theme.line_height_for_font_size(font_size);
+    div()
         .id("fm-yaml")
-        .text_xs()
-        .font_family(theme.code_font_family.clone())
-        .text_color(theme.frontmatter_text)
+        .relative()
+        .mt(px(4.))
         .cursor(CursorStyle::PointingHand)
-        .when(editing, |el| el.border_b_1().border_color(theme.accent))
+        .when(editing, |el| {
+            el.border_b_1()
+                .border_color(theme.accent)
+                .on_mouse_down_out(move |_, _, cx| {
+                    editor_away.update(cx, |host, cx| host.finish_widget(cx));
+                })
+        })
         .child(
             div()
                 .text_xs()
@@ -1484,26 +2244,19 @@ fn frontmatter_yaml_row(
                 .font_family(theme.font_family.clone())
                 .child("YAML"),
         )
-        .children(lines)
-        .on_click(move |_, _, cx| {
-            editor_click.update(cx, |host, cx| {
-                host.edit_frontmatter_yaml(&current, cx);
-            });
-        });
-    div()
-        .relative()
-        .mt(px(4.))
-        .child(block)
-        .when(editing, |el| {
-            el.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .child(WidgetImeSink { editor }),
-            )
+        .child(WidgetOverlay {
+            editor,
+            prefix: String::new(),
+            text: display,
+            editing,
+            font_size,
+            line_height,
+            theme: theme.clone(),
+            color: theme.frontmatter_text,
+            italic: false,
+            monospace: true,
+            hug_width: false,
+            target: OverlayTarget::FrontmatterYaml { stored: current },
         })
         .into_any_element()
 }

@@ -56,6 +56,9 @@ pub struct ImeLeafHit {
 pub struct ImeOriginState {
     widget_focused: bool,
     widget_bounds: Option<Bounds<Pixels>>,
+    /// Inner `|` / caret quad inside the overlay. Prefer this over the
+    /// trailing overlay edge so a mid-draft caret is not the widget's right.
+    widget_caret: Option<Bounds<Pixels>>,
     caret_source: usize,
     leaves: Vec<ImeLeafHit>,
     /// Non-text painted surfaces (standalone images, thematic rules) so a
@@ -76,6 +79,7 @@ impl ImeOriginState {
         self.widget_focused = widget_focused;
         self.caret_source = caret_source;
         self.widget_bounds = None;
+        self.widget_caret = None;
         self.leaves.clear();
         self.painted_bounds.clear();
     }
@@ -86,6 +90,10 @@ impl ImeOriginState {
 
     pub fn report_widget(&mut self, bounds: Bounds<Pixels>) {
         self.widget_bounds = Some(bounds);
+    }
+
+    pub fn report_widget_caret(&mut self, caret: Bounds<Pixels>) {
+        self.widget_caret = Some(caret);
     }
 
     pub fn report_leaf(&mut self, leaf: ImeLeafHit) {
@@ -1143,6 +1151,7 @@ mod tests {
         widget_draft: Option<String>,
         widget_preedit: Option<String>,
         widget_bounds: Option<Bounds<Pixels>>,
+        widget_caret: Option<Bounds<Pixels>>,
         ime: ImeOriginState,
     }
 
@@ -1161,6 +1170,7 @@ mod tests {
                 widget_draft: None,
                 widget_preedit: None,
                 widget_bounds: None,
+                widget_caret: None,
                 ime: ImeOriginState::default(),
             }
         }
@@ -1296,6 +1306,11 @@ mod tests {
             self.widget_draft = Some(draft.to_string());
             self.widget_preedit = None;
             self.widget_bounds = Some(bounds);
+        }
+
+        fn report_widget_caret(&mut self, caret: Bounds<Pixels>) {
+            self.widget_caret = Some(caret);
+            self.ime.report_widget_caret(caret);
         }
 
         fn jump_to(&mut self, caret: usize) {

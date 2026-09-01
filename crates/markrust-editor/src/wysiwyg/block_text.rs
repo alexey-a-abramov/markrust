@@ -17,6 +17,34 @@ use markrust_core::rich::{import_markdown, Block, BreakStyle, IdGen, Inline, Mar
 
 use crate::theme::EditorTheme;
 
+/// Which chip / caption / frontmatter overlay a click should focus.
+#[derive(Debug, Clone)]
+pub enum OverlayTarget {
+    CodeInfo(NodeId),
+    ImageAlt { range: Range<usize>, stored: String },
+    Frontmatter { key: &'static str, stored: String },
+    FrontmatterYaml { stored: String },
+}
+
+/// Map a shaped-text visible index onto the overlay draft.
+pub fn overlay_draft_offset(
+    prefix_len: usize,
+    vis: usize,
+    draft_len: usize,
+    caret: usize,
+    preedit_len: usize,
+) -> usize {
+    let vis = vis.saturating_sub(prefix_len);
+    let caret = caret.min(draft_len);
+    if vis <= caret {
+        vis.min(draft_len)
+    } else if vis <= caret + preedit_len {
+        caret
+    } else {
+        vis.saturating_sub(preedit_len).min(draft_len)
+    }
+}
+
 /// Host implemented by [`super::view::RichEditorView`].
 pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     fn click_source(
@@ -43,6 +71,21 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     fn open_table_menu(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>);
     fn finish_widget(&mut self, cx: &mut Context<Self>);
     fn preedit(&self) -> Option<&str>;
+    fn overlay_preedit(&self) -> Option<&str>;
+    fn widget_caret_offset(&self) -> usize;
+    fn widget_sel(&self) -> Range<usize>;
+    fn is_widget_selecting(&self) -> bool;
+    fn click_overlay(
+        &mut self,
+        target: OverlayTarget,
+        offset: usize,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn drag_overlay(&mut self, offset: usize, cx: &mut Context<Self>);
+    fn end_overlay_drag(&mut self, cx: &mut Context<Self>);
+    fn report_widget_caret(&mut self, caret: Bounds<Pixels>);
     fn report_widget_bounds(&mut self, bounds: Bounds<Pixels>);
     fn report_leaf(
         &mut self,
@@ -1482,6 +1525,362 @@ fn paint_carets(
         y += h;
     }
     (selection, cursor, caret_bounds)
+}
+
+/// Overlay text for a language chip, image caption, or frontmatter field.
+///
+/// Shapes the draft (body-quality hit-test), paints an inner caret, and
+/// reports that caret as the IME origin. Clicks do not move the body caret.
+pub struct WidgetOverlay<H: WysiwygHost> {
+    pub editor: Entity<H>,
+    pub prefix: String,
+    pub text: String,
+    pub editing: bool,
+    pub font_size: f32,
+    pub line_height: f32,
+    pub theme: EditorTheme,
+    pub color: gpui::Hsla,
+    pub italic: bool,
+    pub monospace: bool,
+    pub hug_width: bool,
+    pub target: OverlayTarget,
+}
+
+pub struct OverlayPrepaint {
+    lines: Vec<WrappedLine>,
+    display: String,
+    cursor: Option<PaintQuad>,
+    selection: Option<PaintQuad>,
+}
+
+impl<H: WysiwygHost> IntoElement for WidgetOverlay<H> {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl<H: WysiwygHost> Element for WidgetOverlay<H> {
+    type RequestLayoutState = ();
+    type PrepaintState = OverlayPrepaint;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let wrap = (window.viewport_size().width - px(80.)).max(px(120.));
+        let mut style = Style::default();
+        let (display, _) = self.display_and_caret(cx);
+        let layout = overlay_leaf_layout(&display, self.text_style(), self.italic);
+        let width = if self.hug_width {
+            let lines = shape_layout(
+                &layout,
+                window,
+                px(100_000.),
+                self.font_size,
+                self.line_height,
+                &self.theme,
+            );
+            lines
+                .iter()
+                .map(|l| l.width())
+                .fold(px(0.), |a, b| a.max(b))
+                .min(wrap)
+                .max(px(1.))
+        } else {
+            wrap
+        };
+        let lines = shape_layout(
+            &layout,
+            window,
+            width,
+            self.font_size,
+            self.line_height,
+            &self.theme,
+        );
+        let lh = px(self.line_height);
+        let height = lines
+            .iter()
+            .map(|l| l.size(lh).height.max(lh))
+            .fold(px(0.), |a, b| a + b)
+            .max(lh);
+        if self.hug_width {
+            style.size.width = width.into();
+            style.flex_shrink = 0.;
+        } else {
+            style.size.width = relative(1.).into();
+        }
+        style.size.height = height.into();
+        style.min_size.height = lh.into();
+        (window.request_layout(style, Vec::new(), cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let (display, vis_caret) = self.display_and_caret(cx);
+        let vis_sel = self.display_sel(cx, display.len());
+        let show_sel = self.editing && vis_sel.start != vis_sel.end;
+        let layout = overlay_leaf_layout(&display, self.text_style(), self.italic);
+        let lines = shape_layout(
+            &layout,
+            window,
+            bounds.size.width,
+            self.font_size,
+            self.line_height,
+            &self.theme,
+        );
+        let focused = self.editor.read(cx).focused(window);
+        let caret_visible = self.editor.read(cx).caret_visible();
+        let (selection, cursor, caret_bounds) = paint_carets(
+            &lines,
+            bounds,
+            px(self.line_height),
+            vis_caret,
+            vis_sel,
+            display.len(),
+            self.editing && focused && caret_visible,
+            show_sel,
+            self.theme.caret,
+            self.theme.selection,
+        );
+        self.editor.update(cx, |host, _cx| {
+            host.report_widget_bounds(bounds);
+            if let Some(caret) = caret_bounds {
+                host.report_widget_caret(caret);
+            }
+        });
+        OverlayPrepaint {
+            lines,
+            display,
+            cursor,
+            selection,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self.editing {
+            let focus = self.editor.read(cx).input_focus_handle();
+            window.handle_input(
+                &focus,
+                ElementInputHandler::new(bounds, self.editor.clone()),
+                cx,
+            );
+        }
+
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection);
+        }
+
+        let origin = bounds.origin;
+        let mut y = origin.y;
+        let line_height = px(self.line_height);
+        for line in &prepaint.lines {
+            let _ = line.paint(
+                point(origin.x, y),
+                line_height,
+                gpui::TextAlign::Left,
+                Some(bounds),
+                window,
+                cx,
+            );
+            y += line.size(line_height).height.max(line_height);
+        }
+
+        if let Some(cursor) = prepaint.cursor.take() {
+            window.paint_quad(cursor);
+        }
+
+        if self.editing {
+            self.editor.update(cx, |host, _cx| {
+                host.sync_ime_cursor(window);
+            });
+        }
+
+        let editor = self.editor.clone();
+        let target = self.target.clone();
+        let prefix_len = self.prefix.len();
+        let draft_len = self.text.len();
+        let font_size = self.font_size;
+        let line_height_px = self.line_height;
+        let theme = self.theme.clone();
+        let style = self.text_style();
+        let display = prepaint.display.clone();
+        let preedit_len = self
+            .editor
+            .read(cx)
+            .overlay_preedit()
+            .map(str::len)
+            .unwrap_or(0);
+
+        let italic = self.italic;
+        let vis_caret_draft = self
+            .editor
+            .read(cx)
+            .widget_caret_offset()
+            .min(self.text.len());
+
+        window.on_mouse_event({
+            let editor = editor.clone();
+            let target = target.clone();
+            let theme = theme.clone();
+            let display = display.clone();
+            let style = style.clone();
+            move |event: &MouseDownEvent, phase, window, cx| {
+                if !phase.bubble() || event.button != MouseButton::Left {
+                    return;
+                }
+                if !bounds.contains(&event.position) {
+                    return;
+                }
+                let layout = overlay_leaf_layout(&display, style.clone(), italic);
+                let lines = shape_layout(
+                    &layout,
+                    window,
+                    bounds.size.width,
+                    font_size,
+                    line_height_px,
+                    &theme,
+                );
+                let vis = visible_index_at(&lines, bounds, event.position, px(line_height_px));
+                let offset =
+                    overlay_draft_offset(prefix_len, vis, draft_len, vis_caret_draft, preedit_len);
+                editor.update(cx, |host, cx| {
+                    host.click_overlay(target.clone(), offset, event.modifiers.shift, window, cx);
+                });
+                window.prevent_default();
+            }
+        });
+        window.on_mouse_event({
+            let editor = editor.clone();
+            let theme = theme.clone();
+            let display = display.clone();
+            let style = style.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                if !phase.bubble() {
+                    return;
+                }
+                let selecting = editor.read(cx).is_widget_selecting();
+                if !selecting || !event.pressed_button.is_some_and(|b| b == MouseButton::Left) {
+                    return;
+                }
+                let layout = overlay_leaf_layout(&display, style.clone(), italic);
+                let lines = shape_layout(
+                    &layout,
+                    window,
+                    bounds.size.width,
+                    font_size,
+                    line_height_px,
+                    &theme,
+                );
+                let vis = visible_index_at(&lines, bounds, event.position, px(line_height_px));
+                let offset =
+                    overlay_draft_offset(prefix_len, vis, draft_len, vis_caret_draft, preedit_len);
+                editor.update(cx, |host, cx| host.drag_overlay(offset, cx));
+            }
+        });
+        window.on_mouse_event({
+            move |event: &MouseUpEvent, phase, _, cx| {
+                if phase.bubble() && event.button == MouseButton::Left {
+                    editor.update(cx, |host, cx| host.end_overlay_drag(cx));
+                }
+            }
+        });
+    }
+}
+
+impl<H: WysiwygHost> WidgetOverlay<H> {
+    fn text_style(&self) -> TextStyle {
+        TextStyle {
+            color: self.color,
+            font_family: if self.monospace {
+                self.theme.code_font_family.clone().into()
+            } else {
+                self.theme.font_family.clone().into()
+            },
+            font_size: px(self.font_size).into(),
+            line_height: px(self.line_height).into(),
+            ..Default::default()
+        }
+    }
+
+    fn display_and_caret(&self, cx: &App) -> (String, usize) {
+        let prefix = &self.prefix;
+        if !self.editing {
+            return (format!("{prefix}{}", self.text), prefix.len());
+        }
+        let host = self.editor.read(cx);
+        let caret = host.widget_caret_offset().min(self.text.len());
+        let pre = host.overlay_preedit().unwrap_or("");
+        let mut at = caret;
+        if !self.text.is_char_boundary(at) {
+            at = self.text.len();
+        }
+        let display = format!("{prefix}{}{}{}", &self.text[..at], pre, &self.text[at..]);
+        (display, prefix.len() + at + pre.len())
+    }
+
+    fn display_sel(&self, cx: &App, display_len: usize) -> Range<usize> {
+        if !self.editing {
+            return 0..0;
+        }
+        let host = self.editor.read(cx);
+        let pre_len = host.overlay_preedit().map(str::len).unwrap_or(0);
+        let prefix = self.prefix.len();
+        let sel = host.widget_sel();
+        let start = (prefix + sel.start).min(display_len);
+        let end = (prefix + sel.end + pre_len).min(display_len);
+        start.min(end)..start.max(end)
+    }
+}
+
+fn overlay_leaf_layout(text: &str, style: TextStyle, italic: bool) -> LeafLayout {
+    let display = if text.is_empty() {
+        " ".to_string()
+    } else {
+        text.to_string()
+    };
+    let mut run = style.to_run(display.len());
+    if italic {
+        run.font.style = gpui::FontStyle::Italic;
+    }
+    let mut source_at = Vec::with_capacity(display.len() + 1);
+    for i in 0..=display.len() {
+        source_at.push(i);
+    }
+    LeafLayout {
+        text: display,
+        runs: vec![run],
+        source_at,
+        block_start: 0,
+    }
 }
 
 /// Invisible overlay that reports its layout bounds for IME candidate placement

@@ -22,8 +22,8 @@ use markrust_core::rich::{
 
 use super::block_text::{
     build_blank_gap_layout, build_code_block_layout, build_html_block_layout,
-    build_leaf_layout_inlines, build_leaf_layout_revealed, BlockTextElement, RevealState,
-    WidgetImeSink, WysiwygHost,
+    build_leaf_layout_inlines, build_leaf_layout_revealed, BlockTextElement, OverlayTarget,
+    RevealState, WidgetOverlay, WysiwygHost,
 };
 use super::image::{resolve_image_source, ResolvedImage};
 use super::inline_layout::{
@@ -43,7 +43,6 @@ pub struct RenderSnapshot {
     pub base_dir: Option<PathBuf>,
     pub editing_code: Option<(NodeId, String)>,
     pub editing_image: Option<(Range<usize>, String)>,
-    pub widget_preedit: Option<String>,
     pub caret: usize,
     pub selected_range: Range<usize>,
 }
@@ -142,15 +141,6 @@ fn render_block<H: WysiwygHost>(
                 .editing_code
                 .as_ref()
                 .is_some_and(|(id, _)| *id == block.id);
-            let chip_label = if editing {
-                format!(
-                    "{}{}|",
-                    chip_text,
-                    snap.widget_preedit.as_deref().unwrap_or("")
-                )
-            } else {
-                chip_text
-            };
             let mut code_style = base_text_style(theme, theme.font_size * 0.9, FontWeight::NORMAL);
             code_style.font_family = theme.code_font_family.clone().into();
             let mut layout =
@@ -161,13 +151,11 @@ fn render_block<H: WysiwygHost>(
             }
             let layout = std::sync::Arc::new(layout);
             let line_height = theme.line_height_for_font_size(theme.font_size * 0.9);
-            let chip_id = block.id;
-            let editor_chip = editor.clone();
             let editor_away = editor.clone();
+            let chip_font = 11.0;
+            let chip_lh = theme.line_height_for_font_size(chip_font);
             let chip = div()
                 .id(("code-lang", block.id.0))
-                .text_size(px(11.))
-                .text_color(theme.secondary_text)
                 .px(px(6.))
                 .py(px(2.))
                 .mb(px(4.))
@@ -177,28 +165,25 @@ fn render_block<H: WysiwygHost>(
                     el.bg(theme.code_bg).border_1().border_color(theme.accent)
                 })
                 .when(!editing, |el| el.bg(theme.code_bg.opacity(0.5)))
-                .child(SharedString::from(chip_label))
-                .on_click(move |_, _, cx| {
-                    editor_chip.update(cx, |host, cx| host.edit_code_info(chip_id, cx));
-                })
                 .when(editing, |el| {
                     el.on_mouse_down_out(move |_, _, cx| {
                         editor_away.update(cx, |host, cx| host.finish_widget(cx));
                     })
+                })
+                .child(WidgetOverlay {
+                    editor: editor.clone(),
+                    prefix: String::new(),
+                    text: chip_text,
+                    editing,
+                    font_size: chip_font,
+                    line_height: chip_lh,
+                    theme: theme.clone(),
+                    color: theme.secondary_text,
+                    italic: false,
+                    monospace: true,
+                    hug_width: true,
+                    target: OverlayTarget::CodeInfo(block.id),
                 });
-            let chip = div().relative().child(chip).when(editing, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .child(WidgetImeSink {
-                            editor: editor.clone(),
-                        }),
-                )
-            });
             div()
                 .my(px(4.))
                 .p(px(12.))
@@ -950,7 +935,6 @@ fn render_image<H: WysiwygHost>(
         .editing_image
         .as_ref()
         .is_some_and(|(range, _)| *range == image_range);
-    let editor_cap = editor.clone();
     let editor_away = editor.clone();
     let editor_click = editor.clone();
     let alt_for_edit = alt.to_string();
@@ -1043,51 +1027,37 @@ fn render_image<H: WysiwygHost>(
             .into_any_element()
     };
     let show_caption = role == ImageRole::Block || editing;
+    let cap_font = 12.0;
+    let cap_lh = snap.theme.line_height_for_font_size(cap_font);
     let caption_el = div()
         .id(("img-alt", image_range.start as u64))
-        .text_size(px(12.))
-        .text_color(snap.theme.secondary_text)
-        .italic()
         .cursor(CursorStyle::PointingHand)
         .when(editing, |el| {
             el.border_b_1().border_color(snap.theme.accent)
-        })
-        .child(SharedString::from(if editing {
-            format!(
-                "{}{}|",
-                caption,
-                snap.widget_preedit.as_deref().unwrap_or("")
-            )
-        } else {
-            caption
-        }))
-        .on_click({
-            let range = image_range.clone();
-            let current = alt.to_string();
-            move |_, _, cx| {
-                editor_cap.update(cx, |host, cx| {
-                    host.edit_image_alt(range.clone(), &current, cx);
-                });
-            }
         })
         .when(editing, |el| {
             el.on_mouse_down_out(move |_, _, cx| {
                 editor_away.update(cx, |host, cx| host.finish_widget(cx));
             })
+        })
+        .child(WidgetOverlay {
+            editor: editor.clone(),
+            prefix: String::new(),
+            text: caption,
+            editing,
+            font_size: cap_font,
+            line_height: cap_lh,
+            theme: snap.theme.clone(),
+            color: snap.theme.secondary_text,
+            italic: true,
+            monospace: false,
+            hug_width: false,
+            target: OverlayTarget::ImageAlt {
+                range: image_range.clone(),
+                stored: alt.to_string(),
+            },
         });
-    let caption_row = div().relative().child(caption_el).when(editing, |el| {
-        el.child(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .child(WidgetImeSink {
-                    editor: editor.clone(),
-                }),
-        )
-    });
+    let caption_row = caption_el;
     match role {
         ImageRole::Inline => {
             let mut el = div()
