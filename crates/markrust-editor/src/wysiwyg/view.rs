@@ -709,6 +709,34 @@ impl RichEditorView {
                     EditorOutcome::Changed
                 }
             }
+            EditorCommand::DeleteWordLeft => {
+                if self.apply_rich(RichCommand::DeleteWordLeft, cx) == RichOutcome::Noop {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::DeleteWordRight => {
+                if self.apply_rich(RichCommand::DeleteWordRight, cx) == RichOutcome::Noop {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::DeleteToLineStart => {
+                if self.apply_rich(RichCommand::DeleteToLineStart, cx) == RichOutcome::Noop {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::DeleteToLineEnd => {
+                if self.apply_rich(RichCommand::DeleteToLineEnd, cx) == RichOutcome::Noop {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
             EditorCommand::Undo => {
                 if widget_owns_caret(&self.widget_edit) {
                     self.undo_widget(cx)
@@ -1828,6 +1856,54 @@ impl Render for RichEditorView {
                 move |_: &crate::editor::Delete, window, cx| {
                     editor.update(cx, |e, cx| {
                         if e.apply_editor_command(EditorCommand::Delete, cx) == EditorOutcome::Noop
+                        {
+                            window.play_system_bell();
+                        }
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::DeleteWordLeft, window, cx| {
+                    editor.update(cx, |e, cx| {
+                        if e.apply_editor_command(EditorCommand::DeleteWordLeft, cx)
+                            == EditorOutcome::Noop
+                        {
+                            window.play_system_bell();
+                        }
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::DeleteWordRight, window, cx| {
+                    editor.update(cx, |e, cx| {
+                        if e.apply_editor_command(EditorCommand::DeleteWordRight, cx)
+                            == EditorOutcome::Noop
+                        {
+                            window.play_system_bell();
+                        }
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::DeleteToLineStart, window, cx| {
+                    editor.update(cx, |e, cx| {
+                        if e.apply_editor_command(EditorCommand::DeleteToLineStart, cx)
+                            == EditorOutcome::Noop
+                        {
+                            window.play_system_bell();
+                        }
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::DeleteToLineEnd, window, cx| {
+                    editor.update(cx, |e, cx| {
+                        if e.apply_editor_command(EditorCommand::DeleteToLineEnd, cx)
+                            == EditorOutcome::Noop
                         {
                             window.play_system_bell();
                         }

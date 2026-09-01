@@ -42,10 +42,21 @@ pub enum EditorCommand {
     InsertText(String),
     Backspace,
     Delete,
+    /// Option-Backspace / Ctrl-Backspace.
+    DeleteWordLeft,
+    /// Option-Delete / Ctrl-Delete.
+    DeleteWordRight,
+    /// Cmd-Backspace: delete to the current source line start.
+    DeleteToLineStart,
+    /// Cmd-Delete: delete to the current source line end.
+    DeleteToLineEnd,
     Move(CaretMove),
     Select(CaretMove),
     SelectAll,
-    SetSelection { start: usize, end: usize },
+    SetSelection {
+        start: usize,
+        end: usize,
+    },
     Undo,
     Redo,
     JumpTo(usize),
@@ -245,6 +256,26 @@ pub fn apply_editor_command(
         }
         EditorCommand::Backspace => Ok(backspace(document, state)),
         EditorCommand::Delete => Ok(delete_forward(document, state)),
+        EditorCommand::DeleteWordLeft => {
+            let content = document.buffer.content();
+            let target = prev_word_start(&content, state.cursor_offset());
+            Ok(delete_to_offset(document, state, target))
+        }
+        EditorCommand::DeleteWordRight => {
+            let content = document.buffer.content();
+            let target = next_word_end(&content, state.cursor_offset());
+            Ok(delete_to_offset(document, state, target))
+        }
+        EditorCommand::DeleteToLineStart => {
+            let content = document.buffer.content();
+            let target = line_start(&content, state.cursor_offset());
+            Ok(delete_to_offset(document, state, target))
+        }
+        EditorCommand::DeleteToLineEnd => {
+            let content = document.buffer.content();
+            let target = line_end(&content, state.cursor_offset());
+            Ok(delete_to_offset(document, state, target))
+        }
         EditorCommand::Move(movement) => {
             let content = document.buffer.content();
             move_caret(&content, document, state, movement, false);
@@ -428,6 +459,31 @@ fn delete_forward(document: &mut Document, state: &mut EditorState) -> EditorOut
         state.selected_range = state.cursor_offset()..next;
         state.selection_reversed = false;
     }
+    replace_selection(document, state, "");
+    EditorOutcome::Changed
+}
+
+fn delete_to_offset(
+    document: &mut Document,
+    state: &mut EditorState,
+    target: usize,
+) -> EditorOutcome {
+    if !state.selected_range.is_empty() {
+        replace_selection(document, state, "");
+        return EditorOutcome::Changed;
+    }
+    let cursor = state.cursor_offset();
+    let target = target.min(document.buffer.len_bytes());
+    if target == cursor {
+        return EditorOutcome::Noop;
+    }
+    let (start, end) = if target < cursor {
+        (target, cursor)
+    } else {
+        (cursor, target)
+    };
+    state.selected_range = start..end;
+    state.selection_reversed = target < cursor;
     replace_selection(document, state, "");
     EditorOutcome::Changed
 }
@@ -824,6 +880,63 @@ mod tests {
         cafe.apply(EditorCommand::Move(CaretMove::WordLeft))
             .unwrap();
         assert_eq!(cafe.cursor_offset(), "café ".len());
+    }
+
+    #[test]
+    fn word_and_line_delete() {
+        let mut editor = HeadlessEditor::new("hello world");
+        editor
+            .apply(EditorCommand::JumpTo("hello world".len()))
+            .unwrap();
+        editor.apply(EditorCommand::DeleteWordLeft).unwrap();
+        assert_eq!(
+            editor.content(),
+            "hello ",
+            "Option-Backspace at EOF leaves `hello |`"
+        );
+        assert_eq!(editor.cursor_offset(), "hello ".len());
+
+        let mut bold = HeadlessEditor::new("**hello** world");
+        bold.apply(EditorCommand::JumpTo(bold.content().len()))
+            .unwrap();
+        bold.apply(EditorCommand::DeleteWordLeft).unwrap();
+        assert_eq!(
+            bold.content(),
+            "**hello** ",
+            "source word-delete stops on `world`, not `*`"
+        );
+
+        let mut right = HeadlessEditor::new("hello world");
+        right.apply(EditorCommand::DeleteWordRight).unwrap();
+        assert_eq!(right.content(), " world");
+
+        let mut line = HeadlessEditor::new("hello\nworld extra");
+        line.apply(EditorCommand::JumpTo(line.content().len()))
+            .unwrap();
+        line.apply(EditorCommand::DeleteToLineStart).unwrap();
+        assert_eq!(
+            line.content(),
+            "hello\n",
+            "Cmd-Backspace is the current line, not the document"
+        );
+
+        let mut line_end = HeadlessEditor::new("hello\nworld extra");
+        line_end
+            .apply(EditorCommand::JumpTo("hello\n".len()))
+            .unwrap();
+        line_end.apply(EditorCommand::DeleteToLineEnd).unwrap();
+        assert_eq!(line_end.content(), "hello\n");
+
+        let mut selected = HeadlessEditor::new("hello world");
+        selected
+            .apply(EditorCommand::SetSelection { start: 0, end: 5 })
+            .unwrap();
+        selected.apply(EditorCommand::DeleteWordLeft).unwrap();
+        assert_eq!(
+            selected.content(),
+            " world",
+            "non-empty selection word-delete removes the selection"
+        );
     }
 
     #[test]

@@ -91,6 +91,14 @@ fn desktop_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-cmd-t", crate::window::ToggleTheme, None),
         KeyBinding::new("backspace", markrust_editor::Backspace, None),
         KeyBinding::new("delete", markrust_editor::Delete, None),
+        // Option-Backspace/Delete (macOS) and Ctrl-Backspace/Delete (Windows/Linux).
+        KeyBinding::new("alt-backspace", markrust_editor::DeleteWordLeft, None),
+        KeyBinding::new("alt-delete", markrust_editor::DeleteWordRight, None),
+        KeyBinding::new("ctrl-backspace", markrust_editor::DeleteWordLeft, None),
+        KeyBinding::new("ctrl-delete", markrust_editor::DeleteWordRight, None),
+        // Cmd-Backspace/Delete: current visual/source line, not the document.
+        KeyBinding::new("cmd-backspace", markrust_editor::DeleteToLineStart, None),
+        KeyBinding::new("cmd-delete", markrust_editor::DeleteToLineEnd, None),
         KeyBinding::new("left", markrust_editor::Left, None),
         KeyBinding::new("right", markrust_editor::Right, None),
         KeyBinding::new("up", markrust_editor::Up, None),
@@ -320,6 +328,54 @@ mod tests {
         assert_eq!(
             action_for("pageup"),
             markrust_editor::PageUp::name_for_type()
+        );
+    }
+
+    #[test]
+    fn word_and_line_delete_keys_bind() {
+        assert_eq!(
+            action_for("alt-backspace"),
+            markrust_editor::DeleteWordLeft::name_for_type(),
+            "Option-Backspace is word-delete-left on macOS"
+        );
+        assert_eq!(
+            action_for("alt-delete"),
+            markrust_editor::DeleteWordRight::name_for_type()
+        );
+        assert_eq!(
+            action_for("ctrl-backspace"),
+            markrust_editor::DeleteWordLeft::name_for_type(),
+            "Ctrl-Backspace is word-delete-left on Windows/Linux"
+        );
+        assert_eq!(
+            action_for("ctrl-delete"),
+            markrust_editor::DeleteWordRight::name_for_type()
+        );
+        assert_eq!(
+            action_for("cmd-backspace"),
+            markrust_editor::DeleteToLineStart::name_for_type(),
+            "Cmd-Backspace deletes to the current line start"
+        );
+        assert_eq!(
+            action_for("cmd-delete"),
+            markrust_editor::DeleteToLineEnd::name_for_type()
+        );
+        // Word-move and line-move keys from last turn must stay move, not delete.
+        assert_eq!(
+            action_for("alt-left"),
+            markrust_editor::WordLeft::name_for_type()
+        );
+        assert_eq!(
+            action_for("cmd-left"),
+            markrust_editor::Home::name_for_type()
+        );
+        assert_eq!(
+            action_for("backspace"),
+            markrust_editor::Backspace::name_for_type()
+        );
+        assert_eq!(
+            action_for("delete"),
+            markrust_editor::Delete::name_for_type()
         );
     }
 }

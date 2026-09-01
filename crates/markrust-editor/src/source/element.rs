@@ -918,6 +918,30 @@ impl Render for MarkdownEditorView {
             })
             .on_action({
                 let editor = editor.clone();
+                move |action: &crate::editor::DeleteWordLeft, window, cx| {
+                    editor.update(cx, |e, cx| e.delete_word_left(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::DeleteWordRight, window, cx| {
+                    editor.update(cx, |e, cx| e.delete_word_right(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::DeleteToLineStart, window, cx| {
+                    editor.update(cx, |e, cx| e.delete_to_line_start(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::DeleteToLineEnd, window, cx| {
+                    editor.update(cx, |e, cx| e.delete_to_line_end(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
                 move |action: &crate::editor::ToggleBold, window, cx| {
                     editor.update(cx, |e, cx| e.toggle_bold(action, window, cx))
                 }

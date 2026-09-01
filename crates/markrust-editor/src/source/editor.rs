@@ -41,6 +41,10 @@ actions!(
         WordRight,
         SelectWordLeft,
         SelectWordRight,
+        DeleteWordLeft,
+        DeleteWordRight,
+        DeleteToLineStart,
+        DeleteToLineEnd,
         DocumentHome,
         DocumentEnd,
         SelectDocumentHome,
@@ -391,6 +395,50 @@ impl MarkdownEditor {
 
     pub fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         if self.apply_command(EditorCommand::Delete, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn delete_word_left(
+        &mut self,
+        _: &DeleteWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::DeleteWordLeft, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::DeleteWordRight, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn delete_to_line_start(
+        &mut self,
+        _: &DeleteToLineStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::DeleteToLineStart, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn delete_to_line_end(
+        &mut self,
+        _: &DeleteToLineEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::DeleteToLineEnd, cx) == EditorOutcome::Noop {
             window.play_system_bell();
         }
     }

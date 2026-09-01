@@ -304,6 +304,10 @@ impl HeadlessWorkspace {
             EditorCommand::InsertText(_)
                 | EditorCommand::Backspace
                 | EditorCommand::Delete
+                | EditorCommand::DeleteWordLeft
+                | EditorCommand::DeleteWordRight
+                | EditorCommand::DeleteToLineStart
+                | EditorCommand::DeleteToLineEnd
                 | EditorCommand::Undo
                 | EditorCommand::Redo
                 | EditorCommand::Wrap(_)

@@ -102,6 +102,8 @@ bash scripts/release.sh
 | `Cmd/Ctrl+B` / `I` / `E` / `K` | Bold / italic / code / link |
 | `Option+Left` / `Right` (or `Ctrl+Left` / `Right`) | Move by word |
 | `Option+Shift+Left` / `Right` (or `Ctrl+Shift+Left` / `Right`) | Select by word |
+| `Option+Backspace` / `Delete` (or `Ctrl+Backspace` / `Delete`) | Delete by word |
+| `Cmd+Backspace` / `Delete` | Delete to line start / end |
 | `Cmd+Up` / `Down` (or `Ctrl+Home` / `End`) | Document start / end |
 | `Cmd+Shift+Up` / `Down` (or `Ctrl+Shift+Home` / `End`) | Select to document start / end |
 | `Cmd+Left` / `Right` | Line start / end |

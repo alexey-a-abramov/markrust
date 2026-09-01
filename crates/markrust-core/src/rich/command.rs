@@ -93,6 +93,14 @@ pub enum RichCommand {
     InsertText(String),
     Backspace,
     Delete,
+    /// Option-Backspace / Ctrl-Backspace: delete to the previous word start.
+    DeleteWordLeft,
+    /// Option-Delete / Ctrl-Delete: delete to the next word end.
+    DeleteWordRight,
+    /// Cmd-Backspace: delete from the caret to the current source line start.
+    DeleteToLineStart,
+    /// Cmd-Delete: delete from the caret to the current source line end.
+    DeleteToLineEnd,
     SplitBlock,
     InsertLineBreak,
     ToggleMark(MarkSet),
@@ -160,6 +168,12 @@ pub fn apply_rich_command(
         RichCommand::InsertText(text) => insert_text(doc, engine, caret, &text),
         RichCommand::Backspace => backspace(doc, engine, caret),
         RichCommand::Delete => delete_forward(doc, engine, caret),
+        RichCommand::DeleteWordLeft => delete_to_bound(doc, engine, caret, DeleteBound::WordLeft),
+        RichCommand::DeleteWordRight => delete_to_bound(doc, engine, caret, DeleteBound::WordRight),
+        RichCommand::DeleteToLineStart => {
+            delete_to_bound(doc, engine, caret, DeleteBound::LineStart)
+        }
+        RichCommand::DeleteToLineEnd => delete_to_bound(doc, engine, caret, DeleteBound::LineEnd),
         RichCommand::SplitBlock => split_block(doc, engine, caret),
         RichCommand::InsertLineBreak => insert_line_break(doc, engine, caret),
         RichCommand::ToggleMark(mark) => toggle_mark(doc, engine, caret, mark),
@@ -466,6 +480,48 @@ fn delete_range(
     doc.replace_range_tx(start, end, "", kind, before, after.snapshot());
     *caret = after;
     Ok(RichOutcome::Changed)
+}
+
+/// Word/line delete boundary kinds for [`delete_to_bound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteBound {
+    WordLeft,
+    WordRight,
+    LineStart,
+    LineEnd,
+}
+
+/// Option/Ctrl word-delete and Cmd line-delete. A non-empty selection is
+/// removed like Backspace; otherwise the caret deletes the visible region up
+/// to the previous/next word start/end or the current source line bounds.
+fn delete_to_bound(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    bound: DeleteBound,
+) -> Result<RichOutcome, RichError> {
+    if !caret.range.is_empty() {
+        return delete_range(doc, engine, caret, TransactionKind::Command);
+    }
+    let source = doc.buffer.content();
+    let cursor = caret.cursor();
+    let target = match bound {
+        DeleteBound::WordLeft => engine.prev_word_caret(&source, cursor),
+        DeleteBound::WordRight => engine.next_word_caret(&source, cursor),
+        DeleteBound::LineStart => line_start(&source, cursor),
+        DeleteBound::LineEnd => line_end_exclusive(&source, cursor),
+    };
+    let (start, end, reversed) = if target < cursor {
+        (target, cursor, true)
+    } else {
+        (cursor, target, false)
+    };
+    if start >= end {
+        return Ok(RichOutcome::Noop);
+    }
+    caret.range = start..end;
+    caret.reversed = reversed;
+    delete_range(doc, engine, caret, TransactionKind::Command)
 }
 
 fn split_block(
@@ -2796,6 +2852,95 @@ mod tests {
             matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
             "{:?}",
             engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn delete_word_left_removes_previous_word_and_skips_bold_marks() {
+        let (mut doc, mut engine, mut caret) = setup("hello world");
+        caret.collapse_to("hello world".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            after, "hello ",
+            "hello world| Option-Backspace must leave `hello |`, got {after:?}"
+        );
+        assert_eq!(caret.cursor(), "hello ".len());
+
+        let source = "**hello** world";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            after, "**hello** ",
+            "word-delete must skip bold delimiters like word move, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("hello world");
+        caret.range = 0.."hello".len();
+        caret.reversed = false;
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            after, " world",
+            "non-empty selection Option-Backspace deletes the selection, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_word_right_and_line_bounds() {
+        let (mut doc, mut engine, mut caret) = setup("hello world");
+        caret.collapse_to(0);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordRight,
+        );
+        assert_eq!(
+            after, " world",
+            "Option-Delete from the start must remove `hello`, got {after:?}"
+        );
+
+        let source = "hello\nworld extra";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteToLineStart,
+        );
+        assert_eq!(
+            after, "hello\n",
+            "Cmd-Backspace deletes to the current line start, not the document, got {after:?}"
+        );
+
+        let source = "hello\nworld extra";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to("hello\n".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteToLineEnd,
+        );
+        assert_eq!(
+            after, "hello\n",
+            "Cmd-Delete deletes to the current line end, got {after:?}"
         );
     }
 }
