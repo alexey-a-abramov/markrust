@@ -842,28 +842,18 @@ fn toggle_mark(
     if !clamp_wrap_to_table_cell(engine, caret, &source) {
         return Ok(RichOutcome::Noop);
     }
-    let sel = if caret.range.is_empty() {
-        // Toggle the run containing the caret.
-        let Some(id) = engine.block_at(caret.cursor()) else {
-            return Ok(RichOutcome::Noop);
-        };
-        let Some(block) = engine.block(id) else {
-            return Ok(RichOutcome::Noop);
-        };
-        let Some(run) = block.inlines.iter().find_map(|i| match i {
-            Inline::Run { source_range, .. }
-                if source_range.start <= caret.cursor() && caret.cursor() <= source_range.end =>
-            {
-                Some(source_range.clone())
-            }
-            _ => None,
-        }) else {
-            return Ok(RichOutcome::Noop);
-        };
-        run
-    } else {
-        caret.range.clone()
-    };
+    // Typora: Cmd-B/I/E inside `$math$` / `` `code` `` / `[[wiki]]` / `:emoji:`
+    // must not splice `**` into the span (fenced bodies already no-op).
+    if wrap_is_immune(engine, caret) {
+        return Ok(RichOutcome::Noop);
+    }
+    if caret.range.is_empty() {
+        // Typora / source wrap: empty Cmd-B/I/E inserts `****` / `**` / `` ` ` `
+        // with the caret inside so the next insert is wrapped. Do not toggle
+        // the whole run the caret sits in (`**hello**` for a mid-word caret).
+        return toggle_mark_collapsed(doc, engine, caret, mark);
+    }
+    let sel = caret.range.clone();
     let Some(top) = engine.top_level_at(sel.start).cloned() else {
         return Ok(RichOutcome::Noop);
     };
@@ -894,6 +884,136 @@ fn toggle_mark(
     caret.clamp(doc.buffer.len_bytes());
     engine.sync(doc);
     Ok(RichOutcome::Changed)
+}
+
+fn toggle_mark_collapsed(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    mark: MarkSet,
+) -> Result<RichOutcome, RichError> {
+    if mark_wrap_in_raw_block(engine, caret.cursor()) {
+        return Ok(RichOutcome::Noop);
+    }
+    let Some((open, close)) = mark_wrap_delimiters(mark) else {
+        return Ok(RichOutcome::Noop);
+    };
+    let offset = caret.cursor();
+    let source = doc.buffer.content();
+    if sitting_in_empty_mark_wrappers(&source, offset, open, close, mark) {
+        let start = offset - open.len();
+        let end = offset + close.len();
+        splice(doc, caret, start, end, "", TransactionKind::Command);
+        engine.sync(doc);
+        caret.clamp(doc.buffer.len_bytes());
+        return Ok(RichOutcome::Changed);
+    }
+    let pair = format!("{open}{close}");
+    splice(doc, caret, offset, offset, &pair, TransactionKind::Command);
+    caret.collapse_to(offset + open.len());
+    engine.sync(doc);
+    caret.clamp(doc.buffer.len_bytes());
+    Ok(RichOutcome::Changed)
+}
+
+fn mark_wrap_delimiters(mark: MarkSet) -> Option<(&'static str, &'static str)> {
+    if mark == MarkSet::BOLD {
+        Some(("**", "**"))
+    } else if mark == MarkSet::ITALIC {
+        Some(("*", "*"))
+    } else if mark == MarkSet::CODE {
+        Some(("`", "`"))
+    } else if mark == MarkSet::STRIKE {
+        Some(("~~", "~~"))
+    } else if mark == MarkSet::HIGHLIGHT {
+        Some(("==", "=="))
+    } else if mark == MarkSet::SUP {
+        Some(("^", "^"))
+    } else if mark == MarkSet::SUB {
+        Some(("~", "~"))
+    } else {
+        None
+    }
+}
+
+fn mark_wrap_in_raw_block(engine: &RichEngine, offset: usize) -> bool {
+    wrap_immune_range(engine, offset).is_some()
+}
+
+/// Fence / HTML bodies, inline code, `$math$`, `[[wiki]]`, and `:emoji:` are
+/// not markdown-wrap targets. A selection that extends *outside* the atom
+/// still wraps (Cmd-B on `see $x$ here`).
+fn wrap_immune_range(engine: &RichEngine, byte: usize) -> Option<Range<usize>> {
+    let block = engine.block(engine.block_at(byte)?)?;
+    match &block.kind {
+        BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. } => Some(block.source_range.clone()),
+        _ => {
+            for inline in &block.inlines {
+                match inline {
+                    Inline::Run {
+                        source_range,
+                        marks,
+                        ..
+                    } if marks.contains(MarkSet::CODE)
+                        && source_range.start <= byte
+                        && byte <= source_range.end =>
+                    {
+                        return Some(source_range.clone());
+                    }
+                    Inline::Math { source_range, .. }
+                    | Inline::WikiLink { source_range, .. }
+                    | Inline::Emoji { source_range, .. }
+                        if source_range.start <= byte && byte <= source_range.end =>
+                    {
+                        return Some(source_range.clone());
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+    }
+}
+
+fn wrap_is_immune(engine: &RichEngine, caret: &CaretState) -> bool {
+    let Some(atom) = wrap_immune_range(engine, caret.cursor()).or_else(|| {
+        if caret.range.is_empty() {
+            None
+        } else {
+            wrap_immune_range(engine, caret.range.start)
+        }
+    }) else {
+        return false;
+    };
+    caret.range.is_empty() || (caret.range.start >= atom.start && caret.range.end <= atom.end)
+}
+
+/// True when the caret is between a matching empty delimiter pair (`**|**`).
+/// Italic `*` must not unwrap the inside of an empty bold `****`.
+fn sitting_in_empty_mark_wrappers(
+    source: &str,
+    offset: usize,
+    open: &str,
+    close: &str,
+    mark: MarkSet,
+) -> bool {
+    if offset < open.len() || offset + close.len() > source.len() {
+        return false;
+    }
+    if &source[offset - open.len()..offset] != open {
+        return false;
+    }
+    if &source[offset..offset + close.len()] != close {
+        return false;
+    }
+    if mark == MarkSet::ITALIC && open == "*" {
+        let star_before = offset >= 2 && source.as_bytes()[offset - 2] == b'*';
+        let star_after = offset + 1 < source.len() && source.as_bytes()[offset + 1] == b'*';
+        if star_before || star_after {
+            return false;
+        }
+    }
+    true
 }
 
 fn toggle_mark_inlines(inlines: &mut Vec<Inline>, sel: &Range<usize>, mark: MarkSet) {
@@ -1182,6 +1302,11 @@ fn toggle_link(
 ) -> Result<RichOutcome, RichError> {
     let source = doc.buffer.content();
     if !clamp_wrap_to_table_cell(engine, caret, &source) {
+        return Ok(RichOutcome::Noop);
+    }
+    // Typora: Cmd-K inside `$math$` / `` `code` `` / `[[wiki]]` / `:emoji:`
+    // must not wrap the word (or the atom) in link brackets.
+    if wrap_is_immune(engine, caret) {
         return Ok(RichOutcome::Noop);
     }
     if caret.range.is_empty() {
@@ -2021,6 +2146,277 @@ mod tests {
         assert!(
             after.contains("**hello**") || after.contains("__hello__"),
             "{after:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_bold_on_empty_caret_inserts_pair_and_types_inside() {
+        // Typora / source wrap: Cmd-B with no selection inserts `****` and
+        // leaves the caret between the marks so the next insert is `**x**`,
+        // not a wrap of the whole run (`**hello**`).
+        let (mut doc, mut engine, mut caret) = setup("hello\n");
+        caret.collapse_to("he".len());
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        let wrapped = doc.buffer.content();
+        assert_eq!(
+            wrapped, "he****llo\n",
+            "empty Cmd-B must insert a pair, not wrap the run, got {wrapped:?}"
+        );
+        assert_eq!(
+            caret.cursor(),
+            "he**".len(),
+            "caret must sit inside the empty pair, got {}",
+            caret.cursor()
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert_eq!(
+            typed, "he**x**llo\n",
+            "typing after empty Cmd-B must go inside the marks, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_mark_empty_caret_second_press_unwraps() {
+        let (mut doc, mut engine, mut caret) = setup("ab");
+        caret.collapse_to(1);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        assert_eq!(doc.buffer.content(), "a****b");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            "ab",
+            "second empty Cmd-B must unwrap the pair"
+        );
+        assert_eq!(caret.cursor(), 1);
+    }
+
+    #[test]
+    fn toggle_italic_and_code_on_empty_caret_insert_pairs() {
+        let (mut doc, mut engine, mut caret) = setup("ab");
+        caret.collapse_to(1);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::ITALIC),
+        );
+        assert_eq!(doc.buffer.content(), "a**b");
+        assert_eq!(caret.cursor(), 2);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        assert_eq!(doc.buffer.content(), "a*x*b");
+
+        let (mut doc, mut engine, mut caret) = setup("ab");
+        caret.collapse_to(1);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::CODE),
+        );
+        assert_eq!(doc.buffer.content(), "a``b");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        assert_eq!(doc.buffer.content(), "a`x`b");
+    }
+
+    /// Cmd-B/I/E/K inside `$math$`, inline code, `[[wiki]]`, or `:emoji:`
+    /// must not splice markdown wrappers into the span (`$****x^2$`).
+    #[test]
+    fn toggle_wrap_inside_math_code_wiki_emoji_is_noop() {
+        let cases = [
+            ("see $x^2$ here\n", "x", "math"),
+            ("see `code` here\n", "c", "inline code"),
+            ("see [[page]] here\n", "p", "wikilink"),
+            ("see :smile: here\n", "smile", "emoji"),
+        ];
+        let cmds = [
+            RichCommand::ToggleMark(MarkSet::BOLD),
+            RichCommand::ToggleMark(MarkSet::ITALIC),
+            RichCommand::ToggleMark(MarkSet::CODE),
+            RichCommand::ToggleLink,
+        ];
+        for (source, needle, label) in cases {
+            let at = source.find(needle).expect(label);
+            for cmd in &cmds {
+                let (mut doc, mut engine, mut caret) = setup(source);
+                caret.collapse_to(at);
+                apply(&mut doc, &mut engine, &mut caret, cmd.clone());
+                assert_eq!(
+                    doc.buffer.content(),
+                    source,
+                    "wrap {cmd:?} inside {label} must no-op, got {:?}",
+                    doc.buffer.content()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn toggle_bold_on_text_next_to_math_still_wraps() {
+        let source = "see $x^2$ here\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("here").expect("here"));
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("$x^2$") && after.contains("**"),
+            "Cmd-B on `here` must still wrap, got {after:?}"
+        );
+        assert!(
+            !after.contains("$**") && !after.contains("**$") && !after.contains("$****"),
+            "math span must stay unmarked, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_mark_empty_caret_in_trailing_blank_inserts_pair() {
+        let source = "hello\n\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let gap = blank_caret_gap_after_last(engine.tree()).expect("trailing gap");
+        caret.collapse_to(gap.start);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("**x**") && typed.contains("hello"),
+            "empty Cmd-B in the trailing blank must wrap the new paragraph, got {typed:?}"
+        );
+        let hello_line = typed
+            .lines()
+            .find(|line| line.contains("hello"))
+            .expect("hello line");
+        assert!(
+            !hello_line.contains('*'),
+            "wrap must not attach to the last paragraph, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_mark_empty_caret_in_newlines_only_inserts_pair() {
+        let (mut doc, mut engine, mut caret) = setup("\n\n");
+        let gap = blank_caret_gap_after_last(engine.tree()).expect("caret home");
+        caret.collapse_to(gap.start);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("**x**"),
+            "empty Cmd-B on a newlines-only document must wrap, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_mark_after_click_below_without_blank_wraps_new_paragraph() {
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        place_caret_for_click_below(&mut doc, &mut engine, &mut caret);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("**x**") && typed.contains("hello"),
+            "empty Cmd-B after leftover click must wrap the new paragraph, got {typed:?}"
+        );
+        let hello_line = typed
+            .lines()
+            .find(|line| line.contains("hello"))
+            .expect("hello line");
+        assert!(
+            !hello_line.contains('*'),
+            "wrap must not attach to the last paragraph, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_mark_empty_caret_in_separator_inserts_pair() {
+        let source = "hello\n\n# Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let gap = blank_caret_gap_before(engine.tree(), 1).expect("separator gap");
+        caret.collapse_to(gap.start);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("**x**") && typed.contains("# Title") && typed.contains("hello"),
+            "empty Cmd-B in the gap must wrap the new paragraph, got {typed:?}"
+        );
+        assert!(
+            !typed.contains("**#") && !typed.contains("# **"),
+            "wrap must not attach to heading chrome, got {typed:?}"
         );
     }
 
