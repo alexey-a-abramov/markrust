@@ -281,6 +281,23 @@ fn insert_text(
         TransactionKind::Command
     };
     let before = caret.snapshot();
+    // `[hello](<>)` leftover dest: typing must replace `<>`, not insert inside.
+    if !raw {
+        if let Some(angle) = empty_angle_destination(&source, offset) {
+            let after = CaretState::collapsed(angle.start + inserted.len());
+            doc.replace_range_tx(
+                angle.start,
+                angle.end,
+                &inserted,
+                kind,
+                before,
+                after.snapshot(),
+            );
+            *caret = after;
+            engine.sync(doc);
+            return Ok(RichOutcome::Changed);
+        }
+    }
     let after = CaretState::collapsed(offset + inserted.len());
     doc.replace_range_tx(offset, offset, &inserted, kind, before, after.snapshot());
     *caret = after;
@@ -1310,9 +1327,17 @@ fn toggle_link(
         return Ok(RichOutcome::Noop);
     }
     if caret.range.is_empty() {
-        let source = doc.buffer.content();
         let word = word_range(&source, caret.cursor());
-        if word.is_empty() {
+        if !word.is_empty() {
+            caret.range = word;
+            caret.reversed = false;
+            // Word bounds cannot include `|`, but clamp if the caret sat on a
+            // pipe and snapped into a cell.
+            if !clamp_wrap_to_table_cell(engine, caret, &source) {
+                return Ok(RichOutcome::Noop);
+            }
+        }
+        if caret.range.is_empty() {
             splice(
                 doc,
                 caret,
@@ -1326,8 +1351,6 @@ fn toggle_link(
             engine.sync(doc);
             return Ok(RichOutcome::Changed);
         }
-        caret.range = word;
-        caret.reversed = false;
     }
     let sel = caret.range.clone();
     let Some(top) = engine.top_level_at(sel.start).cloned() else {
@@ -1348,13 +1371,28 @@ fn toggle_link(
     });
     toggle_link_inlines(&mut leaf.inlines, &sel, !already_link);
     let source = doc.buffer.content();
+    let inner = source.get(sel.clone()).unwrap_or("").to_string();
     let new_md = serialize_block(&rewritten, &source);
     let before = caret.snapshot();
     let range = top.source_range.clone();
-    let after = CaretState {
-        range: range.start + (sel.start.saturating_sub(range.start))
-            ..range.start + (sel.end.saturating_sub(range.start)).min(new_md.len()),
-        reversed: caret.reversed,
+    // Source wrap leaves the caret in the URL `()` after wrapping a selection
+    // (or a word), so Cmd-K can type the destination right away.
+    let after = if !already_link {
+        if let Some(rel) = link_url_caret_in(&new_md, &inner) {
+            CaretState::collapsed(range.start + rel)
+        } else {
+            CaretState {
+                range: range.start + (sel.start.saturating_sub(range.start))
+                    ..range.start + (sel.end.saturating_sub(range.start)).min(new_md.len()),
+                reversed: caret.reversed,
+            }
+        }
+    } else {
+        CaretState {
+            range: range.start + (sel.start.saturating_sub(range.start))
+                ..range.start + (sel.end.saturating_sub(range.start)).min(new_md.len()),
+            reversed: caret.reversed,
+        }
     };
     doc.replace_range_tx(
         range.start,
@@ -1394,6 +1432,38 @@ fn toggle_link_inlines(inlines: &mut [Inline], sel: &Range<usize>, wrap: bool) {
                 *raw = None;
             }
         }
+    }
+}
+
+/// Byte offset of the empty URL slot in `[label]()` (after `](`).
+fn link_url_caret_in(md: &str, inner: &str) -> Option<usize> {
+    let needle = format!("[{inner}](");
+    if let Some(at) = md.find(&needle) {
+        return Some(at + needle.len());
+    }
+    md.find("]()").map(|i| i + 2)
+}
+
+/// If `offset` sits on an empty `<>` link/image destination, the range of
+/// those two bytes so InsertText can replace them (not type inside).
+fn empty_angle_destination(source: &str, offset: usize) -> Option<Range<usize>> {
+    let start = if source.get(offset..).is_some_and(|s| s.starts_with("<>")) {
+        offset
+    } else if offset > 0
+        && source
+            .get(offset - 1..)
+            .is_some_and(|s| s.starts_with("<>"))
+    {
+        offset - 1
+    } else {
+        return None;
+    };
+    let before = source.get(..start)?;
+    let dest_open = before.trim_end_matches([' ', '\t']);
+    if dest_open.ends_with("](") {
+        Some(start..start + 2)
+    } else {
+        None
     }
 }
 
@@ -2670,6 +2740,193 @@ mod tests {
         assert!(
             after.contains("[hello]("),
             "expected markdown link, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_link_on_selection_wraps_with_empty_url_caret() {
+        let (mut doc, mut engine, mut caret) = setup("hello\n");
+        caret.range = 0..5;
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        assert_eq!(
+            after, "[hello]()\n",
+            "Cmd-K on a selection must use empty (), got {after:?}"
+        );
+        assert!(
+            !after.contains("<>"),
+            "empty dest must not serialize as <>, got {after:?}"
+        );
+        let url_at = after
+            .find("[hello](")
+            .map(|i| i + "[hello](".len())
+            .expect("url slot");
+        assert_eq!(
+            caret.cursor(),
+            url_at,
+            "Cmd-K on a selection must leave the caret in the URL, got {} in {after:?}",
+            caret.cursor()
+        );
+        assert!(
+            caret.range.is_empty(),
+            "URL caret must be collapsed, got {:?}",
+            caret.range
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("https://e.com".into()),
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            "[hello](https://e.com)\n",
+            "typing a URL must fill (), not prepend inside <>"
+        );
+    }
+
+    #[test]
+    fn toggle_link_on_word_wraps_with_empty_url_caret() {
+        // Cmd-K on a caret inside a word wraps the whole word, not just the
+        // typed character, and leaves the caret in the empty URL `()`.
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        caret.collapse_to(2);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        assert_eq!(
+            after, "[hello]()",
+            "Cmd-K on a word must use empty (), got {after:?}"
+        );
+        assert!(
+            !after.contains("<>"),
+            "empty dest must not serialize as <>, got {after:?}"
+        );
+        let url_at = after
+            .find("[hello](")
+            .map(|i| i + "[hello](".len())
+            .expect("url slot");
+        assert_eq!(
+            caret.cursor(),
+            url_at,
+            "Cmd-K on a word must leave the caret in the URL, got {} in {after:?}",
+            caret.cursor()
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("https://e.com".into()),
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            "[hello](https://e.com)",
+            "typing a URL must fill (), not leave <>"
+        );
+    }
+
+    #[test]
+    fn empty_destination_becomes_empty_parens() {
+        // A just-wrapped link with no url serializes its destination as bare
+        // `()` (Typora), never `<>`.
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        caret.range = 0..5;
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        assert_eq!(
+            after, "[hello]()",
+            "empty dest must serialize bare, got {after:?}"
+        );
+        assert!(
+            !after.contains("<>"),
+            "empty dest must not be <>, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn empty_destination_with_url_fills_it() {
+        // Typing a URL into an existing empty `()` fills the destination.
+        let source = "[hello]()";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let at = source.find("](").expect("dest") + 2; // after `](`
+        caret.collapse_to(at);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("https://e.com".into()),
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            "[hello](https://e.com)",
+            "typing a URL must fill the empty (), got {:?}",
+            doc.buffer.content()
+        );
+    }
+
+    #[test]
+    fn empty_angle_destination_becomes_empty_parens() {
+        // A leftover `<>` empty destination collapses back to `()` when the
+        // link is unwrapped and rewrapped (the empty URL no longer needs <>).
+        let source = "[hello](<>)";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.range = 0..5;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        assert_eq!(doc.buffer.content(), "hello", "unwrap must drop the link");
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        assert_eq!(
+            doc.buffer.content(),
+            "[hello]()",
+            "empty <> dest must become empty parens, got {:?}",
+            doc.buffer.content()
+        );
+    }
+
+    #[test]
+    fn insert_text_replaces_empty_angle_destination() {
+        let source = "[hello](<>)\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let at = source.find("<>").expect("empty dest");
+        caret.collapse_to(at);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("https://e.com".into()),
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            "[hello](https://e.com)\n",
+            "InsertText at <> must replace the brackets, not type inside"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(at + 1);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("https://e.com".into()),
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            "[hello](https://e.com)\n",
+            "InsertText inside <> must replace the brackets"
+        );
+    }
+
+    #[test]
+    fn typing_in_autolink_does_not_double_wrap() {
+        let source = "<https://example.com>\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let at = source.find("example").expect("host");
+        caret.collapse_to(at);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("<https://") && after.contains("example.com>"),
+            "typing inside an autolink must keep the url and not double-wrap, got {after:?}"
         );
     }
 

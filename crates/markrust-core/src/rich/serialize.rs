@@ -605,7 +605,7 @@ impl<'a> Ser<'a> {
                     self.out.push_str("![");
                     self.out.push_str(alt);
                     self.out.push_str("](");
-                    self.out.push_str(&printable_url(url));
+                    self.out.push_str(&printable_url(url, title.is_some()));
                     if let Some(t) = title {
                         self.out.push_str(" \"");
                         self.out.push_str(&t.replace('"', "\\\""));
@@ -781,7 +781,7 @@ fn key_delims(key: &MarkKey, inline: &Inline, normalize: bool) -> (String, Strin
         MarkKey::Sub(_) => ("~".into(), "~".into()),
         MarkKey::Link(l) => {
             let mut close = String::from("](");
-            close.push_str(&printable_url(&l.url));
+            close.push_str(&printable_url(&l.url, l.title.is_some()));
             if let Some(t) = &l.title {
                 close.push_str(" \"");
                 close.push_str(&t.replace('"', "\\\""));
@@ -821,8 +821,12 @@ fn close_down_to(ser: &mut Ser, stack: &mut Vec<(MarkKey, String)>, keep: usize)
 }
 
 /// Destination form for a link/image URL: wrap in <> when it needs it.
-fn printable_url(url: &str) -> String {
-    let needs_brackets = url.is_empty()
+///
+/// An empty destination stays bare so Cmd-K serializes `[hello]()` (Typora),
+/// not `[hello](<>)`. A following title still needs `<>` so `"title"` is not
+/// parsed as the destination.
+fn printable_url(url: &str, has_title: bool) -> String {
+    let needs_brackets = (url.is_empty() && has_title)
         || url.chars().any(|c| c == ' ' || c.is_control())
         || url.matches('(').count() != url.matches(')').count();
     if needs_brackets {
@@ -853,4 +857,17 @@ fn escape_trailing_hashes(out: &mut String, text_start: usize) {
         return; // already escaped
     }
     out.insert(hash_start, '\\');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::printable_url;
+
+    #[test]
+    fn empty_destination_is_bare_unless_a_title_follows() {
+        assert_eq!(printable_url("", false), "");
+        assert_eq!(printable_url("", true), "<>");
+        assert_eq!(printable_url("https://e.com", false), "https://e.com");
+        assert_eq!(printable_url("/my uri", false), "</my uri>");
+    }
 }
