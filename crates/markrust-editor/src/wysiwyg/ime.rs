@@ -355,7 +355,9 @@ fn focused_leaf_index(leaves: &[ImeLeafHit], caret: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use markrust_core::rich::{apply_rich_command, RichCommand};
+    use markrust_core::rich::{
+        apply_rich_command, code_body_source_map, import_markdown, BlockKind, IdGen, RichCommand,
+    };
 
     fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
         Bounds {
@@ -642,6 +644,289 @@ mod tests {
             ime.point_is_below_painted_content(point(px(40.0), px(200.0))),
             "newlines-only / unpainted document must accept a leftover click"
         );
+    }
+    fn first_code(blocks: &[markrust_core::rich::Block]) -> Option<&markrust_core::rich::Block> {
+        for b in blocks {
+            if matches!(b.kind, BlockKind::CodeBlock { .. }) {
+                return Some(b);
+            }
+            if let Some(found) = first_code(&b.children) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn mapped_fence_leaf(source: &str, bounds: Bounds<Pixels>) -> ImeLeafHit {
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let block = first_code(&tree.blocks).expect("code block");
+        let body = match &block.kind {
+            BlockKind::CodeBlock { literal, .. } => {
+                literal.strip_suffix('\n').unwrap_or(literal).to_string()
+            }
+            _ => unreachable!(),
+        };
+        let source_at = code_body_source_map(source, block, body.len());
+        let start = block.code_body_range(source).start;
+        let c = source.find("code").unwrap_or(start);
+        ImeLeafHit {
+            layout: Arc::new(LeafLayout {
+                text: body,
+                runs: Vec::new(),
+                source_at,
+                block_start: start,
+            }),
+            bounds,
+            font_size: 16.0,
+            line_height: 22.0,
+            caret_bounds: Some(caret_on(bounds, c, c)),
+        }
+    }
+
+    #[test]
+    fn quoted_fence_ime_character_index_skips_quote_prefix() {
+        let source = "> ```\n> code\n> ```\n";
+        let bounds = rect(8.0, 10.0, 200.0, 22.0);
+        let leaf = mapped_fence_leaf(source, bounds);
+        let c = source.find("code").expect("code");
+        let gt = source.find('>').expect(">");
+        assert_eq!(
+            leaf.layout.source_for_visible(0),
+            c,
+            "character_index_for_point vis 0 must be the first painted body byte"
+        );
+        assert_ne!(
+            leaf.layout.source_for_visible(0),
+            gt,
+            "click x on painted `code` must not equal the `>` byte"
+        );
+        assert_eq!(leaf.layout.visible_for_source(c), 0);
+
+        let ime = body_frame(c, vec![leaf]);
+        let focused = ime.focused_leaf().expect("code leaf owns the caret");
+        assert_eq!(focused.layout.source_for_visible(0), c);
+        assert_eq!(
+            ime.leaf_at_point(point(px(20.0), px(14.0)))
+                .expect("hit")
+                .layout
+                .source_for_visible(0),
+            c,
+            "IME origin hit-test uses the same prefix-skipping map"
+        );
+    }
+
+    #[test]
+    fn list_nested_fence_ime_character_index_skips_indent() {
+        let source = "- item\n  ```\n  code\n  ```\n";
+        let bounds = rect(8.0, 40.0, 200.0, 22.0);
+        let leaf = mapped_fence_leaf(source, bounds);
+        let c = source.find("code").expect("code");
+        let indent = source.find("  code").expect("indent");
+        assert_eq!(leaf.layout.source_for_visible(0), c);
+        assert_ne!(leaf.layout.source_for_visible(0), indent);
+        let ime = body_frame(c, vec![leaf]);
+        assert_eq!(
+            ime.focused_leaf()
+                .expect("leaf")
+                .layout
+                .visible_for_source(c),
+            0
+        );
+    }
+
+    fn first_opaque(blocks: &[markrust_core::rich::Block]) -> Option<&markrust_core::rich::Block> {
+        for b in blocks {
+            if matches!(b.kind, BlockKind::Opaque { .. }) {
+                return Some(b);
+            }
+            if let Some(found) = first_opaque(&b.children) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn mapped_html_leaf(source: &str, bounds: Bounds<Pixels>) -> ImeLeafHit {
+        use super::super::block_text::build_html_block_layout;
+        use crate::theme::EditorTheme;
+        use gpui::TextStyle;
+
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let block = first_opaque(&tree.blocks).expect("html block");
+        let raw = match &block.kind {
+            BlockKind::Opaque { raw } => raw.as_str(),
+            _ => unreachable!(),
+        };
+        let theme = EditorTheme::dark();
+        let style = TextStyle {
+            color: theme.text,
+            font_family: theme.font_family.clone().into(),
+            font_size: px(theme.font_size).into(),
+            ..Default::default()
+        };
+        let layout = match markrust_core::html_visual::project_html_block(raw) {
+            markrust_core::html_visual::HtmlBlockVisual::Flow {
+                text,
+                source_at,
+                runs,
+            } => build_html_block_layout(&text, &source_at, &runs, source, block, &style, &theme),
+            other => panic!("expected flow, got {other:?}"),
+        };
+        let x = source.find('x').unwrap_or(block.source_range.start);
+        ImeLeafHit {
+            layout: Arc::new(layout),
+            bounds,
+            font_size: 16.0,
+            line_height: 22.0,
+            caret_bounds: Some(caret_on(bounds, x, x)),
+        }
+    }
+
+    #[test]
+    fn quoted_html_ime_character_index_skips_quote_prefix() {
+        let source = "> <div>\n> x\n> </div>\n";
+        let bounds = rect(8.0, 10.0, 200.0, 22.0);
+        let leaf = mapped_html_leaf(source, bounds);
+        let x = source.find('x').expect("x");
+        let gt = source.find('>').expect(">");
+        assert_ne!(
+            leaf.layout.source_for_visible(0),
+            gt,
+            "character_index_for_point vis 0 must not be the `>` byte"
+        );
+        let vis = leaf.layout.visible_for_source(x);
+        assert_eq!(leaf.layout.source_for_visible(vis), x);
+        let ime = body_frame(x, vec![leaf]);
+        let focused = ime.focused_leaf().expect("html leaf owns the caret");
+        assert_eq!(focused.layout.source_for_visible(vis), x);
+        assert_eq!(
+            ime.leaf_at_point(point(px(20.0), px(14.0)))
+                .expect("hit")
+                .layout
+                .source_for_visible(0),
+            focused.layout.source_for_visible(0),
+            "IME origin hit-test uses the same prefix-skipping HTML map"
+        );
+    }
+
+    fn first_paragraph(
+        blocks: &[markrust_core::rich::Block],
+    ) -> Option<&markrust_core::rich::Block> {
+        for b in blocks {
+            if matches!(b.kind, BlockKind::Paragraph) {
+                return Some(b);
+            }
+            if let Some(found) = first_paragraph(&b.children) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn mapped_para_leaf(source: &str, bounds: Bounds<Pixels>) -> ImeLeafHit {
+        use super::super::block_text::{build_leaf_layout_revealed, RevealState};
+        use crate::theme::EditorTheme;
+        use gpui::TextStyle;
+
+        let mut ids = IdGen::default();
+        let tree = import_markdown(source, &mut ids);
+        let block = first_paragraph(&tree.blocks).expect("paragraph");
+        let theme = EditorTheme::dark();
+        let style = TextStyle {
+            color: theme.text,
+            font_family: theme.font_family.clone().into(),
+            font_size: px(theme.font_size).into(),
+            ..Default::default()
+        };
+        let layout = build_leaf_layout_revealed(
+            block,
+            &style,
+            &theme,
+            gpui::FontWeight::NORMAL,
+            &RevealState::HIDDEN,
+        );
+        let h = source.find('h').unwrap_or(block.source_range.start);
+        ImeLeafHit {
+            layout: Arc::new(layout),
+            bounds,
+            font_size: 16.0,
+            line_height: 22.0,
+            caret_bounds: Some(caret_on(bounds, h, h)),
+        }
+    }
+
+    #[test]
+    fn quoted_paragraph_ime_character_index_skips_quote_prefix() {
+        let source = "> hello\n";
+        let bounds = rect(8.0, 10.0, 200.0, 22.0);
+        let leaf = mapped_para_leaf(source, bounds);
+        let h = source.find('h').expect("h");
+        let gt = source.find('>').expect(">");
+        assert_eq!(
+            leaf.layout.source_for_visible(0),
+            h,
+            "character_index_for_point vis 0 must be `h`"
+        );
+        assert_ne!(leaf.layout.source_for_visible(0), gt);
+        let ime = body_frame(h, vec![leaf]);
+        assert_eq!(
+            ime.focused_leaf()
+                .expect("leaf")
+                .layout
+                .source_for_visible(0),
+            h
+        );
+    }
+
+    #[test]
+    fn list_item_ime_character_index_skips_marker() {
+        let source = "- hello\n";
+        let bounds = rect(8.0, 10.0, 200.0, 22.0);
+        let leaf = mapped_para_leaf(source, bounds);
+        let h = source.find('h').expect("h");
+        let dash = source.find('-').expect("-");
+        assert_eq!(leaf.layout.source_for_visible(0), h);
+        assert_ne!(leaf.layout.source_for_visible(0), dash);
+        let ime = body_frame(h, vec![leaf]);
+        assert_eq!(
+            ime.leaf_at_point(point(px(20.0), px(14.0)))
+                .expect("hit")
+                .layout
+                .source_for_visible(0),
+            h,
+            "IME origin hit-test uses the same prefix-skipping map"
+        );
+    }
+
+    #[test]
+    fn nested_quote_ime_character_index_skips_inner_marker() {
+        let source = "> > hello\n";
+        let bounds = rect(8.0, 10.0, 200.0, 22.0);
+        let leaf = mapped_para_leaf(source, bounds);
+        let h = source.find('h').expect("h");
+        assert_eq!(leaf.layout.source_for_visible(0), h);
+        assert_ne!(&source[leaf.layout.source_for_visible(0)..][..1], ">");
+    }
+
+    #[test]
+    fn ordered_list_ime_character_index_skips_marker() {
+        let source = "1. hello\n";
+        let bounds = rect(8.0, 10.0, 200.0, 22.0);
+        let leaf = mapped_para_leaf(source, bounds);
+        let h = source.find('h').expect("h");
+        assert_eq!(leaf.layout.source_for_visible(0), h);
+        assert_ne!(&source[leaf.layout.source_for_visible(0)..][..1], "1");
+    }
+
+    #[test]
+    fn unchecked_task_ime_character_index_skips_checkbox() {
+        let source = "- [ ] hello\n";
+        let bounds = rect(8.0, 10.0, 200.0, 22.0);
+        let leaf = mapped_para_leaf(source, bounds);
+        let h = source.find('h').expect("h");
+        assert_eq!(leaf.layout.source_for_visible(0), h);
     }
 
     fn hit_for_range(

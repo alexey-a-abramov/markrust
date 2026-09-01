@@ -21,8 +21,9 @@ use markrust_core::rich::{
 };
 
 use super::block_text::{
-    build_blank_gap_layout, build_code_layout, build_html_block_layout, build_leaf_layout_inlines,
-    build_leaf_layout_revealed, BlockTextElement, RevealState, WidgetImeSink, WysiwygHost,
+    build_blank_gap_layout, build_code_block_layout, build_html_block_layout,
+    build_leaf_layout_inlines, build_leaf_layout_revealed, BlockTextElement, RevealState,
+    WidgetImeSink, WysiwygHost,
 };
 use super::image::{resolve_image_source, ResolvedImage};
 use super::inline_layout::{
@@ -152,8 +153,8 @@ fn render_block<H: WysiwygHost>(
             };
             let mut code_style = base_text_style(theme, theme.font_size * 0.9, FontWeight::NORMAL);
             code_style.font_family = theme.code_font_family.clone().into();
-            let body_start = code_body_source_start(&snap.source, block);
-            let mut layout = build_code_layout(&body, body_start, &code_style, theme);
+            let mut layout =
+                build_code_block_layout(&body, &snap.source, block, &code_style, theme);
             let hl = code_runs(&body, &language, theme);
             if !hl.is_empty() && !body.is_empty() {
                 layout.runs = text_runs_from_highlights(&body, &hl, &code_style);
@@ -291,9 +292,10 @@ fn render_alert<H: WysiwygHost>(
         let slice = snap.source.get(chrome_range.clone()).unwrap_or("");
         let mut text_style = base_text_style(theme, theme.font_size * 0.85, FontWeight::SEMIBOLD);
         text_style.color = accent;
-        let layout = std::sync::Arc::new(build_code_layout(
+        let layout = std::sync::Arc::new(build_code_block_layout(
             slice,
-            chrome_range.start,
+            &snap.source,
+            block,
             &text_style,
             theme,
         ));
@@ -465,7 +467,8 @@ fn render_opaque<H: WysiwygHost>(
                 &text,
                 &source_at,
                 &runs,
-                block.source_range.start,
+                &snap.source,
+                block,
                 &text_style,
                 theme,
             );
@@ -1159,14 +1162,6 @@ fn code_runs(
         cursor = end;
     }
     out
-}
-
-fn code_body_source_start(source: &str, block: &Block) -> usize {
-    let slice = source.get(block.source_range.clone()).unwrap_or("");
-    match slice.find('\n') {
-        Some(i) => block.source_range.start + i + 1,
-        None => block.source_range.start,
-    }
 }
 
 fn text_runs_from_highlights(

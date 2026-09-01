@@ -23,7 +23,8 @@ pub use command::{
 pub use emoji::{lookup_emoji, lookup_shortcode};
 pub use engine::{
     blank_caret_gap_after_last, blank_caret_gap_at, blank_caret_gap_before, blank_caret_gaps,
-    caret_for_click_below_content, Bias, BlockSpan, BlockSplice, RichEngine, TablePos,
+    caret_for_click_below_content, code_body_source_map, Bias, BlockSpan, BlockSplice, RichEngine,
+    TablePos,
 };
 pub use import::import_markdown;
 pub use input_rules::{match_input_rule, InputRule};
@@ -32,7 +33,7 @@ pub use serialize::{serialize_block, serialize_tree, SerializeMode};
 pub use tree::{
     find_alert_chrome, is_toc_marker, wiki_visible_range, AlertChrome, AlertKind, Block, BlockKind,
     BreakStyle, ColumnAlign, FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs,
-    MarkFidelity, MarkSet, NodeId, RichTree,
+    MarkFidelity, MarkSet, NodeId, PrefixBlank, RichTree,
 };
 
 #[cfg(test)]
@@ -171,6 +172,11 @@ mod tests {
             }
             other => panic!("expected fenced code block, got {other:?}"),
         }
+        let body = source.find("fn main() {}").expect("body");
+        assert_eq!(
+            tree.blocks[0].code_body_range(source),
+            body..body + "fn main() {}".len()
+        );
     }
 
     #[test]

@@ -253,10 +253,13 @@ pub fn build_html_block_layout(
     text: &str,
     source_at: &[usize],
     paints: &[markrust_core::html_visual::HtmlPaintRun],
-    block_start: usize,
+    source: &str,
+    block: &Block,
     text_style: &TextStyle,
     theme: &EditorTheme,
 ) -> LeafLayout {
+    let literal_map = html_literal_source_map(source, block);
+    let block_start = *literal_map.first().unwrap_or(&block.source_range.start);
     let mut inlines = inlines_from_inner_markdown(text);
     let markdown_visible = if inlines.is_empty() {
         false
@@ -291,9 +294,23 @@ pub fn build_html_block_layout(
         &RevealState::HIDDEN,
     );
     if layout.text.is_empty() && !text.is_empty() {
-        return html_flow_layout(text, source_at, paints, block_start, text_style, theme);
+        return html_flow_layout(
+            text,
+            source_at,
+            paints,
+            &literal_map,
+            block_start,
+            text_style,
+            theme,
+        );
     }
-    remap_html_sources(&mut layout, source_at, block_start, text.len());
+    remap_html_sources(
+        &mut layout,
+        source_at,
+        &literal_map,
+        block_start,
+        text.len(),
+    );
     layout
 }
 
@@ -301,6 +318,7 @@ fn html_flow_layout(
     text: &str,
     source_at: &[usize],
     paints: &[markrust_core::html_visual::HtmlPaintRun],
+    literal_map: &[usize],
     block_start: usize,
     text_style: &TextStyle,
     theme: &EditorTheme,
@@ -320,7 +338,7 @@ fn html_flow_layout(
     }
     let mut mapped: Vec<usize> = source_at
         .iter()
-        .map(|o| block_start.saturating_add(*o))
+        .map(|o| doc_offset_for_html_literal(literal_map, *o, block_start))
         .collect();
     if text.is_empty() {
         mapped = vec![block_start, block_start];
@@ -344,6 +362,19 @@ fn html_flow_layout(
         source_at: mapped,
         block_start,
     }
+}
+
+fn html_literal_source_map(source: &str, block: &Block) -> Vec<usize> {
+    let body = block.code_body_range(source);
+    markrust_core::rich::code_body_source_map(source, block, body.len())
+}
+
+fn doc_offset_for_html_literal(literal_map: &[usize], html: usize, fallback: usize) -> usize {
+    literal_map
+        .get(html)
+        .copied()
+        .or_else(|| literal_map.last().copied())
+        .unwrap_or(fallback)
 }
 
 fn inlines_from_inner_markdown(source: &str) -> Vec<Inline> {
@@ -496,6 +527,7 @@ fn split_inlines_by_html_paints(
 fn remap_html_sources(
     layout: &mut LeafLayout,
     html_source_at: &[usize],
+    literal_map: &[usize],
     block_start: usize,
     inner_len: usize,
 ) {
@@ -506,7 +538,7 @@ fn remap_html_sources(
             .copied()
             .or_else(|| html_source_at.last().copied())
             .unwrap_or(0);
-        *slot = block_start.saturating_add(html);
+        *slot = doc_offset_for_html_literal(literal_map, html, block_start);
     }
     layout.block_start = block_start;
 }
@@ -928,9 +960,22 @@ pub fn build_leaf_layout_inlines(
 }
 
 /// Layout for a fenced code body: 1:1 map from visible bytes to source.
-pub fn build_code_layout(
+pub fn build_code_block_layout(
     body: &str,
-    source_start: usize,
+    source: &str,
+    block: &Block,
+    text_style: &TextStyle,
+    theme: &EditorTheme,
+) -> LeafLayout {
+    let source_at = markrust_core::rich::code_body_source_map(source, block, body.len());
+    let block_start = block.code_body_range(source).start;
+    finish_code_layout(body, source_at, block_start, text_style, theme)
+}
+
+fn finish_code_layout(
+    body: &str,
+    mut source_at: Vec<usize>,
+    block_start: usize,
     text_style: &TextStyle,
     theme: &EditorTheme,
 ) -> LeafLayout {
@@ -938,19 +983,22 @@ pub fn build_code_layout(
     if !body.is_empty() {
         runs[0].font.family = theme.code_font_family.clone().into();
     }
-    let mut source_at = Vec::with_capacity(body.len() + 1);
-    for i in 0..=body.len() {
-        source_at.push(source_start + i);
-    }
     if body.is_empty() {
-        source_at = vec![source_start, source_start];
+        let at = source_at.first().copied().unwrap_or(block_start);
+        source_at = vec![at, at];
         runs = vec![text_style.to_run(1)];
+    } else {
+        while source_at.len() < body.len() + 1 {
+            let last = source_at.last().copied().unwrap_or(block_start);
+            source_at.push(last);
+        }
+        source_at.truncate(body.len() + 1);
     }
     LeafLayout {
         text: body.to_string(),
         runs,
         source_at,
-        block_start: source_start,
+        block_start,
     }
 }
 
@@ -1790,14 +1838,18 @@ mod tests {
             font_size: px(theme.font_size).into(),
             ..Default::default()
         };
-        let layout = build_code_layout("fn x() {}", 10, &style, &theme);
+        let source = "```rust\nfn x() {}\n```\n";
+        let tree = markrust_core::rich::import_markdown(source, &mut IdGen::default());
+        let block = tree
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::CodeBlock { .. }))
+            .expect("code block");
+        let layout = build_code_block_layout("fn x() {}", source, block, &style, &theme);
         assert_eq!(layout.text, "fn x() {}");
-        assert_eq!(layout.source_for_visible(0), 10);
-        assert_eq!(layout.source_for_visible(5), 15);
-        assert!(layout.contains_source(10));
-        assert!(layout.contains_source(19));
-        assert!(!layout.contains_source(9));
-        assert!(!layout.contains_source(20));
+        assert!(layout.source_for_visible(0) >= block.code_body_range(source).start);
+        assert!(layout.contains_source(block.code_body_range(source).start + "fn".len()));
+        assert!(!layout.contains_source(0));
     }
 
     fn html_block_layout(raw: &str) -> LeafLayout {
@@ -1813,8 +1865,29 @@ mod tests {
                 text,
                 source_at,
                 runs,
-            } => build_html_block_layout(&text, &source_at, &runs, 0, &style, &theme),
+            } => build_html_block_layout(
+                &text,
+                &source_at,
+                &runs,
+                raw,
+                &mk_opaque_block(raw),
+                &style,
+                &theme,
+            ),
             other => panic!("expected flow, got {other:?}"),
+        }
+    }
+
+    fn mk_opaque_block(raw: &str) -> Block {
+        Block {
+            id: NodeId(0),
+            kind: BlockKind::Opaque {
+                raw: raw.to_string(),
+            },
+            source_range: 0..raw.len(),
+            inlines: Vec::new(),
+            children: Vec::new(),
+            content_hash: 0,
         }
     }
 

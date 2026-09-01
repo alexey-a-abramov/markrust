@@ -42,6 +42,24 @@ pub struct RichTree {
     /// blank line (`hello\n\n`). `None` when the last line has content or
     /// only a terminator `\n`. Extra unused newlines share this one range.
     pub trailing_blank: Option<Range<usize>>,
+    /// Empty quoted / list lines (`> `, `- `, `1. `, `- [ ] `) that have no
+    /// descendant inlines. Caret/click sit after the prefix so typing is
+    /// `> x` / `- x`, not chrome.
+    pub empty_prefix_homes: Vec<PrefixBlank>,
+}
+
+/// One empty quote/list line: the source line (no `\n`) and the body offset
+/// after `>` / `- ` / `1. ` / task checkbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixBlank {
+    pub line: Range<usize>,
+    pub home: usize,
+}
+
+impl PrefixBlank {
+    pub fn contains(&self, byte: usize) -> bool {
+        byte >= self.line.start && byte <= self.home.max(self.line.end)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +100,35 @@ impl Block {
                 | BlockKind::DefinitionTerm
                 | BlockKind::DefinitionDetails
         )
+    }
+
+    /// Editable inner range of a fenced code block (between the opening and
+    /// closing fence lines). Indented code and non-code blocks return the
+    /// full `source_range`. Empty fences collapse to the byte after the
+    /// opening newline so the caret can sit in the body.
+    pub fn code_body_range(&self, source: &str) -> Range<usize> {
+        let BlockKind::CodeBlock { fence: Some(_), .. } = &self.kind else {
+            return self.source_range.clone();
+        };
+        let start = self.source_range.start;
+        let end = self.source_range.end.min(source.len());
+        if start >= end {
+            return start..start;
+        }
+        let slice = &source[start..end];
+        let body_start = match slice.find('\n') {
+            Some(i) => start + i + 1,
+            None => start,
+        };
+        let body_end = match slice.rfind('\n') {
+            Some(i) => start + i,
+            None => end,
+        };
+        if body_start > body_end {
+            body_start..body_start
+        } else {
+            body_start..body_end
+        }
     }
 }
 

@@ -111,12 +111,15 @@ pub fn import_markdown(source: &str, ids: &mut IdGen) -> RichTree {
         }
         blocks.push(importer.import_block(child, ids));
     }
-    RichTree {
+    let mut tree = RichTree {
         frontmatter,
         blocks,
         source_len: source.len(),
         trailing_blank: trailing_blank_gap(source),
-    }
+        empty_prefix_homes: Vec::new(),
+    };
+    tree.empty_prefix_homes = super::engine::collect_empty_prefix_homes(source, &tree);
+    tree
 }
 
 impl<'s> Importer<'s> {
@@ -311,17 +314,21 @@ impl<'s> Importer<'s> {
             return block;
         }
         if matches!(block.kind, BlockKind::CodeBlock { .. }) {
-            if let BlockKind::CodeBlock { literal, .. } = &block.kind {
-                let text = literal.strip_suffix('\n').unwrap_or(literal).to_string();
-                block.inlines.push(Inline::Run {
-                    text,
-                    raw: None,
-                    source_range: block.source_range.clone(),
-                    marks: MarkSet::CODE,
-                    link: None,
-                    fidelity: MarkFidelity::default(),
-                });
-            }
+            let text = match &block.kind {
+                BlockKind::CodeBlock { literal, .. } => {
+                    literal.strip_suffix('\n').unwrap_or(literal).to_string()
+                }
+                _ => unreachable!(),
+            };
+            let body = block.code_body_range(self.source);
+            block.inlines.push(Inline::Run {
+                text,
+                raw: None,
+                source_range: body,
+                marks: MarkSet::CODE,
+                link: None,
+                fidelity: MarkFidelity::default(),
+            });
             return block;
         }
 

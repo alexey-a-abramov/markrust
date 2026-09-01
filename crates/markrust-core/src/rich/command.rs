@@ -10,6 +10,7 @@ use std::ops::Range;
 use crate::document::Document;
 use crate::undo::{SelectionSnapshot, TransactionKind};
 
+pub use super::engine::code_body_source_map;
 use super::engine::{
     blank_caret_gap_after_last, caret_for_click_below_content, RichEngine, TablePos,
 };

@@ -347,6 +347,7 @@ impl RichEditorView {
         let source = self.document.read(cx).buffer.content();
         self.engine.sync(self.document.read(cx));
         let offset = self.engine.snap_caret(offset.min(len), Bias::Left);
+        let offset = self.engine.clamp_raw_prefix(&source, offset, Bias::Left);
         if extend {
             let anchor = if self.selection_reversed {
                 self.selected_range.end

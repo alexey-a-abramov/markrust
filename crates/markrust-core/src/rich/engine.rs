@@ -12,7 +12,7 @@ use std::ops::Range;
 use crate::document::Document;
 
 use super::import::import_markdown;
-use super::tree::{Block, BlockKind, IdGen, Inline, MarkSet, NodeId, RichTree};
+use super::tree::{Block, BlockKind, IdGen, Inline, MarkSet, NodeId, PrefixBlank, RichTree};
 
 /// Caret snapping direction when a byte falls on delimiter bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +291,9 @@ impl RichEngine {
             }
             return byte;
         }
+        if let Some(home) = self.prefix_blank_home_at(byte) {
+            return home;
+        }
         let Some(id) = self.block_at(byte) else {
             return byte;
         };
@@ -324,10 +327,17 @@ impl RichEngine {
     /// One visible-grapheme step left from `byte`, skipping delimiter gaps
     /// between runs and treating backslash escapes as atomic. A blank gap
     /// between blocks is one stop (extra unused newlines are not extra steps).
+    /// Quote markers, list markers, and HTML tags are not caret stops
+    /// (same prefixes click/IME skip). Empty `> ` / `- ` lines are one stop.
     pub fn prev_caret(&self, source: &str, byte: usize) -> usize {
         let byte = self.snap_caret(byte, Bias::Left);
         if let Some(gap) = blank_caret_gap_at(&self.tree, byte) {
             return self.snap_caret(gap.start.saturating_sub(1), Bias::Left);
+        }
+        if let Some(blank) = self.prefix_blank_at(byte) {
+            if byte == blank.home {
+                return self.snap_caret(blank.line.start.saturating_sub(1), Bias::Left);
+            }
         }
         let Some(block) = self.block_at(byte).and_then(|id| self.block(id)) else {
             return byte.saturating_sub(1);
@@ -336,25 +346,49 @@ impl RichEngine {
         let Some(idx) = ranges.iter().position(|r| r.start <= byte && byte <= r.end) else {
             return byte;
         };
-        if byte > ranges[idx].start {
-            return step_left_in_slice(source, ranges[idx].start, byte);
-        }
-        if idx > 0 {
+        let stepped = if byte > ranges[idx].start {
+            step_left_in_slice(source, ranges[idx].start, byte)
+        } else if idx > 0 {
             let prev = &ranges[idx - 1];
-            return step_left_in_slice(source, prev.start, prev.end);
-        }
-        // Cross to the previous block (a blank gap before this block is one stop).
-        if let Some(gap) = blank_caret_gap_ending_at(&self.tree, block.source_range.start) {
-            return gap.start;
-        }
-        let prev_block = self.block_before(block.id);
-        match prev_block {
-            Some(pb) => {
-                let pranges = inline_ranges(pb);
-                pranges.last().map(|r| r.end).unwrap_or(pb.source_range.end)
+            step_left_in_slice(source, prev.start, prev.end)
+        } else if let Some(home) = self.prev_prefix_blank_home(byte, block.source_range.start) {
+            home
+        } else if let Some(gap) = blank_caret_gap_ending_at(&self.tree, block.source_range.start) {
+            gap.start
+        } else {
+            match self.block_before(block.id) {
+                Some(pb) => {
+                    if let Some(home) = self.prev_prefix_blank_home(byte, pb.source_range.end) {
+                        home
+                    } else {
+                        let pranges = inline_ranges(pb);
+                        pranges.last().map(|r| r.end).unwrap_or(pb.source_range.end)
+                    }
+                }
+                None => byte,
             }
-            None => byte,
+        };
+        let clamped = self.clamp_raw_prefix(source, stepped, Bias::Left);
+        if clamped == byte {
+            if let Some(raw) = raw_leaf_at(self, byte) {
+                let first =
+                    self.clamp_raw_prefix(source, raw_body_range(raw, source).start, Bias::Right);
+                if byte <= first {
+                    if let Some(gap) = blank_caret_gap_ending_at(&self.tree, raw.source_range.start)
+                    {
+                        return gap.start;
+                    }
+                    return match self.block_before(raw.id) {
+                        Some(pb) => {
+                            let pranges = inline_ranges(pb);
+                            pranges.last().map(|r| r.end).unwrap_or(pb.source_range.end)
+                        }
+                        None => byte,
+                    };
+                }
+            }
         }
+        clamped
     }
 
     /// One visible-grapheme step right from `byte` (mirror of `prev_caret`).
@@ -363,6 +397,17 @@ impl RichEngine {
         if let Some(gap) = blank_caret_gap_at(&self.tree, byte) {
             return self.snap_caret(gap.end.min(source.len()), Bias::Right);
         }
+        if let Some(blank) = self.prefix_blank_at(byte) {
+            if byte == blank.home {
+                let after = blank.line.end;
+                let next = if source.as_bytes().get(after) == Some(&b'\n') {
+                    after + 1
+                } else {
+                    after
+                };
+                return self.snap_caret(next.min(source.len()), Bias::Right);
+            }
+        }
         let Some(block) = self.block_at(byte).and_then(|id| self.block(id)) else {
             return (byte + 1).min(source.len());
         };
@@ -370,29 +415,120 @@ impl RichEngine {
         let Some(idx) = ranges.iter().position(|r| r.start <= byte && byte <= r.end) else {
             return byte;
         };
-        if byte < ranges[idx].end {
-            return step_right_in_slice(source, byte, ranges[idx].end);
-        }
-        if idx + 1 < ranges.len() {
+        let stepped = if byte < ranges[idx].end {
+            step_right_in_slice(source, byte, ranges[idx].end)
+        } else if idx + 1 < ranges.len() {
             let next = &ranges[idx + 1];
-            return step_right_in_slice(source, next.start, next.end);
-        }
-        match self.block_after(block.id) {
-            Some(nb) => {
-                if let Some(gap) = blank_caret_gap_ending_at(&self.tree, nb.source_range.start) {
-                    gap.start
+            if next.start > byte {
+                // Gap is quote/list chrome (`\n>` / `- `), not a caret stop.
+                // Continuation indent (`  world`) is also skipped so Right
+                // from `hello` lands on `w`.
+                if let Some(home) = self.next_prefix_blank_home(byte, next.start) {
+                    home
                 } else {
-                    let nranges = inline_ranges(nb);
-                    nranges
-                        .first()
-                        .map(|r| r.start)
-                        .unwrap_or(nb.source_range.start)
+                    self.clamp_raw_prefix(source, next.start, Bias::Right)
+                }
+            } else {
+                step_right_in_slice(source, byte.max(next.start), next.end)
+            }
+        } else if let Some(home) = self.next_prefix_blank_home(
+            byte,
+            self.block_after(block.id)
+                .map(|nb| nb.source_range.start)
+                .unwrap_or(source.len()),
+        ) {
+            home
+        } else {
+            match self.block_after(block.id) {
+                Some(nb) => {
+                    if let Some(gap) = blank_caret_gap_ending_at(&self.tree, nb.source_range.start)
+                    {
+                        gap.start
+                    } else {
+                        let nranges = inline_ranges(nb);
+                        nranges
+                            .first()
+                            .map(|r| r.start)
+                            .unwrap_or(nb.source_range.start)
+                    }
+                }
+                None => blank_caret_gap_after_last(&self.tree)
+                    .map(|gap| gap.start)
+                    .unwrap_or(byte),
+            }
+        };
+        self.clamp_raw_prefix(source, stepped, Bias::Right)
+    }
+
+    fn prefix_blank_at(&self, byte: usize) -> Option<&PrefixBlank> {
+        self.tree
+            .empty_prefix_homes
+            .iter()
+            .find(|blank| blank.contains(byte))
+    }
+
+    fn prefix_blank_home_at(&self, byte: usize) -> Option<usize> {
+        self.prefix_blank_at(byte).map(|blank| blank.home)
+    }
+
+    fn next_prefix_blank_home(&self, byte: usize, until: usize) -> Option<usize> {
+        self.tree
+            .empty_prefix_homes
+            .iter()
+            .filter(|blank| blank.home > byte && blank.home <= until)
+            .map(|blank| blank.home)
+            .min()
+    }
+
+    fn prev_prefix_blank_home(&self, byte: usize, after: usize) -> Option<usize> {
+        self.tree
+            .empty_prefix_homes
+            .iter()
+            .filter(|blank| blank.home < byte && blank.home >= after)
+            .map(|blank| blank.home)
+            .max()
+    }
+
+    /// If `byte` sits on a quote/list prefix (fence, HTML, quoted paragraph,
+    /// or list item), move onto the editable body of that line (`Right`) or
+    /// the previous line's terminator (`Left`). Unquoted 1:1 bodies are
+    /// unchanged. HTML-block tag bytes (`<div>`, `</div>`) are skipped the
+    /// same way.
+    pub fn clamp_raw_prefix(&self, source: &str, byte: usize, bias: Bias) -> usize {
+        let Some(id) = self.block_at(byte) else {
+            return byte;
+        };
+        let Some(block) = self.block(id) else {
+            return byte;
+        };
+        let body = raw_body_range(block, source);
+        let mut at = byte.clamp(body.start, body.end);
+        let prefix = raw_container_prefix(source, block);
+        if !prefix.is_empty() {
+            let ls = source_line_start(source, at);
+            let le = source_line_end_exclusive(source, at);
+            let line = &source[ls..le];
+            let skip = skip_line_prefix(line, &prefix);
+            if skip > 0 {
+                let content = (ls + skip).min(le).clamp(body.start, body.end);
+                if at < content {
+                    at = match bias {
+                        Bias::Right => content,
+                        Bias::Left => {
+                            if ls > body.start {
+                                ls.saturating_sub(1).clamp(body.start, body.end)
+                            } else {
+                                content
+                            }
+                        }
+                    };
                 }
             }
-            None => blank_caret_gap_after_last(&self.tree)
-                .map(|gap| gap.start)
-                .unwrap_or(byte),
         }
+        if matches!(block.kind, BlockKind::Opaque { .. }) {
+            at = clamp_html_tag(source, at, body, bias);
+        }
+        at
     }
 
     /// Move `delta` visual lines (`+` down, `-` up). A painted blank gap
@@ -447,7 +583,13 @@ impl RichEngine {
             if moved == pos {
                 break;
             }
-            pos = moved;
+            // Quoted/nested fences, HTML, quotes, and lists: skip `>` / `- `
+            // so Up/Down land on the painted body (same prefixes click maps past).
+            let next_pos = self.clamp_raw_prefix(source, moved, Bias::Right);
+            if next_pos == pos {
+                break;
+            }
+            pos = next_pos;
             left -= 1;
         }
         pos
@@ -641,44 +783,376 @@ fn blank_between(lo: usize, hi: usize, leading: bool) -> Option<Range<usize>> {
     Some(start..hi)
 }
 
+/// Byte ranges of caret-valid inline content within a leaf block. Quote and
+/// list containers with no inlines of their own use their descendants so
+/// `>` / `- ` are not caret homes (Home / snap land on painted body).
 fn inline_ranges(block: &Block) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
     match &block.kind {
-        // Code blocks and opaque blocks are edited as raw text.
-        BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. } => {
-            out.push(block.source_range.clone());
-        }
-        BlockKind::Alert { chrome_range, .. } => {
-            if chrome_range.start < chrome_range.end {
-                out.push(chrome_range.clone());
+        BlockKind::CodeBlock { .. } => {
+            if let Some(Inline::Run { source_range, .. }) = block.inlines.first() {
+                vec![source_range.clone()]
             } else {
-                out.push(block.source_range.clone());
+                vec![block.source_range.clone()]
             }
         }
-        _ => {
-            for inline in &block.inlines {
-                match inline {
-                    Inline::Run { source_range, .. }
-                    | Inline::Image { source_range, .. }
-                    | Inline::Math { source_range, .. }
-                    | Inline::WikiLink { source_range, .. }
-                    | Inline::Emoji { source_range, .. } => {
-                        out.push(source_range.clone());
-                    }
-                    Inline::OpaqueInline {
-                        source_range, raw, ..
-                    } => {
-                        if !crate::html_visual::opaque_inline_is_caret_chrome(raw) {
-                            out.push(source_range.clone());
-                        }
-                    }
-                    Inline::SoftBreak { .. } | Inline::HardBreak { .. } => {}
-                }
+        BlockKind::Opaque { .. } => vec![block.source_range.clone()],
+        BlockKind::Alert { chrome_range, .. } => {
+            let mut out = Vec::new();
+            if chrome_range.start < chrome_range.end {
+                out.push(chrome_range.clone());
+            }
+            for child in &block.children {
+                out.extend(inline_ranges(child));
             }
             if out.is_empty() {
                 out.push(block.source_range.clone());
             }
+            out
         }
+        BlockKind::Table { .. } | BlockKind::TableRow { .. } => {
+            vec![block.source_range.clone()]
+        }
+        _ if block.inlines.is_empty() && !block.children.is_empty() => {
+            let mut out = Vec::new();
+            for child in &block.children {
+                out.extend(inline_ranges(child));
+            }
+            if out.is_empty() {
+                out.push(block.source_range.clone());
+            }
+            out
+        }
+        _ => leaf_inline_ranges(block),
+    }
+}
+
+fn raw_leaf_at(engine: &RichEngine, offset: usize) -> Option<&Block> {
+    let id = engine.block_at(offset)?;
+    let block = engine.block(id)?;
+    matches!(
+        block.kind,
+        BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. }
+    )
+    .then_some(block)
+}
+
+/// Editable inner range: fence body between ticks, else the whole raw block.
+pub(crate) fn raw_body_range(block: &Block, source: &str) -> Range<usize> {
+    match &block.kind {
+        BlockKind::CodeBlock { fence: Some(_), .. } => block.code_body_range(source),
+        _ => block.source_range.clone(),
+    }
+}
+
+/// Quote markers, list marker (`- ` / `1. ` / task), and continuation indent
+/// of a block's opening line. Click/IME/arrows skip this prefix; Tab/Enter
+/// keep it on fences. Unquoted paragraphs have an empty prefix (1:1).
+pub(crate) fn raw_container_prefix(source: &str, block: &Block) -> String {
+    let start = block.source_range.start.min(source.len());
+    let line_start = source_line_start(source, start);
+    let line_end = source_line_end_exclusive(source, start);
+    let line = &source[line_start..line_end];
+    let quote = quote_marker_on_line(line);
+    let after = &line[quote.len()..];
+    let marker = list_marker_on_line(after);
+    let rest = &after[marker.len()..];
+    let indent = rest
+        .bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count();
+    format!("{quote}{marker}{}", &rest[..indent])
+}
+
+/// Leading indent plus `>` markers (optional space after each), or empty.
+fn quote_marker_on_line(line: &str) -> &str {
+    let indent_len = line
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count();
+    let bytes = line.as_bytes();
+    if bytes.get(indent_len) != Some(&b'>') {
+        return "";
+    }
+    let mut i = indent_len;
+    while bytes.get(i) == Some(&b'>') {
+        i += 1;
+        if bytes.get(i) == Some(&b' ') || bytes.get(i) == Some(&b'\t') {
+            i += 1;
+        }
+    }
+    &line[..i]
+}
+
+/// Leading indent plus `- ` / `* ` / `+ ` / `1. ` / task checkbox, or empty.
+/// Same width `command.rs` uses when stripping a list marker.
+fn list_marker_on_line(line: &str) -> &str {
+    let indent_len = line
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count();
+    let rest = &line[indent_len..];
+    let marker_len = if rest.starts_with(['-', '*', '+']) && rest.as_bytes().get(1) == Some(&b' ') {
+        2
+    } else if rest == "-" || rest == "*" || rest == "+" {
+        rest.len()
+    } else if let Some(end) = rest.find(['.', ')']) {
+        if !rest[..end].is_empty() && rest[..end].bytes().all(|b| b.is_ascii_digit()) {
+            end + 1 + usize::from(rest.as_bytes().get(end + 1) == Some(&b' '))
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    if marker_len == 0 {
+        return "";
+    }
+    let mut take = indent_len + marker_len;
+    let after = line.get(take..).unwrap_or("");
+    if after.starts_with("[ ]") || after.starts_with("[x]") || after.starts_with("[X]") {
+        take = (take + 4).min(line.len());
+    }
+    &line[..take.min(line.len())]
+}
+
+/// Quote markers plus list marker (`- ` / `1. ` / task), without extra
+/// body indent. Empty `> ` / `- ` lines use this as the caret skip width.
+fn quote_list_prefix_on_line(line: &str) -> &str {
+    let quote = quote_marker_on_line(line);
+    let marker = list_marker_on_line(&line[quote.len()..]);
+    &line[..quote.len() + marker.len()]
+}
+
+/// Bytes to skip at the start of `line` so click/arrows land on painted
+/// body. Opening-line prefix (`- `, `> `) on matching lines, or GFM
+/// continuation indent (`  world` after `- hello`).
+fn skip_line_prefix(line: &str, prefix: &str) -> usize {
+    if prefix.is_empty() {
+        return 0;
+    }
+    if line.starts_with(prefix) {
+        return prefix.len();
+    }
+    let quote = quote_marker_on_line(line);
+    let rest = &line[quote.len()..];
+    let budget = prefix.len().saturating_sub(quote.len());
+    let indent = rest
+        .bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count()
+        .min(budget);
+    quote.len() + indent
+}
+
+/// Empty `> ` / `- ` / `1. ` / task lines that are not fenced/HTML body.
+pub(crate) fn collect_empty_prefix_homes(source: &str, tree: &RichTree) -> Vec<PrefixBlank> {
+    let mut out = Vec::new();
+    let mut ls = 0usize;
+    while ls <= source.len() {
+        let le = source[ls..]
+            .find('\n')
+            .map(|i| ls + i)
+            .unwrap_or(source.len());
+        let line = &source[ls..le];
+        let prefix = quote_list_prefix_on_line(line);
+        if !prefix.is_empty() && line[prefix.len()..].trim().is_empty() {
+            let home = (ls + prefix.len()).min(le).min(source.len());
+            if prefix_blank_is_quote_or_list(tree, home) {
+                out.push(PrefixBlank { line: ls..le, home });
+            }
+        }
+        if le == source.len() {
+            break;
+        }
+        ls = le + 1;
+        if ls > source.len() {
+            break;
+        }
+    }
+    out
+}
+
+fn prefix_blank_is_quote_or_list(tree: &RichTree, byte: usize) -> bool {
+    let Some(block) = deepest_block(&tree.blocks, byte) else {
+        return false;
+    };
+    !matches!(
+        block.kind,
+        BlockKind::CodeBlock { .. }
+            | BlockKind::Opaque { .. }
+            | BlockKind::Table { .. }
+            | BlockKind::TableRow { .. }
+            | BlockKind::TableCell
+            | BlockKind::Heading { .. }
+            | BlockKind::ThematicBreak
+    )
+}
+
+fn deepest_block(blocks: &[Block], byte: usize) -> Option<&Block> {
+    let mut best = None;
+    fn walk<'a>(blocks: &'a [Block], byte: usize, best: &mut Option<&'a Block>) {
+        for b in blocks {
+            if b.source_range.start <= byte && byte <= b.source_range.end {
+                *best = Some(b);
+                walk(&b.children, byte, best);
+            }
+        }
+    }
+    walk(blocks, byte, &mut best);
+    best
+}
+
+/// If `offset` sits inside an HTML tag (`<div>`, `</div>`, `<!-- -->`), skip
+/// it like quote prefix. Leaves `a < b` text alone (not a tag).
+fn html_tag_bounds(source: &str, offset: usize, body: Range<usize>) -> Option<Range<usize>> {
+    let offset = offset.clamp(body.start, body.end);
+    if body.start >= body.end || offset >= body.end {
+        return None;
+    }
+    let slice = &source[body.start..body.end];
+    let rel = offset - body.start;
+    let before = &slice[..=rel.min(slice.len().saturating_sub(1))];
+    let open_rel = before.rfind('<')?;
+    let after_open = &slice[open_rel..];
+    let tag_rest = after_open.get(1..)?;
+    let first = tag_rest.chars().next()?;
+    if first != '/' && first != '!' && !first.is_ascii_alphabetic() {
+        return None;
+    }
+    let close = after_open.find('>')?;
+    let start = body.start + open_rel;
+    let end = (body.start + open_rel + close + 1).min(body.end);
+    (offset >= start && offset < end).then_some(start..end)
+}
+
+fn clamp_html_tag(source: &str, offset: usize, body: Range<usize>, bias: Bias) -> usize {
+    let Some(tag) = html_tag_bounds(source, offset, body.clone()) else {
+        return offset;
+    };
+    match bias {
+        Bias::Right => tag.end.clamp(body.start, body.end),
+        Bias::Left => {
+            if tag.start > body.start {
+                tag.start.saturating_sub(1).clamp(body.start, body.end)
+            } else {
+                tag.end.clamp(body.start, body.end)
+            }
+        }
+    }
+}
+
+fn source_line_start(source: &str, offset: usize) -> usize {
+    let offset = offset.min(source.len());
+    source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)
+}
+
+fn source_line_end_exclusive(source: &str, offset: usize) -> usize {
+    let offset = offset.min(source.len());
+    source[offset..]
+        .find('\n')
+        .map(|i| offset + i)
+        .unwrap_or(source.len())
+}
+
+/// Source offsets for each UTF-8 index in a painted fence/HTML/indented-code
+/// body (`painted_len + 1` slots). Quote/list prefixes are skipped so a click
+/// on painted content does not land on `>` or list indent.
+pub fn code_body_source_map(source: &str, block: &Block, painted_len: usize) -> Vec<usize> {
+    let body = raw_body_range(block, source);
+    map_visible_skipping_prefix(
+        source,
+        body,
+        &raw_container_prefix(source, block),
+        painted_len,
+    )
+}
+
+/// Map painted body bytes onto `source[body]`, skipping `prefix` at the start
+/// of each line (newlines stay in the painted stream).
+fn map_visible_skipping_prefix(
+    source: &str,
+    body: Range<usize>,
+    prefix: &str,
+    painted_len: usize,
+) -> Vec<usize> {
+    let start = body.start.min(source.len());
+    let end = body.end.min(source.len()).max(start);
+    if painted_len == 0 || start == end {
+        return vec![start, start];
+    }
+    let slice = &source[start..end];
+    let mut content = Vec::new();
+    let mut i = 0usize;
+    while i < slice.len() {
+        let rest = &slice[i..];
+        let nl = rest.find('\n').unwrap_or(rest.len());
+        let line = &rest[..nl];
+        let skip = skip_line_prefix(line, prefix).min(nl);
+        for j in skip..nl {
+            content.push(start + i + j);
+        }
+        if nl < rest.len() {
+            content.push(start + i + nl);
+            i += nl + 1;
+        } else {
+            break;
+        }
+    }
+    let mut source_at = Vec::with_capacity(painted_len + 1);
+    for k in 0..painted_len {
+        source_at.push(
+            content
+                .get(k)
+                .copied()
+                .or_else(|| content.last().copied())
+                .unwrap_or(start),
+        );
+    }
+    let last = content
+        .get(painted_len)
+        .copied()
+        .or_else(|| {
+            content.last().map(|p| {
+                let next = p.saturating_add(1);
+                if next <= end {
+                    next
+                } else {
+                    *p
+                }
+            })
+        })
+        .unwrap_or(start);
+    source_at.push(last);
+    source_at
+}
+
+/// Inline-run sources of a leaf block (delimiter gaps are not caret homes).
+fn leaf_inline_ranges(block: &Block) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for inline in &block.inlines {
+        match inline {
+            Inline::Run { source_range, .. }
+            | Inline::Image { source_range, .. }
+            | Inline::Math { source_range, .. }
+            | Inline::WikiLink { source_range, .. }
+            | Inline::Emoji { source_range, .. } => {
+                out.push(source_range.clone());
+            }
+            Inline::OpaqueInline {
+                source_range, raw, ..
+            } => {
+                if !crate::html_visual::opaque_inline_is_caret_chrome(raw) {
+                    out.push(source_range.clone());
+                }
+            }
+            Inline::SoftBreak { .. } | Inline::HardBreak { .. } => {
+                // Not extra caret homes. WYSIWYG maps the painted space / newline
+                // onto `source_range.start`, which sits at the previous run's end.
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(block.source_range.clone());
     }
     out
 }
