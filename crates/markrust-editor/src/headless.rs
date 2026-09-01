@@ -22,6 +22,14 @@ pub enum CaretMove {
     Down,
     Home,
     End,
+    /// Previous word start (Option-Left / Ctrl-Left).
+    WordLeft,
+    /// Next word end (Option-Right / Ctrl-Right).
+    WordRight,
+    /// Document start (Cmd-Up / Ctrl-Home).
+    DocumentHome,
+    /// Document end (Cmd-Down / Ctrl-End).
+    DocumentEnd,
     /// Move by a signed number of visual lines (page up/down, etc.).
     Vertical {
         delta_lines: i32,
@@ -448,6 +456,10 @@ fn move_caret(
         }
         CaretMove::Home => line_start(content, state.cursor_offset()),
         CaretMove::End => line_end(content, state.cursor_offset()),
+        CaretMove::WordLeft => prev_word_start(content, state.cursor_offset()),
+        CaretMove::WordRight => next_word_end(content, state.cursor_offset()),
+        CaretMove::DocumentHome => 0,
+        CaretMove::DocumentEnd => content.len(),
         CaretMove::Up => vertical_offset(content, document, state.cursor_offset(), -1),
         CaretMove::Down => vertical_offset(content, document, state.cursor_offset(), 1),
         CaretMove::Vertical { delta_lines } => {
@@ -491,6 +503,82 @@ pub fn next_boundary(content: &str, offset: usize) -> usize {
         .grapheme_indices(true)
         .find_map(|(idx, _)| (idx > offset).then_some(idx))
         .unwrap_or(content.len())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharKind {
+    Word,
+    Punct,
+    Whitespace,
+}
+
+fn char_kind(c: char) -> CharKind {
+    if c.is_whitespace() {
+        CharKind::Whitespace
+    } else if c.is_alphanumeric() || c == '_' {
+        CharKind::Word
+    } else {
+        CharKind::Punct
+    }
+}
+
+fn clamp_char_boundary(text: &str, mut offset: usize) -> usize {
+    offset = offset.min(text.len());
+    if offset > 0 && !text.is_char_boundary(offset) {
+        offset = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|i| *i <= offset)
+            .last()
+            .unwrap_or(0);
+    }
+    offset
+}
+
+/// Cocoa-style Option-Right: end of the current (or next) word / punct run.
+/// Whitespace is skipped; punctuation is its own run. Not UAX#29.
+pub fn next_word_end(text: &str, offset: usize) -> usize {
+    let offset = clamp_char_boundary(text, offset);
+    if offset >= text.len() {
+        return text.len();
+    }
+    let mut chars = text[offset..].char_indices();
+    let Some((_, first)) = chars.next() else {
+        return text.len();
+    };
+    let mut prev_kind = char_kind(first);
+    for (rel, c) in chars {
+        let kind = char_kind(c);
+        if prev_kind != kind && prev_kind != CharKind::Whitespace {
+            return offset + rel;
+        }
+        prev_kind = kind;
+    }
+    text.len()
+}
+
+/// Cocoa-style Option-Left: start of the current (or previous) word / punct run.
+pub fn prev_word_start(text: &str, offset: usize) -> usize {
+    let offset = clamp_char_boundary(text, offset);
+    if offset == 0 {
+        return 0;
+    }
+    let mut iter = text[..offset].char_indices().rev();
+    let Some((mut right_start, mut right)) = iter.next() else {
+        return 0;
+    };
+    for (left_start, left) in iter {
+        if char_kind(left) != char_kind(right) && !right.is_whitespace() {
+            return right_start;
+        }
+        right = left;
+        right_start = left_start;
+    }
+    if right.is_whitespace() {
+        0
+    } else {
+        right_start
+    }
 }
 
 fn line_start(content: &str, offset: usize) -> usize {
@@ -576,6 +664,166 @@ mod tests {
             .apply(EditorCommand::Select(CaretMove::Right))
             .unwrap();
         assert_eq!(editor.selections().len(), 1);
+    }
+
+    #[test]
+    fn shift_up_down_home_end_extend_selection() {
+        let mut editor = HeadlessEditor::new("one\ntwo\nthree");
+        let two = editor.content().find("two").expect("two");
+        editor.apply(EditorCommand::JumpTo(two)).unwrap();
+        editor.apply(EditorCommand::Select(CaretMove::Up)).unwrap();
+        assert_eq!(
+            editor.state.selected_range.start, 0,
+            "Shift-Up from `two` extends onto `one`"
+        );
+        assert_eq!(editor.state.selected_range.end, two);
+        assert!(editor.state.selection_reversed);
+
+        editor.apply(EditorCommand::JumpTo(two)).unwrap();
+        editor.apply(EditorCommand::Select(CaretMove::End)).unwrap();
+        assert_eq!(
+            editor.state.selected_range,
+            two..two + 3,
+            "Shift-End selects to the end of `two`"
+        );
+        assert!(!editor.state.selection_reversed);
+
+        editor.apply(EditorCommand::JumpTo(two + 3)).unwrap();
+        editor
+            .apply(EditorCommand::Select(CaretMove::Home))
+            .unwrap();
+        assert_eq!(
+            editor.state.selected_range,
+            two..two + 3,
+            "Shift-Home from the end of `two` selects the line"
+        );
+
+        editor.apply(EditorCommand::JumpTo(two)).unwrap();
+        editor
+            .apply(EditorCommand::Select(CaretMove::Down))
+            .unwrap();
+        assert_eq!(editor.state.selected_range.start, two);
+        assert!(
+            editor.state.selected_range.end > two + 3,
+            "Shift-Down from `two` must reach `three`, got {:?}",
+            editor.state.selected_range
+        );
+    }
+
+    #[test]
+    fn word_and_document_move_and_select() {
+        let mut editor = HeadlessEditor::new("one, two\nthree");
+        editor
+            .apply(EditorCommand::Move(CaretMove::WordRight))
+            .unwrap();
+        assert_eq!(
+            editor.cursor_offset(),
+            3,
+            "WordRight from start lands at the end of `one`"
+        );
+        editor
+            .apply(EditorCommand::Move(CaretMove::WordRight))
+            .unwrap();
+        assert_eq!(
+            editor.cursor_offset(),
+            4,
+            "WordRight treats the comma as its own run"
+        );
+        editor
+            .apply(EditorCommand::Move(CaretMove::WordRight))
+            .unwrap();
+        assert_eq!(editor.cursor_offset(), 8, "then the end of `two`");
+
+        editor
+            .apply(EditorCommand::Move(CaretMove::WordLeft))
+            .unwrap();
+        assert_eq!(editor.cursor_offset(), 5, "WordLeft is the start of `two`");
+        editor
+            .apply(EditorCommand::Move(CaretMove::WordLeft))
+            .unwrap();
+        assert_eq!(editor.cursor_offset(), 3, "then the comma");
+        editor
+            .apply(EditorCommand::Move(CaretMove::WordLeft))
+            .unwrap();
+        assert_eq!(editor.cursor_offset(), 0);
+
+        editor.apply(EditorCommand::JumpTo(5)).unwrap();
+        editor
+            .apply(EditorCommand::Select(CaretMove::WordRight))
+            .unwrap();
+        assert_eq!(
+            editor.state.selected_range,
+            5..8,
+            "SelectWord extends to the end of `two`"
+        );
+        assert!(!editor.state.selection_reversed);
+
+        editor.apply(EditorCommand::JumpTo(5)).unwrap();
+        editor
+            .apply(EditorCommand::Select(CaretMove::WordLeft))
+            .unwrap();
+        assert_eq!(
+            editor.state.selected_range,
+            3..5,
+            "SelectWord left covers the comma"
+        );
+        assert!(editor.state.selection_reversed);
+
+        editor
+            .apply(EditorCommand::Move(CaretMove::DocumentEnd))
+            .unwrap();
+        assert_eq!(editor.cursor_offset(), editor.content().len());
+        editor
+            .apply(EditorCommand::Move(CaretMove::DocumentHome))
+            .unwrap();
+        assert_eq!(editor.cursor_offset(), 0);
+
+        editor.apply(EditorCommand::JumpTo(5)).unwrap();
+        editor
+            .apply(EditorCommand::Select(CaretMove::DocumentEnd))
+            .unwrap();
+        assert_eq!(
+            editor.state.selected_range,
+            5..editor.content().len(),
+            "Select to document end keeps the anchor"
+        );
+        editor.apply(EditorCommand::JumpTo(5)).unwrap();
+        editor
+            .apply(EditorCommand::Select(CaretMove::DocumentHome))
+            .unwrap();
+        assert_eq!(editor.state.selected_range, 0..5);
+        assert!(editor.state.selection_reversed);
+
+        editor.apply(EditorCommand::JumpTo(5)).unwrap();
+        editor
+            .apply(EditorCommand::Select(CaretMove::Vertical {
+                delta_lines: 1,
+            }))
+            .unwrap();
+        assert_eq!(
+            editor.state.selected_range.start, 5,
+            "Shift-Page keeps the caret as the anchor"
+        );
+        assert!(
+            editor.state.selected_range.end > 8,
+            "Shift-Page down from `two` must reach `three`, got {:?}",
+            editor.state.selected_range
+        );
+
+        let mut cafe = HeadlessEditor::new("café latte");
+        cafe.apply(EditorCommand::Move(CaretMove::WordRight))
+            .unwrap();
+        assert_eq!(
+            cafe.cursor_offset(),
+            "café".len(),
+            "WordRight is unicode-aware for letters, not only ASCII"
+        );
+        cafe.apply(EditorCommand::Move(CaretMove::WordRight))
+            .unwrap();
+        assert_eq!(cafe.cursor_offset(), "café latte".len());
+        cafe.apply(EditorCommand::Move(CaretMove::WordLeft))
+            .unwrap();
+        assert_eq!(cafe.cursor_offset(), "café ".len());
     }
 
     #[test]

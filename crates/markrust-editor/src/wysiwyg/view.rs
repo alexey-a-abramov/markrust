@@ -28,7 +28,7 @@ use super::image::{
     cache_path_for_url, collect_remote_image_urls, default_image_cache_dir, fetch_remote_image,
 };
 use super::ime::{ImeLeafHit, ImeOriginState};
-use crate::headless::{CaretMove, EditorCommand, EditorOutcome};
+use crate::headless::{next_word_end, prev_word_start, CaretMove, EditorCommand, EditorOutcome};
 use crate::theme::EditorTheme;
 use crate::wrap::{wrap_selection, WrapKind};
 
@@ -486,6 +486,10 @@ fn move_in_widget(
             .find('\n')
             .map(|i| at + i)
             .unwrap_or(draft.len()),
+        CaretMove::WordLeft => prev_word_start(draft, at),
+        CaretMove::WordRight => next_word_end(draft, at),
+        CaretMove::DocumentHome => 0,
+        CaretMove::DocumentEnd => draft.len(),
         CaretMove::Up => vertical_in_draft(draft, at, false),
         CaretMove::Down => vertical_in_draft(draft, at, true),
         CaretMove::Vertical { delta_lines } => {
@@ -957,18 +961,13 @@ impl RichEditorView {
         let offset = self.engine.snap_caret(offset.min(len), Bias::Left);
         let offset = self.engine.clamp_raw_prefix(&source, offset, Bias::Left);
         if extend {
-            let anchor = if self.selection_reversed {
-                self.selected_range.end
-            } else {
-                self.selected_range.start
-            };
-            if offset < anchor {
-                self.selected_range = offset..anchor;
-                self.selection_reversed = true;
-            } else {
-                self.selected_range = anchor..offset;
-                self.selection_reversed = false;
-            }
+            let (range, reversed) = extend_selection_range(
+                self.selected_range.clone(),
+                self.selection_reversed,
+                offset,
+            );
+            self.selected_range = range;
+            self.selection_reversed = reversed;
         } else {
             self.selected_range = offset..offset;
             self.selection_reversed = false;
@@ -1008,6 +1007,18 @@ impl RichEditorView {
                     .unwrap_or(source.len());
                 self.engine.snap_caret(end, Bias::Left)
             }
+            CaretMove::WordLeft => self.engine.prev_word_caret(&source, cursor),
+            CaretMove::WordRight => self.engine.next_word_caret(&source, cursor),
+            CaretMove::DocumentHome => self.engine.clamp_raw_prefix(
+                &source,
+                self.engine.snap_caret(0, Bias::Right),
+                Bias::Right,
+            ),
+            CaretMove::DocumentEnd => self.engine.clamp_raw_prefix(
+                &source,
+                self.engine.snap_caret(source.len(), Bias::Left),
+                Bias::Left,
+            ),
             CaretMove::Up => self.engine.vertical_caret(&source, cursor, -1),
             CaretMove::Down => self.engine.vertical_caret(&source, cursor, 1),
             CaretMove::Vertical { delta_lines } => {
@@ -1873,6 +1884,22 @@ impl Render for RichEditorView {
             })
             .on_action({
                 let editor = editor.clone();
+                move |_: &crate::editor::SelectUp, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Select(CaretMove::Up), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::SelectDown, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Select(CaretMove::Down), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
                 move |_: &crate::editor::Home, _, cx| {
                     editor.update(cx, |e, cx| {
                         e.apply_editor_command(EditorCommand::Move(CaretMove::Home), cx);
@@ -1884,6 +1911,146 @@ impl Render for RichEditorView {
                 move |_: &crate::editor::End, _, cx| {
                     editor.update(cx, |e, cx| {
                         e.apply_editor_command(EditorCommand::Move(CaretMove::End), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::SelectHome, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Select(CaretMove::Home), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::SelectEnd, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Select(CaretMove::End), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::PageUp, window, cx| {
+                    editor.update(cx, |e, cx| {
+                        let lines =
+                            (window.bounds().size.height / window.line_height()).floor() as i32;
+                        e.apply_editor_command(
+                            EditorCommand::Move(CaretMove::Vertical {
+                                delta_lines: -lines.max(1),
+                            }),
+                            cx,
+                        );
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::PageDown, window, cx| {
+                    editor.update(cx, |e, cx| {
+                        let lines =
+                            (window.bounds().size.height / window.line_height()).floor() as i32;
+                        e.apply_editor_command(
+                            EditorCommand::Move(CaretMove::Vertical {
+                                delta_lines: lines.max(1),
+                            }),
+                            cx,
+                        );
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::SelectPageUp, window, cx| {
+                    editor.update(cx, |e, cx| {
+                        let lines =
+                            (window.bounds().size.height / window.line_height()).floor() as i32;
+                        e.apply_editor_command(
+                            EditorCommand::Select(CaretMove::Vertical {
+                                delta_lines: -lines.max(1),
+                            }),
+                            cx,
+                        );
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::SelectPageDown, window, cx| {
+                    editor.update(cx, |e, cx| {
+                        let lines =
+                            (window.bounds().size.height / window.line_height()).floor() as i32;
+                        e.apply_editor_command(
+                            EditorCommand::Select(CaretMove::Vertical {
+                                delta_lines: lines.max(1),
+                            }),
+                            cx,
+                        );
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::WordLeft, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Move(CaretMove::WordLeft), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::WordRight, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Move(CaretMove::WordRight), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::SelectWordLeft, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Select(CaretMove::WordLeft), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::SelectWordRight, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Select(CaretMove::WordRight), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::DocumentHome, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Move(CaretMove::DocumentHome), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::DocumentEnd, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Move(CaretMove::DocumentEnd), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::SelectDocumentHome, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Select(CaretMove::DocumentHome), cx);
+                    });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::SelectDocumentEnd, _, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.apply_editor_command(EditorCommand::Select(CaretMove::DocumentEnd), cx);
                     });
                 }
             })

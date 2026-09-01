@@ -35,6 +35,16 @@ actions!(
         SelectEnd,
         PageUp,
         PageDown,
+        SelectPageUp,
+        SelectPageDown,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DocumentHome,
+        DocumentEnd,
+        SelectDocumentHome,
+        SelectDocumentEnd,
         SelectAll,
         Enter,
         ToggleBold,
@@ -290,6 +300,83 @@ impl MarkdownEditor {
             }),
             cx,
         );
+    }
+
+    pub fn select_page_up(
+        &mut self,
+        _: &SelectPageUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lines = (window.bounds().size.height / window.line_height()).floor() as i32;
+        self.apply_command(
+            EditorCommand::Select(CaretMove::Vertical {
+                delta_lines: -lines.max(1),
+            }),
+            cx,
+        );
+    }
+
+    pub fn select_page_down(
+        &mut self,
+        _: &SelectPageDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lines = (window.bounds().size.height / window.line_height()).floor() as i32;
+        self.apply_command(
+            EditorCommand::Select(CaretMove::Vertical {
+                delta_lines: lines.max(1),
+            }),
+            cx,
+        );
+    }
+
+    pub fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Move(CaretMove::WordLeft), cx);
+    }
+
+    pub fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Move(CaretMove::WordRight), cx);
+    }
+
+    pub fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Select(CaretMove::WordLeft), cx);
+    }
+
+    pub fn select_word_right(
+        &mut self,
+        _: &SelectWordRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_command(EditorCommand::Select(CaretMove::WordRight), cx);
+    }
+
+    pub fn document_home(&mut self, _: &DocumentHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Move(CaretMove::DocumentHome), cx);
+    }
+
+    pub fn document_end(&mut self, _: &DocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_command(EditorCommand::Move(CaretMove::DocumentEnd), cx);
+    }
+
+    pub fn select_document_home(
+        &mut self,
+        _: &SelectDocumentHome,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_command(EditorCommand::Select(CaretMove::DocumentHome), cx);
+    }
+
+    pub fn select_document_end(
+        &mut self,
+        _: &SelectDocumentEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_command(EditorCommand::Select(CaretMove::DocumentEnd), cx);
     }
 
     pub fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {

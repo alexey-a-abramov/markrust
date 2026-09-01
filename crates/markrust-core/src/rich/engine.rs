@@ -460,6 +460,115 @@ impl RichEngine {
         self.clamp_raw_prefix(source, stepped, Bias::Right)
     }
 
+    /// Option-Right: end of the current (or next) visible word / punct run.
+    /// Hidden delimiter bytes (`**`, `*`, ticks) are not word stops.
+    pub fn next_word_caret(&self, source: &str, byte: usize) -> usize {
+        let mut pos = self.clamp_raw_prefix(
+            source,
+            self.snap_caret(byte.min(source.len()), Bias::Right),
+            Bias::Right,
+        );
+        pos = self.skip_hidden_marks(source, pos, true);
+        if pos >= source.len() {
+            return pos;
+        }
+        let mut prev_kind = word_kind_at(source, pos);
+        let guard = source.len().saturating_add(4);
+        for _ in 0..guard {
+            let next = self.step_visible_caret(source, pos, true);
+            if next == pos {
+                return pos;
+            }
+            let next_kind = word_kind_at(source, next);
+            if prev_kind != next_kind && prev_kind != WordCharKind::Whitespace {
+                return next;
+            }
+            pos = next;
+            prev_kind = next_kind;
+        }
+        pos
+    }
+
+    /// Option-Left: start of the current (or previous) visible word / punct run.
+    pub fn prev_word_caret(&self, source: &str, byte: usize) -> usize {
+        let mut pos = self.clamp_raw_prefix(
+            source,
+            self.snap_caret(byte.min(source.len()), Bias::Left),
+            Bias::Left,
+        );
+        pos = self.skip_hidden_marks(source, pos, false);
+        if pos == 0 {
+            return 0;
+        }
+        pos = self.step_visible_caret(source, pos, false);
+        let guard = source.len().saturating_add(4);
+        for _ in 0..guard {
+            let prev = self.step_visible_caret(source, pos, false);
+            if prev == pos {
+                return pos;
+            }
+            let right_kind = word_kind_at(source, pos);
+            let left_kind = word_kind_at(source, prev);
+            if left_kind != right_kind && right_kind != WordCharKind::Whitespace {
+                return pos;
+            }
+            pos = prev;
+        }
+        pos
+    }
+
+    /// One grapheme step that skips exclusive-end delimiter bytes (hidden
+    /// `**` / `*` / ticks). Real punctuation (`hello, world`) is kept: those
+    /// move by one grapheme. Mark wrappers jump more than one byte.
+    fn step_visible_caret(&self, source: &str, pos: usize, forward: bool) -> usize {
+        let mut at = pos;
+        for _ in 0..8 {
+            let next = if forward {
+                self.next_caret(source, at)
+            } else {
+                self.prev_caret(source, at)
+            };
+            if next == at {
+                return at;
+            }
+            if self.is_hidden_mark_caret(source, next) {
+                at = next;
+                continue;
+            }
+            return next;
+        }
+        at
+    }
+
+    fn is_hidden_mark_caret(&self, source: &str, at: usize) -> bool {
+        let Some(c) = source.get(at..).and_then(|s| s.chars().next()) else {
+            return false;
+        };
+        if !matches!(c, '*' | '_' | '`' | '~' | '[' | ']' | '(' | ')' | '!') {
+            return false;
+        }
+        let skipped = self.next_caret(source, at);
+        skipped > at + c.len_utf8()
+    }
+
+    fn skip_hidden_marks(&self, source: &str, mut pos: usize, forward: bool) -> usize {
+        for _ in 0..8 {
+            if !self.is_hidden_mark_caret(source, pos) {
+                return pos;
+            }
+            let next = if forward {
+                self.next_caret(source, pos)
+            } else {
+                self.prev_caret(source, pos)
+            };
+            if next == pos {
+                return pos;
+            }
+            pos = next;
+        }
+        pos
+    }
+
     fn prefix_blank_at(&self, byte: usize) -> Option<&PrefixBlank> {
         self.tree
             .empty_prefix_homes
@@ -671,6 +780,31 @@ impl RichEngine {
     pub fn outline(&self) -> Vec<(usize, u8, String)> {
         self.tree.outline()
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordCharKind {
+    Word,
+    Punct,
+    Whitespace,
+}
+
+fn word_char_kind(c: char) -> WordCharKind {
+    if c.is_whitespace() {
+        WordCharKind::Whitespace
+    } else if c.is_alphanumeric() || c == '_' {
+        WordCharKind::Word
+    } else {
+        WordCharKind::Punct
+    }
+}
+
+fn word_kind_at(source: &str, at: usize) -> WordCharKind {
+    source
+        .get(at..)
+        .and_then(|s| s.chars().next())
+        .map(word_char_kind)
+        .unwrap_or(WordCharKind::Whitespace)
 }
 
 /// Byte ranges of caret-valid inline content within a leaf block.
@@ -1725,5 +1859,75 @@ mod tests {
         assert_eq!(outline[1].1, 2);
         assert_eq!(outline[2].1, 3);
         assert_eq!(&outline[2].2, "Quoted");
+    }
+
+    #[test]
+    fn word_caret_skips_bold_delimiters_and_punctuation() {
+        let source = "**hello** world";
+        let (_doc, engine) = engine_for(source);
+        let h = source.find('h').expect("h");
+        let w = source.find('w').expect("w");
+        let end_hello = engine.next_word_caret(source, h);
+        assert_eq!(
+            end_hello,
+            source.find(' ').expect("space"),
+            "WordRight from `hello` lands on the visible space, not `*`"
+        );
+        assert_eq!(
+            engine.next_word_caret(source, end_hello),
+            w + "world".len(),
+            "next WordRight is the end of `world`"
+        );
+        assert_eq!(
+            engine.prev_word_caret(source, source.len()),
+            w,
+            "WordLeft from EOF is the start of `world`"
+        );
+        assert_eq!(
+            engine.prev_word_caret(source, w),
+            h,
+            "WordLeft from `world` skips `**` onto `hello`"
+        );
+
+        let punct = "one, two";
+        let (_doc, engine) = engine_for(punct);
+        assert_eq!(engine.next_word_caret(punct, 0), 3, "end of `one`");
+        assert_eq!(
+            engine.next_word_caret(punct, 3),
+            4,
+            "comma is its own visible run"
+        );
+        assert_eq!(engine.next_word_caret(punct, 4), punct.len());
+        assert_eq!(engine.prev_word_caret(punct, punct.len()), 5);
+        assert_eq!(engine.prev_word_caret(punct, 5), 3);
+        assert_eq!(engine.prev_word_caret(punct, 3), 0);
+    }
+
+    #[test]
+    fn document_home_skips_frontmatter_yaml() {
+        let source = "---\ntitle: Hello\n---\n\n# Body\n";
+        let (_doc, engine) = engine_for(source);
+        let fm_end = frontmatter_body_start(engine.tree());
+        let home = engine.clamp_raw_prefix(source, engine.snap_caret(0, Bias::Right), Bias::Right);
+        assert!(
+            home >= fm_end,
+            "Cmd-Up / document start must sit after YAML, got {home} fm_end={fm_end}"
+        );
+        let body = source.find("Body").expect("Body");
+        assert!(
+            home <= body,
+            "document start must not overshoot `# Body`, got {home} body={body}"
+        );
+        let title = source.find("Hello").expect("title");
+        assert!(
+            home > title,
+            "document start must not land in the YAML title, home={home} title={title}"
+        );
+        let end = engine.clamp_raw_prefix(
+            source,
+            engine.snap_caret(source.len(), Bias::Left),
+            Bias::Left,
+        );
+        assert!(end >= body, "document end must stay in the body, got {end}");
     }
 }

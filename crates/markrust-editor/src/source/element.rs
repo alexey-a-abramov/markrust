@@ -840,6 +840,66 @@ impl Render for MarkdownEditorView {
             })
             .on_action({
                 let editor = editor.clone();
+                move |action: &crate::editor::SelectPageUp, window, cx| {
+                    editor.update(cx, |e, cx| e.select_page_up(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SelectPageDown, window, cx| {
+                    editor.update(cx, |e, cx| e.select_page_down(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::WordLeft, window, cx| {
+                    editor.update(cx, |e, cx| e.word_left(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::WordRight, window, cx| {
+                    editor.update(cx, |e, cx| e.word_right(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SelectWordLeft, window, cx| {
+                    editor.update(cx, |e, cx| e.select_word_left(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SelectWordRight, window, cx| {
+                    editor.update(cx, |e, cx| e.select_word_right(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::DocumentHome, window, cx| {
+                    editor.update(cx, |e, cx| e.document_home(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::DocumentEnd, window, cx| {
+                    editor.update(cx, |e, cx| e.document_end(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SelectDocumentHome, window, cx| {
+                    editor.update(cx, |e, cx| e.select_document_home(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SelectDocumentEnd, window, cx| {
+                    editor.update(cx, |e, cx| e.select_document_end(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
                 move |action: &crate::editor::SelectAll, window, cx| {
                     editor.update(cx, |e, cx| e.select_all(action, window, cx))
                 }
