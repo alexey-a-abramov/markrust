@@ -13,7 +13,8 @@ use crate::undo::{SelectionSnapshot, TransactionKind};
 pub use super::engine::code_body_source_map;
 use super::engine::{
     blank_caret_gap_after_last, caret_for_click_below_content, expand_mark_delimiters,
-    frontmatter_body_start, RichEngine, TablePos,
+    frontmatter_body_start, raw_body_range, raw_container_prefix, step_right_in_slice,
+    RichEngine, TablePos,
 };
 use super::escape::{escape_text, EscapeContext};
 use super::input_rules::{input_rule_breaks_table, match_input_rule_with, InputRule};
@@ -379,6 +380,12 @@ fn backspace(
     if to == 0 {
         return Ok(RichOutcome::Noop);
     }
+    // Typora: Backspace at the first body byte of a fenced code / HTML block
+    // must not nibble opening ticks, list/quote prefixes, or the previous
+    // block. Later body lines join without eating `>` / list indent.
+    if let Some(outcome) = backspace_in_raw_block(doc, engine, caret, &source, to)? {
+        return Ok(outcome);
+    }
     let from = engine.prev_caret(&source, to);
     let grapheme_end = engine.next_caret(&source, from);
     // Prefer deleting only the previous visible grapheme, not delimiter gaps.
@@ -412,6 +419,12 @@ fn delete_forward(
     let from = caret.cursor();
     if from >= source.len() {
         return Ok(RichOutcome::Noop);
+    }
+    // Typora: Delete at the end of a fence / HTML body must not nibble
+    // closing ticks or `>` (pair of Backspace-at-start). Mid-body Delete
+    // still removes one grapheme, clamped to the editable range.
+    if let Some(outcome) = delete_forward_in_raw_block(doc, engine, caret, &source, from)? {
+        return Ok(outcome);
     }
     let to = engine.next_caret(&source, from);
     if to <= from {
@@ -685,6 +698,13 @@ fn split_block(
     }
     let offset = caret.cursor();
     let source = doc.buffer.content();
+    // Fenced/indented code and HTML blocks keep Enter inside the block.
+    // Check before empty-list/quote so a `- ` or `> ` line of code is not
+    // treated as a list item or quote exit (and so a caret on fence chrome
+    // cannot SplitBlock the ticks in half).
+    if in_raw_block(engine, offset) {
+        return insert_raw_newline(doc, engine, caret, &source, offset);
+    }
     if empty_list_line(&source, offset) {
         return outdent_current_list_line(doc, engine, caret);
     }
@@ -697,7 +717,6 @@ fn split_block(
         return Ok(RichOutcome::Noop);
     };
     let insert = match &leaf.kind {
-        BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. } => "\n".to_string(),
         BlockKind::ListItem { .. } => list_split_text(&source, engine, leaf, offset),
         _ => {
             if let Some(item) = ancestor_list_item(engine, leaf_id) {
@@ -844,6 +863,10 @@ fn insert_line_break(
         engine.sync(doc);
     }
     let offset = caret.cursor();
+    if in_raw_block(engine, offset) {
+        let source = doc.buffer.content();
+        return insert_raw_newline(doc, engine, caret, &source, offset);
+    }
     splice(doc, caret, offset, offset, "\\\n", TransactionKind::Command);
     engine.sync(doc);
     Ok(RichOutcome::Changed)
@@ -1492,6 +1515,13 @@ fn indent_list(
 ) -> Result<RichOutcome, RichError> {
     engine.sync(doc);
     if engine.in_raw_context(caret.cursor()) {
+        // Tab inside a fence / HTML block indents the body after the
+        // list/quote prefix, not the fence chrome or the list item itself.
+        if in_raw_block(engine, caret.cursor()) {
+            let source = doc.buffer.content();
+            let at = clamp_to_raw_edit(engine, &source, caret.cursor());
+            caret.collapse_to(at);
+        }
         return insert_text(doc, engine, caret, "  ");
     }
     let source = doc.buffer.content();
@@ -1512,7 +1542,167 @@ fn outdent_list(
     caret: &mut CaretState,
 ) -> Result<RichOutcome, RichError> {
     engine.sync(doc);
+    // Shift-Tab inside a fence / HTML body unindents the body line after the
+    // list/quote prefix instead of treating a code line as a list item.
+    if in_raw_block(engine, caret.cursor()) {
+        return unindent_raw_line(doc, engine, caret);
+    }
     outdent_current_list_line(doc, engine, caret)
+}
+
+/// Shift-Tab inside a fence / HTML block: strip one tab or up to two leading
+/// spaces on the current **body** line, after the list/quote prefix. Never
+/// treat a code line as a list item, and never strip the indent that keeps a
+/// nested fence inside `- ` / `>`.
+fn unindent_raw_line(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    engine.sync(doc);
+    let source = doc.buffer.content();
+    let offset = caret.cursor();
+    let Some(block) = raw_block_at(engine, offset) else {
+        return Ok(RichOutcome::Noop);
+    };
+    let body = raw_body_range(block, &source);
+    let start = line_start(&source, offset);
+    let line = current_line(&source, offset).to_string();
+    let line_end = start + line.len();
+    // Opening/closing fence (or HTML) chrome is not body indent.
+    if line_end <= body.start || start > body.end {
+        return Ok(RichOutcome::Noop);
+    }
+    let prefix = raw_container_prefix(&source, block);
+    if !line.starts_with(&prefix) {
+        return Ok(RichOutcome::Noop);
+    }
+    let rest = &line[prefix.len()..];
+    let stripped = if let Some(r) = rest.strip_prefix('\t') {
+        r.to_string()
+    } else {
+        let n = rest.bytes().take(2).take_while(|b| *b == b' ').count();
+        if n == 0 {
+            return Ok(RichOutcome::Noop);
+        }
+        rest[n..].to_string()
+    };
+    let from = start + prefix.len();
+    rewrite_range(doc, engine, caret, from..start + line.len(), &stripped)
+}
+
+fn in_raw_block(engine: &RichEngine, offset: usize) -> bool {
+    raw_block_at(engine, offset).is_some()
+}
+
+fn raw_block_at(engine: &RichEngine, offset: usize) -> Option<&Block> {
+    let id = engine.block_at(offset)?;
+    let block = engine.block(id)?;
+    matches!(
+        block.kind,
+        BlockKind::CodeBlock { .. } | BlockKind::Opaque { .. }
+    )
+    .then_some(block)
+}
+
+/// Clamp into the raw body and past the list/quote prefix on that line.
+fn clamp_to_raw_edit(engine: &RichEngine, source: &str, offset: usize) -> usize {
+    let Some(block) = raw_block_at(engine, offset) else {
+        return offset;
+    };
+    let body = raw_body_range(block, source);
+    let at = offset.clamp(body.start, body.end);
+    let prefix = raw_container_prefix(source, block);
+    let content = line_start(source, at) + prefix.len();
+    if at < content {
+        content.clamp(body.start, body.end)
+    } else {
+        at
+    }
+}
+
+fn insert_raw_newline(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    source: &str,
+    offset: usize,
+) -> Result<RichOutcome, RichError> {
+    let at = clamp_to_raw_edit(engine, source, offset);
+    let prefix = raw_block_at(engine, offset)
+        .map(|block| raw_container_prefix(source, block))
+        .unwrap_or_default();
+    splice(
+        doc,
+        caret,
+        at,
+        at,
+        &format!("\n{prefix}"),
+        TransactionKind::Command,
+    );
+    engine.sync(doc);
+    Ok(RichOutcome::Changed)
+}
+
+fn backspace_in_raw_block(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    source: &str,
+    to: usize,
+) -> Result<Option<RichOutcome>, RichError> {
+    let Some(block) = raw_block_at(engine, to) else {
+        return Ok(None);
+    };
+    let body = raw_body_range(block, source);
+    let prefix = raw_container_prefix(source, block);
+    let first_line_start = line_start(source, body.start);
+    let first_content = (first_line_start + prefix.len()).clamp(body.start, body.end);
+    if to <= first_content {
+        return Ok(Some(RichOutcome::Noop));
+    }
+    let line_s = line_start(source, to);
+    let content = line_s + prefix.len();
+    if line_s > first_line_start && to <= content {
+        if source.as_bytes().get(line_s - 1) == Some(&b'\n') {
+            let del_end = content.min(line_end_exclusive(source, to)).max(line_s);
+            caret.range = (line_s - 1)..del_end;
+            caret.reversed = true;
+            delete_range(doc, engine, caret, TransactionKind::DeleteBack)?;
+            return Ok(Some(RichOutcome::Changed));
+        }
+        return Ok(Some(RichOutcome::Noop));
+    }
+    Ok(None)
+}
+
+/// Delete at/past the end of a fence or HTML body is a no-op (does not nibble
+/// closing ticks or `>`). Opening chrome is the same. Inside the body, Delete
+/// removes one grapheme and will not cross `body.end`.
+fn delete_forward_in_raw_block(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    source: &str,
+    from: usize,
+) -> Result<Option<RichOutcome>, RichError> {
+    let Some(block) = raw_block_at(engine, from) else {
+        return Ok(None);
+    };
+    let body = raw_body_range(block, source);
+    if from < body.start || from >= body.end {
+        return Ok(Some(RichOutcome::Noop));
+    }
+    // One source grapheme, not prefix-skipping `next_caret` (that would eat
+    // `>` / list indent when Delete is at a line break).
+    let to = step_right_in_slice(source, from, body.end).min(body.end);
+    if to <= from {
+        return Ok(Some(RichOutcome::Noop));
+    }
+    caret.range = from..to;
+    caret.reversed = false;
+    delete_range(doc, engine, caret, TransactionKind::Command)?;
+    Ok(Some(RichOutcome::Changed))
 }
 
 fn outdent_current_list_line(
@@ -4306,4 +4496,598 @@ mod tests {
             "cross-cell Delete must not merge header cells, got {after:?}"
         );
     }
+
+    fn fence_body_offset(source: &str, needle: &str) -> usize {
+        source.find(needle).expect(needle)
+    }
+
+    fn still_one_fence(source: &str) -> bool {
+        let ticks = source.matches("```").count();
+        ticks == 2
+            && source.contains("```")
+            && !source.contains("`\n``")
+            && !source.contains("``\n`")
+    }
+
+    fn first_opaque(blocks: &[Block]) -> Option<&Block> {
+        for b in blocks {
+            if matches!(b.kind, BlockKind::Opaque { .. }) {
+                return Some(b);
+            }
+            if let Some(found) = first_opaque(&b.children) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn tab_in_fenced_code_inserts_indent_not_list_indent() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        assert!(
+            after.contains("```\n  code\n```") || after.contains("```\n\tcode\n```"),
+            "Tab in a fence must indent the body, got {after:?}"
+        );
+        assert!(
+            still_one_fence(&after),
+            "Tab must not break fence chrome, got {after:?}"
+        );
+        assert!(
+            !after.contains("  ```") && !after.contains("- code"),
+            "Tab must not IndentList the document or the fence line, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn tab_in_list_nested_fence_indents_code_not_the_list() {
+        let source = "- item\n  ```\n  code\n  ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        assert!(
+            after.contains("```"),
+            "nested fence must survive Tab, got {after:?}"
+        );
+        assert!(
+            after.starts_with("- item"),
+            "Tab in nested fence must not re-indent the list item, got {after:?}"
+        );
+        assert!(
+            after.contains("  code") || after.contains("\tcode") || after.contains("    code"),
+            "Tab must indent the fenced body, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn enter_in_fenced_code_stays_inside_the_fence() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            still_one_fence(&after),
+            "Enter must not split fence chrome, got {after:?}"
+        );
+        assert!(
+            after.contains("```\ncode\n\n```") || after.contains("```\ncode\n \n```"),
+            "Enter must add a line inside the fence, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::CodeBlock { .. }),
+            "must remain a single code block, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn enter_on_fence_chrome_does_not_split_ticks() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(1);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            still_one_fence(&after),
+            "Enter on opening ticks must not split ```, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::CodeBlock { .. }),
+            "must remain a code block, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn enter_on_list_looking_line_inside_fence_stays_in_fence() {
+        let source = "```\n- \n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "- ") + 2);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            still_one_fence(&after),
+            "Enter on `- ` inside a fence must not outdent as a list, got {after:?}"
+        );
+        assert!(
+            after.contains("- "),
+            "the code line `- ` must remain, got {after:?}"
+        );
+        assert!(
+            after.contains("```\n- \n\n```") || after.contains("- \n\n```"),
+            "Enter must insert a newline inside the fence, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::CodeBlock { .. }),
+            "must remain a code block, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn insert_line_break_in_fenced_code_is_a_newline() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertLineBreak,
+        );
+        assert!(
+            still_one_fence(&after) && !after.contains('\\'),
+            "Shift-Enter in a fence must be a raw newline, got {after:?}"
+        );
+        assert!(
+            after.contains("```\ncode\n\n```"),
+            "Shift-Enter must add a line inside the fence, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_fenced_body_start_does_not_eat_the_fence() {
+        let source = "hello\n\n```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert_eq!(
+            after, source,
+            "Backspace at fence body start must be a no-op, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_last_char_in_fence_does_not_delete_the_fence() {
+        let source = "```\nx\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "x") + 1);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            still_one_fence(&after),
+            "deleting the last body char must not swallow ```, got {after:?}"
+        );
+        assert!(
+            !after.contains('x'),
+            "the body character must be deleted, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::CodeBlock { .. }),
+            "empty body must still be a fence, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn shift_tab_in_fenced_code_does_not_strip_list_looking_lines() {
+        let source = "```\n- foo\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "- foo") + 2);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        assert_eq!(
+            after, source,
+            "Shift-Tab in a fence must not treat a code line as a list item, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn shift_tab_in_fenced_code_unindents_leading_spaces() {
+        let source = "```\n  x\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "x"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        assert!(
+            after.contains("```\nx\n```"),
+            "Shift-Tab must strip leading indent inside the fence, got {after:?}"
+        );
+        assert!(
+            still_one_fence(&after),
+            "Shift-Tab must not break fence chrome, got {after:?}"
+        );
+    }
+
+    fn every_line_quoted(source: &str) -> bool {
+        source
+            .lines()
+            .all(|line| line.is_empty() || line.starts_with('>'))
+    }
+
+    fn still_list_nested_fence(source: &str) -> bool {
+        still_one_fence(source)
+            && source.starts_with("- ")
+            && source.contains("\n  ```")
+            && !source.contains("\n```")
+    }
+
+    #[test]
+    fn shift_tab_in_list_nested_fence_keeps_required_indent() {
+        let source = "- item\n  ```\n  code\n  ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        assert_eq!(
+            after, source,
+            "Shift-Tab must not strip the list indent that keeps the fence in `- `, got {after:?}"
+        );
+        assert!(
+            still_list_nested_fence(&after),
+            "nested fence chrome must stay indented, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn shift_tab_in_list_nested_fence_unindents_body_only() {
+        let source = "- item\n  ```\n    code\n  ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        assert!(
+            still_list_nested_fence(&after),
+            "Shift-Tab must keep the list-nested fence, got {after:?}"
+        );
+        assert!(
+            after.contains("\n  code\n"),
+            "Shift-Tab must strip only body indent after the list prefix, got {after:?}"
+        );
+        assert!(
+            !after.contains("\ncode\n"),
+            "must not pop the body out of the list item, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn tab_in_quoted_fence_indents_after_the_quote() {
+        let source = "> ```\n> code\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        assert!(
+            still_one_fence(&after) && every_line_quoted(&after),
+            "Tab must keep a quoted fence, got {after:?}"
+        );
+        assert!(
+            after.contains(">   code") || after.contains(">\tcode") || after.contains("> \tcode"),
+            "Tab must indent after `>`, got {after:?}"
+        );
+        assert!(
+            !after.contains(" >") && !after.starts_with(' '),
+            "Tab must not put a space before `>`, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn shift_tab_in_quoted_fence_unindents_after_the_quote() {
+        let source = "> ```\n>   code\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        assert!(
+            still_one_fence(&after) && every_line_quoted(&after),
+            "Shift-Tab must keep a quoted fence, got {after:?}"
+        );
+        assert!(
+            after.contains("> code"),
+            "Shift-Tab must strip body indent after `>`, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn shift_tab_in_quoted_fence_does_not_eat_quote() {
+        let source = "> ```\n> code\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        assert_eq!(
+            after, source,
+            "Shift-Tab must not eat `>` when there is no body indent, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn enter_in_quoted_fence_keeps_quote_prefixes() {
+        let source = "> ```\n> code\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            still_one_fence(&after) && every_line_quoted(&after),
+            "Enter must keep `>` on every fence line, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::BlockQuote),
+            "must remain a quoted fence, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn enter_on_quoted_fence_chrome_keeps_quote_prefixes() {
+        let source = "> ```\n> code\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('`').expect("ticks"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            still_one_fence(&after) && every_line_quoted(&after),
+            "Enter on quoted ticks must not unquote the fence, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_line_break_in_quoted_fence_keeps_quote_prefixes() {
+        let source = "> ```\n> code\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertLineBreak,
+        );
+        assert!(
+            still_one_fence(&after) && every_line_quoted(&after) && !after.contains('\\'),
+            "Shift-Enter must keep quoted fence lines, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_quoted_fence_body_start_does_not_eat_quote() {
+        let source = "> ```\n> code\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert_eq!(
+            after, source,
+            "Backspace at quoted body start must not eat `>` or the fence, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_last_char_in_quoted_fence_keeps_quote_and_fence() {
+        let source = "> ```\n> x\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "x") + 1);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            still_one_fence(&after) && every_line_quoted(&after),
+            "deleting the last quoted body char must keep `>` and ```, got {after:?}"
+        );
+        assert!(
+            !after.contains('x'),
+            "body char must be deleted, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_on_later_quoted_fence_line_joins_without_eating_quote() {
+        let source = "> ```\n> a\n> b\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "b"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            still_one_fence(&after) && every_line_quoted(&after),
+            "join must keep quoted fence chrome, got {after:?}"
+        );
+        assert!(
+            after.contains("> ab") || after.contains("> a b"),
+            "Backspace at the start of the next code line must join, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn tab_and_shift_tab_on_quoted_list_nested_fence() {
+        let source = "> - item\n>   ```\n>   code\n>   ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code"));
+        let indented = apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        assert!(
+            still_one_fence(&indented) && every_line_quoted(&indented),
+            "Tab must keep a quoted list-nested fence, got {indented:?}"
+        );
+        assert!(
+            indented.contains("> - item"),
+            "Tab must not indent before `- `, got {indented:?}"
+        );
+        let out = apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        assert!(
+            still_one_fence(&out) && every_line_quoted(&out),
+            "Shift-Tab must keep the quoted list-nested fence, got {out:?}"
+        );
+        assert!(
+            out.contains(">   ```"),
+            "Shift-Tab must not strip the list indent inside the quote, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn enter_in_quoted_html_block_keeps_quote_prefixes() {
+        let source = "> <div>\n> x\n> </div>\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('x').expect("x"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            every_line_quoted(&after),
+            "Enter in quoted HTML must keep `>` on every line, got {after:?}"
+        );
+        assert!(
+            after.contains("<div>") && after.contains("</div>"),
+            "HTML chrome must survive, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::BlockQuote),
+            "must remain quoted, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn backspace_at_html_block_start_does_not_eat_previous_paragraph() {
+        let source = "hello\n\n<div>\nx\n</div>\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("<div>").expect("div"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            after.starts_with("hello"),
+            "Backspace at HTML start must not eat the previous paragraph, got {after:?}"
+        );
+        assert!(
+            after.contains("<div>"),
+            "HTML chrome must survive, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn enter_in_html_block_stays_inside() {
+        let source = "<div>\nx\n</div>\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('x').expect("x") + 1);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.contains("<div>") && after.contains("</div>"),
+            "Enter must stay inside the HTML block, got {after:?}"
+        );
+        assert!(
+            after.contains("x\n"),
+            "Enter must insert a newline in the HTML body, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Opaque { .. }),
+            "must remain an HTML block, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+
+    #[test]
+    fn delete_at_end_of_fence_does_not_nibble_closing_ticks() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        assert_eq!(
+            after, source,
+            "Delete at end of fence body must not nibble closing ticks, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_in_middle_of_fence_deletes_a_grapheme() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + 1);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        assert!(
+            still_one_fence(&after),
+            "mid-body Delete must keep the fence, got {after:?}"
+        );
+        assert!(
+            after.contains("```\ncde\n```") || after.contains("cde"),
+            "Delete on `o` must remove that grapheme, got {after:?}"
+        );
+        assert!(!after.contains("code"), "got {after:?}");
+    }
+
+    #[test]
+    fn delete_last_char_in_fence_does_not_nibble_ticks() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len() - 1);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        assert!(
+            still_one_fence(&after),
+            "Delete on the last body grapheme must keep ```, got {after:?}"
+        );
+        assert!(
+            after.contains("```\ncod\n```"),
+            "Delete must remove the last body grapheme, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_at_end_of_quoted_fence_does_not_nibble_quote_or_ticks() {
+        let source = "> ```\n> code\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        assert_eq!(
+            after, source,
+            "Delete at end of quoted fence must not nibble `>` or ticks, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_at_end_of_html_block_does_not_nibble_closing() {
+        let source = "hello\n\n<div>\nx\n</div>\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let html_end = first_opaque(&engine.tree().blocks)
+            .expect("html")
+            .source_range
+            .end;
+        caret.collapse_to(html_end);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        assert_eq!(
+            after, source,
+            "Delete at end of HTML body must not nibble tags or the next bytes, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_in_middle_of_html_deletes_a_grapheme() {
+        let source = "<div>\nx\n</div>\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('x').expect("x"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        assert!(
+            after.contains("<div>") && after.contains("</div>"),
+            "HTML chrome must survive, got {after:?}"
+        );
+        assert!(
+            !after.contains('x'),
+            "Delete must remove `x`, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_at_end_of_quoted_html_does_not_eat_quote() {
+        let source = "> <div>\n> x\n> </div>\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let html_end = first_opaque(&engine.tree().blocks)
+            .expect("html")
+            .source_range
+            .end;
+        caret.collapse_to(html_end);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        assert_eq!(
+            after, source,
+            "Delete at end of quoted HTML must not nibble `>` or tags, got {after:?}"
+        );
+    }
+
+
 }

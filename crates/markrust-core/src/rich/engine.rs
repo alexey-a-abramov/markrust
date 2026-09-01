@@ -1958,7 +1958,7 @@ fn step_left_in_slice(source: &str, start: usize, byte: usize) -> usize {
 }
 
 /// Step one grapheme-ish unit right within (byte, end].
-fn step_right_in_slice(source: &str, byte: usize, end: usize) -> usize {
+pub(crate) fn step_right_in_slice(source: &str, byte: usize, end: usize) -> usize {
     let slice = &source[byte..end];
     let mut it = slice.char_indices();
     let Some((_, first)) = it.next() else {
