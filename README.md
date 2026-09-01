@@ -99,6 +99,7 @@ bash scripts/release.sh
 | `Cmd/Ctrl+P` | Command palette |
 | `Cmd/Ctrl+Shift+M` | Cycle Rich / Source / Split |
 | `Cmd/Ctrl+Shift+T` | Toggle light/dark theme |
+| `Cmd/Ctrl+C` / `X` | Copy / cut as Markdown (empty caret copies/cuts the current block) |
 | `Cmd/Ctrl+B` / `I` / `E` / `K` | Bold / italic / code / link |
 | `Option+Left` / `Right` (or `Ctrl+Left` / `Right`) | Move by word |
 | `Option+Shift+Left` / `Right` (or `Ctrl+Shift+Left` / `Right`) | Select by word |

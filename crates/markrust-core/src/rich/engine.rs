@@ -13,7 +13,8 @@ use crate::document::Document;
 
 use super::import::import_markdown;
 use super::tree::{
-    Block, BlockKind, IdGen, Inline, LinkAttrs, MarkSet, NodeId, PrefixBlank, RichTree,
+    math_delim_width, wiki_visible_range, Block, BlockKind, IdGen, Inline, LinkAttrs, MarkSet,
+    NodeId, PrefixBlank, RichTree,
 };
 
 /// Caret snapping direction when a byte falls on delimiter bytes.
@@ -207,6 +208,15 @@ impl RichEngine {
             None
         }
         walk(&self.tree.blocks, byte)
+    }
+
+    /// Editable source range of the table cell containing `byte`.
+    ///
+    /// GFM `|` separators are not part of the range. A byte that sits only on
+    /// a pipe (not in any cell) returns `None` — unlike [`Self::table_pos`],
+    /// there is no last-cell fallback.
+    pub fn cell_edit_range(&self, byte: usize, source: &str) -> Option<Range<usize>> {
+        table_cell_copy_range(&self.tree.blocks, byte, source)
     }
 
     /// Source caret for the start of cell `(row, col)` in `table_id`.
@@ -864,6 +874,27 @@ impl RichEngine {
     pub fn outline(&self) -> Vec<(usize, u8, String)> {
         self.tree.outline()
     }
+
+    /// `![…](url)`). Table `|` is never included (collapsed caret copies the
+    /// cell text). Fenced/HTML bodies keep their ticks/tags.
+    pub fn expand_markdown_selection(&self, source: &str, range: Range<usize>) -> Range<usize> {
+        expand_markdown_selection(&self.tree, source, range, false)
+    }
+
+    /// Like [`Self::expand_markdown_selection`], but a collapsed caret in a
+    /// table stays empty (Cut must not delete the cell/row) and a collapsed
+    /// block cut includes one trailing `\n` so the line is removed.
+    pub fn expand_markdown_cut_selection(&self, source: &str, range: Range<usize>) -> Range<usize> {
+        expand_markdown_selection(&self.tree, source, range, true)
+    }
+
+    /// Source markdown for a WYSIWYG selection (after
+    /// [`Self::expand_markdown_selection`]). A collapsed caret yields the
+    /// current block; empty when there is no block (blank gap).
+    pub fn markdown_for_selection(&self, source: &str, range: Range<usize>) -> String {
+        let range = self.expand_markdown_selection(source, range);
+        source.get(range).unwrap_or("").to_string()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1415,6 +1446,281 @@ fn leaf_inline_ranges(block: &Block) -> Vec<Range<usize>> {
     out
 }
 
+/// Drop `|` separators that comrak sometimes includes at a cell's edges.
+fn trim_cell_pipes(source: &str, range: Range<usize>) -> Range<usize> {
+    let bytes = source.as_bytes();
+    let mut start = range.start.min(source.len());
+    let mut end = range.end.min(source.len());
+    while start < end && bytes[start] == b'|' {
+        start += 1;
+    }
+    while end > start && bytes[end - 1] == b'|' {
+        end -= 1;
+    }
+    start..end
+}
+
+fn expand_markdown_selection(
+    tree: &RichTree,
+    source: &str,
+    range: Range<usize>,
+    for_cut: bool,
+) -> Range<usize> {
+    let len = source.len();
+    let mut start = range.start.min(len);
+    let mut end = range.end.min(len);
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
+    }
+    if start == end {
+        if for_cut && tree_in_table(&tree.blocks, start) {
+            return start..end;
+        }
+        let mut expanded = expand_collapsed_caret_to_block(tree, source, start);
+        if for_cut && expanded.start < expanded.end {
+            let end = expanded.end;
+            if end < source.len()
+                && source.is_char_boundary(end)
+                && source.as_bytes().get(end) == Some(&b'\n')
+            {
+                expanded.end = end + 1;
+            }
+        }
+        return expanded;
+    }
+    if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+        return start..end;
+    }
+    expand_inlines_for_copy(&tree.blocks, source, start..end, &mut start, &mut end);
+    expand_block_chrome_for_copy(&tree.blocks, start..end, &mut start, &mut end);
+    clamp_copy_range(tree, source, start, end, range)
+}
+
+fn expand_collapsed_caret_to_block(tree: &RichTree, source: &str, byte: usize) -> Range<usize> {
+    let len = source.len();
+    let byte = byte.min(len);
+    if tree_in_table(&tree.blocks, byte) {
+        return table_cell_copy_range(&tree.blocks, byte, source).unwrap_or(byte..byte);
+    }
+    if blank_caret_gap_at(tree, byte).is_some() {
+        return byte..byte;
+    }
+    let Some(block) = innermost_block_at(tree, byte) else {
+        return byte..byte;
+    };
+    if matches!(
+        block.kind,
+        BlockKind::Table { .. } | BlockKind::TableRow { .. } | BlockKind::TableCell
+    ) {
+        return table_cell_copy_range(&tree.blocks, byte, source).unwrap_or(byte..byte);
+    }
+    let selected = block.source_range.clone();
+    if selected.start == selected.end {
+        return clamp_copy_range(tree, source, selected.start, selected.end, selected);
+    }
+    if !source.is_char_boundary(selected.start) || !source.is_char_boundary(selected.end) {
+        return byte..byte;
+    }
+    let mut start = selected.start.min(len);
+    let mut end = selected.end.min(len);
+    expand_inlines_for_copy(&tree.blocks, source, selected.clone(), &mut start, &mut end);
+    expand_block_chrome_for_copy(&tree.blocks, selected.clone(), &mut start, &mut end);
+    clamp_copy_range(tree, source, start, end, selected)
+}
+
+fn clamp_copy_range(
+    tree: &RichTree,
+    source: &str,
+    mut start: usize,
+    mut end: usize,
+    fallback: Range<usize>,
+) -> Range<usize> {
+    let len = source.len();
+    let fm = frontmatter_body_start(tree);
+    start = start.max(fm).min(len);
+    end = end.max(start).min(len);
+    if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+        let lo = fallback.start.min(len);
+        let hi = fallback.end.min(len).max(lo);
+        return lo..hi;
+    }
+    start..end
+}
+
+fn innermost_block_at(tree: &RichTree, byte: usize) -> Option<&Block> {
+    fn descend(blocks: &[Block], byte: usize) -> Option<&Block> {
+        let mut best = None;
+        for b in blocks {
+            if b.source_range.start <= byte && byte <= b.source_range.end {
+                best = Some(b);
+            }
+        }
+        let b = best?;
+        descend(&b.children, byte).or(Some(b))
+    }
+    if let Some(block) = descend(&tree.blocks, byte) {
+        return Some(block);
+    }
+    let mut prev = None;
+    for b in &tree.blocks {
+        if b.source_range.start <= byte {
+            prev = Some(b);
+        }
+    }
+    prev.or_else(|| tree.blocks.first())
+}
+
+fn tree_in_table(blocks: &[Block], byte: usize) -> bool {
+    for b in blocks {
+        if b.source_range.start <= byte && byte <= b.source_range.end {
+            if matches!(b.kind, BlockKind::TableCell | BlockKind::Table { .. }) {
+                return true;
+            }
+            if tree_in_table(&b.children, byte) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn table_cell_copy_range(blocks: &[Block], byte: usize, source: &str) -> Option<Range<usize>> {
+    fn walk(blocks: &[Block], byte: usize) -> Option<&Block> {
+        for b in blocks {
+            if matches!(b.kind, BlockKind::TableCell)
+                && b.source_range.start <= byte
+                && byte <= b.source_range.end
+            {
+                return Some(b);
+            }
+            if let Some(found) = walk(&b.children, byte) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let cell = walk(blocks, byte)?;
+    Some(trim_cell_pipes(source, cell.source_range.clone()))
+}
+
+fn expand_inlines_for_copy(
+    blocks: &[Block],
+    source: &str,
+    selected: Range<usize>,
+    start: &mut usize,
+    end: &mut usize,
+) {
+    for block in blocks {
+        for inline in &block.inlines {
+            match inline {
+                Inline::Image { link, .. } => {
+                    if let Some(img) = atomic_image_range(inline) {
+                        if selected.start < img.end && selected.end > img.start {
+                            let mut wrapped = img;
+                            if let Some(link) = link.as_ref() {
+                                wrapped = expand_link_chrome(source, wrapped, link);
+                            }
+                            *start = (*start).min(wrapped.start);
+                            *end = (*end).max(wrapped.end);
+                        }
+                    }
+                }
+                Inline::OpaqueInline { .. } => {
+                    if let Some(img) = atomic_image_range(inline) {
+                        if selected.start < img.end && selected.end > img.start {
+                            *start = (*start).min(img.start);
+                            *end = (*end).max(img.end);
+                        }
+                    }
+                }
+                Inline::WikiLink {
+                    raw, source_range, ..
+                } => {
+                    let vis = wiki_visible_range(raw, source_range.clone());
+                    if selected.start <= vis.start && selected.end >= vis.end {
+                        *start = (*start).min(source_range.start);
+                        *end = (*end).max(source_range.end);
+                    }
+                }
+                Inline::Math {
+                    display,
+                    source_range,
+                    ..
+                } => {
+                    let w = math_delim_width(*display);
+                    let vis_start = source_range.start.saturating_add(w);
+                    let vis_end = source_range.end.saturating_sub(w).max(vis_start);
+                    if selected.start <= vis_start && selected.end >= vis_end {
+                        *start = (*start).min(source_range.start);
+                        *end = (*end).max(source_range.end);
+                    }
+                }
+                Inline::Emoji { source_range, .. } => {
+                    if selected.start <= source_range.start && selected.end >= source_range.end {
+                        *start = (*start).min(source_range.start);
+                        *end = (*end).max(source_range.end);
+                    }
+                }
+                Inline::Run {
+                    source_range,
+                    marks,
+                    link,
+                    ..
+                } => {
+                    if selected.start <= source_range.start && selected.end >= source_range.end {
+                        let mut wrapped = if marks.is_empty() {
+                            source_range.clone()
+                        } else {
+                            expand_mark_delimiters(source, block, source_range)
+                        };
+                        if let Some(link) = link {
+                            wrapped = expand_link_chrome(source, wrapped, link);
+                        }
+                        *start = (*start).min(wrapped.start);
+                        *end = (*end).max(wrapped.end);
+                    }
+                }
+                Inline::SoftBreak { .. } | Inline::HardBreak { .. } => {}
+            }
+        }
+        expand_inlines_for_copy(&block.children, source, selected.clone(), start, end);
+    }
+}
+
+fn expand_block_chrome_for_copy(
+    blocks: &[Block],
+    selected: Range<usize>,
+    start: &mut usize,
+    _end: &mut usize,
+) {
+    for block in blocks {
+        if matches!(
+            block.kind,
+            BlockKind::CodeBlock { .. }
+                | BlockKind::Opaque { .. }
+                | BlockKind::Table { .. }
+                | BlockKind::TableRow { .. }
+                | BlockKind::TableCell
+        ) {
+            expand_block_chrome_for_copy(&block.children, selected.clone(), start, _end);
+            continue;
+        }
+        let ranges = inline_ranges(block);
+        if !ranges.is_empty() {
+            let body_start = ranges
+                .iter()
+                .map(|r| r.start)
+                .min()
+                .unwrap_or(selected.start);
+            let body_end = ranges.iter().map(|r| r.end).max().unwrap_or(selected.end);
+            if selected.start <= body_start && selected.end >= body_end {
+                *start = (*start).min(block.source_range.start);
+            }
+        }
+        expand_block_chrome_for_copy(&block.children, selected.clone(), start, _end);
+    }
+}
+
 /// ASCII mark delimiters immediately outside `inner` (`*`, `_`, ticks, `~`, `=`, `^`).
 pub(crate) fn expand_mark_delimiters(
     source: &str,
@@ -1686,6 +1992,31 @@ mod tests {
         engine.sync(&doc);
         let ids_after: Vec<_> = engine.tree().blocks.iter().map(|b| b.id).collect();
         assert_eq!(ids, ids_after);
+    }
+
+    #[test]
+    fn cell_edit_range_excludes_pipe_separators() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (_doc, engine) = engine_for(source);
+        let a = source.find('a').expect("a");
+        let pipe = a + source[a..].find('|').expect("pipe after a");
+        let range = engine.cell_edit_range(a, source).expect("cell a");
+        assert!(
+            range.contains(&a),
+            "cell range must cover the header text, got {range:?}"
+        );
+        assert!(
+            !source[range.clone()].contains('|'),
+            "editable cell range must not include `|`, got {:?}",
+            &source[range.clone()]
+        );
+        if let Some(on_pipe) = engine.cell_edit_range(pipe, source) {
+            assert!(
+                !source[on_pipe.clone()].contains('|'),
+                "a pipe byte must not yield an editable range that includes `|`, got {:?}",
+                &source[on_pipe]
+            );
+        }
     }
 
     #[test]
@@ -2221,6 +2552,188 @@ mod tests {
         let img = first_image_range(&engine);
         assert_eq!(engine.next_caret(source, img.start), img.end);
         assert_eq!(engine.prev_caret(source, img.end), img.start);
+    }
+
+    #[test]
+    fn copy_of_visible_bold_is_markdown() {
+        let source = "**hello** world\n";
+        let (_doc, engine) = engine_for(source);
+        let inner = source.find("hello").expect("hello")
+            ..source.find("hello").expect("hello") + "hello".len();
+        let copied = engine.markdown_for_selection(source, inner.clone());
+        assert_eq!(
+            copied, "**hello**",
+            "Typora copies markdown, not painted inner text, got {copied:?}"
+        );
+        let empty_caret = engine.markdown_for_selection(source, 0..0);
+        assert!(
+            empty_caret.contains("**hello**") && empty_caret.contains("world"),
+            "empty caret copies the current paragraph, got {empty_caret:?}"
+        );
+        let ell = inner.start + 1..inner.end - 1;
+        assert_eq!(
+            engine.markdown_for_selection(source, ell),
+            "ell",
+            "partial selection inside bold stays inner text"
+        );
+    }
+
+    #[test]
+    fn empty_caret_copy_is_current_block_markdown() {
+        let heading = "# Title\n";
+        let (_doc, engine) = engine_for(heading);
+        let t = heading.find('T').expect("T");
+        let copied = engine.markdown_for_selection(heading, t..t);
+        assert!(
+            copied.starts_with("# Title"),
+            "empty-caret heading copy must include `# `, got {copied:?}"
+        );
+        assert!(!copied.contains('\n'), "copy omits the terminator newline");
+
+        let list = "- hello\n";
+        let (_doc, engine) = engine_for(list);
+        let h = list.find('h').expect("h");
+        let copied = engine.markdown_for_selection(list, h..h);
+        assert!(
+            copied.starts_with("- hello"),
+            "empty-caret list copy must include the marker, got {copied:?}"
+        );
+
+        let quote = "> hello\n";
+        let (_doc, engine) = engine_for(quote);
+        let h = quote.find('h').expect("h");
+        let copied = engine.markdown_for_selection(quote, h..h);
+        assert!(
+            copied.contains("> hello"),
+            "empty-caret quote copy must include `>`, got {copied:?}"
+        );
+
+        let fence = "```rust\ncode\n```\n";
+        let (_doc, engine) = engine_for(fence);
+        let c = fence.find("code").expect("code");
+        let copied = engine.markdown_for_selection(fence, c..c);
+        assert!(
+            copied.contains("```") && copied.contains("code"),
+            "empty-caret fence copy must include ticks, got {copied:?}"
+        );
+
+        let para = "hello world\n";
+        let (_doc, engine) = engine_for(para);
+        let w = para.find('w').expect("w");
+        assert_eq!(
+            engine.markdown_for_selection(para, w..w).trim_end(),
+            "hello world"
+        );
+
+        let img = "![cat](a.png)\n";
+        let (_doc, engine) = engine_for(img);
+        let bang = img.find('!').expect("image");
+        assert_eq!(
+            engine.markdown_for_selection(img, bang..bang),
+            "![cat](a.png)"
+        );
+
+        let table = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (_doc, engine) = engine_for(table);
+        let a = table.find('a').expect("a");
+        let copied = engine.markdown_for_selection(table, a..a);
+        assert!(
+            copied.contains('a') && !copied.contains('|'),
+            "empty-caret table copy is cell text, got {copied:?}"
+        );
+        let cut = engine.expand_markdown_cut_selection(table, a..a);
+        assert_eq!(cut.start, cut.end, "empty-caret table Cut is a no-op");
+    }
+
+    #[test]
+    fn copy_of_visible_heading_and_list_is_markdown() {
+        let heading = "# Title\n";
+        let (_doc, engine) = engine_for(heading);
+        let title = heading.find("Title").expect("Title");
+        let copied = engine.markdown_for_selection(heading, title..title + "Title".len());
+        assert!(
+            copied.starts_with("# Title"),
+            "heading copy must include `# `, got {copied:?}"
+        );
+
+        let list = "- hello\n";
+        let (_doc, engine) = engine_for(list);
+        let h = list.find("hello").expect("hello");
+        let copied = engine.markdown_for_selection(list, h..h + "hello".len());
+        assert!(
+            copied.starts_with("- hello"),
+            "list copy must include the marker, got {copied:?}"
+        );
+
+        let quote = "> hello\n";
+        let (_doc, engine) = engine_for(quote);
+        let h = quote.find("hello").expect("hello");
+        let copied = engine.markdown_for_selection(quote, h..h + "hello".len());
+        assert!(
+            copied.contains("> hello"),
+            "quote copy must include `>`, got {copied:?}"
+        );
+    }
+
+    #[test]
+    fn copy_of_visible_link_is_markdown() {
+        let source = "[hello](https://e.com)\n";
+        let (_doc, engine) = engine_for(source);
+        let hello = source.find("hello").expect("hello");
+        let copied = engine.markdown_for_selection(source, hello..hello + "hello".len());
+        assert_eq!(
+            copied, "[hello](https://e.com)",
+            "link copy must include dest, got {copied:?}"
+        );
+    }
+
+    #[test]
+    fn copy_of_visible_reference_link_is_markdown() {
+        let source = "[hello][ref]\n\n[ref]: https://e.com\n";
+        let (_doc, engine) = engine_for(source);
+        let hello = source.find("hello").expect("hello");
+        let copied = engine.markdown_for_selection(source, hello..hello + "hello".len());
+        assert!(
+            copied.contains("[hello][ref]"),
+            "reference link copy must include `[ref]`, got {copied:?}"
+        );
+    }
+
+    #[test]
+    fn copy_of_image_is_markdown() {
+        let source = "hello ![cat](a.png) world\n";
+        let (_doc, engine) = engine_for(source);
+        let img = first_image_range(&engine);
+        assert_eq!(
+            engine.markdown_for_selection(source, img.clone()),
+            "![cat](a.png)"
+        );
+        assert_eq!(
+            engine.markdown_for_selection(source, img.start..img.end),
+            "![cat](a.png)"
+        );
+
+        let linked = "see [![cat](a.png)](https://e.com) now\n";
+        let (_doc, engine) = engine_for(linked);
+        let img = first_image_range(&engine);
+        let copied = engine.markdown_for_selection(linked, img.clone());
+        assert_eq!(
+            copied, "[![cat](a.png)](https://e.com)",
+            "linked image copy must include wrapping dest, got {copied:?}"
+        );
+    }
+
+    #[test]
+    fn copy_of_table_cell_does_not_include_pipes() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (_doc, engine) = engine_for(source);
+        let a = source.find('a').expect("a");
+        let copied = engine.markdown_for_selection(source, a..a + 1);
+        assert_eq!(copied, "a");
+        assert!(
+            !copied.contains('|'),
+            "cell copy must not include `|`, got {copied:?}"
+        );
     }
 
     #[test]

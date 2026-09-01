@@ -3147,4 +3147,85 @@ mod tests {
             "Cmd-Delete deletes to the current line end, got {after:?}"
         );
     }
+
+    #[test]
+    fn cut_of_visible_bold_removes_markdown_marks() {
+        let source = "**hello** world\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let inner = source.find("hello").expect("hello");
+        caret.range = inner..inner + "hello".len();
+        caret.reversed = false;
+        let expanded = engine.expand_markdown_selection(&doc.buffer.content(), caret.range.clone());
+        assert_eq!(&source[expanded.clone()], "**hello**");
+        caret.range = expanded;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("**") && after.contains("world"),
+            "cut of a fully selected bold word must remove the marks, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn empty_caret_cut_removes_the_current_block() {
+        let source = "# Title\n\npara\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let t = source.find('T').expect("T");
+        caret.collapse_to(t);
+        let expanded =
+            engine.expand_markdown_cut_selection(&doc.buffer.content(), caret.range.clone());
+        assert!(
+            source[expanded.clone()].contains("# Title"),
+            "cut range must be the heading, got {:?}",
+            &source[expanded.clone()]
+        );
+        caret.range = expanded;
+        caret.reversed = false;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("# Title") && after.contains("para"),
+            "empty-caret heading cut must remove the heading, got {after:?}"
+        );
+
+        let source = "- hello\n- world\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let h = source.find('h').expect("h");
+        caret.collapse_to(h);
+        let expanded =
+            engine.expand_markdown_cut_selection(&doc.buffer.content(), caret.range.clone());
+        caret.range = expanded;
+        caret.reversed = false;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("hello") && after.contains("- world"),
+            "empty-caret list cut must remove that item, got {after:?}"
+        );
+
+        let source = "```\ncode\n```\n\npara\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let c = source.find("code").expect("code");
+        caret.collapse_to(c);
+        let expanded =
+            engine.expand_markdown_cut_selection(&doc.buffer.content(), caret.range.clone());
+        caret.range = expanded;
+        caret.reversed = false;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("```") && after.contains("para"),
+            "empty-caret fence cut must remove the fence, got {after:?}"
+        );
+
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (_doc, engine, mut caret) = setup(source);
+        let a = source.find('a').expect("a");
+        caret.collapse_to(a);
+        let expanded = engine.expand_markdown_cut_selection(source, caret.range.clone());
+        assert_eq!(
+            expanded.start, expanded.end,
+            "empty-caret table Cut must stay a no-op"
+        );
+    }
 }

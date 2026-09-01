@@ -139,6 +139,10 @@ fn desktop_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-pageup", markrust_editor::SelectPageUp, None),
         KeyBinding::new("shift-pagedown", markrust_editor::SelectPageDown, None),
         KeyBinding::new("cmd-a", markrust_editor::SelectAll, None),
+        KeyBinding::new("cmd-c", markrust_editor::Copy, None),
+        KeyBinding::new("ctrl-c", markrust_editor::Copy, None),
+        KeyBinding::new("cmd-x", markrust_editor::Cut, None),
+        KeyBinding::new("ctrl-x", markrust_editor::Cut, None),
         KeyBinding::new("enter", markrust_editor::Enter, None),
         KeyBinding::new("cmd-b", markrust_editor::ToggleBold, None),
         KeyBinding::new("ctrl-b", markrust_editor::ToggleBold, None),
@@ -168,6 +172,31 @@ mod tests {
     #[test]
     fn gpui_rev_is_non_empty() {
         assert_eq!(GPUI_GIT_REV.len(), 40);
+    }
+
+    #[test]
+    fn cmd_c_and_cmd_x_bind_copy_cut() {
+        let bindings = desktop_key_bindings();
+        let copy = Keystroke::parse("cmd-c").expect("cmd-c parses");
+        let copy_hit = bindings
+            .iter()
+            .find(|binding| binding.match_keystrokes(std::slice::from_ref(&copy)) == Some(false))
+            .expect("cmd-c must be bound");
+        assert_eq!(
+            copy_hit.action().name(),
+            markrust_editor::Copy::name_for_type(),
+            "Cmd-C copies the WYSIWYG selection as markdown"
+        );
+        let cut = Keystroke::parse("cmd-x").expect("cmd-x parses");
+        let cut_hit = bindings
+            .iter()
+            .find(|binding| binding.match_keystrokes(std::slice::from_ref(&cut)) == Some(false))
+            .expect("cmd-x must be bound");
+        assert_eq!(
+            cut_hit.action().name(),
+            markrust_editor::Cut::name_for_type(),
+            "Cmd-X cuts the WYSIWYG selection as markdown"
+        );
     }
 
     fn action_for(key: &str) -> String {

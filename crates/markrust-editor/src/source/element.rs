@@ -906,6 +906,18 @@ impl Render for MarkdownEditorView {
             })
             .on_action({
                 let editor = editor.clone();
+                move |action: &crate::editor::Copy, window, cx| {
+                    editor.update(cx, |e, cx| e.copy(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::Cut, window, cx| {
+                    editor.update(cx, |e, cx| e.cut(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
                 move |action: &crate::editor::Backspace, window, cx| {
                     editor.update(cx, |e, cx| e.backspace(action, window, cx))
                 }

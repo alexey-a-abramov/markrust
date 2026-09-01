@@ -6,8 +6,8 @@ use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{
-    actions, App, Bounds, Context, Entity, EntityInputHandler, FocusHandle, Focusable, Pixels,
-    Subscription, Task, UTF16Selection, Window,
+    actions, App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle,
+    Focusable, Pixels, Subscription, Task, UTF16Selection, Window,
 };
 use markrust_core::Document;
 
@@ -50,6 +50,8 @@ actions!(
         SelectDocumentHome,
         SelectDocumentEnd,
         SelectAll,
+        Copy,
+        Cut,
         Enter,
         ToggleBold,
         ToggleItalic,
@@ -385,6 +387,24 @@ impl MarkdownEditor {
 
     pub fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.apply_command(EditorCommand::SelectAll, cx);
+    }
+
+    pub fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        let content = self.document.read(cx).buffer.content();
+        if self.selected_range.start < self.selected_range.end {
+            if let Some(text) = content.get(self.selected_range.clone()) {
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                }
+            }
+        }
+    }
+
+    pub fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy(&Copy, window, cx);
+        if self.selected_range.start < self.selected_range.end {
+            self.apply_command(EditorCommand::Delete, cx);
+        }
     }
 
     pub fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {

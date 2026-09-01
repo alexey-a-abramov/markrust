@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    canvas, div, list, prelude::*, px, App, Bounds, Context, CursorStyle, Entity,
+    canvas, div, list, prelude::*, px, App, Bounds, ClipboardItem, Context, CursorStyle, Entity,
     EntityInputHandler, FocusHandle, Focusable, ListAlignment, ListState, MouseButton,
     MouseDownEvent, MouseMoveEvent, Pixels, Render, SharedString, Subscription, Task,
     UTF16Selection, Window,
@@ -880,6 +880,56 @@ impl RichEditorView {
                 }
             }
         }
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.widget_edit, WidgetEdit::Idle) {
+            if let Some((draft, _)) = self.widget_display() {
+                if let Some(text) = overlay_copy_text(&draft, self.widget_sel()) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            return;
+        }
+        let source = self.document.read(cx).buffer.content();
+        self.engine.sync(self.document.read(cx));
+        let text = self
+            .engine
+            .markdown_for_selection(&source, self.selected_range.clone());
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.widget_edit, WidgetEdit::Idle) {
+            let sel = self.widget_sel();
+            if sel.start < sel.end {
+                if let Some((draft, _)) = self.widget_display() {
+                    if let Some(text) = overlay_copy_text(&draft, sel) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                }
+                let _ = self.widget_backspace(cx);
+            }
+            return;
+        }
+        let source = self.document.read(cx).buffer.content();
+        self.engine.sync(self.document.read(cx));
+        let expanded = self
+            .engine
+            .expand_markdown_cut_selection(&source, self.selected_range.clone());
+        if expanded.start == expanded.end {
+            return;
+        }
+        if let Some(text) = source.get(expanded.clone()) {
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+            }
+        }
+        self.selected_range = expanded;
+        self.selection_reversed = false;
+        self.apply_rich(RichCommand::Delete, cx);
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) -> EditorOutcome {
@@ -2154,6 +2204,18 @@ impl Render for RichEditorView {
                     editor.update(cx, |e, cx| {
                         e.apply_editor_command(EditorCommand::SelectAll, cx);
                     });
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::Copy, _, cx| {
+                    editor.update(cx, |e, cx| e.copy_selection(cx));
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |_: &crate::editor::Cut, _, cx| {
+                    editor.update(cx, |e, cx| e.cut_selection(cx));
                 }
             })
             .on_action({
