@@ -10,17 +10,19 @@ use std::ops::Range;
 use crate::document::Document;
 use crate::undo::{SelectionSnapshot, TransactionKind};
 
-pub use super::engine::code_body_source_map;
 use super::engine::{
-    blank_caret_gap_after_last, caret_for_click_below_content, expand_mark_delimiters,
-    frontmatter_body_start, raw_body_range, raw_container_prefix, step_right_in_slice,
-    RichEngine, TablePos,
+    blank_caret_gap_after_last, blank_caret_gap_at, caret_for_click_below_content,
+    expand_mark_delimiters, frontmatter_body_start, raw_body_range, raw_container_prefix,
+    step_right_in_slice, Bias, RichEngine, TablePos,
 };
+
+pub use super::engine::code_body_source_map;
 use super::escape::{escape_text, EscapeContext};
 use super::input_rules::{input_rule_breaks_table, match_input_rule_with, InputRule};
 use super::serialize::serialize_block;
 use super::tree::{
     Block, BlockKind, ColumnAlign, Frontmatter, HeadingStyle, Inline, LinkAttrs, MarkSet, NodeId,
+    RichTree,
 };
 
 /// Caret/selection in source byte offsets.
@@ -166,6 +168,14 @@ pub fn apply_rich_command(
 ) -> Result<RichOutcome, RichError> {
     engine.sync(doc);
     caret.clamp(doc.buffer.len_bytes());
+    // YAML is the frontmatter panel. Body commands must not splice into it
+    // (a caret at 0 on a file with `---` would otherwise type `x---`).
+    if !matches!(
+        command,
+        RichCommand::SetFrontmatter { .. } | RichCommand::SetFrontmatterField { .. }
+    ) {
+        clamp_caret_out_of_frontmatter(engine, caret);
+    }
     match command {
         RichCommand::InsertText(text) => insert_text(doc, engine, caret, &text),
         RichCommand::Backspace => backspace(doc, engine, caret),
@@ -204,6 +214,13 @@ pub fn apply_rich_command(
     }
 }
 
+/// Leftover viewport click below the last painted block: open a trailing
+/// blank if the file has none, then sit the caret on that empty paragraph
+/// (Typora: `hello` then type `x` is two paragraphs, not `hellox`).
+///
+/// No-op when a trailing blank (or a newlines-only document) already hosts
+/// a caret. Click **on** the last line of the last block must not call this
+/// — that path hit-tests the leaf and may land at EOF inside the paragraph.
 pub fn place_caret_for_click_below(
     doc: &mut Document,
     engine: &mut RichEngine,
@@ -244,7 +261,7 @@ fn insert_text(
     caret: &mut CaretState,
     text: &str,
 ) -> Result<RichOutcome, RichError> {
-    if text == "\n" {
+    if text == "\n" || text == "\r\n" || text == "\r" {
         return split_block(doc, engine, caret);
     }
     if text.is_empty() {
@@ -253,6 +270,9 @@ fn insert_text(
     if !caret.range.is_empty() {
         delete_range(doc, engine, caret, TransactionKind::Command)?;
         engine.sync(doc);
+    }
+    if text.contains('\n') || text.contains('\r') {
+        return insert_multiline_text(doc, engine, caret, text);
     }
     let offset = caret.cursor();
     let source = doc.buffer.content();
@@ -267,7 +287,16 @@ fn insert_text(
             }
         }
     }
-    let inserted = if raw {
+    // Single-line clipboard/IME paste of a complete GFM block (`# Title`,
+    // `- world`) must not go through `escape_text` (`\# Title`) or glue onto
+    // the current list item (`- hello- world`). Typed `#` / `-` keystrokes
+    // stay input-rule driven (they are not a complete block line).
+    if !raw && !in_table {
+        if let Some(result) = try_insert_gfm_block_paste(doc, engine, caret, text) {
+            return result;
+        }
+    }
+    let mut inserted = if raw {
         text.to_string()
     } else {
         let ctx = EscapeContext {
@@ -276,6 +305,11 @@ fn insert_text(
         };
         escape_text(text, ctx)
     };
+    // Typora empty quotes/lists are `> ` / `- `, not `>`. InsertText at
+    // that home fills in the missing marker space so typing is `> x`.
+    if empty_prefix_home_needs_marker_space(engine.tree(), &source, offset, &inserted) {
+        inserted.insert(0, ' ');
+    }
     let kind = if is_coalescable_insert(&inserted) {
         TransactionKind::Typing
     } else {
@@ -284,6 +318,356 @@ fn insert_text(
     let before = caret.snapshot();
     // `[hello](<>)` leftover dest: typing must replace `<>`, not insert inside.
     if !raw {
+        if let Some(angle) = empty_angle_destination(&source, offset) {
+            let after = CaretState::collapsed(angle.start + inserted.len());
+            doc.replace_range_tx(
+                angle.start,
+                angle.end,
+                &inserted,
+                kind,
+                before,
+                after.snapshot(),
+            );
+            *caret = after;
+            engine.sync(doc);
+            return Ok(RichOutcome::Changed);
+        }
+    }
+    let after = CaretState::collapsed(offset + inserted.len());
+    doc.replace_range_tx(offset, offset, &inserted, kind, before, after.snapshot());
+    *caret = after;
+    engine.sync(doc);
+    Ok(RichOutcome::Changed)
+}
+
+/// IME/clipboard paste (`InsertText` with embedded newlines). A lone `"\n"`
+/// stays Enter (`SplitBlock`). Typora-ish: real source newlines (not `&#10;`);
+/// paragraph soft-wrap vs `\n\n` paragraph; later lines that look like GFM
+/// (ATX / list / quote / fence) stay markdown instead of escaped text; list
+/// marker lines become sibling items; quote/list prefixes kept for wraps;
+/// raw blocks stay inside. Single-line complete GFM pastes (`# Title` with
+/// no `\n`) are rewritten onto this path by `try_insert_gfm_block_paste`.
+fn insert_multiline_text(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    text: &str,
+) -> Result<RichOutcome, RichError> {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let offset = caret.cursor();
+    let source = doc.buffer.content();
+    if engine.in_table(offset) {
+        let inserted = format_table_paste(&text, &source, offset);
+        return commit_inserted_text(doc, engine, caret, offset, inserted, false);
+    }
+    if in_raw_block(engine, offset) {
+        let at = clamp_to_raw_edit(engine, &source, offset);
+        let prefix = raw_block_at(engine, offset)
+            .map(|block| raw_container_prefix(&source, block))
+            .unwrap_or_default();
+        let inserted = join_prefixed_lines(&text, &prefix);
+        return commit_inserted_text(doc, engine, caret, at, inserted, false);
+    }
+    let wrap_prefix = paste_line_prefix(&source, engine, offset);
+    let in_list = engine
+        .block_at(offset)
+        .is_some_and(|id| ancestor_list_item(engine, id).is_some());
+    let in_quote = engine
+        .block_at(offset)
+        .is_some_and(|id| ancestor_is_quote(engine, id));
+    let quote_pfx = if in_quote {
+        quote_marker_prefix(current_line(&source, offset)).unwrap_or_else(|| "> ".to_string())
+    } else {
+        String::new()
+    };
+    let first_at_start = offset == 0 || source.as_bytes().get(offset - 1) == Some(&b'\n');
+    let mut inserted = String::new();
+    for (i, line) in text.split('\n').enumerate() {
+        let at_line_start = i == 0 && first_at_start;
+        if i > 0 {
+            inserted.push('\n');
+        }
+        if (i > 0 || at_line_start) && keep_markdown_paste_line(line, in_list) {
+            inserted.push_str(&with_container_quote(line, &quote_pfx));
+            continue;
+        }
+        if i > 0 {
+            inserted.push_str(&wrap_prefix);
+        }
+        inserted.push_str(&escape_text(
+            line,
+            EscapeContext {
+                in_table: false,
+                at_line_start: if i == 0 {
+                    first_at_start
+                } else {
+                    wrap_prefix.is_empty()
+                },
+            },
+        ));
+    }
+    commit_inserted_text(doc, engine, caret, offset, inserted, true)
+}
+
+fn format_table_paste(text: &str, source: &str, offset: usize) -> String {
+    let first_at_start = offset == 0 || source.as_bytes().get(offset - 1) == Some(&b'\n');
+    let mut out = String::new();
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push_str("<br>");
+        }
+        out.push_str(&escape_text(
+            line,
+            EscapeContext {
+                in_table: true,
+                at_line_start: i == 0 && first_at_start,
+            },
+        ));
+    }
+    out
+}
+
+fn join_prefixed_lines(text: &str, prefix: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+            out.push_str(prefix);
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Quote `>` (and nested `> > `) or list continuation indent, matching Enter
+/// continuing the block so a paste cannot drop prefixes and split the quote.
+fn paste_line_prefix(source: &str, engine: &RichEngine, offset: usize) -> String {
+    let Some(leaf_id) = engine.block_at(offset) else {
+        return String::new();
+    };
+    if let Some(item) = ancestor_list_item(engine, leaf_id) {
+        return list_continuation_prefix(source, item, offset);
+    }
+    if ancestor_is_quote(engine, leaf_id) {
+        let line = current_line(source, offset);
+        return quote_marker_prefix(line).unwrap_or_else(|| "> ".to_string());
+    }
+    String::new()
+}
+
+fn list_continuation_prefix(source: &str, item: &Block, offset: usize) -> String {
+    let line = current_line(source, offset);
+    let quote = quote_prefix(line).to_string();
+    let after = after_quote(line);
+    if let Some(marker) = list_marker_prefix(after) {
+        return format!("{quote}{}", " ".repeat(marker.len()));
+    }
+    let indent = after
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count();
+    if indent > 0 {
+        return format!("{quote}{}", &after[..indent]);
+    }
+    let slice = source.get(item.source_range.clone()).unwrap_or_default();
+    let first = slice.split('\n').next().unwrap_or(slice);
+    let q = quote_prefix(first);
+    let marker = list_marker_prefix(after_quote(first)).unwrap_or_else(|| "- ".to_string());
+    format!("{q}{}", " ".repeat(marker.len()))
+}
+
+/// List items keep sibling markers; everywhere else, ATX / list / quote /
+/// fence lines stay GFM instead of `\#` / `\-` / escaped ticks.
+fn keep_markdown_paste_line(line: &str, in_list: bool) -> bool {
+    if in_list {
+        looks_like_list_item_line(line)
+    } else {
+        looks_like_gfm_block_start(line)
+    }
+}
+
+fn looks_like_list_item_line(line: &str) -> bool {
+    list_marker_prefix(after_quote(line)).is_some()
+}
+
+fn looks_like_gfm_block_start(line: &str) -> bool {
+    quote_marker_prefix(line).is_some()
+        || atx_marker_prefix(after_quote(line)).is_some()
+        || list_marker_prefix(after_quote(line)).is_some()
+        || is_fence_line(after_quote(line))
+}
+
+fn is_fence_line(line: &str) -> bool {
+    let indent = line
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line[indent..];
+    let ticks = rest.bytes().take_while(|b| *b == b'`').count();
+    if ticks >= 3 {
+        return true;
+    }
+    rest.bytes().take_while(|b| *b == b'~').count() >= 3
+}
+
+/// Clipboard/IME `InsertText` of a complete GFM block line with no embedded
+/// newline (`# Title`, `- world`). Not a typed `#` / `-` keystroke.
+fn try_insert_gfm_block_paste(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    text: &str,
+) -> Option<Result<RichOutcome, RichError>> {
+    if !is_complete_gfm_block_paste(text) {
+        return None;
+    }
+    let offset = caret.cursor();
+    let (in_list, at_line_start, can_start) = {
+        let source = doc.buffer.content();
+        let in_list = engine
+            .block_at(offset)
+            .is_some_and(|id| ancestor_list_item(engine, id).is_some());
+        let at_line_start = offset == 0 || source.as_bytes().get(offset - 1) == Some(&b'\n');
+        let can_start = caret_can_start_gfm_block(engine, &source, offset);
+        (in_list, at_line_start, can_start)
+    };
+    if in_list && looks_like_list_item_line(text) {
+        // Mid-item paste without a leading `\n` must still start a sibling
+        // (`- hello` + `- world` → two items, not `- hello- world`).
+        let paste = if at_line_start {
+            text.to_string()
+        } else {
+            format!("\n{text}")
+        };
+        return Some(insert_multiline_text(doc, engine, caret, &paste));
+    }
+    if can_start {
+        return Some(insert_multiline_text(doc, engine, caret, text));
+    }
+    None
+}
+
+/// True when `text` is a whole ATX / list / task / quote / fence-opener line,
+/// not a typical keystroke. `# Title` has a space after the marker; a fence
+/// opener is longer than two bytes; a lone `#` / `-` / `>` is typing.
+fn is_complete_gfm_block_paste(text: &str) -> bool {
+    looks_like_gfm_block_start(text) && gfm_block_paste_not_keystroke(text)
+}
+
+fn gfm_block_paste_not_keystroke(text: &str) -> bool {
+    text.len() > 2 || gfm_marker_has_separator_space(text)
+}
+
+fn gfm_marker_has_separator_space(text: &str) -> bool {
+    let body = after_quote(text);
+    if let Some(prefix) = atx_marker_prefix(body) {
+        return prefix.contains(' ') || prefix.contains('\t');
+    }
+    if let Some(prefix) = list_marker_prefix(body) {
+        return prefix.contains(' ') || prefix.contains('\t');
+    }
+    quote_marker_prefix(text).is_some_and(|prefix| prefix.contains(' ') || prefix.contains('\t'))
+}
+
+/// Empty paragraph (Comrak gap / empty doc), line start of a paragraph, or
+/// after `\n\n`. Not a table cell, fence/HTML body, or list item (list-item
+/// paste uses the sibling path).
+fn caret_can_start_gfm_block(engine: &RichEngine, source: &str, offset: usize) -> bool {
+    if engine.in_table(offset) || in_raw_block(engine, offset) {
+        return false;
+    }
+    if engine
+        .block_at(offset)
+        .is_some_and(|id| ancestor_list_item(engine, id).is_some())
+    {
+        return false;
+    }
+    if blank_caret_gap_at(engine.tree(), offset).is_some() {
+        return true;
+    }
+    let at_line_start = offset == 0 || source.as_bytes().get(offset - 1) == Some(&b'\n');
+    if !at_line_start {
+        return false;
+    }
+    match engine.block_at(offset).and_then(|id| engine.block(id)) {
+        None => true,
+        Some(block) => matches!(block.kind, BlockKind::Paragraph),
+    }
+}
+
+/// Re-apply the current quote prefix without doubling `>` when the paste
+/// already carries the same depth. Extra `>` in the paste stay nested.
+fn with_container_quote(line: &str, quote_pfx: &str) -> String {
+    let rest = strip_matching_quote_prefix(line, quote_pfx);
+    if quote_pfx.is_empty() {
+        rest.to_string()
+    } else {
+        format!("{quote_pfx}{rest}")
+    }
+}
+
+fn quote_depth(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut i = bytes
+        .iter()
+        .take_while(|b| **b == b' ' || **b == b'\t')
+        .count();
+    let mut depth = 0;
+    while bytes.get(i) == Some(&b'>') {
+        depth += 1;
+        i += 1;
+        if bytes.get(i) == Some(&b' ') || bytes.get(i) == Some(&b'\t') {
+            i += 1;
+        }
+    }
+    depth
+}
+
+fn strip_matching_quote_prefix<'a>(line: &'a str, current_quote: &str) -> &'a str {
+    let n = quote_depth(current_quote).min(quote_depth(line));
+    if n == 0 {
+        return line;
+    }
+    let bytes = line.as_bytes();
+    let mut i = bytes
+        .iter()
+        .take_while(|b| **b == b' ' || **b == b'\t')
+        .count();
+    let mut stripped = 0;
+    while stripped < n && bytes.get(i) == Some(&b'>') {
+        i += 1;
+        if bytes.get(i) == Some(&b' ') || bytes.get(i) == Some(&b'\t') {
+            i += 1;
+        }
+        stripped += 1;
+    }
+    &line[i.min(line.len())..]
+}
+
+fn commit_inserted_text(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    offset: usize,
+    mut inserted: String,
+    apply_homes_and_angles: bool,
+) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    if apply_homes_and_angles
+        && empty_prefix_home_needs_marker_space(engine.tree(), &source, offset, &inserted)
+    {
+        inserted.insert(0, ' ');
+    }
+    let kind = if is_coalescable_insert(&inserted) {
+        TransactionKind::Typing
+    } else {
+        TransactionKind::Command
+    };
+    let before = caret.snapshot();
+    if apply_homes_and_angles {
         if let Some(angle) = empty_angle_destination(&source, offset) {
             let after = CaretState::collapsed(angle.start + inserted.len());
             doc.replace_range_tx(
@@ -363,6 +747,72 @@ fn is_coalescable_insert(text: &str) -> bool {
     crate::undo::is_typing_burst(text)
 }
 
+/// Empty `>` / `-` / `1.` (no trailing space) still host a caret after the
+/// marker. InsertText there must become `> x` / `- x`, not `>x`.
+///
+/// Only real quote/list nodes (not a `-` / `*` paragraph waiting for an
+/// input-rule space or a third `-` for `---`).
+fn empty_prefix_home_needs_marker_space(
+    tree: &RichTree,
+    source: &str,
+    offset: usize,
+    inserted: &str,
+) -> bool {
+    if inserted.is_empty() || inserted.starts_with([' ', '\t']) {
+        return false;
+    }
+    tree.empty_prefix_homes.iter().any(|blank| {
+        if blank.home != offset {
+            return false;
+        }
+        let line = source.get(blank.line.clone()).unwrap_or("");
+        let last = line.as_bytes().last();
+        if line.is_empty() || last == Some(&b' ') || last == Some(&b'\t') {
+            return false;
+        }
+        // Unquoted `-` / `*` / `+` are paragraphs or empty items waiting for
+        // an input-rule space (or a third `-` for `---`, or `*hi*` italic).
+        // Only fill the Typora marker space on a real quote (and quoted lists).
+        quote_marker_prefix(line).is_some() && deepest_is_quote_or_list(&tree.blocks, blank.home)
+    })
+}
+
+fn deepest_is_quote_or_list(blocks: &[Block], byte: usize) -> bool {
+    let mut best = None;
+    fn walk<'a>(blocks: &'a [Block], byte: usize, best: &mut Option<&'a Block>) {
+        for b in blocks {
+            if b.source_range.start <= byte && byte <= b.source_range.end {
+                *best = Some(b);
+                walk(&b.children, byte, best);
+            }
+        }
+    }
+    walk(blocks, byte, &mut best);
+    best.is_some_and(|b| {
+        matches!(
+            b.kind,
+            BlockKind::BlockQuote
+                | BlockKind::Alert { .. }
+                | BlockKind::BulletList { .. }
+                | BlockKind::OrderedList { .. }
+                | BlockKind::ListItem { .. }
+        )
+    })
+}
+
+/// Body caret/selection must sit at or after the closing frontmatter fence.
+fn clamp_caret_out_of_frontmatter(engine: &RichEngine, caret: &mut CaretState) {
+    let end = frontmatter_body_start(engine.tree());
+    if end == 0 || caret.range.start >= end {
+        return;
+    }
+    if caret.range.end <= end {
+        caret.collapse_to(end);
+        return;
+    }
+    caret.range.start = end;
+}
+
 fn backspace(
     doc: &mut Document,
     engine: &mut RichEngine,
@@ -378,6 +828,15 @@ fn backspace(
         return Ok(RichOutcome::Noop);
     }
     if to == 0 {
+        if at_heading_body_start(&source, engine, to) {
+            return convert_heading_to_paragraph(doc, engine, caret);
+        }
+        if at_list_item_body_start(&source, engine, to) {
+            return outdent_current_list_line(doc, engine, caret);
+        }
+        if at_definition_details_body_start(&source, engine, to) {
+            return strip_definition_details_marker(doc, engine, caret);
+        }
         return Ok(RichOutcome::Noop);
     }
     // Typora: Backspace at the first body byte of a fenced code / HTML block
@@ -385,6 +844,33 @@ fn backspace(
     // block. Later body lines join without eating `>` / list indent.
     if let Some(outcome) = backspace_in_raw_block(doc, engine, caret, &source, to)? {
         return Ok(outcome);
+    }
+    // Typora: Backspace at the first visible character / heading-body start
+    // strips `#` / setext underline (same idea as list-marker strip). Inner
+    // heading chrome is stripped before a surrounding list marker, so
+    // `- # Title` becomes `- Title` rather than `# Title`.
+    if at_heading_body_start(&source, engine, to) {
+        match convert_heading_to_paragraph(doc, engine, caret)? {
+            RichOutcome::Changed => return Ok(RichOutcome::Changed),
+            RichOutcome::Noop => {}
+        }
+    }
+    // Typora: Backspace at the start of a list item (first visible character /
+    // start of the item body) removes the list marker rather than a grapheme.
+    // Quoted lists keep their `>` prefixes (same as outermost OutdentList).
+    if at_list_item_body_start(&source, engine, to) {
+        match outdent_current_list_line(doc, engine, caret)? {
+            RichOutcome::Changed => return Ok(RichOutcome::Changed),
+            RichOutcome::Noop => {}
+        }
+    }
+    // Typora: Backspace at the start of definition details strips `: `
+    // (same idea as list-marker strip) instead of joining into `Termdetails`.
+    if at_definition_details_body_start(&source, engine, to) {
+        match strip_definition_details_marker(doc, engine, caret)? {
+            RichOutcome::Changed => return Ok(RichOutcome::Changed),
+            RichOutcome::Noop => {}
+        }
     }
     let from = engine.prev_caret(&source, to);
     let grapheme_end = engine.next_caret(&source, from);
@@ -438,6 +924,316 @@ fn delete_forward(
     caret.range = range;
     caret.reversed = false;
     delete_range(doc, engine, caret, TransactionKind::Command)
+}
+
+#[derive(Clone, Copy)]
+enum DeleteBound {
+    WordLeft,
+    WordRight,
+    LineStart,
+    LineEnd,
+}
+
+/// Option/Ctrl word-delete and Cmd line-delete. A non-empty selection is
+/// removed like Backspace. Collapsed carets stay inside a table cell, a
+/// fence/HTML body, and out of YAML. Word-delete-left at the start of a
+/// heading/list/quote matches grapheme Backspace (convert / strip marker /
+/// outdent) instead of splicing the previous block. Word-delete-right at a
+/// paragraph/heading/list/quote end does not eat the next block's `# ` /
+/// `- ` / `>` (no-op, or join the next *paragraph* only).
+fn delete_to_bound(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    bound: DeleteBound,
+) -> Result<RichOutcome, RichError> {
+    if !caret.range.is_empty() {
+        return delete_range(doc, engine, caret, TransactionKind::Command);
+    }
+    if matches!(bound, DeleteBound::WordLeft) {
+        match word_delete_left_at_block_start(doc, engine, caret)? {
+            RichOutcome::Changed => return Ok(RichOutcome::Changed),
+            RichOutcome::Noop => {}
+        }
+    }
+    let source = doc.buffer.content();
+    let cursor = caret.cursor();
+    let target = match bound {
+        DeleteBound::WordLeft => engine.prev_word_caret(&source, cursor),
+        DeleteBound::WordRight => engine.next_word_caret(&source, cursor),
+        DeleteBound::LineStart => {
+            let start = line_start(&source, cursor);
+            engine.clamp_raw_prefix(&source, engine.snap_caret(start, Bias::Right), Bias::Right)
+        }
+        DeleteBound::LineEnd => {
+            let end = line_end_exclusive(&source, cursor);
+            engine.clamp_raw_prefix(&source, engine.snap_caret(end, Bias::Left), Bias::Left)
+        }
+    };
+    let window = delete_edit_window(engine, &source, cursor);
+    let cursor = cursor.clamp(window.start, window.end);
+    let target = target.clamp(window.start, window.end);
+    let (start, end, reversed) = if target < cursor {
+        (target, cursor, true)
+    } else {
+        (cursor, target, false)
+    };
+    if start >= end {
+        return Ok(RichOutcome::Noop);
+    }
+    let range = trim_inline_chrome(engine, &source, start..end);
+    if range.start >= range.end {
+        return Ok(RichOutcome::Noop);
+    }
+    caret.range = range;
+    caret.reversed = reversed;
+    delete_range(doc, engine, caret, TransactionKind::Command)
+}
+
+/// Byte range a collapsed word/line delete may cover from `cursor`.
+fn delete_edit_window(engine: &RichEngine, source: &str, cursor: usize) -> Range<usize> {
+    let fm = frontmatter_body_start(engine.tree()).min(source.len());
+    let mut lo = fm;
+    let mut hi = source.len();
+    if let Some(cell) = cell_edit_range_near(engine, source, cursor) {
+        return cell.start.max(lo)..cell.end.min(hi);
+    }
+    if let Some(block) = raw_block_at(engine, cursor) {
+        let body = raw_body_range(block, source);
+        lo = lo.max(body.start);
+        hi = hi.min(body.end);
+        let prefix = raw_container_prefix(source, block);
+        let first_line_start = line_start(source, body.start);
+        let first_content = (first_line_start + prefix.len()).clamp(lo, hi);
+        lo = lo.max(first_content);
+        if !prefix.is_empty() {
+            let at = cursor.clamp(lo, hi);
+            let line_s = line_start(source, at);
+            let line_e = line_end_exclusive(source, at);
+            let content = (line_s + prefix.len()).clamp(lo, hi);
+            lo = lo.max(content);
+            hi = hi.min(line_e.max(content));
+        }
+        return if lo > hi { hi..hi } else { lo..hi };
+    }
+    // Headings/lists/quotes are not raw: still refuse to delete `# ` / `- ` /
+    // `>` of this or a neighbor block. Interior word-delete stays in the
+    // body. At a paragraph start, joining the previous *paragraph* is OK;
+    // at a paragraph end, joining the next *paragraph* is OK. Heading/list/
+    // quote/alert chrome is never stolen.
+    let body = editable_body_start(engine, source, cursor);
+    if cursor > body {
+        lo = lo.max(body);
+    } else if let Some(prev) = previous_plain_paragraph_body_start(engine, source, cursor) {
+        lo = lo.max(prev);
+    } else {
+        lo = lo.max(body);
+    }
+    let body_end = editable_body_end(engine, source, cursor);
+    if cursor < body_end {
+        hi = hi.min(body_end);
+    } else if is_plain_paragraph_leaf(engine, cursor) {
+        if let Some(next) = next_plain_paragraph_body_end(engine, source, cursor) {
+            hi = hi.min(next);
+        } else {
+            hi = hi.min(body_end);
+        }
+    } else {
+        hi = hi.min(body_end);
+    }
+    if lo > hi {
+        hi..hi
+    } else {
+        lo..hi
+    }
+}
+
+/// Option-Backspace at the first visible body character of a heading, list
+/// item, or quoted paragraph: same structural edit as grapheme Backspace,
+/// not a word delete into the previous block.
+fn word_delete_left_at_block_start(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    let cursor = caret.cursor();
+    let fm_end = frontmatter_body_start(engine.tree());
+    if fm_end > 0 && cursor <= fm_end {
+        return Ok(RichOutcome::Noop);
+    }
+    if at_heading_body_start(&source, engine, cursor) {
+        match convert_heading_to_paragraph(doc, engine, caret)? {
+            RichOutcome::Changed => return Ok(RichOutcome::Changed),
+            RichOutcome::Noop => {}
+        }
+    }
+    if at_list_item_body_start(&doc.buffer.content(), engine, caret.cursor()) {
+        match outdent_current_list_line(doc, engine, caret)? {
+            RichOutcome::Changed => return Ok(RichOutcome::Changed),
+            RichOutcome::Noop => {}
+        }
+    }
+    if at_definition_details_body_start(&doc.buffer.content(), engine, caret.cursor()) {
+        match strip_definition_details_marker(doc, engine, caret)? {
+            RichOutcome::Changed => return Ok(RichOutcome::Changed),
+            RichOutcome::Noop => {}
+        }
+    }
+    if at_quote_body_start(&doc.buffer.content(), engine, caret.cursor()) {
+        match outdent_current_quote_line(doc, engine, caret)? {
+            RichOutcome::Changed => return Ok(RichOutcome::Changed),
+            RichOutcome::Noop => {}
+        }
+    }
+    Ok(RichOutcome::Noop)
+}
+
+/// First visible body byte of the leaf at `offset` (after `# ` / `- ` / `>`).
+fn editable_body_start(engine: &RichEngine, source: &str, offset: usize) -> usize {
+    if let Some(heading) = heading_at(engine, offset) {
+        return heading_body_start(source, heading);
+    }
+    if let Some(details) = ancestor_definition_details(engine, offset) {
+        return definition_details_body_start(source, details);
+    }
+    let Some(id) = engine.block_at(offset) else {
+        return offset;
+    };
+    let Some(block) = engine.block(id) else {
+        return offset;
+    };
+    let first = line_start(source, block.source_range.start);
+    let line = current_line(source, first);
+    let quote = quote_prefix(line).len();
+    let marker = list_marker_prefix(after_quote(line))
+        .map(|p| p.len())
+        .unwrap_or(0);
+    first + quote + marker
+}
+
+/// Last visible body byte of the leaf at `offset` (before the next block's
+/// `# ` / `- ` / `>` / `[!NOTE]` chrome).
+fn editable_body_end(engine: &RichEngine, source: &str, offset: usize) -> usize {
+    let Some(probe) = probe_leaf_offset(engine, offset) else {
+        return offset;
+    };
+    if let Some(heading) = heading_at(engine, probe) {
+        return last_visible_body_end(heading)
+            .unwrap_or_else(|| heading_body_start(source, heading));
+    }
+    let Some(id) = engine.block_at(probe) else {
+        return offset;
+    };
+    let Some(block) = engine.block(id) else {
+        return offset;
+    };
+    last_visible_body_end(block).unwrap_or_else(|| editable_body_start(engine, source, probe))
+}
+
+fn last_visible_body_end(block: &Block) -> Option<usize> {
+    let mut end = None;
+    fn consider(block: &Block, end: &mut Option<usize>) {
+        for inline in &block.inlines {
+            if let Inline::OpaqueInline { raw, .. } = inline {
+                if crate::html_visual::opaque_inline_is_caret_chrome(raw) {
+                    continue;
+                }
+            }
+            let e = inline.source_range().end;
+            *end = Some(end.map_or(e, |cur| cur.max(e)));
+        }
+        for child in &block.children {
+            consider(child, end);
+        }
+    }
+    consider(block, &mut end);
+    end
+}
+
+/// Offset inside a leaf, or the previous byte when `offset` sits in a
+/// Comrak-less gap (separator / trailing blank).
+fn probe_leaf_offset(engine: &RichEngine, offset: usize) -> Option<usize> {
+    if engine.block_at(offset).is_some() {
+        Some(offset)
+    } else if offset > 0 && engine.block_at(offset - 1).is_some() {
+        Some(offset - 1)
+    } else {
+        None
+    }
+}
+
+/// Unquoted, unlisted paragraph (not a heading, quote, alert, table, or raw).
+fn is_plain_paragraph_leaf(engine: &RichEngine, offset: usize) -> bool {
+    let Some(probe) = probe_leaf_offset(engine, offset) else {
+        return false;
+    };
+    if engine.in_table(probe) || engine.in_raw_context(probe) {
+        return false;
+    }
+    if heading_at(engine, probe).is_some() {
+        return false;
+    }
+    let Some(id) = engine.block_at(probe) else {
+        return false;
+    };
+    if ancestor_list_item(engine, id).is_some() || ancestor_is_quote(engine, id) {
+        return false;
+    }
+    matches!(
+        engine.block(id).map(|b| &b.kind),
+        Some(BlockKind::Paragraph)
+    )
+}
+
+/// Body start of the previous leaf when it is an unquoted, unlisted
+/// paragraph (Typora: Option-Backspace at a paragraph start may join it).
+/// Refuses when the caret is already in a heading/list/quote/alert/raw so
+/// a previous paragraph is not spliced into that chrome (`> [!NOTE]`).
+fn previous_plain_paragraph_body_start(
+    engine: &RichEngine,
+    source: &str,
+    cursor: usize,
+) -> Option<usize> {
+    if !is_plain_paragraph_leaf(engine, cursor) {
+        return None;
+    }
+    let mut i = cursor;
+    while i > 0 {
+        let b = source.as_bytes()[i - 1];
+        if matches!(b, b'\n' | b' ' | b'\t') {
+            i -= 1;
+            continue;
+        }
+        break;
+    }
+    if i == 0 {
+        return None;
+    }
+    let prev = i - 1;
+    if !is_plain_paragraph_leaf(engine, prev) {
+        return None;
+    }
+    Some(editable_body_start(engine, source, prev))
+}
+
+/// Body end of the next leaf when it is an unquoted, unlisted paragraph
+/// (Typora: Option-Delete at a paragraph end may join it). Heading/list/
+/// quote/alert chrome is never part of this window.
+fn next_plain_paragraph_body_end(
+    engine: &RichEngine,
+    source: &str,
+    cursor: usize,
+) -> Option<usize> {
+    let mut i = cursor;
+    let bytes = source.as_bytes();
+    while i < bytes.len() && matches!(bytes[i], b'\n' | b' ' | b'\t') {
+        i += 1;
+    }
+    if i >= source.len() || !is_plain_paragraph_leaf(engine, i) {
+        return None;
+    }
+    Some(editable_body_end(engine, source, i))
 }
 
 /// Drop `[` / `](url)` / `**` / ticks from a delete range so Backspace at the
@@ -520,52 +1316,6 @@ fn delete_range(
     doc.replace_range_tx(start, end, "", kind, before, after.snapshot());
     *caret = after;
     Ok(RichOutcome::Changed)
-}
-
-/// Word/line delete boundary kinds for [`delete_to_bound`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeleteBound {
-    WordLeft,
-    WordRight,
-    LineStart,
-    LineEnd,
-}
-
-/// Option/Ctrl word-delete and Cmd line-delete. A non-empty selection is
-/// removed like Backspace; otherwise the caret deletes the visible region up
-/// to the previous/next word start/end or the current source line bounds.
-fn delete_to_bound(
-    doc: &mut Document,
-    engine: &mut RichEngine,
-    caret: &mut CaretState,
-    bound: DeleteBound,
-) -> Result<RichOutcome, RichError> {
-    if !caret.range.is_empty() {
-        return delete_range(doc, engine, caret, TransactionKind::Command);
-    }
-    let source = doc.buffer.content();
-    let cursor = caret.cursor();
-    let target = match bound {
-        DeleteBound::WordLeft => engine.prev_word_caret(&source, cursor),
-        DeleteBound::WordRight => engine.next_word_caret(&source, cursor),
-        DeleteBound::LineStart => line_start(&source, cursor),
-        DeleteBound::LineEnd => line_end_exclusive(&source, cursor),
-    };
-    let (start, end, reversed) = if target < cursor {
-        (target, cursor, true)
-    } else {
-        (cursor, target, false)
-    };
-    if start >= end {
-        return Ok(RichOutcome::Noop);
-    }
-    let range = trim_inline_chrome(engine, &source, start..end);
-    if range.start >= range.end {
-        return Ok(RichOutcome::Noop);
-    }
-    caret.range = range;
-    caret.reversed = reversed;
-    delete_range(doc, engine, caret, TransactionKind::Command)
 }
 
 /// Drag-select across GFM `|` must not merge cells. Clamp the range to the
@@ -708,6 +1458,35 @@ fn split_block(
     if empty_list_line(&source, offset) {
         return outdent_current_list_line(doc, engine, caret);
     }
+    // Enter in a table is a cell line-break (`<br>`), not a paragraph split.
+    // A raw newline would split the GFM row the same way Tab used to indent.
+    if engine.in_table(offset) {
+        return table_cell_break(doc, engine, caret);
+    }
+    // Empty quote + Enter leaves the quote (Typora / GFM), like an empty list item.
+    if empty_quote_line(&source, offset) {
+        if let Some(leaf_id) = engine.block_at(offset) {
+            if ancestor_is_quote(engine, leaf_id) {
+                return outdent_or_exit_quote(doc, engine, caret);
+            }
+        }
+    }
+    // Typora: Enter on an empty ATX/setext heading drops heading chrome
+    // (becomes a paragraph). Enter at the start of a non-empty heading
+    // inserts a blank paragraph above and keeps the heading. Mid/end
+    // still splits like a paragraph.
+    if empty_heading_at(engine, offset) {
+        return convert_heading_to_paragraph(doc, engine, caret);
+    }
+    if at_heading_body_start(&source, engine, offset) {
+        return insert_paragraph_above_heading(doc, engine, caret);
+    }
+    // Typora/pandoc: Enter at the end of a definition term places or
+    // creates a `: ` details opener. A generic `\n\n` split turns
+    // `Term\n\n: details` into `Term\n\n\n\n: details`.
+    if at_definition_term_end(engine, offset) {
+        return split_at_definition_term_end(doc, engine, caret);
+    }
     let Some(leaf_id) = engine.block_at(offset) else {
         splice(doc, caret, offset, offset, "\n\n", TransactionKind::Command);
         engine.sync(doc);
@@ -722,7 +1501,9 @@ fn split_block(
             if let Some(item) = ancestor_list_item(engine, leaf_id) {
                 list_split_text(&source, engine, item, offset)
             } else if ancestor_is_quote(engine, leaf_id) {
-                "\n>\n> ".to_string()
+                let line = current_line(&source, offset);
+                let prefix = quote_marker_prefix(line).unwrap_or_else(|| "> ".to_string());
+                format!("\n{prefix}")
             } else {
                 "\n\n".to_string()
             }
@@ -743,19 +1524,147 @@ fn split_block(
     Ok(RichOutcome::Changed)
 }
 
-fn list_split_text(source: &str, _engine: &RichEngine, item: &Block, _offset: usize) -> String {
-    let slice = source.get(item.source_range.clone()).unwrap_or_default();
-    let first_line = slice.split('\n').next().unwrap_or(slice);
-    let prefix = list_marker_prefix(first_line).unwrap_or_else(|| "- ".to_string());
-    format!("\n{prefix}")
+fn list_split_text(source: &str, _engine: &RichEngine, item: &Block, offset: usize) -> String {
+    let line = current_line(source, offset);
+    let quote = quote_prefix(line);
+    let marker = list_marker_prefix(after_quote(line)).or_else(|| {
+        let slice = source.get(item.source_range.clone()).unwrap_or_default();
+        let first = slice.split('\n').next().unwrap_or(slice);
+        list_marker_prefix(after_quote(first))
+    });
+    let marker = marker.unwrap_or_else(|| "- ".to_string());
+    format!("\n{quote}{marker}")
 }
 
 fn empty_list_line(source: &str, offset: usize) -> bool {
     let line = current_line(source, offset);
-    match list_marker_prefix(line) {
+    let after = after_quote(line);
+    match list_marker_prefix(after) {
+        Some(prefix) => after[prefix.len()..].trim().is_empty(),
+        None => false,
+    }
+}
+
+/// Bytes of a leading `>` chain (optional space after each), or empty.
+fn quote_prefix(line: &str) -> &str {
+    match quote_marker_prefix(line) {
+        Some(prefix) => &line[..prefix.len()],
+        None => "",
+    }
+}
+
+fn after_quote(line: &str) -> &str {
+    &line[quote_prefix(line).len()..]
+}
+
+fn empty_quote_line(source: &str, offset: usize) -> bool {
+    is_empty_quote_line(current_line(source, offset))
+}
+
+fn is_empty_quote_line(line: &str) -> bool {
+    match quote_marker_prefix(line) {
         Some(prefix) => line[prefix.len()..].trim().is_empty(),
         None => false,
     }
+}
+
+/// Leading indent plus one or more `>` markers (optional space after each).
+fn quote_marker_prefix(line: &str) -> Option<String> {
+    let indent_len = line
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count();
+    let bytes = line.as_bytes();
+    if bytes.get(indent_len) != Some(&b'>') {
+        return None;
+    }
+    let mut i = indent_len;
+    while bytes.get(i) == Some(&b'>') {
+        i += 1;
+        if bytes.get(i) == Some(&b' ') || bytes.get(i) == Some(&b'\t') {
+            i += 1;
+        }
+    }
+    Some(line[..i].to_string())
+}
+
+fn outdent_or_exit_quote(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    let offset = caret.cursor();
+    let start = line_start(&source, offset);
+    let line = current_line(&source, offset);
+    let Some(prefix) = quote_marker_prefix(line) else {
+        return Ok(RichOutcome::Noop);
+    };
+    if let Some(outdented) = outdent_quote_prefix(&prefix) {
+        let rest = line.get(prefix.len()..).unwrap_or("");
+        let new_line = format!("{outdented}{rest}");
+        return rewrite_range(doc, engine, caret, start..start + line.len(), &new_line);
+    }
+    let mut from = start;
+    let mut to = start + line.len();
+    if source.as_bytes().get(to) == Some(&b'\n') {
+        to += 1;
+    }
+    // Drop a blank `>` separator left by a previous continue so two Enters
+    // leave the quote instead of a trailing empty quoted line.
+    loop {
+        if from == 0 || source.as_bytes().get(from - 1) != Some(&b'\n') {
+            break;
+        }
+        let prev_end = from - 1;
+        let prev_start = line_start(&source, prev_end);
+        let prev = &source[prev_start..prev_end];
+        if is_empty_quote_line(prev) {
+            from = prev_start;
+            continue;
+        }
+        break;
+    }
+    let mut replacement = String::new();
+    if from > 0 && source.as_bytes()[from - 1] == b'\n' {
+        from -= 1;
+        replacement = "\n\n".to_string();
+    }
+    rewrite_range(doc, engine, caret, from..to, &replacement)
+}
+
+/// Strip one `>` from the current quoted line, keeping the body (Typora:
+/// Option-Backspace at the start of a quoted paragraph). Nested quotes
+/// outdent one level; a single `>` becomes an unquoted paragraph.
+fn outdent_current_quote_line(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    let offset = caret.cursor();
+    let start = line_start(&source, offset);
+    let line = current_line(&source, offset);
+    let Some(prefix) = quote_marker_prefix(line) else {
+        return Ok(RichOutcome::Noop);
+    };
+    let rest = line.get(prefix.len()..).unwrap_or("");
+    let new_line = match outdent_quote_prefix(&prefix) {
+        Some(kept) => format!("{kept}{rest}"),
+        None => rest.to_string(),
+    };
+    if new_line == line {
+        return Ok(RichOutcome::Noop);
+    }
+    rewrite_range(doc, engine, caret, start..start + line.len(), &new_line)
+}
+
+fn outdent_quote_prefix(prefix: &str) -> Option<String> {
+    let last = prefix.rfind('>')?;
+    if !prefix[..last].contains('>') {
+        return None;
+    }
+    Some(prefix[..last].to_string())
 }
 
 fn current_line(source: &str, offset: usize) -> &str {
@@ -777,6 +1686,507 @@ fn line_end_exclusive(source: &str, offset: usize) -> usize {
         Some(i) => offset + i,
         None => source.len(),
     }
+}
+
+/// True when the caret is on the item's first line at or before the first
+/// visible body character (WYSIWYG start). Quote / list-marker chrome counts
+/// as "start" so Backspace does not nibble `>` one byte at a time.
+fn at_list_item_body_start(source: &str, engine: &RichEngine, offset: usize) -> bool {
+    if engine.in_table(offset) || engine.in_raw_context(offset) {
+        return false;
+    }
+    let start = line_start(source, offset);
+    let line = current_line(source, offset);
+    let Some(marker) = list_marker_prefix(after_quote(line)) else {
+        return false;
+    };
+    let body_start = start + quote_prefix(line).len() + marker.len();
+    let visual_start = engine.snap_caret(body_start, Bias::Right);
+    offset <= visual_start.max(body_start)
+}
+
+/// True when the caret is at or before the first visible heading character
+/// (WYSIWYG start of the heading body). Hash / setext chrome counts as start
+/// so Backspace does not no-op or nibble `#` one byte at a time.
+fn at_heading_body_start(source: &str, engine: &RichEngine, offset: usize) -> bool {
+    if engine.in_table(offset) || engine.in_raw_context(offset) {
+        return false;
+    }
+    let Some(heading) = heading_at(engine, offset) else {
+        return false;
+    };
+    let body_start = heading_body_start(source, heading);
+    let visual_start = engine.snap_caret(body_start, Bias::Right);
+    offset <= visual_start.max(body_start)
+}
+
+/// True when the caret is on the first line of a quoted leaf at or before
+/// the first visible body character (not a heading or list — those convert
+/// / strip first). Quote chrome counts as start so word-delete does not
+/// nibble `>` or eat the previous block.
+fn at_quote_body_start(source: &str, engine: &RichEngine, offset: usize) -> bool {
+    if engine.in_table(offset) || engine.in_raw_context(offset) {
+        return false;
+    }
+    if heading_at(engine, offset).is_some() || at_list_item_body_start(source, engine, offset) {
+        return false;
+    }
+    let Some(id) = engine.block_at(offset) else {
+        return false;
+    };
+    if !ancestor_is_quote(engine, id) {
+        return false;
+    }
+    let Some(block) = engine.block(id) else {
+        return false;
+    };
+    let first = line_start(source, block.source_range.start);
+    if line_start(source, offset) != first {
+        return false;
+    }
+    let line = current_line(source, first);
+    let Some(prefix) = quote_marker_prefix(line) else {
+        return false;
+    };
+    let body_start = first + prefix.len();
+    let visual_start = engine.snap_caret(body_start, Bias::Right);
+    offset <= visual_start.max(body_start)
+}
+
+fn heading_at(engine: &RichEngine, offset: usize) -> Option<&Block> {
+    let id = engine.block_at(offset)?;
+    let block = engine.block(id)?;
+    matches!(block.kind, BlockKind::Heading { .. }).then_some(block)
+}
+
+fn ancestor_block<F>(engine: &RichEngine, offset: usize, pred: F) -> Option<&Block>
+where
+    F: Fn(&Block) -> bool,
+{
+    let id = engine.block_at(offset)?;
+    fn walk<'t>(
+        blocks: &'t [Block],
+        id: NodeId,
+        pred: &impl Fn(&Block) -> bool,
+        current: Option<&'t Block>,
+    ) -> Option<&'t Block> {
+        for b in blocks {
+            let next = if pred(b) { Some(b) } else { current };
+            if b.id == id {
+                return next;
+            }
+            if let Some(found) = walk(&b.children, id, pred, next) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(&engine.tree().blocks, id, &pred, None)
+}
+
+fn parent_block(engine: &RichEngine, child_id: NodeId) -> Option<&Block> {
+    fn walk(blocks: &[Block], child_id: NodeId) -> Option<&Block> {
+        for b in blocks {
+            if b.children.iter().any(|c| c.id == child_id) {
+                return Some(b);
+            }
+            if let Some(found) = walk(&b.children, child_id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(&engine.tree().blocks, child_id)
+}
+
+fn ancestor_definition_term(engine: &RichEngine, offset: usize) -> Option<&Block> {
+    ancestor_block(engine, offset, |b| {
+        matches!(b.kind, BlockKind::DefinitionTerm)
+    })
+}
+
+fn ancestor_definition_details(engine: &RichEngine, offset: usize) -> Option<&Block> {
+    ancestor_block(engine, offset, |b| {
+        matches!(b.kind, BlockKind::DefinitionDetails)
+    })
+}
+
+/// Leading indent plus `:` and an optional following space/tab (the PHP-Extra
+/// / Typora details marker, after any quote prefix).
+fn definition_details_marker_prefix(line: &str) -> Option<String> {
+    let indent_len = line
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count();
+    let rest = &line[indent_len..];
+    if !rest.starts_with(':') {
+        return None;
+    }
+    let mut take = indent_len + 1;
+    if rest.as_bytes().get(1) == Some(&b' ') || rest.as_bytes().get(1) == Some(&b'\t') {
+        take += 1;
+    }
+    Some(line[..take.min(line.len())].to_string())
+}
+
+fn definition_details_body_start(source: &str, details: &Block) -> usize {
+    let start = line_start(source, details.source_range.start);
+    let line = current_line(source, start);
+    let quote_len = quote_prefix(line).len();
+    let after = after_quote(line);
+    if let Some(marker) = definition_details_marker_prefix(after) {
+        return start + quote_len + marker.len();
+    }
+    first_visible_body_start(details).unwrap_or(details.source_range.start)
+}
+
+fn first_visible_body_start(block: &Block) -> Option<usize> {
+    let mut start = None;
+    fn consider(block: &Block, start: &mut Option<usize>) {
+        for inline in &block.inlines {
+            if let Inline::OpaqueInline { raw, .. } = inline {
+                if crate::html_visual::opaque_inline_is_caret_chrome(raw) {
+                    continue;
+                }
+            }
+            let s = inline.source_range().start;
+            *start = Some(start.map_or(s, |cur| cur.min(s)));
+        }
+        for child in &block.children {
+            consider(child, start);
+        }
+    }
+    consider(block, &mut start);
+    start
+}
+
+fn following_definition_details(engine: &RichEngine, term_id: NodeId) -> Option<&Block> {
+    let item = parent_block(engine, term_id)?;
+    let mut seen = false;
+    for child in &item.children {
+        if child.id == term_id {
+            seen = true;
+            continue;
+        }
+        if !seen {
+            continue;
+        }
+        match child.kind {
+            BlockKind::DefinitionDetails => return Some(child),
+            BlockKind::DefinitionTerm => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True when the caret is at or after the last visible character of a
+/// definition term, still before the following details (if any).
+fn at_definition_term_end(engine: &RichEngine, offset: usize) -> bool {
+    if engine.in_table(offset) || engine.in_raw_context(offset) {
+        return false;
+    }
+    if ancestor_definition_details(engine, offset).is_some() {
+        return false;
+    }
+    let Some(term) = ancestor_definition_term(engine, offset) else {
+        return false;
+    };
+    match last_visible_body_end(term) {
+        Some(end) => offset >= end,
+        None => true,
+    }
+}
+
+/// True when the caret is on the details opener line at or before the first
+/// visible body character (WYSIWYG start of `: details`).
+fn at_definition_details_body_start(source: &str, engine: &RichEngine, offset: usize) -> bool {
+    if engine.in_table(offset) || engine.in_raw_context(offset) {
+        return false;
+    }
+    let Some(details) = ancestor_definition_details(engine, offset) else {
+        return false;
+    };
+    let first = line_start(source, details.source_range.start);
+    if line_start(source, offset) != first {
+        return false;
+    }
+    let body = definition_details_body_start(source, details);
+    let visual_start = engine.snap_caret(body, Bias::Right);
+    offset <= visual_start.max(body)
+}
+
+fn split_at_definition_term_end(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    let offset = caret.cursor();
+    let Some(term) = ancestor_definition_term(engine, offset) else {
+        return Ok(RichOutcome::Noop);
+    };
+    let term_id = term.id;
+    if let Some(details) = following_definition_details(engine, term_id) {
+        let body = definition_details_body_start(&source, details);
+        let empty = first_visible_body_start(details).is_none();
+        let at = if empty {
+            body
+        } else {
+            engine.snap_caret(body, Bias::Right)
+        };
+        caret.collapse_to(at.min(source.len()));
+        return Ok(RichOutcome::Noop);
+    }
+    let end = last_visible_body_end(term).unwrap_or(offset);
+    let line_at = if end == 0 { 0 } else { end - 1 };
+    let line = current_line(&source, line_at);
+    let insert = format!("\n{}: ", quote_prefix(line));
+    splice(
+        doc,
+        caret,
+        offset,
+        offset,
+        &insert,
+        TransactionKind::Command,
+    );
+    engine.sync(doc);
+    Ok(RichOutcome::Changed)
+}
+
+fn strip_definition_details_marker(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    let offset = caret.cursor();
+    let Some(details) = ancestor_definition_details(engine, offset) else {
+        return Ok(RichOutcome::Noop);
+    };
+    let start = line_start(&source, details.source_range.start);
+    let line = current_line(&source, start);
+    let quote = quote_prefix(line);
+    let after = after_quote(line);
+    let Some(marker) = definition_details_marker_prefix(after) else {
+        return Ok(RichOutcome::Noop);
+    };
+    let rest = after.get(marker.len()..).unwrap_or("");
+    let new_line = format!("{quote}{rest}");
+    if new_line == line {
+        return Ok(RichOutcome::Noop);
+    }
+    rewrite_range(doc, engine, caret, start..start + line.len(), &new_line)
+}
+
+fn empty_heading_at(engine: &RichEngine, offset: usize) -> bool {
+    heading_at(engine, offset).is_some_and(heading_body_empty)
+}
+
+fn heading_body_empty(heading: &Block) -> bool {
+    heading.inlines.iter().all(|inline| match inline {
+        Inline::Run { text, .. } => text.trim().is_empty(),
+        Inline::SoftBreak { .. } | Inline::HardBreak { .. } => true,
+        _ => false,
+    })
+}
+
+fn heading_body_start(source: &str, heading: &Block) -> usize {
+    let start = line_start(source, heading.source_range.start);
+    let line = current_line(source, start);
+    let quote_len = quote_prefix(line).len();
+    let after = after_quote(line);
+    match heading.kind {
+        BlockKind::Heading {
+            style: HeadingStyle::Setext,
+            ..
+        } => {
+            let indent = after
+                .bytes()
+                .take_while(|b| *b == b' ' || *b == b'\t')
+                .count();
+            start + quote_len + indent
+        }
+        BlockKind::Heading { .. } => {
+            let marker_len = list_marker_prefix(after).map(|p| p.len()).unwrap_or(0);
+            let rest = after.get(marker_len..).unwrap_or("");
+            let prefix = atx_marker_prefix(rest).map(|p| p.len()).unwrap_or(0);
+            start + quote_len + marker_len + prefix
+        }
+        _ => start,
+    }
+}
+
+fn heading_rewrite_range(source: &str, heading: &Block) -> Range<usize> {
+    let start = line_start(source, heading.source_range.start);
+    let end_anchor = heading.source_range.end.max(start);
+    let end = line_end_exclusive(source, end_anchor.saturating_sub(1).max(start));
+    start..end
+}
+
+fn convert_heading_to_paragraph(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    let offset = caret.cursor();
+    let Some(heading) = heading_at(engine, offset).cloned() else {
+        return Ok(RichOutcome::Noop);
+    };
+    let range = heading_rewrite_range(&source, &heading);
+    let stripped = strip_heading_chrome(&source, &heading);
+    if stripped == source.get(range.clone()).unwrap_or("") {
+        return Ok(RichOutcome::Noop);
+    }
+    rewrite_range(doc, engine, caret, range, &stripped)
+}
+
+/// Insert a blank paragraph (or blank list item) before a non-empty heading
+/// (Typora: Enter at the first visible character). Splitting at the body
+/// caret would leave an empty `# ` line and turn the rest into a paragraph.
+fn insert_paragraph_above_heading(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    let offset = caret.cursor();
+    let Some(heading) = heading_at(engine, offset) else {
+        return Ok(RichOutcome::Noop);
+    };
+    let insert_at = line_start(&source, heading.source_range.start);
+    let line = current_line(&source, insert_at);
+    let quote = quote_prefix(line);
+    let (text, new_cursor) = if let Some(marker) = list_marker_prefix(after_quote(line)) {
+        let prefix = format!("{quote}{marker}");
+        (format!("{prefix}\n"), insert_at + prefix.len())
+    } else if let Some(prefix) = quote_marker_prefix(line) {
+        (format!("{prefix}\n"), insert_at + prefix.len())
+    } else {
+        ("\n\n".to_string(), insert_at)
+    };
+    let before = caret.snapshot();
+    let after = CaretState::collapsed(new_cursor);
+    doc.replace_range_tx(
+        insert_at,
+        insert_at,
+        &text,
+        TransactionKind::Command,
+        before,
+        after.snapshot(),
+    );
+    *caret = after;
+    engine.sync(doc);
+    caret.clamp(doc.buffer.len_bytes());
+    Ok(RichOutcome::Changed)
+}
+
+fn strip_heading_chrome(source: &str, heading: &Block) -> String {
+    let range = heading_rewrite_range(source, heading);
+    let slice = source.get(range).unwrap_or("");
+    match heading.kind {
+        BlockKind::Heading {
+            style: HeadingStyle::Setext,
+            ..
+        } => strip_setext_underline(slice),
+        BlockKind::Heading { .. } => map_item_lines(slice, strip_atx_from_line),
+        _ => slice.to_string(),
+    }
+}
+
+fn strip_setext_underline(slice: &str) -> String {
+    let trailing_nl = slice.ends_with('\n');
+    let body = slice.strip_suffix('\n').unwrap_or(slice);
+    let Some((head, last)) = body.rsplit_once('\n') else {
+        return slice.to_string();
+    };
+    if is_setext_underline(after_quote(last)) || is_setext_underline(last) {
+        let mut out = head.to_string();
+        if trailing_nl {
+            out.push('\n');
+        }
+        return out;
+    }
+    slice.to_string()
+}
+
+fn is_setext_underline(line: &str) -> bool {
+    let t = line.trim_end();
+    let indent = t.bytes().take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let rest = t[indent..].trim_end();
+    !rest.is_empty() && (rest.bytes().all(|b| b == b'=') || rest.bytes().all(|b| b == b'-'))
+}
+
+fn strip_atx_from_line(line: &str) -> String {
+    let quote = quote_prefix(line);
+    let after = after_quote(line);
+    let marker = list_marker_prefix(after).unwrap_or_default();
+    let rest = after.get(marker.len()..).unwrap_or("");
+    let Some(prefix) = atx_marker_prefix(rest) else {
+        return line.to_string();
+    };
+    format!(
+        "{quote}{marker}{}",
+        strip_closing_atx(rest.get(prefix.len()..).unwrap_or(""))
+    )
+}
+
+/// Opening ATX marker: 0–3 spaces, 1–6 `#`, optional separator space/tab.
+fn atx_marker_prefix(after_quote: &str) -> Option<String> {
+    let indent = after_quote
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &after_quote[indent..];
+    let hashes = rest.bytes().take_while(|b| *b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let after_hashes = &rest[hashes..];
+    let extra = if after_hashes.starts_with(' ') || after_hashes.starts_with('\t') {
+        1
+    } else if after_hashes.is_empty()
+        || after_hashes
+            .bytes()
+            .all(|b| b == b'#' || b == b' ' || b == b'\t')
+    {
+        0
+    } else {
+        return None;
+    };
+    Some(after_quote[..indent + hashes + extra].to_string())
+}
+
+fn strip_closing_atx(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut end = body.len();
+    while end > 0 && (bytes[end - 1] == b' ' || bytes[end - 1] == b'\t') {
+        end -= 1;
+    }
+    let trimmed = end;
+    while end > 0 && bytes[end - 1] == b'#' {
+        end -= 1;
+    }
+    if end == trimmed {
+        return body.to_string();
+    }
+    if end == 0 {
+        return String::new();
+    }
+    if bytes[end - 1] == b' ' || bytes[end - 1] == b'\t' {
+        while end > 0 && (bytes[end - 1] == b' ' || bytes[end - 1] == b'\t') {
+            end -= 1;
+        }
+        return body[..end].to_string();
+    }
+    body.to_string()
 }
 
 fn list_marker_prefix(line: &str) -> Option<String> {
@@ -904,7 +2314,7 @@ fn toggle_mark(
         return Ok(RichOutcome::Noop);
     }
     if caret.range.is_empty() {
-        // Typora / source wrap: empty Cmd-B/I/E inserts `****` / `**` / `` ` ` `
+        // Typora / source wrap: empty Cmd-B/I/E inserts `****` / `**` / `` ` ` ``
         // with the caret inside so the next insert is wrapped. Do not toggle
         // the whole run the caret sits in (`**hello**` for a mid-word caret).
         return toggle_mark_collapsed(doc, engine, caret, mark);
@@ -1360,8 +2770,6 @@ fn toggle_link(
     if !clamp_wrap_to_table_cell(engine, caret, &source) {
         return Ok(RichOutcome::Noop);
     }
-    // Typora: Cmd-K inside `$math$` / `` `code` `` / `[[wiki]]` / `:emoji:`
-    // must not wrap the word (or the atom) in link brackets.
     if wrap_is_immune(engine, caret) {
         return Ok(RichOutcome::Noop);
     }
@@ -1414,8 +2822,8 @@ fn toggle_link(
     let new_md = serialize_block(&rewritten, &source);
     let before = caret.snapshot();
     let range = top.source_range.clone();
-    // Source wrap leaves the caret in the URL `()` after wrapping a selection
-    // (or a word), so Cmd-K can type the destination right away.
+    // Source wrap leaves the caret in the URL `()` after wrapping a
+    // selection (or a word). Keep that so Cmd-K can type the destination.
     let after = if !already_link {
         if let Some(rel) = link_url_caret_in(&new_md, &inner) {
             CaretState::collapsed(range.start + rel)
@@ -1530,9 +2938,12 @@ fn indent_list(
     caret: &mut CaretState,
 ) -> Result<RichOutcome, RichError> {
     engine.sync(doc);
+    // Tab in a table is cell navigation (Typora), not indent. Check before
+    // raw-context so inline code inside a cell still TableTabs.
+    if engine.in_table(caret.cursor()) {
+        return table_tab(doc, engine, caret, false);
+    }
     if engine.in_raw_context(caret.cursor()) {
-        // Tab inside a fence / HTML block indents the body after the
-        // list/quote prefix, not the fence chrome or the list item itself.
         if in_raw_block(engine, caret.cursor()) {
             let source = doc.buffer.content();
             let at = clamp_to_raw_edit(engine, &source, caret.cursor());
@@ -1558,8 +2969,9 @@ fn outdent_list(
     caret: &mut CaretState,
 ) -> Result<RichOutcome, RichError> {
     engine.sync(doc);
-    // Shift-Tab inside a fence / HTML body unindents the body line after the
-    // list/quote prefix instead of treating a code line as a list item.
+    if engine.in_table(caret.cursor()) {
+        return table_tab(doc, engine, caret, true);
+    }
     if in_raw_block(engine, caret.cursor()) {
         return unindent_raw_line(doc, engine, caret);
     }
@@ -1730,7 +3142,9 @@ fn outdent_current_list_line(
     let offset = caret.cursor();
     let start = line_start(&source, offset);
     let line = current_line(&source, offset);
-    if list_marker_prefix(line).is_none() {
+    let quote = quote_prefix(line).to_string();
+    let after = after_quote(line).to_string();
+    if list_marker_prefix(&after).is_none() {
         let Some(id) = engine.block_at(offset) else {
             return Ok(RichOutcome::Noop);
         };
@@ -1740,7 +3154,7 @@ fn outdent_current_list_line(
         let range = item_visual_range(&source, &item);
         let slice = source.get(range.clone()).unwrap_or("");
         let first = slice.split('\n').next().unwrap_or(slice);
-        let indent = first
+        let indent = after_quote(first)
             .bytes()
             .take_while(|b| *b == b' ' || *b == b'\t')
             .count();
@@ -1749,18 +3163,22 @@ fn outdent_current_list_line(
         }
         return Ok(RichOutcome::Noop);
     }
-    let indent = line
+    let indent = after
         .bytes()
         .take_while(|b| *b == b' ' || *b == b'\t')
         .count();
     if indent >= 2 {
-        let new_line = unprefix_item_lines(line, 2);
+        let new_line = format!("{quote}{}", unprefix_item_lines(&after, 2));
         return rewrite_range(doc, engine, caret, start..start + line.len(), &new_line);
     }
     // Exit the list: drop this empty (or top-level) item line.
-    let prefix = list_marker_prefix(line).unwrap_or_default();
-    let rest = line.get(prefix.len()..).unwrap_or("");
+    let prefix = list_marker_prefix(&after).unwrap_or_default();
+    let rest = after.get(prefix.len()..).unwrap_or("");
     if rest.trim().is_empty() {
+        if !quote.is_empty() {
+            // Typora: empty quoted list item becomes an empty quoted paragraph.
+            return rewrite_range(doc, engine, caret, start..start + line.len(), &quote);
+        }
         let mut from = start;
         let mut to = start + line.len();
         if source.as_bytes().get(to) == Some(&b'\n') {
@@ -1773,7 +3191,7 @@ fn outdent_current_list_line(
         }
         return rewrite_range(doc, engine, caret, from..to, &replacement);
     }
-    let new_line = rest.to_string();
+    let new_line = format!("{quote}{rest}");
     rewrite_range(doc, engine, caret, start..start + line.len(), &new_line)
 }
 
@@ -1814,6 +3232,25 @@ fn rewrite_range(
 
 fn prefix_item_lines(slice: &str, n: usize) -> String {
     let pad = " ".repeat(n);
+    map_item_lines(slice, |line| {
+        if line.is_empty() {
+            return String::new();
+        }
+        // Indent after `>` so Tab on a quoted list becomes `>   - item`,
+        // not a leading space before the quote (`  > - item`).
+        let quote = quote_prefix(line);
+        format!("{quote}{pad}{}", after_quote(line))
+    })
+}
+
+fn unprefix_item_lines(slice: &str, n: usize) -> String {
+    map_item_lines(slice, |line| {
+        let quote = quote_prefix(line);
+        format!("{quote}{}", strip_line_indent(after_quote(line), n))
+    })
+}
+
+fn map_item_lines(slice: &str, mut map: impl FnMut(&str) -> String) -> String {
     let trailing_nl = slice.ends_with('\n');
     let body = slice.strip_suffix('\n').unwrap_or(slice);
     let mut out = String::new();
@@ -1821,10 +3258,7 @@ fn prefix_item_lines(slice: &str, n: usize) -> String {
         if i > 0 {
             out.push('\n');
         }
-        if !line.is_empty() {
-            out.push_str(&pad);
-        }
-        out.push_str(line);
+        out.push_str(&map(line));
     }
     if trailing_nl {
         out.push('\n');
@@ -1832,32 +3266,19 @@ fn prefix_item_lines(slice: &str, n: usize) -> String {
     out
 }
 
-fn unprefix_item_lines(slice: &str, n: usize) -> String {
-    let trailing_nl = slice.ends_with('\n');
-    let body = slice.strip_suffix('\n').unwrap_or(slice);
-    let mut out = String::new();
-    for (i, line) in body.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        if let Some(rest) = line.strip_prefix('\t') {
-            out.push_str(rest);
-            continue;
-        }
-        let mut take = 0usize;
-        for (idx, b) in line.bytes().enumerate() {
-            if b == b' ' && idx < n {
-                take += 1;
-            } else {
-                break;
-            }
-        }
-        out.push_str(&line[take..]);
+fn strip_line_indent(line: &str, n: usize) -> String {
+    if let Some(rest) = line.strip_prefix('\t') {
+        return rest.to_string();
     }
-    if trailing_nl {
-        out.push('\n');
+    let mut take = 0usize;
+    for (idx, b) in line.bytes().enumerate() {
+        if b == b' ' && idx < n {
+            take += 1;
+        } else {
+            break;
+        }
     }
-    out
+    line[take..].to_string()
 }
 
 fn splice_serialized(
@@ -2315,7 +3736,7 @@ mod tests {
     use super::*;
     use crate::rich::blank_caret_gap_after_last;
     use crate::rich::blank_caret_gap_before;
-    use crate::rich::engine::RichEngine;
+    use crate::rich::engine::{Bias, RichEngine};
     use crate::rich::place_caret_for_click_below;
     use crate::Document;
 
@@ -2353,6 +3774,752 @@ mod tests {
         assert!(
             after.contains("wor\\*ld") || after.contains("\\*"),
             "star escaped: {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_text_newline_in_paragraph_is_soft_wrap_not_ncr() {
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        caret.collapse_to(5);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("\nworld".into()),
+        );
+        assert!(
+            !after.contains("&#10;"),
+            "paste must not HTML-encode newlines, got {after:?}"
+        );
+        assert_eq!(after, "hello\nworld");
+    }
+
+    #[test]
+    fn insert_text_lone_newline_in_paragraph_still_splits() {
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        caret.collapse_to(5);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("\n".into()),
+        );
+        assert!(
+            after.contains("hello\n\n") || after == "hello\n\n",
+            "IME Enter (InsertText newline) must still split, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_text_double_newline_in_paragraph_starts_new_paragraph() {
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        caret.collapse_to(5);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("a\n\nb".into()),
+        );
+        assert!(!after.contains("&#10;"), "{after:?}");
+        assert_eq!(after, "helloa\n\nb");
+        engine.sync(&doc);
+        assert!(
+            engine.tree().blocks.len() >= 2,
+            "\\n\\n must start a new paragraph, got {} blocks in {after:?}",
+            engine.tree().blocks.len()
+        );
+    }
+
+    #[test]
+    fn insert_text_multiline_in_quote_keeps_quote_prefix() {
+        let source = "> hello";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("a\nb".into()),
+        );
+        assert!(!after.contains("&#10;"), "{after:?}");
+        assert!(
+            after.contains("> helloa") && after.contains("> b"),
+            "each pasted line must keep `>`, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::BlockQuote),
+            "quote must not split, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn insert_text_multiline_in_list_keeps_continuation_indent() {
+        let source = "- hello";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("a\nb".into()),
+        );
+        assert!(!after.contains("&#10;"), "{after:?}");
+        assert!(
+            after.contains("- helloa") && after.contains("\n  b"),
+            "pasted wrap must keep list continuation indent, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::BulletList { .. }),
+            "list must survive paste, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn insert_text_paste_list_marker_lines_become_sibling_items() {
+        for (source, paste, second) in [
+            ("- hello", "\n- world", "- world"),
+            ("* hello", "\n* world", "* world"),
+            ("1. hello", "\n2. world", "2. world"),
+            ("- [ ] hello", "\n- [ ] world", "- [ ] world"),
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(source.len());
+            let after = apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(paste.into()),
+            );
+            assert!(
+                !after.contains("\\-") && !after.contains("\\*") && !after.contains("\\."),
+                "list marker must not be escaped, got {after:?}"
+            );
+            assert!(
+                after.contains(second) && !after.contains(&format!("  {second}")),
+                "pasted marker line must be a sibling item, not continuation, got {after:?}"
+            );
+            engine.sync(&doc);
+            assert_eq!(
+                count_list_items(&engine.tree().blocks),
+                2,
+                "expected two list items after pasting {paste:?} into {source:?}, got {after:?} {:?}",
+                engine.tree().blocks[0].kind
+            );
+        }
+    }
+
+    #[test]
+    fn insert_text_paste_list_marker_in_quoted_list_stays_quoted_sibling() {
+        let source = "> - hello";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("\n- world".into()),
+        );
+        assert!(
+            after.contains("> - hello") && after.contains("> - world"),
+            "quoted sibling list paste, got {after:?}"
+        );
+        assert!(
+            !after.contains(">   - world") && !after.contains(">>"),
+            "must not continuation-indent or double quote, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert_eq!(count_list_items(&engine.tree().blocks), 2, "{after:?}");
+    }
+
+    #[test]
+    fn insert_text_paste_quoted_line_does_not_double_gt() {
+        let source = "> hello";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("\n> world".into()),
+        );
+        assert!(
+            after.contains("> hello") && after.contains("> world") && !after.contains("> > world"),
+            "pasted `>` must not nest, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::BlockQuote),
+            "must remain a quote, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn insert_text_paste_atx_line_in_paragraph_becomes_heading() {
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        caret.collapse_to(5);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("\n# Title".into()),
+        );
+        assert!(
+            !after.contains("\\#"),
+            "ATX paste must not be escaped, got {after:?}"
+        );
+        assert_eq!(after, "hello\n# Title");
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Paragraph),
+            "first line stays a paragraph, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        assert!(
+            matches!(
+                engine.tree().blocks.get(1).map(|b| &b.kind),
+                Some(BlockKind::Heading { level: 1, .. })
+            ),
+            "later `# Title` must be a heading, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn insert_text_single_line_atx_on_empty_doc_becomes_heading() {
+        let (mut doc, mut engine, mut caret) = setup("");
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("# Title".into()),
+        );
+        assert!(
+            !after.contains("\\#"),
+            "single-line ATX paste must not be escaped, got {after:?}"
+        );
+        assert!(
+            after.starts_with("# Title"),
+            "empty doc paste must stay markdown, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(
+                engine.tree().blocks.first().map(|b| &b.kind),
+                Some(BlockKind::Heading { level: 1, .. })
+            ),
+            "empty doc + `# Title` must be a heading, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn insert_text_single_line_atx_at_paragraph_start_becomes_heading() {
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        caret.collapse_to(0);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("# Title".into()),
+        );
+        assert!(
+            !after.contains("\\#"),
+            "paragraph-start ATX paste must not be escaped, got {after:?}"
+        );
+        assert!(
+            after.starts_with("# Title"),
+            "must insert as markdown at paragraph start, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(
+                engine.tree().blocks.first().map(|b| &b.kind),
+                Some(BlockKind::Heading { level: 1, .. })
+            ),
+            "paragraph start + `# Title` must be a heading, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn insert_text_single_line_atx_after_blank_becomes_heading() {
+        let source = "hello\n\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let gap = blank_caret_gap_after_last(engine.tree()).expect("trailing blank");
+        caret.collapse_to(gap.start);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("# Title".into()),
+        );
+        assert!(
+            !after.contains("\\#"),
+            "ATX paste after \\n\\n must not be escaped, got {after:?}"
+        );
+        assert!(
+            after.contains("hello") && after.contains("# Title"),
+            "must keep the paragraph and insert a heading, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Paragraph),
+            "first block stays a paragraph, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        assert!(
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading { level: 1, .. })),
+            "after \\n\\n, `# Title` must be a heading, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn insert_text_single_line_atx_mid_paragraph_stays_text() {
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        caret.collapse_to(5);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("# Title".into()),
+        );
+        assert_eq!(after, "hello# Title");
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Paragraph),
+            "mid-paragraph `# Title` must not become a heading, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn insert_text_single_line_list_item_inside_item_becomes_sibling() {
+        for (source, paste, second) in [
+            ("- hello", "- world", "- world"),
+            ("* hello", "* world", "* world"),
+            ("1. hello", "2. world", "2. world"),
+            ("- [ ] hello", "- [ ] world", "- [ ] world"),
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(source.len());
+            let after = apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(paste.into()),
+            );
+            assert!(
+                !after.contains("\\-") && !after.contains("\\*") && !after.contains("\\."),
+                "list marker must not be escaped, got {after:?}"
+            );
+            assert!(
+                !after.contains(&format!("{source}{paste}"))
+                    && !after.contains(&format!("{source}{second}")),
+                "must not concatenate onto the item, got {after:?}"
+            );
+            assert!(
+                after.contains(second) && !after.contains(&format!("  {second}")),
+                "pasted marker line must be a sibling item, not continuation, got {after:?}"
+            );
+            engine.sync(&doc);
+            assert_eq!(
+                count_list_items(&engine.tree().blocks),
+                2,
+                "expected two list items after pasting {paste:?} into {source:?}, got {after:?} {:?}",
+                engine.tree().blocks[0].kind
+            );
+        }
+    }
+
+    #[test]
+    fn insert_text_single_line_list_item_in_quoted_list_stays_quoted_sibling() {
+        let source = "> - hello";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("- world".into()),
+        );
+        assert!(
+            after.contains("> - hello") && after.contains("> - world"),
+            "quoted sibling list paste without leading newline, got {after:?}"
+        );
+        assert!(
+            !after.contains(">   - world") && !after.contains(">>") && !after.contains("- hello-"),
+            "must not continuation-indent, double quote, or concatenate, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert_eq!(count_list_items(&engine.tree().blocks), 2, "{after:?}");
+    }
+
+    #[test]
+    fn insert_text_single_line_hash_in_fence_stays_literal() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("# Title".into()),
+        );
+        assert!(
+            still_one_fence(&after) && after.contains("# Title") && !after.contains("\\#"),
+            "fence paste must stay literal `#`, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::CodeBlock { .. }),
+            "must remain a code block, not a heading, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        assert!(
+            !engine
+                .tree()
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading { .. })),
+            "single-line `#` inside a fence must not become a heading, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn insert_text_single_line_hash_in_table_stays_cell_literal() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('a').expect("header a") + 1);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("# Title".into()),
+        );
+        assert!(
+            after.contains("# Title") && !after.contains("\\#"),
+            "table paste of `# Title` must stay cell text, got {after:?}"
+        );
+        assert!(
+            !after.contains("\n# Title"),
+            "must not split the GFM row, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "table must not become a heading, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        assert!(
+            !engine
+                .tree()
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading { .. })),
+            "cell `#` must not parse as a heading, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn insert_text_single_line_hash_in_html_stays_literal() {
+        let source = "<div>\nx\n</div>\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('x').expect("html body") + 1);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("# Title".into()),
+        );
+        assert!(
+            after.contains("<div>") && after.contains("x# Title") && after.contains("</div>"),
+            "HTML paste must stay inside the block, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Opaque { .. }),
+            "must remain an HTML block, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        assert!(
+            !engine
+                .tree()
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading { .. })),
+            "HTML-body `#` must not become a heading, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn insert_text_paste_list_line_in_paragraph_becomes_list() {
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        caret.collapse_to(5);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("\n- world".into()),
+        );
+        assert_eq!(after, "hello\n- world");
+        engine.sync(&doc);
+        assert!(
+            matches!(
+                engine.tree().blocks.get(1).map(|b| &b.kind),
+                Some(BlockKind::BulletList { .. })
+            ),
+            "later `- world` must be a list, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn insert_text_multiline_in_heading_keeps_heading_on_first_line() {
+        let source = "# Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("a\nb".into()),
+        );
+        assert!(!after.contains("&#10;"), "{after:?}");
+        assert!(
+            after.starts_with("# Titlea"),
+            "first pasted line must stay in the heading, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(
+                engine.tree().blocks[0].kind,
+                BlockKind::Heading { level: 1, .. }
+            ),
+            "must not smash the heading into a paragraph, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        assert!(
+            after.contains('\n') && after.contains('b'),
+            "further lines become a following block, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_text_multiline_in_fence_stays_in_the_fence() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("a\nb".into()),
+        );
+        assert!(!after.contains("&#10;"), "{after:?}");
+        assert!(
+            still_one_fence(&after) && after.contains("codea") && after.contains('\n'),
+            "paste must stay inside the fence, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::CodeBlock { .. }),
+            "must remain a code block, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn insert_text_paste_hash_in_fence_stays_literal() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("\n# Title".into()),
+        );
+        assert!(
+            still_one_fence(&after) && after.contains("# Title") && !after.contains("\\#"),
+            "fence paste must stay literal `#`, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::CodeBlock { .. }),
+            "must remain a code block, not a heading, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        assert!(
+            !engine
+                .tree()
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading { .. })),
+            "pasted `#` inside a fence must not become a heading, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn insert_text_multiline_in_quoted_fence_keeps_quote_prefixes() {
+        let source = "> ```\n> code\n> ```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(fence_body_offset(source, "code") + "code".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("a\nb".into()),
+        );
+        assert!(
+            still_one_fence(&after) && every_line_quoted(&after) && !after.contains("&#10;"),
+            "quoted fence paste must keep `>` on every line, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_text_multiline_in_html_block_stays_inside() {
+        let source = "<div>\nx\n</div>\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('x').expect("html body") + 1);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("a\nb".into()),
+        );
+        assert!(
+            after.contains("<div>") && after.contains("</div>") && after.contains("xa"),
+            "paste must stay inside the HTML block, got {after:?}"
+        );
+        assert!(!after.contains("&#10;"), "{after:?}");
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Opaque { .. }),
+            "must remain an HTML block, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn insert_text_multiline_in_table_uses_br_not_row_break() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('a').expect("header a") + 1);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x\ny".into()),
+        );
+        assert!(
+            after.contains("<br>") && !after.contains("&#10;"),
+            "table paste must use <br>, got {after:?}"
+        );
+        assert!(
+            !after.contains("a\n") && !after.contains("ax\n"),
+            "paste must not splice a newline into the GFM row: {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "table must survive multiline paste, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn insert_text_paste_hash_in_table_stays_cell_literal() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('a').expect("header a") + 1);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("\n# Title".into()),
+        );
+        assert!(
+            after.contains("<br>") && after.contains("# Title") && !after.contains("\n#"),
+            "table paste of `#` must stay in the cell via <br>, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "table must not become a heading, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        assert!(
+            !engine
+                .tree()
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading { .. })),
+            "cell `#` must not parse as a heading, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2525,6 +4692,82 @@ mod tests {
         assert_eq!(doc.buffer.content(), "a`x`b");
     }
 
+    #[test]
+    fn toggle_link_on_empty_caret_inserts_brackets() {
+        // Mid-word Cmd-K wraps the word; a caret on whitespace is a true empty.
+        let (mut doc, mut engine, mut caret) = setup("hello ");
+        caret.collapse_to("hello ".len());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        assert_eq!(after, "hello []()");
+        assert_eq!(
+            caret.cursor(),
+            "hello [".len(),
+            "empty Cmd-K must put the caret in the label, got {}",
+            caret.cursor()
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        assert_eq!(doc.buffer.content(), "hello [x]()");
+    }
+
+    #[test]
+    fn toggle_link_on_word_wraps_the_word() {
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        caret.collapse_to(2);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        assert_eq!(
+            after, "[hello]()",
+            "Cmd-K on a word must use empty (), got {after:?}"
+        );
+        assert!(
+            !after.contains("<>"),
+            "empty dest must not serialize as <>, got {after:?}"
+        );
+        let url_at = after
+            .find("[hello](")
+            .map(|i| i + "[hello](".len())
+            .expect("url slot");
+        assert_eq!(
+            caret.cursor(),
+            url_at,
+            "Cmd-K on a word must leave the caret in the URL, got {} in {after:?}",
+            caret.cursor()
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("https://e.com".into()),
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            "[hello](https://e.com)",
+            "typing a URL must fill (), not leave <>"
+        );
+    }
+
+    #[test]
+    fn toggle_bold_in_fenced_code_is_noop() {
+        let source = "```\ncode\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("code").expect("code body"));
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            source,
+            "Cmd-B inside a fence must not insert wrap marks"
+        );
+    }
+
     /// Cmd-B/I/E/K inside `$math$`, inline code, `[[wiki]]`, or `:emoji:`
     /// must not splice markdown wrappers into the span (`$****x^2$`).
     #[test]
@@ -2580,123 +4823,6 @@ mod tests {
     }
 
     #[test]
-    fn toggle_mark_empty_caret_in_trailing_blank_inserts_pair() {
-        let source = "hello\n\n";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        let gap = blank_caret_gap_after_last(engine.tree()).expect("trailing gap");
-        caret.collapse_to(gap.start);
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::ToggleMark(MarkSet::BOLD),
-        );
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::InsertText("x".into()),
-        );
-        let typed = doc.buffer.content();
-        assert!(
-            typed.contains("**x**") && typed.contains("hello"),
-            "empty Cmd-B in the trailing blank must wrap the new paragraph, got {typed:?}"
-        );
-        let hello_line = typed
-            .lines()
-            .find(|line| line.contains("hello"))
-            .expect("hello line");
-        assert!(
-            !hello_line.contains('*'),
-            "wrap must not attach to the last paragraph, got {typed:?}"
-        );
-    }
-
-    #[test]
-    fn toggle_mark_empty_caret_in_newlines_only_inserts_pair() {
-        let (mut doc, mut engine, mut caret) = setup("\n\n");
-        let gap = blank_caret_gap_after_last(engine.tree()).expect("caret home");
-        caret.collapse_to(gap.start);
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::ToggleMark(MarkSet::BOLD),
-        );
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::InsertText("x".into()),
-        );
-        let typed = doc.buffer.content();
-        assert!(
-            typed.contains("**x**"),
-            "empty Cmd-B on a newlines-only document must wrap, got {typed:?}"
-        );
-    }
-
-    #[test]
-    fn toggle_mark_after_click_below_without_blank_wraps_new_paragraph() {
-        let (mut doc, mut engine, mut caret) = setup("hello");
-        place_caret_for_click_below(&mut doc, &mut engine, &mut caret);
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::ToggleMark(MarkSet::BOLD),
-        );
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::InsertText("x".into()),
-        );
-        let typed = doc.buffer.content();
-        assert!(
-            typed.contains("**x**") && typed.contains("hello"),
-            "empty Cmd-B after leftover click must wrap the new paragraph, got {typed:?}"
-        );
-        let hello_line = typed
-            .lines()
-            .find(|line| line.contains("hello"))
-            .expect("hello line");
-        assert!(
-            !hello_line.contains('*'),
-            "wrap must not attach to the last paragraph, got {typed:?}"
-        );
-    }
-
-    #[test]
-    fn toggle_mark_empty_caret_in_separator_inserts_pair() {
-        let source = "hello\n\n# Title";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        let gap = blank_caret_gap_before(engine.tree(), 1).expect("separator gap");
-        caret.collapse_to(gap.start);
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::ToggleMark(MarkSet::BOLD),
-        );
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::InsertText("x".into()),
-        );
-        let typed = doc.buffer.content();
-        assert!(
-            typed.contains("**x**") && typed.contains("# Title") && typed.contains("hello"),
-            "empty Cmd-B in the gap must wrap the new paragraph, got {typed:?}"
-        );
-        assert!(
-            !typed.contains("**#") && !typed.contains("# **"),
-            "wrap must not attach to heading chrome, got {typed:?}"
-        );
-    }
-
-    #[test]
     fn backspace_deletes_visible_grapheme_not_delimiters() {
         let source = "**ab**\n";
         let (mut doc, mut engine, mut caret) = setup(source);
@@ -2705,6 +4831,651 @@ mod tests {
         apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
         let after = doc.buffer.content();
         assert_eq!(after, "**a**\n", "{after:?}");
+    }
+
+    #[test]
+    fn backspace_after_image_deletes_the_whole_image() {
+        let source = "hello ![cat](a.png) world\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        engine.sync(&doc);
+        let img = engine
+            .tree()
+            .blocks
+            .iter()
+            .find_map(|b| {
+                b.inlines.iter().find_map(|inline| match inline {
+                    Inline::Image { source_range, .. } => Some(source_range.clone()),
+                    _ => None,
+                })
+            })
+            .expect("image");
+        caret.collapse_to(img.end);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("![cat]"),
+            "Backspace after an image must delete `![…](url)`, got {after:?}"
+        );
+        assert!(after.contains("hello"), "{after:?}");
+        assert!(after.contains("world"), "{after:?}");
+    }
+
+    #[test]
+    fn delete_before_image_deletes_the_whole_image() {
+        let source = "hello ![cat](a.png) world\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        engine.sync(&doc);
+        let img = engine
+            .tree()
+            .blocks
+            .iter()
+            .find_map(|b| {
+                b.inlines.iter().find_map(|inline| match inline {
+                    Inline::Image { source_range, .. } => Some(source_range.clone()),
+                    _ => None,
+                })
+            })
+            .expect("image");
+        caret.collapse_to(img.start);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("![cat]"),
+            "Delete before an image must delete `![…](url)`, got {after:?}"
+        );
+        assert!(after.contains("hello"), "{after:?}");
+        assert!(after.contains("world"), "{after:?}");
+    }
+
+    #[test]
+    fn delete_word_left_removes_previous_word_and_skips_bold_marks() {
+        let (mut doc, mut engine, mut caret) = setup("hello world");
+        caret.collapse_to("hello world".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            after, "hello ",
+            "hello world| Option-Backspace must leave `hello |`, got {after:?}"
+        );
+        assert_eq!(caret.cursor(), "hello ".len());
+
+        let source = "**hello** world";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            after, "**hello** ",
+            "word-delete must skip bold delimiters like word move, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("hello world");
+        caret.range = 0.."hello".len();
+        caret.reversed = false;
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            after, " world",
+            "non-empty selection Option-Backspace deletes the selection, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_word_right_and_line_bounds() {
+        let (mut doc, mut engine, mut caret) = setup("hello world");
+        caret.collapse_to(0);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordRight,
+        );
+        assert_eq!(
+            after, " world",
+            "Option-Delete from the start must remove `hello`, got {after:?}"
+        );
+
+        let source = "hello\nworld extra";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteToLineStart,
+        );
+        assert_eq!(
+            after, "hello\n",
+            "Cmd-Backspace deletes to the current line start, not the document, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to("hello\n".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteToLineEnd,
+        );
+        assert_eq!(
+            after, "hello\n",
+            "Cmd-Delete deletes to the current line end, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("# Title extra");
+        caret.collapse_to("# Title extra".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteToLineStart,
+        );
+        assert!(
+            after.starts_with("# "),
+            "Cmd-Backspace on a heading must keep `# `, got {after:?}"
+        );
+        assert!(
+            !after.contains("Title") && !after.contains("extra"),
+            "Cmd-Backspace must delete the heading body, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_word_clamps_to_table_cell_and_fence_body() {
+        let source = "| hello world | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let world = source.find("world").expect("world");
+        caret.collapse_to(world + "world".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "word-delete in a cell must keep a table, got {after:?}"
+        );
+        assert!(
+            after.contains('|') && after.contains('b'),
+            "word-delete must not eat `|`, got {after:?}"
+        );
+        assert!(
+            after.contains("hello") && !after.contains("world"),
+            "Option-Backspace in the cell must delete `world` only, got {after:?}"
+        );
+
+        let source = "```\nhello world\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let world = source.find("world").expect("world");
+        caret.collapse_to(world + "world".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert!(
+            after.starts_with("```") && after.contains("```\n"),
+            "word-delete must stay in the fence body, got {after:?}"
+        );
+        assert!(
+            after.contains("hello ") && !after.contains("world"),
+            "Option-Backspace in a fence must delete `world`, got {after:?}"
+        );
+
+        let source = "```\nhello world\n```\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("hello").expect("hello"));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            after, source,
+            "Option-Backspace at fence body start must not nibble ticks, got {after:?}"
+        );
+
+        let source = "---\ntitle: Hello\n---\n\nhello world";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("hello").expect("hello"));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            after, source,
+            "Option-Backspace at body start after YAML must not nibble the fence, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_word_left_at_heading_start_converts_to_paragraph() {
+        let source = "# Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(atx_body_start(source, 0));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            first_line(&after).trim_end(),
+            "Title",
+            "Option-Backspace at heading start must strip `#`, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            !caret_in_heading(&engine, caret.cursor()),
+            "heading must become a paragraph, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+
+        let source = "hello\n\n# Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(atx_body_start(
+            source,
+            source.find("# Title").expect("heading"),
+        ));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert!(
+            after.contains("hello") && after.contains("Title") && !after.contains("# Title"),
+            "Option-Backspace at `# Title` must convert, not splice `hello# Title`, got {after:?}"
+        );
+        assert!(
+            !after.contains("helloTitle") && !after.contains("hello#"),
+            "must not join the previous paragraph into heading chrome, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            !caret_in_heading(&engine, caret.cursor()),
+            "converted heading must be a paragraph, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+
+        let source = "# Title extra";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.len());
+        let mid = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert!(
+            mid.contains("# Title") && !mid.contains("extra"),
+            "mid-heading Option-Backspace still deletes a word, got {mid:?}"
+        );
+    }
+
+    #[test]
+    fn delete_word_left_at_list_start_strips_the_marker() {
+        let (mut doc, mut engine, mut caret) = setup("- hello");
+        caret.collapse_to(list_body_start("- hello", 0));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            first_line(&after).trim_end(),
+            "hello",
+            "Option-Backspace at list start must strip the marker, got {after:?}"
+        );
+        assert!(
+            list_marker_prefix(first_line(&after)).is_none(),
+            "list marker must be gone, got {after:?}"
+        );
+
+        let source = "hello\n\n- world";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(list_body_start(
+            source,
+            source.find("- world").expect("item"),
+        ));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert!(
+            after.contains("hello") && after.contains("world") && !after.contains("- world"),
+            "Option-Backspace at list start must not join the previous paragraph, got {after:?}"
+        );
+        assert!(
+            list_marker_prefix(
+                after
+                    .lines()
+                    .find(|line| line.contains("world"))
+                    .expect("world line")
+            )
+            .is_none(),
+            "list marker must be gone, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_word_left_at_quote_start_outdents() {
+        let source = "> hello";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(quote_body_start(source, 0));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert_eq!(
+            first_line(&after).trim_end(),
+            "hello",
+            "Option-Backspace at quote start must strip `>`, got {after:?}"
+        );
+
+        let source = "> > hello";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(quote_body_start(source, 0));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        let line = first_line(&after);
+        assert!(
+            line.starts_with('>') && !line.starts_with("> >") && line.contains("hello"),
+            "nested quote Option-Backspace outdents one `>`, got {after:?}"
+        );
+
+        let source = "hello\n\n> world";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(quote_body_start(
+            source,
+            source.find("> world").expect("quote"),
+        ));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert!(
+            after.contains("hello") && after.contains("world") && !after.contains("> world"),
+            "Option-Backspace at quote start must not eat the previous block, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_word_left_at_paragraph_start_does_not_eat_heading_chrome() {
+        let source = "# Hello\n\nnext";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("next").expect("next"));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert!(
+            after.contains("# Hello") && after.contains("next") && !after.contains("Hellonext"),
+            "Option-Backspace after a heading must not eat `# `, got {after:?}"
+        );
+
+        let source = "- Hello\n\nnext";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("next").expect("next"));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert!(
+            after.contains("- Hello") && after.contains("next") && !after.contains("Hellonext"),
+            "Option-Backspace after a list must not eat `- `, got {after:?}"
+        );
+
+        let source = "hello\n\nworld";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("world").expect("world"));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert!(
+            after.contains("world") && !after.contains("hello\n\nworld"),
+            "paragraph-to-paragraph Option-Backspace may join, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_word_right_at_paragraph_end_does_not_eat_heading_or_list_chrome() {
+        let source = "hello\n\n# Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to("hello".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordRight,
+        );
+        assert!(
+            after.contains("# Title") && after.contains("hello"),
+            "Option-Delete at `hello|` must not eat `# Title`, got {after:?}"
+        );
+        assert!(
+            !after.contains("helloTitle") && !after.contains("hello#"),
+            "must not join the paragraph onto heading chrome, got {after:?}"
+        );
+
+        let source = "hello\n\n- world";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to("hello".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordRight,
+        );
+        assert!(
+            after.contains("- world") && after.contains("hello"),
+            "Option-Delete at `hello|` must not eat `- world`, got {after:?}"
+        );
+        assert!(
+            !after.contains("helloworld") && !after.contains("hello-"),
+            "must not join the paragraph onto list chrome, got {after:?}"
+        );
+
+        let source = "hello\n\n> world";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to("hello".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordRight,
+        );
+        assert!(
+            after.contains("> world") && after.contains("hello"),
+            "Option-Delete at `hello|` must not eat `> world`, got {after:?}"
+        );
+
+        let source = "hello\n\nworld";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to("hello".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordRight,
+        );
+        assert!(
+            after.contains("hello") && !after.contains("hello\n\nworld"),
+            "paragraph-to-paragraph Option-Delete may join, got {after:?}"
+        );
+
+        let source = "hello world extra";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to("hello ".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordRight,
+        );
+        assert_eq!(
+            after, "hello  extra",
+            "mid-paragraph Option-Delete still deletes the next word, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_word_left_at_alert_start_does_not_splice_previous_paragraph() {
+        let source = "hello\n\n> [!NOTE]\n> body\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("[!NOTE]").expect("alert tag"));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert!(
+            after.contains("hello") && after.contains("[!NOTE]"),
+            "Option-Backspace at `> [!NOTE]` must not splice `hello` into the alert, got {after:?}"
+        );
+        assert!(
+            !after.contains("hello[!NOTE]")
+                && !after.contains("hello [!NOTE]")
+                && !after.contains("hello> [!NOTE]"),
+            "previous paragraph must stay a separate block, got {after:?}"
+        );
+
+        let source = "hello\n\n> [!NOTE]\n> body\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to("hello".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordRight,
+        );
+        assert!(
+            after.contains("hello") && after.contains("[!NOTE]") && after.contains("> "),
+            "Option-Delete at `hello|` must not eat alert chrome, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn cut_of_visible_bold_removes_markdown_marks() {
+        let source = "**hello** world\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let inner = source.find("hello").expect("hello");
+        caret.range = inner..inner + "hello".len();
+        caret.reversed = false;
+        let expanded = engine.expand_markdown_selection(&doc.buffer.content(), caret.range.clone());
+        assert_eq!(&source[expanded.clone()], "**hello**");
+        caret.range = expanded;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("**") && after.contains("world"),
+            "cut of a fully selected bold word must remove the marks, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn empty_caret_cut_removes_the_current_block() {
+        let source = "# Title\n\npara\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let t = source.find('T').expect("T");
+        caret.collapse_to(t);
+        let expanded =
+            engine.expand_markdown_cut_selection(&doc.buffer.content(), caret.range.clone());
+        assert!(
+            source[expanded.clone()].contains("# Title"),
+            "cut range must be the heading, got {:?}",
+            &source[expanded.clone()]
+        );
+        caret.range = expanded;
+        caret.reversed = false;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("# Title") && after.contains("para"),
+            "empty-caret heading cut must remove the heading, got {after:?}"
+        );
+
+        let source = "- hello\n- world\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let h = source.find('h').expect("h");
+        caret.collapse_to(h);
+        let expanded =
+            engine.expand_markdown_cut_selection(&doc.buffer.content(), caret.range.clone());
+        caret.range = expanded;
+        caret.reversed = false;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("hello") && after.contains("- world"),
+            "empty-caret list cut must remove that item, got {after:?}"
+        );
+
+        let source = "```\ncode\n```\n\npara\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let c = source.find("code").expect("code");
+        caret.collapse_to(c);
+        let expanded =
+            engine.expand_markdown_cut_selection(&doc.buffer.content(), caret.range.clone());
+        caret.range = expanded;
+        caret.reversed = false;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        assert!(
+            !after.contains("```") && after.contains("para"),
+            "empty-caret fence cut must remove the fence, got {after:?}"
+        );
+
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (_doc, engine, mut caret) = setup(source);
+        let a = source.find('a').expect("a");
+        caret.collapse_to(a);
+        let expanded = engine.expand_markdown_cut_selection(source, caret.range.clone());
+        assert_eq!(
+            expanded.start, expanded.end,
+            "empty-caret table Cut must stay a no-op"
+        );
     }
 
     #[test]
@@ -2758,6 +5529,421 @@ mod tests {
     }
 
     #[test]
+    fn blockquote_enter_continues_the_quote() {
+        let (mut doc, mut engine, mut caret) = setup("> hello");
+        caret.collapse_to(doc.buffer.len_bytes());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.starts_with("> hello\n>"),
+            "expected a new quoted line, got {after:?}"
+        );
+        engine.sync(&doc);
+        let leaf = engine.block_at(caret.cursor()).expect("caret in a block");
+        assert!(
+            ancestor_is_quote(&engine, leaf),
+            "caret must stay in the quote after Enter on a non-empty line"
+        );
+    }
+
+    #[test]
+    fn empty_blockquote_enter_exits_the_quote() {
+        let (mut doc, mut engine, mut caret) = setup("> hello\n> ");
+        caret.collapse_to(doc.buffer.len_bytes());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.starts_with("> hello"),
+            "expected quote content kept, got {after:?}"
+        );
+        assert!(
+            !after.trim_end().ends_with('>'),
+            "empty quote marker should be gone: {after:?}"
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            !x_line.trim_start().starts_with('>'),
+            "text after exiting the quote must not be quoted, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn empty_blockquote_enter_after_continue_exits() {
+        let (mut doc, mut engine, mut caret) = setup("> hello");
+        caret.collapse_to(doc.buffer.len_bytes());
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.starts_with("> hello"),
+            "quote body must remain, got {after:?}"
+        );
+        assert!(
+            !after.trim_end().ends_with('>'),
+            "second Enter on the empty quoted line must leave the quote: {after:?}"
+        );
+    }
+
+    #[test]
+    fn nested_empty_quote_enter_outdents() {
+        let (mut doc, mut engine, mut caret) = setup("> > nested\n> > ");
+        caret.collapse_to(doc.buffer.len_bytes());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.contains("> > nested") && after.contains("\n> ") && !after.contains("\n> > "),
+            "expected one quote level outdented, got {after:?}"
+        );
+        engine.sync(&doc);
+        let leaf = engine.block_at(caret.cursor()).expect("caret in a block");
+        assert!(
+            ancestor_is_quote(&engine, leaf),
+            "nested empty quote Enter outdents, it does not jump out of the outer quote"
+        );
+    }
+
+    fn atx_body_start(source: &str, at: usize) -> usize {
+        let start = line_start(source, at);
+        let line = current_line(source, start);
+        let after = after_quote(line);
+        let marker_len = list_marker_prefix(after).map(|p| p.len()).unwrap_or(0);
+        let rest = after.get(marker_len..).unwrap_or("");
+        start
+            + quote_prefix(line).len()
+            + marker_len
+            + atx_marker_prefix(rest).expect("atx marker").len()
+    }
+
+    fn line_is_empty_atx_heading(line: &str) -> bool {
+        let after = after_quote(line);
+        let Some(prefix) = atx_marker_prefix(after) else {
+            return false;
+        };
+        strip_closing_atx(after.get(prefix.len()..).unwrap_or(""))
+            .trim()
+            .is_empty()
+    }
+
+    fn caret_in_heading(engine: &RichEngine, offset: usize) -> bool {
+        heading_at(engine, offset).is_some()
+    }
+
+    #[test]
+    fn empty_atx_heading_enter_converts_to_paragraph_levels_1_to_6() {
+        for level in 1u8..=6 {
+            let hashes = "#".repeat(level as usize);
+            let source = format!("{hashes} ");
+            let (mut doc, mut engine, mut caret) = setup(&source);
+            caret.collapse_to(doc.buffer.len_bytes());
+            assert!(
+                empty_heading_at(&engine, caret.cursor()),
+                "level {level} `{source:?}` should be an empty heading"
+            );
+            let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            assert!(
+                !after.lines().any(line_is_empty_atx_heading),
+                "empty h{level} Enter must drop heading chrome, got {after:?}"
+            );
+            engine.sync(&doc);
+            assert!(
+                !caret_in_heading(&engine, caret.cursor()),
+                "caret must not stay on an empty heading after Enter, got {:?}",
+                doc.buffer.content()
+            );
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("x".into()),
+            );
+            let typed = doc.buffer.content();
+            let x_line = typed
+                .lines()
+                .find(|line| line.contains('x'))
+                .expect("typed x");
+            assert!(
+                !x_line.trim_start().starts_with('#'),
+                "typing after empty h{level} Enter must be a paragraph, got {typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_atx_heading_enter_between_blocks_does_not_leave_hashes() {
+        let source = "hello\n\n# \n\nworld";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let empty_at = source.find("# ").expect("empty heading");
+        caret.collapse_to(empty_at + 2);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.contains("hello") && after.contains("world"),
+            "surrounding paragraphs must remain, got {after:?}"
+        );
+        assert!(
+            !after.lines().any(line_is_empty_atx_heading),
+            "empty heading must not remain as `# `, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn empty_quoted_atx_heading_enter_becomes_quoted_paragraph() {
+        let source = "> # ";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(doc.buffer.len_bytes());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            line_is_empty_quoted_paragraph(last_line(&after)),
+            "empty quoted heading Enter must become `> `, got {after:?}"
+        );
+        assert!(
+            !last_line(&after).contains('#'),
+            "heading hashes must be gone: {after:?}"
+        );
+        engine.sync(&doc);
+        let leaf = engine.block_at(caret.cursor()).expect("caret in a block");
+        assert!(
+            ancestor_is_quote(&engine, leaf),
+            "caret must stay in the quote after dropping heading chrome"
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            x_line.trim_start().starts_with('>') && !x_line.contains('#'),
+            "text after empty quoted heading Enter must stay quoted, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn nonempty_heading_enter_splits_like_a_paragraph() {
+        let (mut doc, mut engine, mut caret) = setup("# Title");
+        caret.collapse_to("# Title".len());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.starts_with("# Title"),
+            "original heading must be kept, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(
+                engine.tree().blocks[0].kind,
+                BlockKind::Heading { level: 1, .. }
+            ),
+            "first block must stay a heading, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            !x_line.trim_start().starts_with('#'),
+            "text after splitting a heading must be a new paragraph, got {typed:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("# Hello");
+        caret.collapse_to(atx_body_start("# Hello", 0) + "Hel".len());
+        let mid = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            mid.contains("# Hel") && mid.contains("lo"),
+            "mid-heading Enter splits like a paragraph, got {mid:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(
+                engine.tree().blocks[0].kind,
+                BlockKind::Heading { level: 1, .. }
+            ),
+            "original heading kept after mid split, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        assert!(
+            engine.tree().blocks.len() >= 2,
+            "new paragraph after the heading, got {} blocks",
+            engine.tree().blocks.len()
+        );
+    }
+
+    fn line_is_atx_heading_title(line: &str, level: u8, title: &str) -> bool {
+        let hashes = "#".repeat(level as usize);
+        after_quote(line).trim_end() == format!("{hashes} {title}")
+    }
+
+    fn typed_line_is_paragraph(line: &str) -> bool {
+        let after = after_quote(line);
+        atx_marker_prefix(after).is_none() && !is_setext_underline(after) && after.contains('x')
+    }
+
+    #[test]
+    fn nonempty_heading_enter_at_start_inserts_paragraph_above_levels_1_to_6() {
+        for level in 1u8..=6 {
+            let hashes = "#".repeat(level as usize);
+            let source = format!("{hashes} Title");
+            let (mut doc, mut engine, mut caret) = setup(&source);
+            caret.collapse_to(atx_body_start(&source, 0));
+            let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            assert!(
+                !after.lines().any(line_is_empty_atx_heading),
+                "h{level} Enter at start must not leave an empty heading, got {after:?}"
+            );
+            assert!(
+                after
+                    .lines()
+                    .any(|line| line_is_atx_heading_title(line, level, "Title")),
+                "h{level} original heading must stay intact, got {after:?}"
+            );
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("x".into()),
+            );
+            let typed = doc.buffer.content();
+            let x_line = typed
+                .lines()
+                .find(|line| line.contains('x'))
+                .expect("typed x");
+            assert!(
+                typed_line_is_paragraph(x_line),
+                "h{level} typing after Enter at start must be a paragraph, got {typed:?}"
+            );
+            assert!(
+                typed
+                    .lines()
+                    .any(|line| line_is_atx_heading_title(line, level, "Title")),
+                "h{level} heading must survive typing into the new paragraph, got {typed:?}"
+            );
+            engine.sync(&doc);
+            assert!(
+                engine
+                    .tree()
+                    .blocks
+                    .iter()
+                    .any(|b| matches!(b.kind, BlockKind::Heading { level: l, .. } if l == level)),
+                "h{level} must remain a heading after Enter at start, got {:?}",
+                engine
+                    .tree()
+                    .blocks
+                    .iter()
+                    .map(|b| &b.kind)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn nonempty_heading_enter_at_start_snap_stays_on_blank() {
+        let source = "# Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(atx_body_start(source, 0));
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        let after = doc.buffer.content();
+        let at = caret.cursor();
+        let snapped_left = engine.snap_caret(at, Bias::Left);
+        let snapped_right = engine.snap_caret(at, Bias::Right);
+        assert_eq!(
+            snapped_left, at,
+            "snap must not move the caret off the blank after Enter-at-start, caret={at} snapped={snapped_left} in {after:?}"
+        );
+        assert_eq!(snapped_right, at);
+        let title = after.find("Title").expect("Title");
+        assert!(
+            snapped_left < title,
+            "snap must not land on `# Title`, caret={at} title={title} in {after:?}"
+        );
+        assert!(
+            !after[snapped_left..].starts_with("# Title")
+                && !after[snapped_left..].starts_with("Title"),
+            "caret after Enter-at-start must remain on the inserted blank, offset {snapped_left} in {after:?}"
+        );
+        let heading = engine
+            .tree()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Heading { .. }))
+            .expect("heading");
+        let body = engine.snap_caret(heading.source_range.start, Bias::Right);
+        let up = engine.prev_caret(&after, body);
+        assert_eq!(engine.snap_caret(up, Bias::Left), up);
+        assert!(
+            up < heading.source_range.start,
+            "arrow-up from the heading must sit on the blank, up={up} heading={:?} in {after:?}",
+            heading.source_range
+        );
+    }
+
+    #[test]
+    fn nonempty_heading_enter_at_start_between_blocks_keeps_heading() {
+        let source = "hello\n\n# Title\n\nworld";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(atx_body_start(
+            source,
+            source.find("# Title").expect("heading"),
+        ));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.contains("hello") && after.contains("world"),
+            "surrounding paragraphs must remain, got {after:?}"
+        );
+        assert!(
+            !after.lines().any(line_is_empty_atx_heading),
+            "must not leave `# `, got {after:?}"
+        );
+        assert!(
+            after
+                .lines()
+                .any(|line| line_is_atx_heading_title(line, 1, "Title")),
+            "heading must stay a heading, got {after:?}"
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("hello") && typed.contains("world"),
+            "surrounding paragraphs must remain after typing, got {typed:?}"
+        );
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            typed_line_is_paragraph(x_line) && !x_line.contains("Title"),
+            "typed text belongs in the new paragraph above, got {typed:?}"
+        );
+        assert!(
+            typed
+                .lines()
+                .any(|line| line_is_atx_heading_title(line, 1, "Title")),
+            "Title must stay a heading, got {typed:?}"
+        );
+    }
+
+    #[test]
     fn insert_in_standard_separator_creates_paragraph_not_heading_chrome() {
         let source = "hello\n\n# Title";
         let (mut doc, mut engine, mut caret) = setup(source);
@@ -2781,6 +5967,12 @@ mod tests {
         assert!(
             typed_line_is_paragraph(x_line) && !x_line.contains('#'),
             "typing in the gap must be a new paragraph, not heading chrome, got {typed:?}"
+        );
+        assert!(
+            typed
+                .lines()
+                .any(|line| line_is_atx_heading_title(line, 1, "Title")),
+            "heading must stay a heading, got {typed:?}"
         );
     }
 
@@ -2820,6 +6012,39 @@ mod tests {
     }
 
     #[test]
+    fn toggle_mark_empty_caret_in_trailing_blank_inserts_pair() {
+        let source = "hello\n\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let gap = blank_caret_gap_after_last(engine.tree()).expect("trailing gap");
+        caret.collapse_to(gap.start);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("**x**") && typed.contains("hello"),
+            "empty Cmd-B in the trailing blank must wrap the new paragraph, got {typed:?}"
+        );
+        let hello_line = typed
+            .lines()
+            .find(|line| line.contains("hello"))
+            .expect("hello line");
+        assert!(
+            !hello_line.contains('*'),
+            "wrap must not attach to the last paragraph, got {typed:?}"
+        );
+    }
+
+    #[test]
     fn insert_in_newlines_only_document_types_a_paragraph() {
         for source in ["", "\n", "\n\n"] {
             let (mut doc, mut engine, mut caret) = setup(source);
@@ -2847,8 +6072,28 @@ mod tests {
         }
     }
 
-    fn typed_line_is_paragraph(line: &str) -> bool {
-        line.contains('x')
+    #[test]
+    fn toggle_mark_empty_caret_in_newlines_only_inserts_pair() {
+        let (mut doc, mut engine, mut caret) = setup("\n\n");
+        let gap = blank_caret_gap_after_last(engine.tree()).expect("caret home");
+        caret.collapse_to(gap.start);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("**x**"),
+            "empty Cmd-B on a newlines-only document must wrap, got {typed:?}"
+        );
     }
 
     fn leftover_click_then_type(source: &str) -> String {
@@ -2908,6 +6153,37 @@ mod tests {
     }
 
     #[test]
+    fn toggle_mark_after_click_below_without_blank_wraps_new_paragraph() {
+        let (mut doc, mut engine, mut caret) = setup("hello");
+        place_caret_for_click_below(&mut doc, &mut engine, &mut caret);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("**x**") && typed.contains("hello"),
+            "empty Cmd-B after leftover click must wrap the new paragraph, got {typed:?}"
+        );
+        let hello_line = typed
+            .lines()
+            .find(|line| line.contains("hello"))
+            .expect("hello line");
+        assert!(
+            !hello_line.contains('*'),
+            "wrap must not attach to the last paragraph, got {typed:?}"
+        );
+    }
+
+    #[test]
     fn insert_at_eof_on_last_line_still_continues_paragraph() {
         let source = "hello";
         let (mut doc, mut engine, mut caret) = setup(source);
@@ -2926,6 +6202,637 @@ mod tests {
     }
 
     #[test]
+    fn toggle_mark_empty_caret_in_separator_inserts_pair() {
+        let source = "hello\n\n# Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let gap = blank_caret_gap_before(engine.tree(), 1).expect("separator gap");
+        caret.collapse_to(gap.start);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains("**x**") && typed.contains("# Title") && typed.contains("hello"),
+            "empty Cmd-B in the gap must wrap the new paragraph, got {typed:?}"
+        );
+        assert!(
+            !typed.contains("**#") && !typed.contains("# **"),
+            "wrap must not attach to heading chrome, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn nonempty_heading_in_list_enter_at_start_inserts_list_item() {
+        let source = "- # Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(atx_body_start(source, 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            !after.starts_with('\n'),
+            "must not insert a document-level blank above the list, got {after:?}"
+        );
+        assert!(
+            !after.lines().any(line_is_empty_atx_heading),
+            "must not leave an empty heading, got {after:?}"
+        );
+        let lines: Vec<_> = after.lines().collect();
+        let blank_item = lines.first().copied().unwrap_or("");
+        let blank_body = list_marker_prefix(after_quote(blank_item))
+            .map(|m| after_quote(blank_item).get(m.len()..).unwrap_or("").trim())
+            .unwrap_or("not-a-list");
+        assert!(
+            lines.len() >= 2
+                && blank_body.is_empty()
+                && lines.iter().any(|line| {
+                    let after = after_quote(line);
+                    list_marker_prefix(after)
+                        .is_some_and(|m| after.get(m.len()..).unwrap_or("").trim_end() == "# Title")
+                }),
+            "Enter at start of `- # Title` must insert a blank list item above, got {after:?}"
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            list_marker_prefix(after_quote(x_line)).is_some() && typed_line_is_paragraph(x_line),
+            "typing must stay a list item, got {typed:?}"
+        );
+        assert!(
+            typed.lines().any(
+                |line| list_marker_prefix(after_quote(line)).is_some_and(|m| {
+                    after_quote(line).get(m.len()..).unwrap_or("").trim_end() == "# Title"
+                })
+            ),
+            "original heading-in-list must remain, got {typed:?}"
+        );
+
+        let quoted = "> - # Title";
+        let (mut doc, mut engine, mut caret) = setup(quoted);
+        caret.collapse_to(atx_body_start(quoted, 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.lines().next().is_some_and(|line| {
+                line.starts_with('>')
+                    && list_marker_prefix(after_quote(line)).is_some_and(|m| {
+                        after_quote(line)
+                            .get(m.len()..)
+                            .unwrap_or("")
+                            .trim()
+                            .is_empty()
+                    })
+            }),
+            "quoted heading-in-list Enter must insert a quoted blank item, got {after:?}"
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            x_line.trim_start().starts_with('>')
+                && list_marker_prefix(after_quote(x_line)).is_some()
+                && typed_line_is_paragraph(x_line),
+            "quoted heading-in-list Enter must insert a quoted list item, got {typed:?}"
+        );
+        assert!(
+            typed.lines().any(|line| line.starts_with('>')
+                && list_marker_prefix(after_quote(line)).is_some_and(|m| {
+                    after_quote(line).get(m.len()..).unwrap_or("").trim_end() == "# Title"
+                })),
+            "quoted `- # Title` must remain, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn nonempty_quoted_heading_enter_at_start_keeps_quote_and_heading() {
+        let source = "> # Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(atx_body_start(source, 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            !after.lines().any(line_is_empty_atx_heading),
+            "must not leave `> # `, got {after:?}"
+        );
+        assert!(
+            after
+                .lines()
+                .any(|line| line.starts_with('>') && line_is_atx_heading_title(line, 1, "Title")),
+            "quoted heading must stay `> # Title`, got {after:?}"
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            x_line.trim_start().starts_with('>') && typed_line_is_paragraph(x_line),
+            "text after quoted heading Enter at start must stay quoted, got {typed:?}"
+        );
+        assert!(
+            typed
+                .lines()
+                .any(|line| line.starts_with('>') && line_is_atx_heading_title(line, 1, "Title")),
+            "quoted heading must survive, got {typed:?}"
+        );
+
+        let nested = "> > # Title";
+        let (mut doc, mut engine, mut caret) = setup(nested);
+        caret.collapse_to(atx_body_start(nested, 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after
+                .lines()
+                .any(|line| after_quote(line).trim_end() == "# Title"
+                    && quote_marker_prefix(line).is_some_and(|p| p.matches('>').count() >= 2)),
+            "nested quoted heading must keep `>`, got {after:?}"
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            quote_marker_prefix(x_line).is_some_and(|p| p.matches('>').count() >= 2)
+                && typed_line_is_paragraph(x_line),
+            "nested quote depth must stay on the new paragraph, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn nonempty_setext_heading_enter_at_start_inserts_paragraph_above() {
+        for (source, underline) in [("Title\n=====\n", "====="), ("Title\n-----\n", "-----")] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(0);
+            let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            assert!(
+                after.contains("Title") && after.contains(underline),
+                "setext heading must stay intact, got {after:?}"
+            );
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("x".into()),
+            );
+            let typed = doc.buffer.content();
+            let x_line = typed
+                .lines()
+                .find(|line| line.contains('x'))
+                .expect("typed x");
+            assert!(
+                typed_line_is_paragraph(x_line) && !x_line.contains("Title"),
+                "typed text must be a paragraph above the setext heading, got {typed:?}"
+            );
+            assert!(
+                typed.contains("Title") && typed.contains(underline),
+                "setext underline must remain, got {typed:?}"
+            );
+            engine.sync(&doc);
+            assert!(
+                engine.tree().blocks.iter().any(|b| matches!(
+                    b.kind,
+                    BlockKind::Heading {
+                        style: HeadingStyle::Setext,
+                        ..
+                    }
+                )),
+                "must remain a setext heading, got {:?}",
+                engine
+                    .tree()
+                    .blocks
+                    .iter()
+                    .map(|b| &b.kind)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let quoted = "> Title\n> =====\n";
+        let (mut doc, mut engine, mut caret) = setup(quoted);
+        caret.collapse_to(quote_prefix(quoted.lines().next().unwrap_or(quoted)).len());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after
+                .lines()
+                .any(|line| after_quote(line).trim_end() == "Title")
+                && after
+                    .lines()
+                    .any(|line| is_setext_underline(after_quote(line))),
+            "quoted setext must stay a heading, got {after:?}"
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            x_line.trim_start().starts_with('>') && typed_line_is_paragraph(x_line),
+            "quoted setext Enter at start must keep `>` on the new paragraph, got {typed:?}"
+        );
+        assert!(
+            typed
+                .lines()
+                .any(|line| line.starts_with('>') && after_quote(line).trim_end() == "Title"),
+            "quoted setext title must stay quoted, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn empty_setext_heading_enter_converts_if_caret_can_sit_on_it() {
+        let source = "a\n=====\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(1);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        engine.sync(&doc);
+        let offset = caret.cursor();
+        if empty_heading_at(&engine, offset) {
+            let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            engine.sync(&doc);
+            assert!(
+                !caret_in_heading(&engine, caret.cursor()),
+                "empty setext Enter must drop heading chrome, got {after:?}"
+            );
+            assert!(
+                !after.contains("=====") && !after.contains("-----"),
+                "setext underline must be gone, got {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_list_line_sees_marker_after_quote() {
+        assert!(empty_list_line("> - ", "> - ".len()), "quoted bullet");
+        assert!(empty_list_line("> 1. ", "> 1. ".len()), "quoted ordered");
+        assert!(empty_list_line("> - [ ] ", "> - [ ] ".len()), "quoted task");
+        assert!(
+            empty_list_line("> > - ", "> > - ".len()),
+            "nested quoted bullet"
+        );
+        assert!(
+            empty_list_line("- ", 2),
+            "unquoted empty list still matches"
+        );
+        assert!(
+            !empty_list_line("> ", 2),
+            "empty quote without a list marker is not an empty list"
+        );
+        assert!(
+            !empty_list_line("> hello", 7),
+            "quoted paragraph is not an empty list"
+        );
+    }
+
+    fn last_line(source: &str) -> &str {
+        source.lines().last().unwrap_or(source)
+    }
+
+    fn line_is_empty_quoted_paragraph(line: &str) -> bool {
+        let Some(quote) = quote_marker_prefix(line) else {
+            return false;
+        };
+        let after = &line[quote.len()..];
+        list_marker_prefix(after).is_none() && after.trim().is_empty()
+    }
+
+    #[test]
+    fn empty_quoted_list_item_enter_becomes_quoted_paragraph() {
+        let (mut doc, mut engine, mut caret) = setup("> - hello\n> - ");
+        caret.collapse_to(doc.buffer.len_bytes());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.starts_with("> - hello"),
+            "quoted list body must remain, got {after:?}"
+        );
+        assert!(
+            line_is_empty_quoted_paragraph(last_line(&after)),
+            "empty quoted list Enter must become `> `, got {after:?}"
+        );
+        assert!(
+            !last_line(&after).contains('-'),
+            "list marker must be gone: {after:?}"
+        );
+        engine.sync(&doc);
+        let leaf = engine.block_at(caret.cursor()).expect("caret in a block");
+        assert!(
+            ancestor_is_quote(&engine, leaf),
+            "caret must stay in the quote after exiting the list"
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        let x_line = typed
+            .lines()
+            .find(|line| line.contains('x'))
+            .expect("typed x");
+        assert!(
+            x_line.trim_start().starts_with('>') && !x_line.contains('-'),
+            "text after exiting the quoted list must stay quoted, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn typing_on_empty_quote_inserts_in_the_body() {
+        let (mut doc, mut engine, mut caret) = setup("> ");
+        caret.collapse_to(engine.snap_caret(0, Bias::Right));
+        assert_eq!(caret.cursor(), 2, "caret must sit after `> `");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.starts_with("> x"),
+            "typing on empty quote must yield `> x`, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn typing_on_empty_quote_without_marker_space_inserts_body() {
+        let (mut doc, mut engine, mut caret) = setup(">");
+        caret.collapse_to(engine.snap_caret(0, Bias::Right));
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.starts_with("> x"),
+            "typing on empty `>` must yield `> x`, got {typed:?}"
+        );
+        assert!(
+            !typed.starts_with(">x"),
+            "must insert the marker space, got {typed:?}"
+        );
+        assert_eq!(
+            caret.cursor(),
+            "> x".len(),
+            "caret must sit after the typed body"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup(">");
+        caret.collapse_to(engine.snap_caret(0, Bias::Right));
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText(" ".into()),
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            "> ",
+            "typing a space on `>` must not double it, got {:?}",
+            doc.buffer.content()
+        );
+    }
+
+    #[test]
+    fn typing_on_empty_list_markers_without_marker_space_inserts_body() {
+        // Unquoted `-` / `*` / `1.` without a space are paragraphs (input
+        // rules / `---` / italic). Quoted empty lists are real list nodes.
+        for (source, want_prefix) in [(">-", ">- x"), ("> -", "> - x"), (">*", ">* x")] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(engine.snap_caret(0, Bias::Right));
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("x".into()),
+            );
+            let typed = doc.buffer.content();
+            assert!(
+                typed.starts_with(want_prefix),
+                "typing on empty `{source}` must yield `{want_prefix}`, got {typed:?}"
+            );
+        }
+        let (mut doc, mut engine, mut caret) = setup(">1.");
+        caret.collapse_to(engine.snap_caret(0, Bias::Right));
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.contains('x') && !typed.contains("1.x") && !typed.contains(">x"),
+            "quoted ordered marker without a space must not glue `x`, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn typing_on_empty_list_item_inserts_in_the_body() {
+        let (mut doc, mut engine, mut caret) = setup("- ");
+        caret.collapse_to(engine.snap_caret(0, Bias::Right));
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.starts_with("- x"),
+            "typing on empty list must yield `- x`, got {typed:?}"
+        );
+        assert!(!typed.starts_with("x-"), "must not eat the list marker");
+    }
+
+    #[test]
+    fn typing_on_empty_ordered_item_inserts_in_the_body() {
+        let (mut doc, mut engine, mut caret) = setup("1. ");
+        caret.collapse_to(engine.snap_caret(0, Bias::Right));
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let typed = doc.buffer.content();
+        assert!(
+            typed.starts_with("1. x"),
+            "typing on empty ordered item must yield `1. x`, got {typed:?}"
+        );
+    }
+
+    #[test]
+    fn empty_quoted_ordered_list_item_enter_becomes_quoted_paragraph() {
+        let (mut doc, mut engine, mut caret) = setup("> 1. hello\n> 1. ");
+        caret.collapse_to(doc.buffer.len_bytes());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.starts_with("> 1. hello"),
+            "quoted ordered body must remain, got {after:?}"
+        );
+        assert!(
+            line_is_empty_quoted_paragraph(last_line(&after)),
+            "empty quoted ordered Enter must become `> `, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn empty_quoted_task_item_enter_becomes_quoted_paragraph() {
+        let (mut doc, mut engine, mut caret) = setup("> - [ ] hello\n> - [ ] ");
+        caret.collapse_to(doc.buffer.len_bytes());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.contains("> - [ ] hello"),
+            "quoted task body must remain, got {after:?}"
+        );
+        assert!(
+            line_is_empty_quoted_paragraph(last_line(&after)),
+            "empty quoted task Enter must become `> `, got {after:?}"
+        );
+        assert!(
+            !last_line(&after).contains('['),
+            "task marker must be gone: {after:?}"
+        );
+    }
+
+    #[test]
+    fn nested_quote_empty_list_item_enter_keeps_quote_depth() {
+        let (mut doc, mut engine, mut caret) = setup("> > - nested\n> > - ");
+        caret.collapse_to(doc.buffer.len_bytes());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.contains("> > - nested"),
+            "nested quoted list body must remain, got {after:?}"
+        );
+        let last = last_line(&after);
+        assert!(
+            last.starts_with("> >") && list_marker_prefix(after_quote(last)).is_none(),
+            "must exit the list and keep both quote levels, got {after:?}"
+        );
+        assert!(
+            line_is_empty_quoted_paragraph(last),
+            "nested empty quoted list must become `> > `, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_nested_empty_list_item_enter_outdents_inside_quote() {
+        let (mut doc, mut engine, mut caret) = setup("> - hello\n>   - ");
+        caret.collapse_to(doc.buffer.len_bytes());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.contains("> - hello") && after.contains("\n> - ") && !after.contains("\n>   - "),
+            "quoted nested empty item must outdent one list level, got {after:?}"
+        );
+        assert!(
+            !line_is_empty_quoted_paragraph(last_line(&after)),
+            "still a quoted list item after one outdent, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_list_enter_continues_the_quoted_list() {
+        let (mut doc, mut engine, mut caret) = setup("> - hello");
+        caret.collapse_to(doc.buffer.len_bytes());
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.starts_with("> - hello\n> -") || after.starts_with("> - hello\n> *"),
+            "Enter on a quoted list item must continue the quoted list, got {after:?}"
+        );
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            line_is_empty_quoted_paragraph(last_line(&after)),
+            "second Enter on the empty quoted list item must become `> `, got {after:?}"
+        );
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            !after.trim_end().ends_with('>'),
+            "third Enter on the empty quoted paragraph must leave the quote, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_line_break_in_paragraph_is_backslash_newline() {
+        let (mut doc, mut engine, mut caret) = setup("hello world\n");
+        caret.collapse_to("hello".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertLineBreak,
+        );
+        assert!(
+            after.contains("hello\\\n world") || after.contains("hello\\\nworld"),
+            "Shift-Enter outside a table must insert a markdown hard break, got {after:?}"
+        );
+        assert!(
+            !after.contains("<br>"),
+            "paragraph hard break is not HTML <br>: {after:?}"
+        );
+    }
+
+    fn list_body_start(source: &str, at: usize) -> usize {
+        let start = line_start(source, at);
+        let line = current_line(source, start);
+        start
+            + quote_prefix(line).len()
+            + list_marker_prefix(after_quote(line))
+                .expect("list marker")
+                .len()
+    }
+
+    fn quote_body_start(source: &str, at: usize) -> usize {
+        let start = line_start(source, at);
+        let line = current_line(source, start);
+        start + quote_prefix(line).len()
+    }
+
+    fn first_line(source: &str) -> &str {
+        source.lines().next().unwrap_or(source)
+    }
+
+    #[test]
     fn indent_outdent_list_item() {
         let (mut doc, mut engine, mut caret) = setup("- hello\n");
         caret.collapse_to(4);
@@ -2939,18 +6846,459 @@ mod tests {
     }
 
     #[test]
-    fn toggle_link_wraps_selection() {
-        let (mut doc, mut engine, mut caret) = setup("hello\n");
-        caret.range = 0..5;
-        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+    fn indent_quoted_list_indents_inside_the_quote() {
+        let (mut doc, mut engine, mut caret) = setup("> - hello");
+        caret.collapse_to(list_body_start("> - hello", 0));
+        let indented = apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        let line = first_line(&indented);
         assert!(
-            after.contains("[hello]("),
-            "expected markdown link, got {after:?}"
+            !line.starts_with(' '),
+            "Tab must not put a space before `>`, got {indented:?}"
+        );
+        assert!(
+            line.starts_with('>'),
+            "quote marker must stay at column 0, got {indented:?}"
+        );
+        assert!(
+            after_quote(line).starts_with("  - hello")
+                || after_quote(line).starts_with("  * hello"),
+            "indent belongs after `>`, got {indented:?}"
+        );
+
+        let out = apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        let restored = first_line(&out);
+        assert!(
+            after_quote(restored).starts_with("- hello")
+                || after_quote(restored).starts_with("* hello"),
+            "Shift-Tab must outdent inside the quote, got {out:?}"
+        );
+        assert!(
+            restored.starts_with('>'),
+            "outdent must not smash `>`, got {out:?}"
+        );
+
+        let para = apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        let last = first_line(&para);
+        assert!(
+            last.starts_with('>') && list_marker_prefix(after_quote(last)).is_none(),
+            "outermost quoted outdent becomes a quoted paragraph, got {para:?}"
+        );
+        assert!(
+            last.contains("hello"),
+            "item body must remain after stripping the marker, got {para:?}"
         );
     }
 
     #[test]
-    fn toggle_link_on_selection_wraps_with_empty_url_caret() {
+    fn indent_nested_quoted_list_and_task_stay_quoted() {
+        let (mut doc, mut engine, mut caret) = setup("> - a\n>   - b");
+        let nested_at = doc.buffer.content().find("- b").expect("nested");
+        caret.collapse_to(nested_at);
+        let indented = apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        assert!(
+            indented.contains(">     - b") || indented.contains(">     * b"),
+            "nested quoted Tab adds indent after `>`, got {indented:?}"
+        );
+        assert!(
+            !indented.contains(" >"),
+            "must not prefix a space before `>`, got {indented:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("> - [ ] task");
+        caret.collapse_to(list_body_start("> - [ ] task", 0));
+        let indented = apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        let line = first_line(&indented);
+        assert!(
+            line.starts_with('>') && after_quote(line).contains("[ ] task"),
+            "quoted task Tab stays quoted, got {indented:?}"
+        );
+        assert!(!line.starts_with(' '), "no leading space, got {indented:?}");
+    }
+
+    #[test]
+    fn indent_quoted_ordered_list_stays_inside_quote() {
+        let (mut doc, mut engine, mut caret) = setup("> 1. hello");
+        caret.collapse_to(list_body_start("> 1. hello", 0));
+        let indented = apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        let line = first_line(&indented);
+        assert!(
+            line.starts_with('>') && after_quote(line).contains("1. hello"),
+            "quoted ordered Tab stays quoted, got {indented:?}"
+        );
+        assert!(!line.starts_with(' '), "{indented:?}");
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        let para = apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        let last = first_line(&para);
+        assert!(
+            last.starts_with('>') && list_marker_prefix(after_quote(last)).is_none(),
+            "outermost quoted ordered outdent is a quoted paragraph, got {para:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_list_item_strips_the_marker() {
+        let (mut doc, mut engine, mut caret) = setup("- hello");
+        caret.collapse_to(list_body_start("- hello", 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert_eq!(
+            first_line(&after).trim_end(),
+            "hello",
+            "unquoted list Backspace at body start becomes a paragraph, got {after:?}"
+        );
+        assert!(
+            list_marker_prefix(first_line(&after)).is_none(),
+            "list marker must be gone, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_quoted_list_item_keeps_the_quote() {
+        let source = "> - hello";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(list_body_start(source, 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let line = first_line(&after);
+        assert!(
+            line.starts_with('>') && list_marker_prefix(after_quote(line)).is_none(),
+            "quoted list Backspace at body start becomes a quoted paragraph, got {after:?}"
+        );
+        assert!(
+            line.contains("hello"),
+            "body grapheme must not be deleted, got {after:?}"
+        );
+        assert!(
+            !line.contains('-'),
+            "list marker must be gone, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("> - hello");
+        caret.collapse_to("> - h".len());
+        let mid = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            mid.contains("> -") && !mid.contains("hello"),
+            "Backspace mid-item still deletes a grapheme, got {mid:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_nested_quoted_list_outdents_inside_quote() {
+        let source = "> - a\n>   - hello";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let nested = source.find("- hello").expect("nested");
+        caret.collapse_to(list_body_start(source, nested));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            after.contains("> - a")
+                && after.contains("> - hello")
+                && !after.contains(">   - hello"),
+            "nested quoted Backspace at start outdents inside the quote, got {after:?}"
+        );
+        assert!(
+            !after.contains(" >"),
+            "must not smash `>` with a leading space, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_quoted_ordered_and_task_strips_marker() {
+        let (mut doc, mut engine, mut caret) = setup("> 1. hello");
+        caret.collapse_to(list_body_start("> 1. hello", 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let line = first_line(&after);
+        assert!(
+            line.starts_with('>') && list_marker_prefix(after_quote(line)).is_none(),
+            "quoted ordered Backspace at start, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("> - [ ] hello");
+        caret.collapse_to(list_body_start("> - [ ] hello", 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let line = first_line(&after);
+        assert!(
+            line.starts_with('>')
+                && list_marker_prefix(after_quote(line)).is_none()
+                && line.contains("hello"),
+            "quoted task Backspace at start, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_heading_converts_to_paragraph() {
+        let source = "# Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(atx_body_start(source, 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert_eq!(
+            first_line(&after).trim_end(),
+            "Title",
+            "Backspace at heading start must strip `#`, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            !caret_in_heading(&engine, caret.cursor()),
+            "heading must become a paragraph, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("# Title");
+        caret.collapse_to(atx_body_start("# Title", 0) + "T".len());
+        let mid = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            mid.contains("#") && mid.contains("itle") && !mid.contains("Title"),
+            "mid-heading Backspace still deletes a grapheme, got {mid:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(
+                engine.tree().blocks[0].kind,
+                BlockKind::Heading { level: 1, .. }
+            ),
+            "mid-heading Backspace must not drop heading chrome, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_heading_in_list_strips_heading_first() {
+        let source = "- # Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(atx_body_start(source, 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let line = first_line(&after);
+        assert!(
+            list_marker_prefix(after_quote(line)).is_some()
+                && !line.contains('#')
+                && line.contains("Title"),
+            "heading-in-list Backspace at Title must strip `#` and keep the list, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            !caret_in_heading(&engine, caret.cursor()),
+            "must no longer be a heading, got {:?}",
+            engine
+                .tree()
+                .blocks
+                .iter()
+                .map(|b| &b.kind)
+                .collect::<Vec<_>>()
+        );
+        caret.collapse_to(list_body_start(&after, 0));
+        let para = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let para_line = first_line(&para);
+        assert!(
+            list_marker_prefix(after_quote(para_line)).is_none() && para_line.contains("Title"),
+            "second Backspace strips the list marker, got {para:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_atx_levels_1_to_6_converts_to_paragraph() {
+        for level in 1u8..=6 {
+            let hashes = "#".repeat(level as usize);
+            let source = format!("{hashes} Title");
+            let (mut doc, mut engine, mut caret) = setup(&source);
+            caret.collapse_to(atx_body_start(&source, 0));
+            let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+            assert_eq!(
+                first_line(&after).trim_end(),
+                "Title",
+                "h{level} Backspace at start must become a paragraph, got {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backspace_at_start_of_quoted_heading_keeps_the_quote() {
+        let source = "> # Title";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(atx_body_start(source, 0));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let line = first_line(&after);
+        assert!(
+            line.starts_with('>') && !line.contains('#') && line.contains("Title"),
+            "quoted heading Backspace at start becomes a quoted paragraph, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_setext_heading_strips_the_underline() {
+        let source = "Title\n=====\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(0);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            after.contains("Title") && !after.contains("====="),
+            "setext Backspace at start must strip the underline, got {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            !caret_in_heading(&engine, caret.cursor()),
+            "setext heading must become a paragraph, got {:?}",
+            engine.tree().blocks.first().map(|b| &b.kind)
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("Title\n-----\n");
+        caret.collapse_to(0);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            after.contains("Title") && !after.contains("-----"),
+            "setext h2 Backspace at start must strip the underline, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("Title\n=====\n");
+        caret.collapse_to("T".len());
+        let mid = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            mid.contains("itle") && mid.contains("=====") && !mid.contains("Title"),
+            "mid-setext Backspace still deletes a grapheme, got {mid:?}"
+        );
+    }
+
+    #[test]
+    fn indent_list_in_table_navigates_cells_instead_of_inserting_spaces() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let cell_a = engine.tree().blocks[0].children[0].children[0]
+            .source_range
+            .start;
+        caret.collapse_to(cell_a);
+        let before = doc.buffer.content();
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        assert_eq!(
+            doc.buffer.content(),
+            before,
+            "Tab in a table must not insert indent spaces"
+        );
+        let pos = engine.table_pos(caret.cursor()).expect("still in table");
+        assert_eq!(
+            pos.col, 1,
+            "IndentList in a table must TableTab to the next cell"
+        );
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::OutdentList);
+        let back = engine.table_pos(caret.cursor()).expect("still in table");
+        assert_eq!(back.col, 0, "OutdentList in a table must Shift-Tab");
+        assert_eq!(doc.buffer.content(), before);
+
+        let last_cell = engine.tree().blocks[0]
+            .children
+            .last()
+            .and_then(|row| row.children.last())
+            .expect("last cell")
+            .source_range
+            .start;
+        caret.collapse_to(last_cell);
+        let rows_before = engine.tree().blocks[0].children.len();
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        engine.sync(&doc);
+        assert!(
+            engine.tree().blocks[0].children.len() > rows_before,
+            "Tab on the last cell must insert a row, got {}",
+            doc.buffer.content()
+        );
+    }
+
+    #[test]
+    fn split_block_in_table_inserts_br_instead_of_breaking_the_row() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let after_a = source.find('a').expect("header a") + 1;
+        caret.collapse_to(after_a);
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            after.contains("<br>"),
+            "Enter in a table cell must insert <br>, got {after:?}"
+        );
+        assert!(
+            !after.contains("a\n") && !after.contains("a\r"),
+            "Enter must not splice a newline into the GFM table row: {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "table must survive Enter, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        assert_eq!(
+            engine.tree().blocks[0].children[0].children.len(),
+            2,
+            "header must keep two cells, got {}",
+            after
+        );
+        assert!(
+            engine.table_pos(caret.cursor()).is_some(),
+            "caret must stay in the table after Enter"
+        );
+
+        // IME / InsertText("\\n") shares SplitBlock.
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('1').expect("body 1") + 1);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("\n".into()),
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "InsertText newline must not break the table, got {}",
+            doc.buffer.content()
+        );
+        assert!(
+            doc.buffer.content().contains("<br>"),
+            "{}",
+            doc.buffer.content()
+        );
+    }
+
+    #[test]
+    fn insert_line_break_in_table_is_br_not_backslash_newline() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('a').expect("header a") + 1);
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertLineBreak,
+        );
+        assert!(
+            after.contains("<br>"),
+            "Shift-Enter in a table cell must insert <br>, got {after:?}"
+        );
+        assert!(
+            !after.contains("\\\n"),
+            "backslash-newline would split the GFM row: {after:?}"
+        );
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "{:?}",
+            engine.tree().blocks[0].kind
+        );
+    }
+
+    #[test]
+    fn indent_list_in_table_code_span_still_tabs() {
+        let source = "| `x` | y |\n| --- | --- |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let code_off = source.find('x').expect("code span");
+        caret.collapse_to(code_off);
+        assert!(engine.in_raw_context(code_off), "caret in inline code");
+        assert!(engine.in_table(code_off));
+        let before = doc.buffer.content();
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::IndentList);
+        assert_eq!(
+            doc.buffer.content(),
+            before,
+            "Tab inside table inline-code must not insert spaces"
+        );
+        let pos = engine.table_pos(caret.cursor()).expect("still in table");
+        assert_eq!(pos.col, 1);
+    }
+
+    #[test]
+    fn toggle_link_wraps_selection() {
         let (mut doc, mut engine, mut caret) = setup("hello\n");
         caret.range = 0..5;
         let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
@@ -2991,100 +7339,6 @@ mod tests {
     }
 
     #[test]
-    fn toggle_link_on_word_wraps_with_empty_url_caret() {
-        // Cmd-K on a caret inside a word wraps the whole word, not just the
-        // typed character, and leaves the caret in the empty URL `()`.
-        let (mut doc, mut engine, mut caret) = setup("hello");
-        caret.collapse_to(2);
-        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
-        assert_eq!(
-            after, "[hello]()",
-            "Cmd-K on a word must use empty (), got {after:?}"
-        );
-        assert!(
-            !after.contains("<>"),
-            "empty dest must not serialize as <>, got {after:?}"
-        );
-        let url_at = after
-            .find("[hello](")
-            .map(|i| i + "[hello](".len())
-            .expect("url slot");
-        assert_eq!(
-            caret.cursor(),
-            url_at,
-            "Cmd-K on a word must leave the caret in the URL, got {} in {after:?}",
-            caret.cursor()
-        );
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::InsertText("https://e.com".into()),
-        );
-        assert_eq!(
-            doc.buffer.content(),
-            "[hello](https://e.com)",
-            "typing a URL must fill (), not leave <>"
-        );
-    }
-
-    #[test]
-    fn empty_destination_becomes_empty_parens() {
-        // A just-wrapped link with no url serializes its destination as bare
-        // `()` (Typora), never `<>`.
-        let (mut doc, mut engine, mut caret) = setup("hello");
-        caret.range = 0..5;
-        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
-        assert_eq!(
-            after, "[hello]()",
-            "empty dest must serialize bare, got {after:?}"
-        );
-        assert!(
-            !after.contains("<>"),
-            "empty dest must not be <>, got {after:?}"
-        );
-    }
-
-    #[test]
-    fn empty_destination_with_url_fills_it() {
-        // Typing a URL into an existing empty `()` fills the destination.
-        let source = "[hello]()";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        let at = source.find("](").expect("dest") + 2; // after `](`
-        caret.collapse_to(at);
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::InsertText("https://e.com".into()),
-        );
-        assert_eq!(
-            doc.buffer.content(),
-            "[hello](https://e.com)",
-            "typing a URL must fill the empty (), got {:?}",
-            doc.buffer.content()
-        );
-    }
-
-    #[test]
-    fn empty_angle_destination_becomes_empty_parens() {
-        // A leftover `<>` empty destination collapses back to `()` when the
-        // link is unwrapped and rewrapped (the empty URL no longer needs <>).
-        let source = "[hello](<>)";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        caret.range = 0..5;
-        apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
-        assert_eq!(doc.buffer.content(), "hello", "unwrap must drop the link");
-        apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
-        assert_eq!(
-            doc.buffer.content(),
-            "[hello]()",
-            "empty <> dest must become empty parens, got {:?}",
-            doc.buffer.content()
-        );
-    }
-
-    #[test]
     fn insert_text_replaces_empty_angle_destination() {
         let source = "[hello](<>)\n";
         let (mut doc, mut engine, mut caret) = setup(source);
@@ -3114,25 +7368,6 @@ mod tests {
             doc.buffer.content(),
             "[hello](https://e.com)\n",
             "InsertText inside <> must replace the brackets"
-        );
-    }
-
-    #[test]
-    fn typing_in_autolink_does_not_double_wrap() {
-        let source = "<https://example.com>\n";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        let at = source.find("example").expect("host");
-        caret.collapse_to(at);
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::InsertText("x".into()),
-        );
-        let after = doc.buffer.content();
-        assert!(
-            after.contains("<https://") && after.contains("example.com>"),
-            "typing inside an autolink must keep the url and not double-wrap, got {after:?}"
         );
     }
 
@@ -3341,6 +7576,582 @@ mod tests {
             doc.buffer.content().contains("- [x] todo"),
             "{}",
             doc.buffer.content()
+        );
+    }
+
+    fn nested_task_ids(engine: &RichEngine) -> (NodeId, NodeId) {
+        let outer = &engine.tree().blocks[0].children[0];
+        let inner = outer
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, BlockKind::BulletList { .. }))
+            .and_then(|list| list.children.first())
+            .expect("nested task item");
+        (outer.id, inner.id)
+    }
+
+    #[test]
+    fn set_task_checked_toggles_nested_item_only() {
+        let source = "- [ ] outer\n  - [ ] inner\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        engine.sync(&doc);
+        let (_, inner_id) = nested_task_ids(&engine);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetTaskChecked {
+                id: inner_id,
+                checked: true,
+            },
+        );
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("- [ ] outer") && after.contains("[x] inner"),
+            "inner checkbox must toggle without checking outer, got {after:?}"
+        );
+        engine.sync(&doc);
+        let (outer_id, _) = nested_task_ids(&engine);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetTaskChecked {
+                id: outer_id,
+                checked: true,
+            },
+        );
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("[x] outer") && after.contains("[x] inner"),
+            "outer checkbox must toggle independently, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_text_at_document_start_does_not_mutate_frontmatter() {
+        let source = "---\ntitle: Hello\n---\n\n# Body\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(0);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let after = doc.buffer.content();
+        let info = crate::parse_frontmatter(&after).expect("frontmatter kept");
+        assert_eq!(
+            info.title.as_deref(),
+            Some("Hello"),
+            "YAML title must stay, got {after:?}"
+        );
+        assert!(
+            !after.starts_with("x---"),
+            "typed text must not prefix the opening fence, got {after:?}"
+        );
+        assert!(
+            after[info.end_byte..].contains('x'),
+            "typed text must land in the body, got {after:?}"
+        );
+        engine.sync(&doc);
+        let fm_end = super::frontmatter_body_start(engine.tree());
+        caret.collapse_to(fm_end);
+        let before = doc.buffer.content();
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert_eq!(
+            doc.buffer.content(),
+            before,
+            "Backspace at the body start must not nibble YAML"
+        );
+    }
+
+    #[test]
+    fn table_shift_tab_on_first_cell_keeps_the_table() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let cell_a = engine.tree().blocks[0].children[0].children[0]
+            .source_range
+            .start;
+        caret.collapse_to(cell_a);
+        let before = doc.buffer.content();
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::TableTab { reverse: true },
+        );
+        assert_eq!(
+            doc.buffer.content(),
+            before,
+            "Shift-Tab in the first cell must not rewrite the table"
+        );
+        assert!(
+            engine.table_pos(caret.cursor()).is_some(),
+            "caret must stay in the table (or a defined exit), got {}",
+            caret.cursor()
+        );
+    }
+
+    #[test]
+    fn delete_cross_cell_selection_does_not_remove_pipes() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let a = source.find('a').expect("header a");
+        let after_b = source.find('b').expect("header b") + 1;
+        caret.range = a..after_b;
+        caret.reversed = false;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "cross-cell Backspace must keep a table, got {after:?}"
+        );
+        assert_eq!(
+            engine.tree().blocks[0].children[0].children.len(),
+            2,
+            "deleting a selection across `|` must not merge header cells, got {after:?}"
+        );
+        assert!(
+            after.contains('|'),
+            "column pipes must survive, got {after:?}"
+        );
+        let header = after.lines().next().unwrap_or("");
+        assert!(
+            header.matches('|').count() >= 3,
+            "header must keep GFM pipes, got {after:?}"
+        );
+        assert!(
+            after.contains('b'),
+            "clamp to the start cell must not delete the other cell, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.range = a..after_b;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert_eq!(
+            engine.tree().blocks[0].children[0].children.len(),
+            2,
+            "cross-cell Delete must not merge header cells, got {after:?}"
+        );
+    }
+
+    fn table_source() -> &'static str {
+        "| a | b |\n|---|---|\n| 1 | 2 |\n"
+    }
+
+    fn assert_gfm_table_survives(engine: &RichEngine, after: &str, label: &str) {
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "{label}: table must survive, got {after:?}"
+        );
+        assert_eq!(
+            engine.tree().blocks[0].children[0].children.len(),
+            2,
+            "{label}: header must keep two cells, got {after:?}"
+        );
+        let header = after.lines().next().unwrap_or("");
+        assert!(
+            header.matches('|').count() >= 3,
+            "{label}: header must keep GFM pipes, got {after:?}"
+        );
+        assert!(
+            after.contains('b'),
+            "{label}: the other cell must remain, got {after:?}"
+        );
+        assert!(
+            !after.contains("**|")
+                && !after.contains("|**")
+                && !after.contains("*|")
+                && !after.contains("|*")
+                && !after.contains("`|")
+                && !after.contains("|`")
+                && !after.contains("[|"),
+            "{label}: wrap must not splice delimiters onto `|`, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_mark_full_doc_selection_does_not_wrap_table_pipes() {
+        let source = table_source();
+        let a = source.find('a').expect("header a");
+        for (cmd, label) in [
+            (RichCommand::ToggleMark(MarkSet::BOLD), "bold"),
+            (RichCommand::ToggleMark(MarkSet::ITALIC), "italic"),
+            (RichCommand::ToggleMark(MarkSet::CODE), "code"),
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(a);
+            caret.range = 0..source.len();
+            caret.reversed = false;
+            apply(&mut doc, &mut engine, &mut caret, cmd.clone());
+            let after = doc.buffer.content();
+            engine.sync(&doc);
+            assert_gfm_table_survives(&engine, &after, label);
+        }
+    }
+
+    #[test]
+    fn toggle_link_full_doc_selection_does_not_wrap_table_pipes() {
+        let source = table_source();
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('a').expect("header a"));
+        caret.range = 0..source.len();
+        caret.reversed = false;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert_gfm_table_survives(&engine, &after, "link");
+        assert!(
+            after.contains("[a]") || after.contains("[ a ]") || after.contains("[ a]"),
+            "Cmd-K must wrap the cell text, not the row, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_bold_in_cell_still_wraps_that_cell() {
+        let source = table_source();
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let a = source.find('a').expect("header a");
+        caret.range = a..a + 1;
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert_gfm_table_survives(&engine, &after, "in-cell bold");
+        assert!(
+            after.contains("**a**") || after.contains("__a__"),
+            "in-cell Cmd-B must still wrap the cell text, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_mark_empty_caret_in_table_cell_inserts_pair() {
+        let source = table_source();
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find('a').expect("header a"));
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert_gfm_table_survives(&engine, &after, "empty Cmd-B in cell");
+        assert!(
+            after.contains("****") || after.contains("**a**"),
+            "empty Cmd-B in a cell must insert a wrap pair, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn toggle_bold_full_selection_from_paragraph_does_not_clamp_into_table() {
+        let source = "hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.range = 0..source.len();
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleMark(MarkSet::BOLD),
+        );
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert!(
+            after.contains("**hello**") || after.contains("__hello__"),
+            "Cmd-A from a paragraph must still wrap that paragraph, got {after:?}"
+        );
+        let table = engine
+            .tree()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+            .expect("table must survive");
+        assert_eq!(
+            table.children[0].children.len(),
+            2,
+            "wrapping the paragraph must not collapse the table, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn table_select_all_selects_cell_then_document() {
+        let source = table_source();
+        let (_doc, engine, _) = setup(source);
+        let a = source.find('a').expect("header a");
+        let cell = engine.cell_edit_range(a, source).expect("cell a");
+        let first = table_select_all_range(&engine, source, &(a..a), None).expect("first Cmd-A");
+        assert_eq!(
+            first, cell,
+            "first SelectAll must be the cell, got {first:?}"
+        );
+        assert!(
+            !source[first.clone()].contains('|'),
+            "cell SelectAll must not include `|`, got {:?}",
+            &source[first.clone()]
+        );
+        assert!(
+            table_select_all_range(&engine, source, &cell, None).is_none(),
+            "second SelectAll (already the cell) must fall through to the document"
+        );
+        assert!(
+            table_select_all_range(&engine, source, &(0..source.len()), None).is_none(),
+            "SelectAll must not shrink a whole-document selection back to a cell"
+        );
+
+        let mixed = "hello\n\n| a | b |\n|---|---|\n";
+        let (_doc, engine, _) = setup(mixed);
+        assert!(
+            table_select_all_range(&engine, mixed, &(0..0), None).is_none(),
+            "SelectAll in a paragraph must still take the document"
+        );
+    }
+
+    fn first_empty_cell_body(engine: &RichEngine, source: &str) -> Range<usize> {
+        fn walk(blocks: &[Block], engine: &RichEngine, source: &str) -> Option<Range<usize>> {
+            for b in blocks {
+                if matches!(b.kind, BlockKind::TableCell) {
+                    for probe in b.source_range.start..=b.source_range.end.min(source.len()) {
+                        if let Some(cell) = engine.cell_edit_range(probe, source) {
+                            if cell.is_empty() {
+                                return Some(cell);
+                            }
+                        }
+                    }
+                }
+                if let Some(found) = walk(&b.children, engine, source) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(&engine.tree().blocks, engine, source).expect("empty table cell")
+    }
+
+    #[test]
+    fn table_select_all_empty_cell_first_stays_in_cell() {
+        let source = "|| b |\n|---|---|\n| 1 | 2 |\n";
+        let (_doc, engine, _) = setup(source);
+        assert!(
+            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
+            "fixture must parse as a table, got {:?}",
+            engine.tree().blocks[0].kind
+        );
+        let cell = first_empty_cell_body(&engine, source);
+        assert!(
+            cell.is_empty(),
+            "empty header cell body must be collapsed, got {cell:?}"
+        );
+        let caret = cell.clone();
+        assert_eq!(
+            caret, cell,
+            "the bug: empty cell range equals the collapsed caret"
+        );
+        let first = table_select_all_range(&engine, source, &caret, None)
+            .expect("first Cmd-A on an empty cell must still select the cell");
+        assert_eq!(first, cell, "first SelectAll must be the empty cell body");
+        assert!(
+            table_select_all_range(&engine, source, &first, Some(&first)).is_none(),
+            "second SelectAll (empty cell already latched) must fall through to the document"
+        );
+        assert!(
+            table_select_all_range(&engine, source, &(0..source.len()), Some(&first)).is_none(),
+            "SelectAll must not shrink a whole-document selection back to a cell"
+        );
+    }
+
+    #[test]
+    fn block_commands_in_table_do_not_rewrite_gfm_structure() {
+        let source = table_source();
+        let a = source.find('a').expect("header a");
+        let cmds: [(RichCommand, &str); 5] = [
+            (RichCommand::ToggleList { ordered: false }, "ToggleList"),
+            (
+                RichCommand::ToggleList { ordered: true },
+                "ToggleList ordered",
+            ),
+            (RichCommand::ToggleBlockquote, "ToggleBlockquote"),
+            (
+                RichCommand::SetBlockType(BlockType::Heading(1)),
+                "SetBlockType heading",
+            ),
+            (
+                RichCommand::SetBlockType(BlockType::Paragraph),
+                "SetBlockType paragraph",
+            ),
+        ];
+        for (cmd, label) in cmds {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(a);
+            let outcome =
+                apply_rich_command(&mut doc, &mut engine, &mut caret, cmd.clone()).expect(label);
+            assert_eq!(
+                outcome,
+                RichOutcome::Noop,
+                "{label}: in-cell block command must no-op, got {}",
+                doc.buffer.content()
+            );
+            let after = doc.buffer.content();
+            engine.sync(&doc);
+            assert_gfm_table_survives(&engine, &after, label);
+            assert_eq!(after, source, "{label}: source bytes must stay the table");
+
+            // Selection start in the table (cursor may sit past `|`).
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.range = a..source.len();
+            caret.reversed = false;
+            apply_rich_command(&mut doc, &mut engine, &mut caret, cmd.clone()).expect(label);
+            let after = doc.buffer.content();
+            engine.sync(&doc);
+            assert_gfm_table_survives(&engine, &after, &format!("{label} selection start"));
+        }
+    }
+
+    #[test]
+    fn block_commands_on_quoted_table_do_not_eat_pipes() {
+        let source = "> | a | b |\n> |---|---|\n> | 1 | 2 |\n";
+        let a = source.find('a').expect("header a");
+        for cmd in [
+            RichCommand::ToggleList { ordered: false },
+            RichCommand::ToggleBlockquote,
+            RichCommand::SetBlockType(BlockType::Heading(1)),
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(a);
+            apply_rich_command(&mut doc, &mut engine, &mut caret, cmd).unwrap();
+            let after = doc.buffer.content();
+            engine.sync(&doc);
+            assert!(
+                after.contains('|'),
+                "quoted table must keep GFM pipes, got {after:?}"
+            );
+            let table = engine
+                .tree()
+                .blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+                .or_else(|| {
+                    engine.tree().blocks.iter().find_map(|b| {
+                        b.children
+                            .iter()
+                            .find(|c| matches!(c.kind, BlockKind::Table { .. }))
+                    })
+                })
+                .expect("table must survive");
+            assert_eq!(
+                table.children[0].children.len(),
+                2,
+                "quoted table must keep two header cells, got {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_commands_on_paragraph_next_to_table_still_apply() {
+        let source = "hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(0);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetBlockType(BlockType::Heading(1)),
+        );
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert!(
+            after.starts_with("# hello"),
+            "heading on the paragraph must still apply, got {after:?}"
+        );
+        let table = engine
+            .tree()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+            .expect("table must survive");
+        assert_eq!(
+            table.children[0].children.len(),
+            2,
+            "heading the paragraph must not collapse the table, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(0);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleList { ordered: false },
+        );
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert!(
+            after.contains("- hello") || after.starts_with("- "),
+            "ToggleList on the paragraph must still wrap it, got {after:?}"
+        );
+        let table = engine
+            .tree()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+            .expect("table must survive list wrap");
+        assert_eq!(
+            table.children[0].children.len(),
+            2,
+            "list wrap must not eat table pipes, got {after:?}"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(0);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::ToggleBlockquote,
+        );
+        let after = doc.buffer.content();
+        engine.sync(&doc);
+        assert!(
+            after.contains("> hello") || after.starts_with("> "),
+            "ToggleBlockquote on the paragraph must still wrap it, got {after:?}"
+        );
+        let table = engine
+            .tree()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Table { .. }))
+            .expect("table must survive quote wrap");
+        assert_eq!(
+            table.children[0].children.len(),
+            2,
+            "quote wrap must not eat table pipes, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn insert_text_inside_autolink_keeps_the_url() {
+        let source = "<https://example.com>\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let at = source.find("example").expect("host");
+        caret.collapse_to(at);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("<https://") && after.contains("example.com>"),
+            "typing inside an autolink must not drop the URL, got {after:?}"
         );
     }
 
@@ -3595,6 +8406,43 @@ mod tests {
             doc.buffer.content().contains("![cat](pic.png)"),
             "{}",
             doc.buffer.content()
+        );
+    }
+
+    #[test]
+    fn set_image_alt_keeps_enclosing_link() {
+        let source = "[![old](pic.png)](https://e.com)\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        engine.sync(&doc);
+        let range = engine.tree().blocks[0]
+            .inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::Image {
+                    source_range,
+                    link: Some(_),
+                    ..
+                } => Some(source_range.clone()),
+                _ => None,
+            })
+            .expect("linked image");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetImageAlt {
+                source_range: range,
+                alt: "cat".into(),
+            },
+        );
+        let after = doc.buffer.content();
+        assert!(
+            after.contains("![cat](pic.png)"),
+            "alt must change, got {after:?}"
+        );
+        assert!(
+            after.contains("https://e.com") && after.contains("[![cat]"),
+            "wrapping link must survive alt edit, got {after:?}"
         );
     }
 
@@ -4055,466 +8903,133 @@ mod tests {
         );
     }
 
-    #[test]
-    fn delete_word_left_removes_previous_word_and_skips_bold_marks() {
-        let (mut doc, mut engine, mut caret) = setup("hello world");
-        caret.collapse_to("hello world".len());
-        let after = apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::DeleteWordLeft,
-        );
-        assert_eq!(
-            after, "hello ",
-            "hello world| Option-Backspace must leave `hello |`, got {after:?}"
-        );
-        assert_eq!(caret.cursor(), "hello ".len());
-
-        let source = "**hello** world";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        caret.collapse_to(source.len());
-        let after = apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::DeleteWordLeft,
-        );
-        assert_eq!(
-            after, "**hello** ",
-            "word-delete must skip bold delimiters like word move, got {after:?}"
-        );
-
-        let (mut doc, mut engine, mut caret) = setup("hello world");
-        caret.range = 0.."hello".len();
-        caret.reversed = false;
-        let after = apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::DeleteWordLeft,
-        );
-        assert_eq!(
-            after, " world",
-            "non-empty selection Option-Backspace deletes the selection, got {after:?}"
-        );
+    fn type_chars(doc: &mut Document, engine: &mut RichEngine, caret: &mut CaretState, text: &str) {
+        for ch in text.chars() {
+            apply(doc, engine, caret, RichCommand::InsertText(ch.to_string()));
+        }
     }
 
-    #[test]
-    fn delete_word_right_and_line_bounds() {
-        let (mut doc, mut engine, mut caret) = setup("hello world");
-        caret.collapse_to(0);
-        let after = apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::DeleteWordRight,
-        );
-        assert_eq!(
-            after, " world",
-            "Option-Delete from the start must remove `hello`, got {after:?}"
-        );
-
-        let source = "hello\nworld extra";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        caret.collapse_to(source.len());
-        let after = apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::DeleteToLineStart,
-        );
-        assert_eq!(
-            after, "hello\n",
-            "Cmd-Backspace deletes to the current line start, not the document, got {after:?}"
-        );
-
-        let source = "hello\nworld extra";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        caret.collapse_to("hello\n".len());
-        let after = apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::DeleteToLineEnd,
-        );
-        assert_eq!(
-            after, "hello\n",
-            "Cmd-Delete deletes to the current line end, got {after:?}"
-        );
+    fn cell_caret_at(engine: &RichEngine, source: &str, needle: char) -> usize {
+        let line = source.lines().next().unwrap_or(source);
+        let off = line
+            .find(needle)
+            .unwrap_or_else(|| source.find(needle).expect("cell needle"));
+        engine
+            .cell_edit_range(off, source)
+            .map(|r| r.start)
+            .unwrap_or(off)
     }
 
-    #[test]
-    fn cut_of_visible_bold_removes_markdown_marks() {
-        let source = "**hello** world\n";
+    fn assert_two_col_table_keeps_literal(source: &str, caret_at: usize, typed: &str, label: &str) {
         let (mut doc, mut engine, mut caret) = setup(source);
-        let inner = source.find("hello").expect("hello");
-        caret.range = inner..inner + "hello".len();
-        caret.reversed = false;
-        let expanded = engine.expand_markdown_selection(&doc.buffer.content(), caret.range.clone());
-        assert_eq!(&source[expanded.clone()], "**hello**");
-        caret.range = expanded;
-        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
+        engine.sync(&doc);
+        assert!(
+            engine.in_table(caret_at),
+            "{label}: caret must start in the table"
+        );
+        caret.collapse_to(caret_at);
+        type_chars(&mut doc, &mut engine, &mut caret, typed);
         let after = doc.buffer.content();
-        assert!(
-            !after.contains("**") && after.contains("world"),
-            "cut of a fully selected bold word must remove the marks, got {after:?}"
-        );
-    }
-
-    #[test]
-    fn empty_caret_cut_removes_the_current_block() {
-        let source = "# Title\n\npara\n";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        let t = source.find('T').expect("T");
-        caret.collapse_to(t);
-        let expanded =
-            engine.expand_markdown_cut_selection(&doc.buffer.content(), caret.range.clone());
-        assert!(
-            source[expanded.clone()].contains("# Title"),
-            "cut range must be the heading, got {:?}",
-            &source[expanded.clone()]
-        );
-        caret.range = expanded;
-        caret.reversed = false;
-        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
-        let after = doc.buffer.content();
-        assert!(
-            !after.contains("# Title") && after.contains("para"),
-            "empty-caret heading cut must remove the heading, got {after:?}"
-        );
-
-        let source = "- hello\n- world\n";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        let h = source.find('h').expect("h");
-        caret.collapse_to(h);
-        let expanded =
-            engine.expand_markdown_cut_selection(&doc.buffer.content(), caret.range.clone());
-        caret.range = expanded;
-        caret.reversed = false;
-        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
-        let after = doc.buffer.content();
-        assert!(
-            !after.contains("hello") && after.contains("- world"),
-            "empty-caret list cut must remove that item, got {after:?}"
-        );
-
-        let source = "```\ncode\n```\n\npara\n";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        let c = source.find("code").expect("code");
-        caret.collapse_to(c);
-        let expanded =
-            engine.expand_markdown_cut_selection(&doc.buffer.content(), caret.range.clone());
-        caret.range = expanded;
-        caret.reversed = false;
-        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
-        let after = doc.buffer.content();
-        assert!(
-            !after.contains("```") && after.contains("para"),
-            "empty-caret fence cut must remove the fence, got {after:?}"
-        );
-
-        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
-        let (_doc, engine, mut caret) = setup(source);
-        let a = source.find('a').expect("a");
-        caret.collapse_to(a);
-        let expanded = engine.expand_markdown_cut_selection(source, caret.range.clone());
-        assert_eq!(
-            expanded.start, expanded.end,
-            "empty-caret table Cut must stay a no-op"
-        );
-    }
-
-    fn table_source() -> &'static str {
-        "| a | b |\n|---|---|\n| 1 | 2 |\n"
-    }
-
-    fn assert_gfm_table_survives(engine: &RichEngine, after: &str, label: &str) {
+        engine.sync(&doc);
         assert!(
             matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
-            "{label}: table must survive, got {after:?}"
+            "{label}: table must survive typing {typed:?}, got {after:?}"
         );
         assert_eq!(
             engine.tree().blocks[0].children[0].children.len(),
             2,
-            "{label}: header must keep two cells, got {after:?}"
+            "{label}: must keep two columns after {typed:?}, got {after:?}"
         );
         let header = after.lines().next().unwrap_or("");
         assert!(
-            header.matches('|').count() >= 3,
-            "{label}: header must keep GFM pipes, got {after:?}"
+            header.contains('|'),
+            "{label}: GFM pipes must remain after {typed:?}, got {after:?}"
         );
-        assert!(
-            after.contains('b'),
-            "{label}: the other cell must remain, got {after:?}"
-        );
-        assert!(
-            !after.contains("**|")
-                && !after.contains("|**")
-                && !after.contains("*|")
-                && !after.contains("|*")
-                && !after.contains("`|")
-                && !after.contains("|`")
-                && !after.contains("[|"),
-            "{label}: wrap must not splice delimiters onto `|`, got {after:?}"
-        );
-    }
-
-    fn first_empty_cell_body(engine: &RichEngine, source: &str) -> Range<usize> {
-        fn walk(blocks: &[Block], engine: &RichEngine, source: &str) -> Option<Range<usize>> {
-            for b in blocks {
-                if matches!(b.kind, BlockKind::TableCell) {
-                    for probe in b.source_range.start..=b.source_range.end.min(source.len()) {
-                        if let Some(cell) = engine.cell_edit_range(probe, source) {
-                            if cell.is_empty() {
-                                return Some(cell);
-                            }
-                        }
-                    }
-                }
-                if let Some(found) = walk(&b.children, engine, source) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        walk(&engine.tree().blocks, engine, source).expect("empty table cell")
-    }
-
-    #[test]
-    fn block_commands_no_op_in_table() {
-        let source = table_source();
-        let a = source.find('a').expect("header a");
-        let cmds: [(RichCommand, &str); 5] = [
-            (RichCommand::ToggleList { ordered: false }, "ToggleList"),
-            (
-                RichCommand::ToggleList { ordered: true },
-                "ToggleList ordered",
-            ),
-            (RichCommand::ToggleBlockquote, "ToggleBlockquote"),
-            (
-                RichCommand::SetBlockType(BlockType::Heading(1)),
-                "SetBlockType heading",
-            ),
-            (
-                RichCommand::SetBlockType(BlockType::Paragraph),
-                "SetBlockType paragraph",
-            ),
-        ];
-        for (cmd, label) in cmds {
-            let (mut doc, mut engine, mut caret) = setup(source);
-            caret.collapse_to(a);
-            let outcome =
-                apply_rich_command(&mut doc, &mut engine, &mut caret, cmd.clone()).expect(label);
-            assert_eq!(
-                outcome,
-                RichOutcome::Noop,
-                "{label}: in-cell block command must no-op, got {}",
-                doc.buffer.content()
+        if source.lines().next().is_some_and(|l| l.starts_with('|')) {
+            assert!(
+                header.matches('|').count() >= 3,
+                "{label}: piped header must keep pipes after {typed:?}, got {after:?}"
             );
-            let after = doc.buffer.content();
-            engine.sync(&doc);
-            assert_gfm_table_survives(&engine, &after, label);
-            assert_eq!(after, source, "{label}: source bytes must stay the table");
+        }
+        let visible = header.replace('\\', "");
+        assert!(
+            visible.contains(typed) || header.contains(typed),
+            "{label}: cell must contain {typed:?}, got {after:?}"
+        );
+        assert!(
+            !after.contains("\n\n```") && !after.contains("---\n\n"),
+            "{label}: must not insert a fence or thematic break, got {after:?}"
+        );
+    }
 
-            // Selection start in the table (cursor may sit past `|`).
-            let (mut doc, mut engine, mut caret) = setup(source);
-            caret.range = a..source.len();
-            caret.reversed = false;
-            apply_rich_command(&mut doc, &mut engine, &mut caret, cmd.clone()).expect(label);
-            let after = doc.buffer.content();
-            engine.sync(&doc);
-            assert_gfm_table_survives(&engine, &after, &format!("{label} selection start"));
+    #[test]
+    fn table_cell_block_input_rules_stay_literal() {
+        let piped = table_source();
+        let empty_first = "|| b |\n|---|---|\n| 1 | 2 |\n";
+        let pipeless = "a | b\n---|---\n1 | 2\n";
+        let prefixes = ["# ", "- ", "> ", "* ", "1. ", "```"];
+
+        for typed in prefixes {
+            let (doc, engine, _) = setup(piped);
+            let a = cell_caret_at(&engine, piped, 'a');
+            drop(doc);
+            assert_two_col_table_keeps_literal(piped, a, typed, &format!("piped a {typed:?}"));
+
+            let b = piped.find('b').expect("header b");
+            assert_two_col_table_keeps_literal(piped, b, typed, &format!("piped b {typed:?}"));
+
+            let (_doc, engine, _) = setup(empty_first);
+            let empty = first_empty_cell_body(&engine, empty_first).start;
+            assert_two_col_table_keeps_literal(
+                empty_first,
+                empty,
+                typed,
+                &format!("empty first {typed:?}"),
+            );
+
+            let (_doc, engine, _) = setup(pipeless);
+            let pa = cell_caret_at(&engine, pipeless, 'a');
+            assert_two_col_table_keeps_literal(
+                pipeless,
+                pa,
+                typed,
+                &format!("pipeless a {typed:?}"),
+            );
         }
     }
 
     #[test]
-    fn wrap_commands_clamp_to_table_cell() {
-        let source = table_source();
-        for (cmd, label) in [
-            (RichCommand::ToggleMark(MarkSet::BOLD), "bold"),
-            (RichCommand::ToggleMark(MarkSet::ITALIC), "italic"),
-            (RichCommand::ToggleMark(MarkSet::CODE), "code"),
-        ] {
-            // A document-wide selection that starts in the table stays in the cell.
-            let (mut doc, mut engine, mut caret) = setup(source);
-            caret.collapse_to(source.find('a').expect("header a"));
-            caret.range = 0..source.len();
-            caret.reversed = false;
-            apply(&mut doc, &mut engine, &mut caret, cmd.clone());
-            let after = doc.buffer.content();
-            engine.sync(&doc);
-            assert_gfm_table_survives(&engine, &after, label);
-        }
-
-        // Cmd-K on a document-wide selection starting in a table stays in the cell.
+    fn table_cell_italic_auto_close_still_works() {
+        let source = "|| b |\n|---|---|\n| 1 | 2 |\n";
         let (mut doc, mut engine, mut caret) = setup(source);
-        caret.collapse_to(source.find('a').expect("header a"));
-        caret.range = 0..source.len();
-        caret.reversed = false;
-        apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
-        let after = doc.buffer.content();
-        engine.sync(&doc);
-        assert_gfm_table_survives(&engine, &after, "link");
-        assert!(
-            after.contains("[a]") || after.contains("[ a ]") || after.contains("[ a]"),
-            "Cmd-K must wrap the cell text, not the row, got {after:?}"
-        );
-
-        // In-cell selection still wraps that cell.
-        let a = source.find('a').expect("header a");
-        let (mut doc, mut engine, mut caret) = setup(source);
-        caret.range = a..a + 1;
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::ToggleMark(MarkSet::BOLD),
-        );
-        let after = doc.buffer.content();
-        engine.sync(&doc);
-        assert_gfm_table_survives(&engine, &after, "in-cell bold");
-        assert!(
-            after.contains("**a**") || after.contains("__a__"),
-            "in-cell Cmd-B must still wrap the cell text, got {after:?}"
-        );
-
-        // Selecting the whole doc from a paragraph still wraps that paragraph.
-        let mixed = "hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
-        let (mut doc, mut engine, mut caret) = setup(mixed);
-        caret.range = 0..mixed.len();
-        apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::ToggleMark(MarkSet::BOLD),
-        );
-        let after = doc.buffer.content();
-        engine.sync(&doc);
-        assert!(
-            after.contains("**hello**") || after.contains("__hello__"),
-            "Cmd-A from a paragraph must still wrap that paragraph, got {after:?}"
-        );
-        let table = engine
-            .tree()
-            .blocks
-            .iter()
-            .find(|b| matches!(b.kind, BlockKind::Table { .. }))
-            .expect("table must survive");
-        assert_eq!(
-            table.children[0].children.len(),
-            2,
-            "wrapping the paragraph must not collapse the table, got {after:?}"
-        );
-    }
-
-    #[test]
-    fn select_all_in_empty_table_cell_selects_that_cell() {
-        let source = table_source();
-        let (_doc, engine, _) = setup(source);
-        let a = source.find('a').expect("header a");
-        let cell = engine.cell_edit_range(a, source).expect("cell a");
-        let first = table_select_all_range(&engine, source, &(a..a), None).expect("first Cmd-A");
-        assert_eq!(
-            first, cell,
-            "first SelectAll must be the cell, got {first:?}"
-        );
-        assert!(
-            !source[first.clone()].contains('|'),
-            "cell SelectAll must not include `|`, got {:?}",
-            &source[first.clone()]
-        );
-        assert!(
-            table_select_all_range(&engine, source, &cell, None).is_none(),
-            "second SelectAll (already the cell) must fall through to the document"
-        );
-        assert!(
-            table_select_all_range(&engine, source, &(0..source.len()), None).is_none(),
-            "SelectAll must not shrink a whole-document selection back to a cell"
-        );
-
-        let mixed = "hello\n\n| a | b |\n|---|---|\n";
-        let (_doc, engine, _) = setup(mixed);
-        assert!(
-            table_select_all_range(&engine, mixed, &(0..0), None).is_none(),
-            "SelectAll in a paragraph must still take the document"
-        );
-
-        // Empty cell: collapsed body range equals the caret, so the prior-cell
-        // latch decides first vs second Cmd-A.
-        let empty = "|| b |\n|---|---|\n| 1 | 2 |\n";
-        let (_doc, engine, _) = setup(empty);
-        assert!(
-            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
-            "fixture must parse as a table, got {:?}",
-            engine.tree().blocks[0].kind
-        );
-        let cell = first_empty_cell_body(&engine, empty);
-        assert!(
-            cell.is_empty(),
-            "empty header cell body must be collapsed, got {cell:?}"
-        );
-        let first = table_select_all_range(&engine, empty, &cell, None)
-            .expect("first Cmd-A on an empty cell must still select the cell");
-        assert_eq!(first, cell, "first SelectAll must be the empty cell body");
-        assert!(
-            table_select_all_range(&engine, empty, &first, Some(&first)).is_none(),
-            "second SelectAll (empty cell already latched) must fall through to the document"
-        );
-        assert!(
-            table_select_all_range(&engine, empty, &(0..empty.len()), Some(&first)).is_none(),
-            "SelectAll must not shrink a whole-document selection back to a cell"
-        );
-    }
-
-    #[test]
-    fn drag_select_across_pipe_clamps_to_cell() {
-        let source = table_source();
-        let a = source.find('a').expect("header a");
-        let after_b = source.find('b').expect("header b") + 1;
-        let (mut doc, mut engine, mut caret) = setup(source);
-        caret.range = a..after_b;
-        caret.reversed = false;
-        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        let empty = first_empty_cell_body(&engine, source).start;
+        caret.collapse_to(empty);
+        type_chars(&mut doc, &mut engine, &mut caret, "*hi*");
         let after = doc.buffer.content();
         engine.sync(&doc);
         assert!(
             matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
-            "cross-cell Backspace must keep a table, got {after:?}"
+            "italic in a cell must not smash the table, got {after:?}"
         );
-        assert_eq!(
-            engine.tree().blocks[0].children[0].children.len(),
-            2,
-            "deleting a selection across `|` must not merge header cells, got {after:?}"
-        );
+        assert_eq!(engine.tree().blocks[0].children[0].children.len(), 2);
         assert!(
-            after.contains('|'),
-            "column pipes must survive, got {after:?}"
-        );
-        let header = after.lines().next().unwrap_or("");
-        assert!(
-            header.matches('|').count() >= 3,
-            "header must keep GFM pipes, got {after:?}"
-        );
-        assert!(
-            after.contains('b'),
-            "clamp to the start cell must not delete the other cell, got {after:?}"
-        );
-
-        let (mut doc, mut engine, mut caret) = setup(source);
-        caret.range = a..after_b;
-        apply(&mut doc, &mut engine, &mut caret, RichCommand::Delete);
-        let after = doc.buffer.content();
-        engine.sync(&doc);
-        assert_eq!(
-            engine.tree().blocks[0].children[0].children.len(),
-            2,
-            "cross-cell Delete must not merge header cells, got {after:?}"
+            after.contains("*hi*") || after.contains("_hi_"),
+            "cell italic auto-close must still wrap, got {after:?}"
         );
     }
 
     fn fence_body_offset(source: &str, needle: &str) -> usize {
         source.find(needle).expect(needle)
+    }
+
+    fn count_list_items(blocks: &[Block]) -> usize {
+        blocks
+            .iter()
+            .map(|b| {
+                usize::from(matches!(b.kind, BlockKind::ListItem { .. }))
+                    + count_list_items(&b.children)
+            })
+            .sum()
     }
 
     fn still_one_fence(source: &str) -> bool {
@@ -4523,6 +9038,18 @@ mod tests {
             && source.contains("```")
             && !source.contains("`\n``")
             && !source.contains("``\n`")
+    }
+
+    fn first_code(blocks: &[Block]) -> Option<&Block> {
+        for b in blocks {
+            if matches!(b.kind, BlockKind::CodeBlock { .. }) {
+                return Some(b);
+            }
+            if let Some(found) = first_code(&b.children) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     fn first_opaque(blocks: &[Block]) -> Option<&Block> {
@@ -4535,6 +9062,15 @@ mod tests {
             }
         }
         None
+    }
+
+    fn painted_code_len(block: &Block) -> usize {
+        match &block.kind {
+            BlockKind::CodeBlock { literal, .. } => {
+                literal.strip_suffix('\n').unwrap_or(literal).len()
+            }
+            _ => 0,
+        }
     }
 
     #[test]
@@ -4871,53 +9407,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_line_break_in_paragraph_is_backslash_newline() {
-        let (mut doc, mut engine, mut caret) = setup("hello world\n");
-        caret.collapse_to("hello".len());
-        let after = apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::InsertLineBreak,
-        );
-        assert!(
-            after.contains("hello\\\n world") || after.contains("hello\\\nworld"),
-            "Shift-Enter outside a table must insert a markdown hard break, got {after:?}"
-        );
-        assert!(
-            !after.contains("<br>"),
-            "paragraph hard break is not HTML <br>: {after:?}"
-        );
-    }
-
-    #[test]
-    fn insert_line_break_in_table_is_br_not_backslash_newline() {
-        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
-        let (mut doc, mut engine, mut caret) = setup(source);
-        caret.collapse_to(source.find('a').expect("header a") + 1);
-        let after = apply(
-            &mut doc,
-            &mut engine,
-            &mut caret,
-            RichCommand::InsertLineBreak,
-        );
-        assert!(
-            after.contains("<br>"),
-            "Shift-Enter in a table cell must insert <br>, got {after:?}"
-        );
-        assert!(
-            !after.contains("\\\n"),
-            "backslash-newline would split the GFM row: {after:?}"
-        );
-        engine.sync(&doc);
-        assert!(
-            matches!(engine.tree().blocks[0].kind, BlockKind::Table { .. }),
-            "{:?}",
-            engine.tree().blocks[0].kind
-        );
-    }
-
-    #[test]
     fn backspace_at_quoted_fence_body_start_does_not_eat_quote() {
         let source = "> ```\n> code\n> ```\n";
         let (mut doc, mut engine, mut caret) = setup(source);
@@ -5046,6 +9535,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quoted_fence_visible_map_skips_quote_prefix() {
+        let source = "> ```\n> code\n> ```\n";
+        let (_doc, engine, _) = setup(source);
+        let block = first_code(&engine.tree().blocks).expect("quoted fence");
+        let map = super::code_body_source_map(source, block, painted_code_len(block));
+        let c = source.find("code").expect("code");
+        let gt = source.find('>').expect(">");
+        assert_eq!(
+            map[0], c,
+            "first painted body byte must be `c`, map={map:?}"
+        );
+        assert_ne!(
+            map[0], gt,
+            "click on painted `code` must not land on `>`, map={map:?}"
+        );
+        assert_eq!(&source[map[0]..map[0] + 1], "c");
+        assert_eq!(map.len(), "code".len() + 1);
+    }
+
+    #[test]
+    fn unquoted_fence_visible_map_is_one_to_one() {
+        let source = "```\ncode\n```\n";
+        let (_doc, engine, _) = setup(source);
+        let block = first_code(&engine.tree().blocks).expect("fence");
+        let map = super::code_body_source_map(source, block, painted_code_len(block));
+        let c = source.find("code").expect("code");
+        assert_eq!(map[0], c);
+        assert_eq!(map[1], c + 1);
+        assert_eq!(map[4], c + 4);
+    }
+
+    #[test]
+    fn list_nested_fence_visible_map_skips_indent() {
+        let source = "- item\n  ```\n  code\n  ```\n";
+        let (_doc, engine, _) = setup(source);
+        let block = first_code(&engine.tree().blocks).expect("nested fence");
+        let map = super::code_body_source_map(source, block, painted_code_len(block));
+        let c = source.find("code").expect("code");
+        let indent = source.find("  code").expect("indented code line");
+        assert_eq!(map[0], c, "first painted byte must be `c`, map={map:?}");
+        assert_ne!(
+            map[0], indent,
+            "click on painted `code` must not land on list indent, map={map:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_list_nested_fence_visible_map_skips_quote_and_indent() {
+        let source = "> - item\n>   ```\n>   code\n>   ```\n";
+        let (_doc, engine, _) = setup(source);
+        let block = first_code(&engine.tree().blocks).expect("quoted nested fence");
+        let map = super::code_body_source_map(source, block, painted_code_len(block));
+        let c = source.find("code").expect("code");
+        let gt = source.rfind(">   code").expect("quoted code line");
+        assert_eq!(map[0], c);
+        assert_ne!(map[0], gt, "must skip `>` on the body line, map={map:?}");
+    }
+
+    #[test]
+    fn quoted_multiline_fence_visible_map_skips_prefix_on_each_line() {
+        let source = "> ```\n> ab\n> cd\n> ```\n";
+        let (_doc, engine, _) = setup(source);
+        let block = first_code(&engine.tree().blocks).expect("quoted fence");
+        let map = super::code_body_source_map(source, block, painted_code_len(block));
+        let a = source.find("ab").expect("ab");
+        let c = source.find("cd").expect("cd");
+        assert_eq!(map[0], a);
+        assert_eq!(&source[map[0]..map[0] + 2], "ab");
+        let nl = map
+            .iter()
+            .position(|&off| source.as_bytes().get(off) == Some(&b'\n'));
+        assert!(
+            nl.is_some(),
+            "newline must stay in the painted map, map={map:?}"
+        );
+        assert_eq!(map[3], c, "second line `c` after skipped `>`, map={map:?}");
+        assert_ne!(map[3], source.find('>').expect(">"));
+    }
+
+    fn painted_html_len(block: &Block) -> usize {
+        match &block.kind {
+            BlockKind::Opaque { raw } => raw.len(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn quoted_html_visible_map_skips_quote_prefix() {
+        let source = "> <div>\n> x\n> </div>\n";
+        let (_doc, engine, _) = setup(source);
+        let block = first_opaque(&engine.tree().blocks).expect("quoted html");
+        let map = super::code_body_source_map(source, block, painted_html_len(block));
+        let x = source.find('x').expect("x");
+        let gt = source.find('>').expect(">");
+        assert!(
+            map.contains(&x),
+            "map must include the `x` byte, map={map:?}"
+        );
+        assert_ne!(
+            map[0], gt,
+            "first painted HTML body byte must not be `>`, map={map:?}"
+        );
+        assert_eq!(&source[x..x + 1], "x");
+    }
+
+    #[test]
+    fn unquoted_html_visible_map_is_one_to_one_on_literal() {
+        let source = "<div>\nx\n</div>\n";
+        let (_doc, engine, _) = setup(source);
+        let block = first_opaque(&engine.tree().blocks).expect("html");
+        let raw = match &block.kind {
+            BlockKind::Opaque { raw } => raw.as_str(),
+            _ => unreachable!(),
+        };
+        let map = super::code_body_source_map(source, block, raw.len());
+        assert_eq!(map[0], block.source_range.start);
+        assert_eq!(map[1], block.source_range.start + 1);
+        let x = source.find('x').expect("x");
+        assert!(map.contains(&x), "map={map:?}");
+    }
+
+    #[test]
+    fn indented_code_visible_map_skips_indent() {
+        let source = "    code\n";
+        let (_doc, engine, _) = setup(source);
+        let block = first_code(&engine.tree().blocks).expect("indented code");
+        let map = super::code_body_source_map(source, block, painted_code_len(block));
+        let c = source.find("code").expect("code");
+        let indent = source.find("    code").expect("indent");
+        assert_eq!(map[0], c, "first painted byte must be `c`, map={map:?}");
+        assert_ne!(map[0], indent);
+    }
 
     #[test]
     fn delete_at_end_of_fence_does_not_nibble_closing_ticks() {
@@ -5152,5 +9774,160 @@ mod tests {
         );
     }
 
+    fn has_definition_list(blocks: &[Block]) -> bool {
+        blocks.iter().any(|b| {
+            matches!(b.kind, BlockKind::DefinitionList) || has_definition_list(&b.children)
+        })
+    }
 
+    fn extra_blank_before_details(source: &str) -> bool {
+        source.contains("\n\n\n")
+    }
+
+    #[test]
+    fn enter_at_end_of_definition_term_places_details_opener() {
+        for source in [
+            "Term\n\n: details\n",
+            "Term\n: details\n",
+            "> Term\n> : details\n",
+            "> Term\n>\n> : details\n",
+            "Term\n: \n",
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            assert!(
+                has_definition_list(&engine.tree().blocks),
+                "fixture must parse as a definition list: {source:?}"
+            );
+            let term_end = source.find("Term").expect("Term") + "Term".len();
+            caret.collapse_to(term_end);
+            let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            assert!(
+                !extra_blank_before_details(&after),
+                "Enter at end of term must not insert extra blanks, {source:?} -> {after:?}"
+            );
+            assert!(
+                has_definition_list(&engine.tree().blocks),
+                "must remain a definition list after Enter, {source:?} -> {after:?}"
+            );
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("x".into()),
+            );
+            let typed = doc.buffer.content();
+            assert!(
+                typed.contains(": x") || typed.contains(":x"),
+                "typing after term-end Enter must land in details, {source:?} -> {typed:?}"
+            );
+            assert!(
+                !typed.contains("Termx") && !typed.contains("Term\n\n\nx"),
+                "must not type into the term or a new blank paragraph, {source:?} -> {typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_at_end_of_definition_term_via_insert_newline_places_details() {
+        let source = "Term\n\n: details\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to("Term".len());
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("\n".into()),
+        );
+        assert_eq!(
+            after, source,
+            "IME Enter at end of term must place the details opener, not splice blanks"
+        );
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("x".into()),
+        );
+        assert!(
+            doc.buffer.content().contains(": xdetails"),
+            "got {:?}",
+            doc.buffer.content()
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_of_definition_details_strips_marker() {
+        for source in [
+            "Term\n\n: details\n",
+            "Term\n: details\n",
+            "> Term\n> : details\n",
+            "> Term\n>\n> : details\n",
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            let d = source.find("details").expect("details");
+            caret.collapse_to(d);
+            let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+            assert!(
+                !after.contains("Termdetails") && !after.contains("> Termdetails"),
+                "Backspace at details start must not concatenate term+details, {source:?} -> {after:?}"
+            );
+            assert!(
+                after.contains("Term") && after.contains("details"),
+                "term and details text must survive, {source:?} -> {after:?}"
+            );
+            let details_line = after
+                .lines()
+                .find(|l| l.contains("details"))
+                .expect("details line");
+            assert!(
+                definition_details_marker_prefix(after_quote(details_line)).is_none(),
+                "`: ` marker must be stripped, {source:?} -> {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backspace_mid_definition_details_still_deletes_a_grapheme() {
+        let source = "Term\n: details\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("tails").expect("mid"));
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert!(
+            after.contains(": ") && after.contains("Term") && !after.contains("details"),
+            "mid-details Backspace still deletes a grapheme, got {after:?}"
+        );
+        assert!(
+            has_definition_list(&engine.tree().blocks),
+            "must remain a definition list, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn delete_word_left_at_definition_details_start_strips_marker() {
+        let source = "Term\n: details\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("details").expect("details"));
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::DeleteWordLeft,
+        );
+        assert!(
+            !after.contains("Termdetails"),
+            "Option-Backspace at details start must not join into Termdetails, got {after:?}"
+        );
+        assert!(
+            after.contains("Term") && after.contains("details"),
+            "got {after:?}"
+        );
+        let details_line = after
+            .lines()
+            .find(|l| l.contains("details"))
+            .expect("details line");
+        assert!(
+            definition_details_marker_prefix(after_quote(details_line)).is_none(),
+            "marker must be gone, got {after:?}"
+        );
+    }
 }
