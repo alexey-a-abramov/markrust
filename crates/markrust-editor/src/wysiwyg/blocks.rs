@@ -4,6 +4,7 @@
 
 //! Per-kind block renderers for the WYSIWYG surface.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,14 +17,17 @@ use markrust_core::html_visual::{
     definition_list_items, footnote_definition, project_html_block, to_superscript, HtmlBlockVisual,
 };
 use markrust_core::rich::{
-    blank_caret_gap_after_last, blank_caret_gap_before, Block, BlockKind, ColumnAlign, Inline,
-    NodeId, PrefixBlank, RichTree,
+    alert_title_range, blank_caret_gap_after_last, blank_caret_gap_before,
+    link_reference_def_chrome, toc_visible_range, Block, BlockKind, ColumnAlign, Inline, NodeId,
+    PrefixBlank, RichTree,
 };
 
 use super::block_text::{
-    build_blank_gap_layout, build_code_block_layout, build_code_layout, build_html_block_layout,
-    build_leaf_layout_inlines, build_leaf_layout_revealed, BlockTextElement, OverlayTarget,
-    RevealState, WidgetOverlay, WysiwygHost,
+    apply_code_fence_reveal, apply_structural_chrome, build_blank_gap_layout,
+    build_code_block_layout, build_code_layout, build_html_block_layout, build_leaf_layout_inlines,
+    build_leaf_layout_revealed, build_prefix_blank_layout, chrome_hosts_for, layout_html_block,
+    table_alignment_line, BlockTextElement, ChromeHosts, OverlayTarget, RevealState, WidgetOverlay,
+    WysiwygHost,
 };
 use super::image::{resolve_image_source, ResolvedImage};
 use super::inline_layout::{
@@ -41,6 +45,17 @@ pub struct RenderSnapshot {
     pub theme: EditorTheme,
     /// Directory of the document, for resolving relative image paths.
     pub base_dir: Option<PathBuf>,
+    /// Original local image path → validated, content-addressed cache path
+    /// approved for GPUI's decoder. The source path never reaches GPUI.
+    pub local_image_paths: HashMap<PathBuf, PathBuf>,
+    /// Paths currently being classified off the UI thread. This distinguishes
+    /// the brief first-frame placeholder from a failed or missing image.
+    pub local_image_pending: HashSet<PathBuf>,
+    /// Normalized document `data:` URL → validated, content-addressed cache
+    /// path approved for GPUI's decoder. The URI itself never reaches GPUI.
+    pub data_image_paths: HashMap<String, PathBuf>,
+    /// `data:` URLs currently undergoing bounded background preflight.
+    pub data_image_pending: HashSet<String>,
     pub editing_code: Option<(NodeId, String)>,
     pub editing_image: Option<(Range<usize>, String)>,
     pub caret: usize,
@@ -118,8 +133,29 @@ fn prefix_blank_element<H: WysiwygHost>(
     blank: &PrefixBlank,
     editor: Entity<H>,
 ) -> AnyElement {
-    let end = blank.home.max(blank.line.end);
-    blank_gap_element(snap, blank.home..end, editor)
+    let theme = &snap.theme;
+    let font_size = theme.font_size;
+    let line_height = theme.line_height_for_font_size(font_size);
+    let reveal = RevealState {
+        caret: snap.caret,
+        selection: snap.selected_range.clone(),
+    };
+    let text_style = base_text_style(theme, font_size, FontWeight::NORMAL);
+    BlockTextElement {
+        editor,
+        layout: Arc::new(build_prefix_blank_layout(
+            &snap.source,
+            blank,
+            &reveal,
+            &text_style,
+            theme,
+        )),
+        font_size,
+        line_height,
+        theme: theme.clone(),
+        hug_width: false,
+    }
+    .into_any_element()
 }
 
 fn with_prefix_blank_leaves<H: WysiwygHost>(
@@ -192,12 +228,24 @@ fn render_block<H: WysiwygHost>(
                 .is_some_and(|(id, _)| *id == block.id);
             let mut code_style = base_text_style(theme, theme.font_size * 0.9, FontWeight::NORMAL);
             code_style.font_family = theme.code_font_family.clone().into();
+            let reveal = RevealState {
+                caret: snap.caret,
+                selection: snap.selected_range.clone(),
+            };
             let mut layout =
                 build_code_block_layout(&body, &snap.source, block, &code_style, theme);
             let hl = code_runs(&body, &language, theme);
             if !hl.is_empty() && !body.is_empty() {
                 layout.runs = text_runs_from_highlights(&body, &hl, &code_style);
             }
+            apply_code_fence_reveal(
+                &mut layout,
+                block,
+                &snap.source,
+                &reveal,
+                &code_style,
+                theme,
+            );
             let layout = std::sync::Arc::new(layout);
             let line_height = theme.line_height_for_font_size(theme.font_size * 0.9);
             let editor_away = editor.clone();
@@ -271,9 +319,12 @@ fn render_block<H: WysiwygHost>(
         }
         BlockKind::Table { alignments } => render_table(snap, block, alignments, editor),
         BlockKind::TableRow { .. } | BlockKind::TableCell => div().into_any_element(),
-        BlockKind::ThematicBreak => thematic_rule(theme, editor),
+        BlockKind::ThematicBreak => render_thematic_break(snap, block, editor),
         BlockKind::FootnoteDefinition { label } => {
             render_footnote_def_nested(snap, block, label, editor)
+        }
+        BlockKind::LinkReferenceDefinition { .. } => {
+            paragraph_element(snap, block, theme.font_size, FontWeight::NORMAL, editor)
         }
         BlockKind::DefinitionList => render_definition_list_nested(snap, block, editor),
         BlockKind::DefinitionItem { .. } => render_definition_item(snap, block, editor),
@@ -281,13 +332,19 @@ fn render_block<H: WysiwygHost>(
             render_nested_inlines(snap, block, theme.font_size, FontWeight::SEMIBOLD, editor)
         }
         BlockKind::DefinitionDetails => {
-            let inner =
-                render_nested_inlines(snap, block, theme.font_size, FontWeight::NORMAL, editor);
-            div()
-                .pl(px(16.))
-                .text_color(theme.secondary_text)
-                .child(inner)
-                .into_any_element()
+            let reveal = RevealState {
+                caret: snap.caret,
+                selection: snap.selected_range.clone(),
+            };
+            let hosts = chrome_hosts_for(&snap.tree, block.id);
+            let show_colon = reveal.intersects(&block.source_range)
+                || revealed_details_prefix(&snap.source, block, &reveal, &hosts);
+            let inner = with_prefix_blank_leaves(snap, block, editor);
+            let mut wrap = div().text_color(theme.secondary_text);
+            if !show_colon {
+                wrap = wrap.pl(px(16.));
+            }
+            wrap.children(inner).into_any_element()
         }
         BlockKind::Opaque { raw } => render_opaque(snap, block, raw, editor),
     }
@@ -335,11 +392,16 @@ fn render_alert<H: WysiwygHost>(
         }
         .into_any_element()
     } else {
-        let caret_at = if tag_range.start < tag_range.end {
-            tag_range.start
-        } else {
-            block.source_range.start
-        };
+        let caret_at = alert_title_range(tag_range, chrome_range)
+            .map(|r| r.start)
+            .or_else(|| {
+                block
+                    .children
+                    .iter()
+                    .find(|child| child.source_range.start >= tag_range.end)
+                    .map(|child| child.source_range.start)
+            })
+            .unwrap_or(tag_range.end);
         let editor_click = editor.clone();
         let label = kind.callout_label(title.as_deref());
         div()
@@ -382,7 +444,7 @@ fn render_toc<H: WysiwygHost>(
     }
     let entries = snap.tree.outline();
     if entries.is_empty() {
-        let caret_at = block.source_range.start;
+        let caret_at = toc_visible_range(&snap.source, block.source_range.clone()).start;
         let editor_click = editor.clone();
         return div()
             .id(("toc-empty", block.id.0))
@@ -432,13 +494,62 @@ fn render_toc<H: WysiwygHost>(
         .into_any_element()
 }
 
-fn thematic_rule<H: WysiwygHost>(theme: &EditorTheme, editor: Entity<H>) -> AnyElement {
+fn render_thematic_break<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    block: &Block,
+    editor: Entity<H>,
+) -> AnyElement {
+    let theme = &snap.theme;
+    let reveal = RevealState {
+        caret: snap.caret,
+        selection: snap.selected_range.clone(),
+    };
+    if reveal.intersects(&block.source_range) {
+        let text_style = base_text_style(theme, theme.font_size, FontWeight::NORMAL);
+        let hosts = chrome_hosts_for(&snap.tree, block.id);
+        let layout = build_leaf_layout_revealed(
+            block,
+            &snap.source,
+            &text_style,
+            theme,
+            FontWeight::NORMAL,
+            &reveal,
+            &hosts,
+        );
+        let line_height = theme.line_height_for_font_size(theme.font_size);
+        return BlockTextElement {
+            editor,
+            layout: Arc::new(layout),
+            font_size: theme.font_size,
+            line_height,
+            theme: theme.clone(),
+            hug_width: false,
+        }
+        .into_any_element();
+    }
+    thematic_rule(theme, editor, block.source_range.clone())
+}
+
+fn thematic_rule<H: WysiwygHost>(
+    theme: &EditorTheme,
+    editor: Entity<H>,
+    click_range: Range<usize>,
+) -> AnyElement {
+    let editor_click = editor.clone();
     div()
+        .id(("thematic-rule", click_range.start as u64))
         .w_full()
-        .my(px(16.))
+        .my(px(8.))
+        .py(px(8.))
         .relative()
+        .cursor(CursorStyle::PointingHand)
         .child(painted_bounds_hit(editor))
         .child(div().w_full().h(px(1.)).bg(theme.table_delimiter))
+        .on_click(move |_, window, cx| {
+            editor_click.update(cx, |host, cx| {
+                host.select_source_range(click_range.clone(), window, cx);
+            });
+        })
         .into_any_element()
 }
 
@@ -467,8 +578,28 @@ fn render_opaque<H: WysiwygHost>(
         return render_definition_list(theme, items);
     }
     match project_html_block(raw) {
-        HtmlBlockVisual::Hidden => div().into_any_element(),
-        HtmlBlockVisual::ThematicBreak => thematic_rule(theme, editor),
+        HtmlBlockVisual::Hidden => {
+            let text_style = base_text_style(theme, theme.font_size, FontWeight::NORMAL);
+            let reveal = RevealState {
+                caret: snap.caret,
+                selection: snap.selected_range.clone(),
+            };
+            let layout = layout_html_block(&snap.source, block, &text_style, theme, &reveal);
+            if layout.text.is_empty() {
+                return div().into_any_element();
+            }
+            let line_height = theme.line_height_for_font_size(theme.font_size);
+            BlockTextElement {
+                editor,
+                layout: Arc::new(layout),
+                font_size: theme.font_size,
+                line_height,
+                theme: theme.clone(),
+                hug_width: false,
+            }
+            .into_any_element()
+        }
+        HtmlBlockVisual::ThematicBreak => render_thematic_break(snap, block, editor),
         HtmlBlockVisual::Image { url, alt } => render_image(
             snap,
             &alt,
@@ -484,6 +615,10 @@ fn render_opaque<H: WysiwygHost>(
             runs,
         } => {
             let text_style = base_text_style(theme, theme.font_size, FontWeight::NORMAL);
+            let reveal = RevealState {
+                caret: snap.caret,
+                selection: snap.selected_range.clone(),
+            };
             let layout = build_html_block_layout(
                 &text,
                 &source_at,
@@ -492,6 +627,7 @@ fn render_opaque<H: WysiwygHost>(
                 block,
                 &text_style,
                 theme,
+                &reveal,
             );
             let line_height = theme.line_height_for_font_size(theme.font_size);
             BlockTextElement {
@@ -514,20 +650,48 @@ fn render_footnote_def_nested<H: WysiwygHost>(
     editor: Entity<H>,
 ) -> AnyElement {
     let theme = &snap.theme;
+    let reveal = RevealState {
+        caret: snap.caret,
+        selection: snap.selected_range.clone(),
+    };
+    let hosts = chrome_hosts_for(&snap.tree, block.id);
+    let show_source = reveal.intersects(&block.source_range)
+        || revealed_footnote_prefix(&snap.source, block, &reveal, &hosts);
+    let body: Vec<AnyElement> = {
+        let mut slots: Vec<(usize, AnyElement)> = block
+            .children
+            .iter()
+            .map(|child| {
+                (
+                    child.source_range.start,
+                    render_nested_inlines(
+                        snap,
+                        child,
+                        theme.font_size * 0.95,
+                        FontWeight::NORMAL,
+                        editor.clone(),
+                    ),
+                )
+            })
+            .collect();
+        for blank in prefix_blanks_for(block, &snap.tree) {
+            slots.push((
+                blank.home,
+                prefix_blank_element(snap, blank, editor.clone()),
+            ));
+        }
+        slots.sort_by_key(|(k, _)| *k);
+        slots.into_iter().map(|(_, el)| el).collect()
+    };
+    if show_source {
+        return div()
+            .flex()
+            .flex_col()
+            .my(px(4.))
+            .children(body)
+            .into_any_element();
+    }
     let mark = to_superscript(label).unwrap_or_else(|| label.to_string());
-    let body: Vec<AnyElement> = block
-        .children
-        .iter()
-        .map(|child| {
-            render_nested_inlines(
-                snap,
-                child,
-                theme.font_size * 0.95,
-                FontWeight::NORMAL,
-                editor.clone(),
-            )
-        })
-        .collect();
     div()
         .flex()
         .flex_row()
@@ -552,11 +716,7 @@ fn render_definition_list_nested<H: WysiwygHost>(
     block: &Block,
     editor: Entity<H>,
 ) -> AnyElement {
-    let rows: Vec<AnyElement> = block
-        .children
-        .iter()
-        .map(|item| render_definition_item(snap, item, editor.clone()))
-        .collect();
+    let rows = with_prefix_blank_leaves(snap, block, editor);
     div().my(px(4.)).children(rows).into_any_element()
 }
 
@@ -565,17 +725,33 @@ fn render_definition_item<H: WysiwygHost>(
     item: &Block,
     editor: Entity<H>,
 ) -> AnyElement {
-    let children: Vec<AnyElement> = item
-        .children
-        .iter()
-        .map(|child| render_block(snap, child, editor.clone()))
-        .collect();
+    let children = with_prefix_blank_leaves(snap, item, editor);
     div()
         .flex()
         .flex_col()
         .mb(px(8.))
         .children(children)
         .into_any_element()
+}
+
+fn revealed_details_prefix(
+    source: &str,
+    block: &Block,
+    reveal: &RevealState,
+    hosts: &ChromeHosts,
+) -> bool {
+    let at = block.source_range.start.min(source.len());
+    super::block_text::prefix_range_shows_details(source, at, reveal, hosts)
+}
+
+fn revealed_footnote_prefix(
+    source: &str,
+    block: &Block,
+    reveal: &RevealState,
+    hosts: &ChromeHosts,
+) -> bool {
+    let at = block.source_range.start.min(source.len());
+    super::block_text::prefix_range_shows_footnote(source, at, reveal, hosts)
 }
 
 fn render_nested_inlines<H: WysiwygHost>(
@@ -660,17 +836,16 @@ fn render_list<H: WysiwygHost>(
                 BlockKind::ListItem { task } => *task,
                 _ => None,
             };
-            let glyph: SharedString = if let Some(checked) = task {
-                if checked {
-                    "☑".into()
-                } else {
-                    "☐".into()
-                }
-            } else if ordered {
-                format!("{}.", start + i).into()
-            } else {
-                "•".into()
+            let reveal = RevealState {
+                caret: snap.caret,
+                selection: snap.selected_range.clone(),
             };
+            let item_revealed = reveal.intersects(&item.source_range);
+            let paints_marker_in_leaf = item
+                .children
+                .iter()
+                .any(|c| matches!(c.kind, BlockKind::Paragraph | BlockKind::Heading { .. }));
+            let hide_pretty = item_revealed && paints_marker_in_leaf;
             let item_id = item.id;
             let is_task = task.is_some();
             let mut children: Vec<AnyElement> = item
@@ -683,32 +858,44 @@ fn render_list<H: WysiwygHost>(
                     children.push(prefix_blank_element(snap, blank, editor.clone()));
                 }
             }
-            let mut marker = div()
-                .id(("task", item_id.0))
-                .min_w(px(20.))
-                .text_color(if is_task {
-                    theme.accent
+            let mut row = div().flex().flex_row().items_start().gap(px(8.));
+            if hide_pretty && !is_task {
+                row = row.child(div().flex_1().children(children));
+            } else {
+                let glyph: SharedString = if hide_pretty {
+                    SharedString::from("")
+                } else if let Some(checked) = task {
+                    if checked {
+                        "☑".into()
+                    } else {
+                        "☐".into()
+                    }
+                } else if ordered {
+                    format!("{}.", start + i).into()
                 } else {
-                    theme.secondary_text
-                })
-                .text_size(px(theme.font_size))
-                .child(glyph);
-            if is_task {
-                let editor = editor.clone();
-                marker = marker
-                    .cursor(CursorStyle::PointingHand)
-                    .on_click(move |_, _, cx| {
-                        editor.update(cx, |host, cx| host.toggle_task(item_id, cx));
-                    });
+                    "•".into()
+                };
+                let mut marker = div()
+                    .id(("task", item_id.0))
+                    .min_w(px(20.))
+                    .text_color(if is_task {
+                        theme.accent
+                    } else {
+                        theme.secondary_text
+                    })
+                    .text_size(px(theme.font_size))
+                    .child(glyph);
+                if is_task {
+                    let editor = editor.clone();
+                    marker = marker
+                        .cursor(CursorStyle::PointingHand)
+                        .on_click(move |_, _, cx| {
+                            editor.update(cx, |host, cx| host.toggle_task(item_id, cx));
+                        });
+                }
+                row = row.child(marker).child(div().flex_1().children(children));
             }
-            div()
-                .flex()
-                .flex_row()
-                .items_start()
-                .gap(px(8.))
-                .child(marker)
-                .child(div().flex_1().children(children))
-                .into_any_element()
+            row.into_any_element()
         })
         .collect();
     div().flex().flex_col().gap(px(2.)).children(rows)
@@ -721,57 +908,92 @@ fn render_table<H: WysiwygHost>(
     editor: Entity<H>,
 ) -> AnyElement {
     let theme = snap.theme.clone();
-    let rows: Vec<AnyElement> = table
-        .children
-        .iter()
-        .map(|row| {
-            let header = matches!(row.kind, BlockKind::TableRow { header: true });
-            let cells: Vec<AnyElement> = row
-                .children
-                .iter()
-                .enumerate()
-                .map(|(c, cell)| {
-                    let align = alignments.get(c).copied().unwrap_or(ColumnAlign::None);
-                    let weight = if header {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::NORMAL
-                    };
-                    let cell_start = cell.source_range.start;
-                    let editor_menu = editor.clone();
-                    let mut el = div()
-                        .flex_1()
-                        .px(px(10.))
-                        .py(px(6.))
-                        .border_1()
-                        .border_color(theme.separator)
-                        .on_mouse_down(MouseButton::Right, move |_, window, cx| {
-                            editor_menu.update(cx, |host, cx| {
-                                host.open_table_menu(cell_start, window, cx);
-                            });
-                        })
-                        .child(paragraph_element(
-                            snap,
-                            cell,
-                            theme.font_size * 0.95,
-                            weight,
-                            editor.clone(),
-                        ));
-                    el = match align {
-                        ColumnAlign::Center => el.text_center(),
-                        ColumnAlign::Right => el.text_right(),
-                        _ => el,
-                    };
-                    el.into_any_element()
-                })
-                .collect();
-            let mut row_el = div().flex().flex_row();
-            if header {
-                row_el = row_el.bg(theme.table_header_bg);
+    let reveal = RevealState {
+        caret: snap.caret,
+        selection: snap.selected_range.clone(),
+    };
+    let show_align = reveal.intersects(&table.source_range);
+    let align_line = show_align
+        .then(|| table_alignment_line(&snap.source, table))
+        .flatten();
+    let mut rows: Vec<AnyElement> = Vec::new();
+    for row in &table.children {
+        let header = matches!(row.kind, BlockKind::TableRow { header: true });
+        let cells: Vec<AnyElement> = row
+            .children
+            .iter()
+            .enumerate()
+            .map(|(c, cell)| {
+                let align = alignments.get(c).copied().unwrap_or(ColumnAlign::None);
+                let weight = if header {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                };
+                let cell_start = cell.source_range.start;
+                let editor_menu = editor.clone();
+                let mut el = div()
+                    .flex_1()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .border_1()
+                    .border_color(theme.separator)
+                    .on_mouse_down(MouseButton::Right, move |_, window, cx| {
+                        editor_menu.update(cx, |host, cx| {
+                            host.open_table_menu(cell_start, window, cx);
+                        });
+                    })
+                    .child(paragraph_element(
+                        snap,
+                        cell,
+                        theme.font_size * 0.95,
+                        weight,
+                        editor.clone(),
+                    ));
+                el = match align {
+                    ColumnAlign::Center => el.text_center(),
+                    ColumnAlign::Right => el.text_right(),
+                    _ => el,
+                };
+                el.into_any_element()
+            })
+            .collect();
+        let mut row_el = div().flex().flex_row();
+        if header {
+            row_el = row_el.bg(theme.table_header_bg);
+        }
+        rows.push(row_el.children(cells).into_any_element());
+        if header {
+            if let Some(range) = &align_line {
+                if let Some(slice) = snap.source.get(range.clone()) {
+                    let mut delim_style =
+                        base_text_style(&theme, theme.font_size * 0.85, FontWeight::NORMAL);
+                    delim_style.color = theme.secondary_text;
+                    let layout = std::sync::Arc::new(build_code_layout(
+                        slice,
+                        range.start,
+                        &delim_style,
+                        &theme,
+                    ));
+                    let line_height = theme.line_height_for_font_size(theme.font_size * 0.85);
+                    rows.push(
+                        div()
+                            .px(px(10.))
+                            .py(px(2.))
+                            .child(BlockTextElement {
+                                editor: editor.clone(),
+                                layout,
+                                font_size: theme.font_size * 0.85,
+                                line_height,
+                                theme: theme.clone(),
+                                hug_width: false,
+                            })
+                            .into_any_element(),
+                    );
+                }
             }
-            row_el.children(cells).into_any_element()
-        })
-        .collect();
+        }
+    }
     div()
         .my(px(6.))
         .rounded_md()
@@ -783,11 +1005,12 @@ fn render_table<H: WysiwygHost>(
 }
 
 /// A leaf block's inline content as wrapped rich text, with images as GPUI
-/// `img()` pixels (filesystem `PathBuf`, decoded on the background executor).
-/// Remote `http(s)` images use a URL cache path once fetched; until then (and
-/// on failure) the alt placeholder is shown. Mixed text+image paragraphs are
-/// a wrapping flex row (GPUI cannot mix Image and glyphs in one `TextRun`);
-/// standalone image paragraphs stay block-sized.
+/// `img()` pixels (validated filesystem cache `PathBuf`s, decoded on the
+/// background executor). Local and `data:` images are materialized before
+/// render; remote `http(s)` images use a URL cache path once fetched. Until
+/// then (and on failure) the alt placeholder is shown. Mixed text+image
+/// paragraphs are a wrapping flex row (GPUI cannot mix Image and glyphs in one
+/// `TextRun`); standalone image paragraphs stay block-sized.
 fn paragraph_element<H: WysiwygHost>(
     snap: &Arc<RenderSnapshot>,
     block: &Block,
@@ -802,12 +1025,20 @@ fn paragraph_element<H: WysiwygHost>(
         caret: snap.caret,
         selection: snap.selected_range.clone(),
     };
+    let hosts = chrome_hosts_for(&snap.tree, block.id);
     let flow = classify_paragraph(&block.inlines);
     let role = image_role(flow).unwrap_or(ImageRole::Inline);
     match flow {
         ParagraphFlow::TextOnly => {
-            let layout =
-                build_leaf_layout_revealed(block, &text_style, theme, base_weight, &reveal);
+            let layout = build_leaf_layout_revealed(
+                block,
+                &snap.source,
+                &text_style,
+                theme,
+                base_weight,
+                &reveal,
+                &hosts,
+            );
             BlockTextElement {
                 editor,
                 layout: Arc::new(layout),
@@ -834,8 +1065,15 @@ fn paragraph_element<H: WysiwygHost>(
                 }
             }
             if children.is_empty() {
-                let layout =
-                    build_leaf_layout_revealed(block, &text_style, theme, base_weight, &reveal);
+                let layout = build_leaf_layout_revealed(
+                    block,
+                    &snap.source,
+                    &text_style,
+                    theme,
+                    base_weight,
+                    &reveal,
+                    &hosts,
+                );
                 children.push(
                     BlockTextElement {
                         editor,
@@ -862,8 +1100,12 @@ fn paragraph_element<H: WysiwygHost>(
                     InlineSegment::Text { start, end } => {
                         push_text_child(
                             &mut children,
-                            &block.inlines[start..end],
+                            block,
+                            &block.inlines,
+                            start,
+                            end,
                             block.source_range.clone(),
+                            &snap.source,
                             &text_style,
                             theme,
                             base_weight,
@@ -872,6 +1114,7 @@ fn paragraph_element<H: WysiwygHost>(
                             editor.clone(),
                             true,
                             &reveal,
+                            &hosts,
                         );
                     }
                     InlineSegment::Image { index } => {
@@ -891,8 +1134,15 @@ fn paragraph_element<H: WysiwygHost>(
                 }
             }
             if children.is_empty() {
-                let layout =
-                    build_leaf_layout_revealed(block, &text_style, theme, base_weight, &reveal);
+                let layout = build_leaf_layout_revealed(
+                    block,
+                    &snap.source,
+                    &text_style,
+                    theme,
+                    base_weight,
+                    &reveal,
+                    &hosts,
+                );
                 children.push(
                     BlockTextElement {
                         editor,
@@ -920,8 +1170,12 @@ fn paragraph_element<H: WysiwygHost>(
 #[allow(clippy::too_many_arguments)]
 fn push_text_child<H: WysiwygHost>(
     children: &mut Vec<AnyElement>,
+    block: &Block,
     inlines: &[Inline],
+    paint_start: usize,
+    paint_end: usize,
     block_range: Range<usize>,
+    source: &str,
     text_style: &TextStyle,
     theme: &EditorTheme,
     base_weight: FontWeight,
@@ -930,12 +1184,28 @@ fn push_text_child<H: WysiwygHost>(
     editor: Entity<H>,
     hug_width: bool,
     reveal: &RevealState,
+    hosts: &ChromeHosts,
 ) {
-    if inlines.is_empty() {
+    if paint_start >= paint_end || paint_start >= inlines.len() {
         return;
     }
-    let layout =
-        build_leaf_layout_inlines(inlines, block_range, text_style, theme, base_weight, reveal);
+    let def_chrome = link_reference_def_chrome(source, block);
+    let mut layout = build_leaf_layout_inlines(
+        inlines,
+        paint_start,
+        paint_end,
+        block_range,
+        source,
+        text_style,
+        theme,
+        base_weight,
+        reveal,
+        hosts,
+        def_chrome.as_ref(),
+    );
+    if paint_start == 0 {
+        apply_structural_chrome(&mut layout, block, source, reveal, hosts, text_style, theme);
+    }
     if layout.text.is_empty() {
         return;
     }
@@ -979,25 +1249,46 @@ fn render_image<H: WysiwygHost>(
     let editor_away = editor.clone();
     let editor_click = editor.clone();
     let alt_for_edit = alt.to_string();
-    let fallback_label = if alt.is_empty() {
-        "Missing image".to_string()
-    } else {
-        alt.to_string()
-    };
     let secondary = snap.theme.secondary_text;
     let code_bg = snap.theme.code_bg;
     let inline_h = px(inline_image_height(font_size));
     let edit_on_click = role == ImageRole::Inline;
     let click_range = image_range.clone();
-    // GPUI: `img(String)` is an *embedded asset*, not a file. Markdown images
-    // must be `PathBuf` (local file or a populated URL cache) so decode runs
-    // on the background executor. Do not `img()` a missing cache path: GPUI
+    // GPUI: `img(String)` is an unvalidated URI path. Markdown images must be
+    // `PathBuf`s: a preflight-approved local/data cache copy or a populated
+    // remote cache. Do not `img()` a missing cache path: GPUI
     // would cache the failure and never retry after the fetch writes the file.
     let resolved = resolve_image_source(snap.base_dir.as_deref(), url);
+    let local_preflight_pending = matches!(
+        &resolved,
+        ResolvedImage::Local(path) if snap.local_image_pending.contains(path)
+    );
+    let data_preflight_pending =
+        matches!(&resolved, ResolvedImage::Data) && snap.data_image_pending.contains(url.trim());
+    let fallback_label = if alt.is_empty() {
+        if local_preflight_pending || data_preflight_pending {
+            "Loading image".to_string()
+        } else {
+            "Missing image".to_string()
+        }
+    } else {
+        alt.to_string()
+    };
     let ready_source = match resolved {
         ResolvedImage::File(path) if path.is_file() => Some(img(path)),
-        ResolvedImage::Uri(uri) => Some(img(uri)),
-        ResolvedImage::File(_) => None,
+        ResolvedImage::Local(path) => snap
+            .local_image_paths
+            .get(&path)
+            .filter(|approved| approved.is_file())
+            .cloned()
+            .map(img),
+        ResolvedImage::Data => snap
+            .data_image_paths
+            .get(url.trim())
+            .filter(|approved| approved.is_file())
+            .cloned()
+            .map(img),
+        ResolvedImage::File(_) | ResolvedImage::Blocked => None,
     };
     let pixels = if let Some(source) = ready_source {
         let source = source

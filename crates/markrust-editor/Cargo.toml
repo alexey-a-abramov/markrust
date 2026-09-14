@@ -21,6 +21,10 @@ tree-sitter-bash = "0.25"
 dirs = "6.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 sha2 = "0.10"
+base64 = "0.22"
+# Validate document-controlled raster bytes, supported formats, and dimensions
+# before a cache copy is handed to GPUI's decoder.
+image = { version = "0.25", default-features = false }
 
 [dev-dependencies]
 pretty_assertions = "1.4"

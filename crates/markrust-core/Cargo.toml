@@ -19,6 +19,8 @@ rayon = { workspace = true }
 thiserror = { workspace = true }
 comrak = "0.36"
 similar = "2.6"
+unicode-segmentation = "1.12"
+yaml-rust = "0.4.5"
 
 [dev-dependencies]
 pretty_assertions = "1.4"

@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use markrust_core::{export_file_to_html, Document};
+use markrust_core::{export_file_to_html_with_policy, Document, HtmlExportPolicy};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -63,7 +63,7 @@ pub fn print_help() {
     println!("Usage:");
     println!("  markrust [PATH]                    Launch the desktop editor");
     println!("  markrust --gui [PATH]              Launch the desktop editor");
-    println!("  markrust export <file.md> [-o out.html]");
+    println!("  markrust export <file.md> [-o out.html] [--unsafe-html]");
     println!();
     println!("PATH may be a Markdown file or a workspace folder.");
     println!();
@@ -72,6 +72,7 @@ pub fn print_help() {
     println!("  -h, --help       Print help");
     println!("  -V, --version    Print version");
     println!("  -o, --output     HTML output path (export subcommand)");
+    println!("  --unsafe-html    Allow trusted raw HTML and dangerous URLs; GFM tag filtering remains enabled");
 }
 
 pub fn print_version() {
@@ -82,6 +83,7 @@ pub fn print_version() {
 pub fn run_export(args: &[String]) -> i32 {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut html_policy = HtmlExportPolicy::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -91,6 +93,9 @@ pub fn run_export(args: &[String]) -> i32 {
             "-h" | "--help" => {
                 print_help();
                 return 0;
+            }
+            "--unsafe-html" => {
+                html_policy = HtmlExportPolicy::Trusted;
             }
             other if input.is_none() => {
                 input = Some(PathBuf::from(other));
@@ -107,7 +112,7 @@ pub fn run_export(args: &[String]) -> i32 {
         print_help();
         return 1;
     };
-    match export_file_to_html(&input, output.as_deref()) {
+    match export_file_to_html_with_policy(&input, output.as_deref(), html_policy) {
         Ok(path) => {
             println!("{}", path.display());
             0
@@ -182,6 +187,12 @@ mod tests {
             parse_args(&["export".into(), "n.md".into()]),
             CliAction::Export { .. }
         ));
+        assert_eq!(
+            parse_args(&["export".into(), "--unsafe-html".into(), "n.md".into()]),
+            CliAction::Export {
+                args: vec!["--unsafe-html".into(), "n.md".into()]
+            }
+        );
         assert!(matches!(
             parse_args(&["--wat".into()]),
             CliAction::Unknown(_)

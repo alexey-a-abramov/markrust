@@ -92,7 +92,7 @@ fn follows_line_start_digits(text: &str, i: usize, line_start: Option<usize>) ->
 }
 
 /// Rough entity detection: `&name;` / `&#123;` / `&#xAB;`.
-fn looks_like_entity(rest: &str) -> bool {
+pub(crate) fn looks_like_entity(rest: &str) -> bool {
     let Some(body) = rest.strip_prefix('&') else {
         return false;
     };

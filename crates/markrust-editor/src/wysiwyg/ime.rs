@@ -7,17 +7,26 @@
 //! Two platform paths must agree on the same rectangle:
 //!
 //! - **Pull:** GPUI asks [`EntityInputHandler::bounds_for_range`] (macOS
-//!   `firstRectForCharacterRange:`) for the OS candidate window.
+//!   `firstRectForCharacterRange:` at `gpui_macos` `window.rs`) for the OS
+//!   candidate window. AppKit has no push-caret API.
 //! - **Push:** after a caret move, widget focus, or composition change, the
 //!   view calls `Window::invalidate_character_coordinates` (GPUI's equivalent
 //!   of `set_ime_cursor_position`). That schedules a next-frame
 //!   `InputHandler::selected_bounds` → `PlatformWindow::update_ime_position`.
-//!   On macOS `update_ime_position` ignores the bounds and calls
-//!   `NSTextInputContext invalidateCharacterCoordinates`, after which the OS
-//!   pulls `firstRectForCharacterRange:`. Linux/Windows use the bounds.
-//!   GPUI's `TestWindow::update_ime_position` is a no-op, so tests assert the
-//!   payload via [`ImeOriginState::take_platform_push`] plus
+//!   On macOS `update_ime_position` still **discards the Bounds** and only
+//!   calls `NSTextInputContext invalidateCharacterCoordinates`; the OS then
+//!   pulls `firstRectForCharacterRange:` → `bounds_for_range`. Linux/Windows
+//!   use the pushed bounds. GPUI's `TestWindow::update_ime_position` is a
+//!   no-op, so tests assert the payload via
+//!   [`ImeOriginState::take_platform_push`] plus
 //!   [`gpui::PlatformInputHandler::compute_ime_candidate_bounds`].
+//!
+//! `Render::render` calls [`ImeOriginState::begin_frame`] before children
+//! paint. The macOS pull can land in that gap, so the last **painted** caret
+//! (body, wrapped line, table cell, or overlay inner `|`) is sticky across
+//! `begin_frame`. It must not fall back to the leaf top-left or the overlay
+//! trailing edge. An unfocused leaf must not push that leftover sticky rect
+//! to Linux/Windows.
 //!
 //! Leaves and chip/caption/frontmatter widgets report geometry as they paint;
 //! this module resolves that noise into **one** caret rect from the focused
@@ -34,8 +43,54 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{point, px, size, Bounds, Pixels, Point, UTF16Selection};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::block_text::LeafLayout;
+
+/// One source-backed caret stop on a painted visual line.
+///
+/// `visible` is the byte offset in [`LeafLayout::text`]; `source` is the
+/// corresponding Markdown byte offset. Keeping both avoids treating hidden
+/// Markdown chrome as a visible column during vertical navigation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisualCaretStop {
+    pub visible: usize,
+    pub source: usize,
+    /// Window-relative horizontal glyph position in pixels.
+    pub x: f32,
+}
+
+/// Geometry for one rendered, soft-wrapped text row.
+///
+/// This is recorded while the text leaf paints. It deliberately stores only
+/// lightweight source/position data rather than a GPUI `WrappedLine`, so key
+/// handling can use the most recent paint without reshaping text or needing a
+/// `Window` borrow.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisualLine {
+    /// Inclusive visible caret bounds for this row. These are offsets, not a
+    /// slicing range: a soft-wrap boundary belongs to both adjacent rows.
+    pub visible_start: usize,
+    pub visible_end: usize,
+    /// Window-relative top edge in pixels.
+    pub top: f32,
+    pub height: f32,
+    pub stops: Vec<VisualCaretStop>,
+}
+
+/// Result of moving by rendered rows. `source` is absent at the viewport
+/// edge, where the caller should retain its source-level fallback.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisualVerticalTarget {
+    pub source: Option<usize>,
+    /// The original horizontal intent, kept even after landing on a short row.
+    pub preferred_x: f32,
+}
+
+struct ImeVisualLine {
+    layout: Arc<LeafLayout>,
+    line: VisualLine,
+}
 
 /// Who owns the IME origin this frame.
 #[cfg(test)]
@@ -66,6 +121,10 @@ pub struct ImeOriginState {
     widget_caret: Option<Bounds<Pixels>>,
     caret_source: usize,
     leaves: Vec<ImeLeafHit>,
+    /// Recent rendered rows used by WYSIWYG Up/Down. Like `leaves`, this is
+    /// frame-local: a virtualized, unpainted target falls back to the rich
+    /// engine's source-level vertical move.
+    visual_lines: Vec<ImeVisualLine>,
     /// Non-text painted surfaces (standalone images, thematic rules) so a
     /// leftover click is below them rather than on them.
     painted_bounds: Vec<Bounds<Pixels>>,
@@ -73,9 +132,10 @@ pub struct ImeOriginState {
     /// [`Self::caret_generation`] so composition start/update/commit still
     /// invalidates the platform IME even when the caret rect is unchanged.
     composition: Option<String>,
-    /// Last painted caret of the focused leaf. Survives blink-off frames
-    /// that omit `caret_bounds` so the OS candidate origin does not jump to
-    /// the leaf top-left.
+    /// Last painted caret of the focused leaf or overlay inner `|`.
+    /// Survives blink-off frames and `begin_frame` (hits cleared before
+    /// paint) so macOS `firstRectForCharacterRange:` / `bounds_for_range`
+    /// does not jump to the leaf top-left or overlay trailing edge.
     sticky_caret: Option<Bounds<Pixels>>,
     /// Bumps when the caret source, widget-focus flag, or composition key
     /// changes so a move still pushes even if two surfaces share a rectangle.
@@ -91,14 +151,20 @@ impl ImeOriginState {
         caret_source: usize,
         composition: Option<&str>,
     ) {
-        let caret_moved =
-            self.widget_focused != widget_focused || self.caret_source != caret_source;
+        let owner_changed = self.widget_focused != widget_focused;
+        let caret_moved = owner_changed || self.caret_source != caret_source;
         let composition_changed = self.composition.as_deref() != composition;
         if caret_moved || composition_changed {
             self.caret_generation = self.caret_generation.wrapping_add(1);
         }
-        if caret_moved {
+        // Snapshot the last painted caret before clearing per-frame hits.
+        // Keep it across in-surface caret moves (slightly stale is the
+        // previous glyph). Drop it when the IME owner changes so an overlay
+        // rect cannot leak onto the body, and vice versa.
+        if owner_changed {
             self.sticky_caret = None;
+        } else if let Some(rect) = self.painted_caret_rect() {
+            self.sticky_caret = Some(rect);
         }
         self.widget_focused = widget_focused;
         self.caret_source = caret_source;
@@ -106,6 +172,7 @@ impl ImeOriginState {
         self.widget_bounds = None;
         self.widget_caret = None;
         self.leaves.clear();
+        self.visual_lines.clear();
         self.painted_bounds.clear();
     }
 
@@ -119,10 +186,139 @@ impl ImeOriginState {
 
     pub fn report_widget_caret(&mut self, caret: Bounds<Pixels>) {
         self.widget_caret = Some(caret);
+        if self.widget_focused {
+            if let Some(rect) = self.painted_caret_rect() {
+                self.sticky_caret = Some(rect);
+            }
+        }
     }
 
     pub fn report_leaf(&mut self, leaf: ImeLeafHit) {
         self.leaves.push(leaf);
+    }
+
+    /// Record the visual rows just painted for one source leaf.
+    pub fn report_visual_lines(&mut self, layout: Arc<LeafLayout>, lines: Vec<VisualLine>) {
+        self.visual_lines
+            .extend(lines.into_iter().map(|line| ImeVisualLine {
+                layout: layout.clone(),
+                line,
+            }));
+    }
+
+    /// Invalidate paint-derived navigation after the document or rendering
+    /// metrics change. Using stale source maps for an edited document would
+    /// be worse than the source-level fallback.
+    pub fn clear_visual_navigation(&mut self) {
+        self.visual_lines.clear();
+    }
+
+    /// Find the adjacent painted visual row and the caret stop closest to the
+    /// requested x-coordinate. The caller persists `preferred_x` across
+    /// repeated Up/Down presses, so a short row does not permanently pull the
+    /// caret left.
+    ///
+    /// This intentionally operates only on freshly painted rows. A
+    /// virtualized list does not necessarily have the next offscreen block's
+    /// glyph geometry; returning `source: None` lets the editor use its
+    /// existing source-level fallback instead of inventing a layout.
+    pub fn visual_vertical_target(
+        &self,
+        caret: usize,
+        delta: i32,
+        preferred_x: Option<f32>,
+    ) -> Option<VisualVerticalTarget> {
+        if delta == 0 || self.visual_lines.is_empty() {
+            return None;
+        }
+
+        let mut current: Option<(usize, usize, usize, bool)> = None;
+        for (index, entry) in self.visual_lines.iter().enumerate() {
+            let visible = entry.layout.visible_for_source(caret);
+            if visible < entry.line.visible_start || visible > entry.line.visible_end {
+                continue;
+            }
+            let span = entry.layout.source_span_len();
+            // At a soft-wrap boundary, use the preceding row. GPUI's
+            // `position_for_index` paints that shared boundary on the first
+            // matching row, so navigation must use the same affinity.
+            let ends_here = entry.line.visible_end == visible;
+            let better = match current {
+                None => true,
+                Some((_, best_span, _, best_ends_here)) => {
+                    span < best_span || (span == best_span && ends_here && !best_ends_here)
+                }
+            };
+            if better {
+                current = Some((index, span, visible, ends_here));
+            }
+        }
+        let (current_index, _, current_visible, _) = current?;
+        let current_line = &self.visual_lines[current_index].line;
+        let current_x = current_line
+            .stops
+            .iter()
+            .find(|stop| stop.visible == current_visible && stop.source == caret)
+            .or_else(|| {
+                current_line
+                    .stops
+                    .iter()
+                    .find(|stop| stop.visible == current_visible)
+            })
+            .or_else(|| current_line.stops.first())
+            .map(|stop| stop.x)?;
+        let preferred_x = preferred_x.unwrap_or(current_x);
+
+        // Several leaves can share a flex row (for example, text around an
+        // image or table cells). Coalesce only exact/near-exact top edges;
+        // this keeps ordinary adjacent wrapped rows separate.
+        let mut ordered: Vec<usize> = (0..self.visual_lines.len()).collect();
+        ordered.sort_by(|left, right| {
+            self.visual_lines[*left]
+                .line
+                .top
+                .total_cmp(&self.visual_lines[*right].line.top)
+                .then_with(|| {
+                    self.visual_lines[*left]
+                        .line
+                        .visible_start
+                        .cmp(&self.visual_lines[*right].line.visible_start)
+                })
+        });
+        let mut rows: Vec<Vec<usize>> = Vec::new();
+        for index in ordered {
+            let top = self.visual_lines[index].line.top;
+            if let Some(last) = rows.last_mut() {
+                let row_top = self.visual_lines[last[0]].line.top;
+                if (top - row_top).abs() <= 0.5 {
+                    last.push(index);
+                    continue;
+                }
+            }
+            rows.push(vec![index]);
+        }
+        let current_row = rows.iter().position(|row| row.contains(&current_index))?;
+        let target_row = current_row as i64 + i64::from(delta);
+        if target_row < 0 || target_row >= rows.len() as i64 {
+            return Some(VisualVerticalTarget {
+                source: None,
+                preferred_x,
+            });
+        }
+        let target = rows[target_row as usize]
+            .iter()
+            .flat_map(|index| self.visual_lines[*index].line.stops.iter())
+            .min_by(|left, right| {
+                (left.x - preferred_x)
+                    .abs()
+                    .total_cmp(&(right.x - preferred_x).abs())
+                    .then_with(|| left.x.total_cmp(&right.x))
+                    .then_with(|| left.source.cmp(&right.source))
+            });
+        Some(VisualVerticalTarget {
+            source: target.map(|stop| stop.source),
+            preferred_x,
+        })
     }
 
     pub fn report_painted_bounds(&mut self, bounds: Bounds<Pixels>) {
@@ -141,19 +337,44 @@ impl ImeOriginState {
     }
 
     /// Caret rectangle the OS IME should follow.
+    ///
+    /// Prefers this frame's painted inner caret / leaf caret, then the sticky
+    /// origin from the last paint (macOS may pull `bounds_for_range` after
+    /// [`Self::begin_frame`] and before children paint). Trailing-edge and
+    /// leaf-top fallbacks are last resort only.
     pub fn caret_rect(&self) -> Option<Bounds<Pixels>> {
+        if let Some(rect) = self.painted_caret_rect() {
+            return Some(rect);
+        }
+        if let Some(rect) = self.sticky_caret {
+            return Some(rect);
+        }
         if self.widget_focused {
-            if let Some(inner) = self.widget_caret {
-                return Some(inner);
-            }
             return self.widget_bounds.map(widget_caret_rect);
         }
-        let leaf = self.focused_leaf()?;
-        Some(
-            leaf.caret_bounds
-                .or(self.sticky_caret)
-                .unwrap_or_else(|| leaf_origin_fallback(leaf)),
-        )
+        self.focused_leaf().map(leaf_origin_fallback)
+    }
+
+    /// Inner overlay `|` or the focused leaf's painted caret this frame.
+    ///
+    /// Does not include sticky, trailing-edge, or leaf-top fallbacks.
+    fn painted_caret_rect(&self) -> Option<Bounds<Pixels>> {
+        if self.widget_focused {
+            return self
+                .widget_caret
+                .filter(|bounds| !is_empty_ime_rect(*bounds));
+        }
+        self.focused_leaf()
+            .and_then(|leaf| leaf.caret_bounds)
+            .filter(|bounds| !is_empty_ime_rect(*bounds))
+    }
+
+    fn this_frame_reported_owner(&self) -> bool {
+        if self.widget_focused {
+            self.widget_caret.is_some()
+        } else {
+            self.focused_leaf().is_some()
+        }
     }
 
     /// Resolved origin to push to the platform IME cursor API.
@@ -163,11 +384,21 @@ impl ImeOriginState {
     /// view must call [`gpui::Window::invalidate_character_coordinates`] —
     /// not only wait for `bounds_for_range`. That is the GPUI equivalent of
     /// `set_ime_cursor_position`; the test window does not record it.
+    ///
+    /// Does not push a leftover sticky rect before this frame has reported
+    /// the focused leaf or overlay caret (an earlier unfocused leaf must
+    /// not send the previous glyph to Linux/Windows).
     pub fn take_platform_push(&mut self) -> Option<Bounds<Pixels>> {
-        if let Some(painted) = self.focused_leaf().and_then(|leaf| leaf.caret_bounds) {
+        if let Some(painted) = self.painted_caret_rect() {
             self.sticky_caret = Some(painted);
         }
+        if !self.this_frame_reported_owner() {
+            return None;
+        }
         let rect = self.caret_rect()?;
+        if is_empty_ime_rect(rect) {
+            return None;
+        }
         let same_generation = self.last_pushed_generation == Some(self.caret_generation);
         let same_rect = self.last_platform_origin == Some(rect);
         if same_generation && same_rect {
@@ -234,12 +465,25 @@ pub fn caret_from_element_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
     }
 }
 
+/// True when a rect cannot anchor an IME candidate window.
+fn is_empty_ime_rect(bounds: Bounds<Pixels>) -> bool {
+    bounds.size.width <= px(0.) || bounds.size.height <= px(0.)
+}
+
 /// Pull path used by [`gpui::EntityInputHandler::bounds_for_range`].
+///
+/// On macOS this is what `firstRectForCharacterRange:` forwards after
+/// converting window-relative GPUI bounds to screen coordinates. Prefer a
+/// sticky caret over the element fallback so a pull between `begin_frame`
+/// and paint still sits on the `|`.
 pub(super) fn ime_origin_bounds(
     ime: &ImeOriginState,
     element_bounds: Bounds<Pixels>,
 ) -> Bounds<Pixels> {
-    if let Some(caret) = ime.caret_rect() {
+    if let Some(caret) = ime
+        .caret_rect()
+        .filter(|bounds| !is_empty_ime_rect(*bounds))
+    {
         return caret;
     }
     if ime.widget_focused() {
@@ -370,18 +614,32 @@ pub(super) fn replace_in_widget_draft(
 ) {
     let (start, end) = if let Some(range_utf16) = range_utf16 {
         let content = draft.clone();
-        let start = offset_from_utf16(&content, range_utf16.start).min(draft.len());
-        let end = offset_from_utf16(&content, range_utf16.end)
-            .min(draft.len())
+        let start =
+            clamp_grapheme_boundary(&content, offset_from_utf16(&content, range_utf16.start));
+        let end = clamp_grapheme_boundary(&content, offset_from_utf16(&content, range_utf16.end))
             .max(start);
         (start, end)
     } else {
-        let start = fallback.start.min(draft.len());
-        let end = fallback.end.min(draft.len()).max(start);
+        let start = clamp_grapheme_boundary(draft, fallback.start);
+        let end = clamp_grapheme_boundary(draft, fallback.end).max(start);
         (start, end)
     };
     draft.replace_range(start..end, new_text);
     *caret = start + new_text.len();
+}
+
+/// AppKit reports UTF-16 scalar offsets. Widget editing exposes visible text,
+/// so an offset inside a combining sequence or ZWJ emoji must not split it.
+fn clamp_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    if offset == text.len() {
+        return offset;
+    }
+    text.grapheme_indices(true)
+        .map(|(start, _)| start)
+        .take_while(|start| *start <= offset)
+        .last()
+        .unwrap_or(0)
 }
 
 fn leaf_origin_fallback(leaf: &ImeLeafHit) -> Bounds<Pixels> {
@@ -454,6 +712,24 @@ mod tests {
         })
     }
 
+    fn visual_line(visible: Range<usize>, top: f32) -> VisualLine {
+        let start = visible.start;
+        let stops = (visible.start..=visible.end)
+            .map(|offset| VisualCaretStop {
+                visible: offset,
+                source: offset,
+                x: (offset.saturating_sub(start) as f32) * 10.0,
+            })
+            .collect();
+        VisualLine {
+            visible_start: visible.start,
+            visible_end: visible.end,
+            top,
+            height: 20.0,
+            stops,
+        }
+    }
+
     fn hit(
         text: &str,
         start: usize,
@@ -476,6 +752,43 @@ mod tests {
             ime.report_leaf(leaf);
         }
         ime
+    }
+
+    #[test]
+    fn visual_vertical_navigation_uses_wrapped_rows_and_keeps_the_original_x() {
+        let layout = leaf_layout("abcdefghijklmnopq", 0);
+        let mut ime = ImeOriginState::default();
+        ime.begin_frame(false, 4, None);
+        // The middle row is deliberately short. A source-line move would not
+        // see any of these wrap boundaries at all.
+        ime.report_visual_lines(
+            layout,
+            vec![
+                visual_line(0..5, 0.0),
+                visual_line(5..7, 20.0),
+                visual_line(7..12, 40.0),
+            ],
+        );
+
+        let first = ime
+            .visual_vertical_target(4, 1, None)
+            .expect("first wrapped-row target");
+        assert_eq!(first.source, Some(7));
+        assert_eq!(first.preferred_x, 40.0);
+
+        // The source offset 7 is the short row's visual end. The saved x
+        // (40), rather than its current x (20), must carry through to the
+        // following long row.
+        let second = ime
+            .visual_vertical_target(7, 1, Some(first.preferred_x))
+            .expect("second wrapped-row target");
+        assert_eq!(second.source, Some(11));
+        assert_eq!(second.preferred_x, 40.0);
+
+        let up = ime
+            .visual_vertical_target(11, -1, Some(second.preferred_x))
+            .expect("upward wrapped-row target");
+        assert_eq!(up.source, Some(7));
     }
 
     fn widget_frame(
@@ -548,6 +861,44 @@ mod tests {
         replace_in_widget_draft(&mut draft, &mut caret, None, "x", 1..3);
         assert_eq!(draft, "cx");
         assert_eq!(caret, 2);
+    }
+
+    #[test]
+    fn widget_ime_replacements_preserve_extended_graphemes() {
+        for (cluster, label) in [
+            ("e\u{301}", "combining accent"),
+            ("👩\u{200d}💻", "ZWJ emoji"),
+        ] {
+            let original = format!("{cluster}x");
+            let inside = cluster.chars().next().expect(label).len_utf8();
+
+            let mut draft = original.clone();
+            let mut caret = 0;
+            replace_in_widget_draft(&mut draft, &mut caret, None, "!", inside..inside);
+            assert_eq!(
+                draft,
+                format!("!{cluster}x"),
+                "IME insertion inside a {label} must normalize to its edge"
+            );
+            assert_eq!(caret, 1);
+
+            let mut draft = original.clone();
+            let mut caret = 0;
+            let start_utf16 = offset_to_utf16(&original, inside);
+            let end_utf16 = offset_to_utf16(&original, cluster.len());
+            replace_in_widget_draft(
+                &mut draft,
+                &mut caret,
+                Some(start_utf16..end_utf16),
+                "q",
+                0..0,
+            );
+            assert_eq!(
+                draft, "qx",
+                "IME replacement starting inside a {label} must replace the whole glyph"
+            );
+            assert_eq!(caret, 1);
+        }
     }
 
     #[test]
@@ -879,7 +1230,7 @@ mod tests {
     }
 
     fn mapped_html_leaf(source: &str, bounds: Bounds<Pixels>) -> ImeLeafHit {
-        use super::super::block_text::build_html_block_layout;
+        use super::super::block_text::{build_html_block_layout, RevealState};
         use crate::theme::EditorTheme;
         use gpui::TextStyle;
 
@@ -902,7 +1253,16 @@ mod tests {
                 text,
                 source_at,
                 runs,
-            } => build_html_block_layout(&text, &source_at, &runs, source, block, &style, &theme),
+            } => build_html_block_layout(
+                &text,
+                &source_at,
+                &runs,
+                source,
+                block,
+                &style,
+                &theme,
+                &RevealState::HIDDEN,
+            ),
             other => panic!("expected flow, got {other:?}"),
         };
         let x = source.find('x').unwrap_or(block.source_range.start);
@@ -957,7 +1317,7 @@ mod tests {
     }
 
     fn mapped_para_leaf(source: &str, bounds: Bounds<Pixels>) -> ImeLeafHit {
-        use super::super::block_text::{build_leaf_layout_revealed, RevealState};
+        use super::super::block_text::{build_leaf_layout_revealed, ChromeHosts, RevealState};
         use crate::theme::EditorTheme;
         use gpui::TextStyle;
 
@@ -973,10 +1333,12 @@ mod tests {
         };
         let layout = build_leaf_layout_revealed(
             block,
+            source,
             &style,
             &theme,
             gpui::FontWeight::NORMAL,
             &RevealState::HIDDEN,
+            &ChromeHosts::NONE,
         );
         let h = source.find('h').unwrap_or(block.source_range.start);
         ImeLeafHit {
@@ -1170,6 +1532,107 @@ mod tests {
             )),
             "IME origin must not jump to the leaf top-left when the caret quad is hidden"
         );
+    }
+
+    #[test]
+    fn begin_frame_before_paint_keeps_body_caret_for_os_pull() {
+        let mut ime = ImeOriginState::default();
+        let caret = rect(80.0, 40.0, 2.0, 22.0);
+        let leaf = rect(8.0, 40.0, 200.0, 22.0);
+        ime.begin_frame(false, 3, None);
+        ime.report_leaf(hit("hello", 0, leaf, Some(caret)));
+        assert_eq!(ime.take_platform_push(), Some(caret));
+
+        ime.begin_frame(false, 3, Some("ni"));
+        assert_eq!(
+            ime.caret_rect(),
+            Some(caret),
+            "macOS firstRectForCharacterRange after begin_frame must keep the caret"
+        );
+        let pulled = ime_origin_bounds(&ime, decoy_element_bounds());
+        assert_eq!(pulled, caret);
+        assert_ne!(pulled, decoy_element_bounds());
+        assert_ne!(
+            pulled,
+            rect(
+                f32::from(leaf.origin.x),
+                f32::from(leaf.origin.y),
+                2.0,
+                22.0
+            ),
+            "OS pull must not fall back to the leaf top-left before paint"
+        );
+        assert_eq!(
+            ime.take_platform_push(),
+            None,
+            "unpainted frame must not push leftover sticky to Linux/Windows"
+        );
+    }
+
+    #[test]
+    fn begin_frame_before_paint_keeps_wrapped_line_caret_for_os_pull() {
+        let mut ime = ImeOriginState::default();
+        let leaf_bounds = rect(8.0, 10.0, 240.0, 66.0);
+        let second_line = rect(8.0, 32.0, 2.0, 22.0);
+        ime.begin_frame(false, 40, None);
+        ime.report_leaf(hit(
+            "a long paragraph that wraps onto a second visual line here",
+            0,
+            leaf_bounds,
+            Some(second_line),
+        ));
+        assert_eq!(ime.take_platform_push(), Some(second_line));
+
+        ime.begin_frame(false, 40, Some("ni"));
+        let pulled = ime_origin_bounds(&ime, decoy_element_bounds());
+        assert_eq!(pulled, second_line);
+        assert!(
+            f32::from(pulled.origin.y) > f32::from(leaf_bounds.origin.y),
+            "OS pull must stay on the wrapped line, not the leaf top"
+        );
+    }
+
+    #[test]
+    fn begin_frame_before_paint_keeps_overlay_inner_caret_not_trailing_edge() {
+        let overlay = rect(24.0, 260.0, 160.0, 16.0);
+        let inner = inner_widget_caret_rect(overlay, "caption text", 4);
+        let trailing = widget_caret_rect(overlay);
+        let mut ime = ImeOriginState::default();
+        ime.begin_frame(true, 0, None);
+        ime.report_widget(overlay);
+        ime.report_widget_caret(inner);
+        assert_eq!(ime.take_platform_push(), Some(inner));
+
+        ime.begin_frame(true, 4, Some("ni"));
+        let pulled = ime_origin_bounds(&ime, decoy_element_bounds());
+        assert_eq!(
+            pulled, inner,
+            "OS pull after begin_frame must keep the inner `|`"
+        );
+        assert_ne!(pulled, trailing);
+        assert_ne!(pulled, decoy_element_bounds());
+        assert_eq!(ime.take_platform_push(), None);
+    }
+
+    #[test]
+    fn unfocused_leaf_does_not_push_stale_sticky_after_caret_move() {
+        let first = rect(10.0, 40.0, 2.0, 22.0);
+        let second = rect(10.0, 80.0, 2.0, 22.0);
+        let mut ime = ImeOriginState::default();
+        ime.begin_frame(false, 3, None);
+        ime.report_leaf(hit("hello", 0, rect(8.0, 40.0, 200.0, 22.0), Some(first)));
+        ime.report_leaf(hit("world", 6, rect(8.0, 80.0, 200.0, 22.0), None));
+        assert_eq!(ime.take_platform_push(), Some(first));
+
+        ime.begin_frame(false, 8, None);
+        ime.report_leaf(hit("hello", 0, rect(8.0, 40.0, 200.0, 22.0), None));
+        assert_eq!(
+            ime.take_platform_push(),
+            None,
+            "the previous paragraph must not push its leftover sticky after the caret left"
+        );
+        ime.report_leaf(hit("world", 6, rect(8.0, 80.0, 200.0, 22.0), Some(second)));
+        assert_eq!(ime.take_platform_push(), Some(second));
     }
 
     #[test]
@@ -1544,6 +2007,34 @@ mod tests {
             ime_origin_bounds(&self.ime, decoy_element_bounds())
         }
 
+        /// macOS `firstRectForCharacterRange:` → `bounds_for_range` after
+        /// `Render::render` calls `begin_frame` and before children paint.
+        /// Not an OS candidate window.
+        fn macos_first_rect_after_render_start(&mut self) -> Bounds<Pixels> {
+            let caret = self.cursor();
+            let composition = self.composition_key().map(str::to_string);
+            self.ime
+                .begin_frame(self.widget_bounds.is_some(), caret, composition.as_deref());
+            self.bounds_for_range(0..0)
+        }
+
+        fn assert_macos_pull_keeps(&mut self, expected: Bounds<Pixels>, label: &str) {
+            let pulled = self.macos_first_rect_after_render_start();
+            assert_eq!(
+                pulled, expected,
+                "{label}: macOS firstRect pull after begin_frame"
+            );
+            assert_ne!(
+                pulled,
+                decoy_element_bounds(),
+                "{label}: OS pull must not be the element fallback"
+            );
+            assert!(
+                f32::from(pulled.size.width) > 0. && f32::from(pulled.size.height) > 0.,
+                "{label}: IME rect must be non-empty"
+            );
+        }
+
         /// GPUI's IME candidate-rect helper (`PlatformInputHandler`).
         ///
         /// Not `set_ime_cursor_position`: the test window does not record that.
@@ -1821,6 +2312,68 @@ mod tests {
             .expect("YAML composition start must request a platform IME rect");
         assert_eq!(composed, pushed_yaml);
         assert_eq!(ime.paint(), None);
+        ime.assert_macos_pull_keeps(pushed_yaml, "YAML after composition paint");
+    }
+
+    #[test]
+    fn macos_first_rect_pull_after_begin_frame_follows_caret_on_each_surface() {
+        let mut body = ImeHandlerProbe::open("hello\n", 5);
+        let origin_body = body.paint().expect("body origin");
+        body.assert_macos_pull_keeps(origin_body, "body paragraph");
+
+        let mut table = ImeHandlerProbe::open("hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n", 5);
+        table.replace_text_in_range(None, "!");
+        let _ = table.paint();
+        let table_block = table
+            .engine
+            .tree()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, markrust_core::rich::BlockKind::Table { .. }))
+            .expect("table");
+        let cell_a = table
+            .engine
+            .cell_caret(table_block.id, 0, 0)
+            .expect("header cell a");
+        table.jump_to(cell_a);
+        table.apply_rich(RichCommand::TableTab { reverse: false });
+        let origin_cell = table.paint().expect("cell origin");
+        table.assert_macos_pull_keeps(origin_cell, "table cell");
+
+        let mut caption = ImeHandlerProbe::open("hello\n\n![cat](img.png)\n", 5);
+        let overlay = rect(24.0, 260.0, 160.0, 16.0);
+        caption.focus_widget_at(overlay, "cat", 1);
+        let origin_caption = caption.paint().expect("caption origin");
+        assert_ne!(origin_caption, widget_caret_rect(overlay));
+        caption.assert_macos_pull_keeps(origin_caption, "image caption");
+
+        let mut chip = ImeHandlerProbe::open("hello\n\n```rust\nfn main() {}\n```\n", 5);
+        let chip_bounds = rect(24.0, 120.0, 48.0, 18.0);
+        chip.focus_widget_at(chip_bounds, "rust", 2);
+        let origin_chip = chip.paint().expect("chip origin");
+        assert_ne!(origin_chip, widget_caret_rect(chip_bounds));
+        chip.assert_macos_pull_keeps(origin_chip, "language chip");
+
+        let source = "---\ntitle: Hi\n---\n\nhello\n";
+        let caret = source.find("hello").expect("body") + 5;
+        let mut title = ImeHandlerProbe::open(source, caret);
+        let title_bounds = rect(24.0, 8.0, 220.0, 20.0);
+        title.focus_widget_at(title_bounds, "Hi", 1);
+        let origin_title = title.paint().expect("frontmatter title origin");
+        assert_ne!(origin_title, widget_caret_rect(title_bounds));
+        title.assert_macos_pull_keeps(origin_title, "frontmatter title");
+
+        let mut yaml = ImeHandlerProbe::open(source, caret);
+        let yaml_bounds = rect(24.0, 48.0, 360.0, 72.0);
+        let draft = "title: Hi\nmore: wrapped";
+        yaml.focus_widget_at(yaml_bounds, draft, draft.find("wrapped").expect("mid") + 3);
+        let origin_yaml = yaml.paint().expect("YAML origin");
+        assert_ne!(origin_yaml, widget_caret_rect(yaml_bounds));
+        assert!(
+            f32::from(origin_yaml.origin.y) > f32::from(yaml_bounds.origin.y),
+            "YAML OS pull must sit on the wrapped inner line"
+        );
+        yaml.assert_macos_pull_keeps(origin_yaml, "frontmatter YAML");
     }
 
     #[test]

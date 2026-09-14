@@ -657,6 +657,10 @@ impl EntityInputHandler for MarkdownEditor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        // Sticky across blink: `report_caret_bounds` always stores the
+        // shaped caret, even when the quad is hidden. macOS pulls this via
+        // `firstRectForCharacterRange:` after `update_ime_position` discards
+        // the pushed rect.
         self.last_caret_bounds.or_else(|| {
             Some(Bounds {
                 origin: bounds.origin,

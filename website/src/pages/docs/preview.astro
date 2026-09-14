@@ -17,5 +17,5 @@ import DocsLayout from '../../layouts/DocsLayout.astro';
   <h2>Export</h2>
   <p>For a full HTML render, use the CLI:</p>
   <pre><code>markrust export document.md -o document.html</code></pre>
-  <p>Or choose <strong>Export HTML</strong> from the command palette (<kbd>⌘P</kbd>) when a saved document is open.</p>
+  <p>Exports omit raw HTML and dangerous URL schemes by default. The CLI’s <code>--unsafe-html</code> option is available only for trusted Markdown that intentionally needs raw HTML; GFM tag filtering still applies. Or choose <strong>Export HTML</strong> from the command palette (<kbd>⌘P</kbd>) when a saved document is open.</p>
 </DocsLayout>

@@ -5,10 +5,12 @@
 //! The WYSIWYG editor view: a virtualized list of rendered blocks kept in
 //! sync with the document through [`RichEngine`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
+
+use unicode_segmentation::UnicodeSegmentation;
 
 use gpui::{
     canvas, div, list, prelude::*, px, App, Bounds, ClipboardItem, Context, CursorStyle, Entity,
@@ -26,9 +28,11 @@ use markrust_core::Document;
 use super::block_text::{hit_test_leaf, LeafLayout, OverlayTarget, WidgetOverlay, WysiwygHost};
 use super::blocks::{render_top_block, RenderSnapshot};
 use super::image::{
-    cache_path_for_url, collect_remote_image_urls, default_image_cache_dir, fetch_remote_image,
+    cache_path_for_url, collect_data_image_urls, collect_local_image_paths,
+    collect_remote_image_urls, default_image_cache_dir, fetch_remote_image,
+    materialize_safe_data_image, materialize_safe_local_image,
 };
-use super::ime::{ImeLeafHit, ImeOriginState};
+use super::ime::{ImeLeafHit, ImeOriginState, VisualLine};
 use crate::headless::{
     next_boundary, next_word_end, prev_word_start, previous_boundary, CaretMove, EditorCommand,
     EditorOutcome,
@@ -88,16 +92,7 @@ impl WidgetEdit {
 
     fn set_caret(&mut self, offset: usize) {
         if let Some((draft, caret)) = self.draft_caret_mut() {
-            let mut at = offset.min(draft.len());
-            if at > 0 && !draft.is_char_boundary(at) {
-                at = draft
-                    .char_indices()
-                    .map(|(i, _)| i)
-                    .take_while(|i| *i <= at)
-                    .last()
-                    .unwrap_or(0);
-            }
-            *caret = at;
+            *caret = clamp_grapheme_boundary(draft, offset);
         }
     }
 
@@ -110,6 +105,23 @@ impl WidgetEdit {
             _ => false,
         }
     }
+}
+
+/// Keep widget carets and selections on visible-character boundaries.
+///
+/// An offset produced by an IME or a stale drag can otherwise land between a
+/// base character and a combining mark (or inside a ZWJ emoji), where editing
+/// would visibly split one glyph.
+fn clamp_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    if offset == text.len() {
+        return offset;
+    }
+    text.grapheme_indices(true)
+        .map(|(start, _)| start)
+        .take_while(|start| *start <= offset)
+        .last()
+        .unwrap_or(0)
 }
 
 /// Tab / Shift-Tab while a language chip, image caption, or frontmatter
@@ -132,14 +144,10 @@ fn widget_owns_wrap(edit: &WidgetEdit) -> bool {
     !matches!(edit, WidgetEdit::Idle)
 }
 
-/// Caption and frontmatter are real text buffers; the language chip is not.
+/// Captions are Markdown text; frontmatter values are YAML and must never
+/// receive Markdown delimiters from formatting shortcuts.
 fn widget_wraps_draft(edit: &WidgetEdit) -> bool {
-    matches!(
-        edit,
-        WidgetEdit::ImageAlt { .. }
-            | WidgetEdit::Frontmatter { .. }
-            | WidgetEdit::FrontmatterYaml { .. }
-    )
+    matches!(edit, WidgetEdit::ImageAlt { .. })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,10 +204,9 @@ fn insert_into_widget(edit: &mut WidgetEdit, anchor: &mut usize, text: &str) {
     let Some((draft, caret)) = edit.draft_caret_mut() else {
         return;
     };
+    *caret = clamp_grapheme_boundary(draft, *caret);
+    *anchor = clamp_grapheme_boundary(draft, *anchor);
     let range = widget_range(*caret, *anchor, draft.len());
-    if !draft.is_char_boundary(range.start) || !draft.is_char_boundary(range.end) {
-        return;
-    }
     let start = range.start;
     draft.replace_range(range, text);
     *caret = start + text.len();
@@ -210,11 +217,10 @@ fn delete_before_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
     let Some((draft, caret)) = edit.draft_caret_mut() else {
         return;
     };
+    *caret = clamp_grapheme_boundary(draft, *caret);
+    *anchor = clamp_grapheme_boundary(draft, *anchor);
     let range = widget_range(*caret, *anchor, draft.len());
     if range.start != range.end {
-        if !draft.is_char_boundary(range.start) || !draft.is_char_boundary(range.end) {
-            return;
-        }
         let start = range.start;
         draft.replace_range(range, "");
         *caret = start;
@@ -225,12 +231,11 @@ fn delete_before_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
     if at == 0 {
         return;
     }
-    let prev = draft[..at]
-        .chars()
+    let start = draft[..at]
+        .grapheme_indices(true)
         .next_back()
-        .map(|c| c.len_utf8())
+        .map(|(start, _)| start)
         .unwrap_or(0);
-    let start = at - prev;
     draft.replace_range(start..at, "");
     *caret = start;
     *anchor = start;
@@ -240,11 +245,10 @@ fn delete_after_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
     let Some((draft, caret)) = edit.draft_caret_mut() else {
         return;
     };
+    *caret = clamp_grapheme_boundary(draft, *caret);
+    *anchor = clamp_grapheme_boundary(draft, *anchor);
     let range = widget_range(*caret, *anchor, draft.len());
     if range.start != range.end {
-        if !draft.is_char_boundary(range.start) || !draft.is_char_boundary(range.end) {
-            return;
-        }
         let start = range.start;
         draft.replace_range(range, "");
         *caret = start;
@@ -256,10 +260,10 @@ fn delete_after_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
         return;
     }
     let next = draft[at..]
-        .chars()
+        .graphemes(true)
         .next()
-        .map(|c| c.len_utf8())
-        .unwrap_or(0);
+        .map(str::len)
+        .unwrap_or_default();
     draft.replace_range(at..at + next, "");
 }
 
@@ -271,12 +275,14 @@ fn delete_toward_in_widget(
     let Some((draft, caret)) = edit.draft_caret_mut() else {
         return;
     };
+    *caret = clamp_grapheme_boundary(draft, *caret);
+    *anchor = clamp_grapheme_boundary(draft, *anchor);
     let range = widget_range(*caret, *anchor, draft.len());
     let (start, end) = if range.start != range.end {
         (range.start, range.end)
     } else {
         let at = range.start;
-        let target = target_of(draft, at).min(draft.len());
+        let target = clamp_grapheme_boundary(draft, target_of(draft, at));
         if target <= at {
             (target, at)
         } else {
@@ -284,9 +290,6 @@ fn delete_toward_in_widget(
         }
     };
     if start == end {
-        return;
-    }
-    if !draft.is_char_boundary(start) || !draft.is_char_boundary(end) {
         return;
     }
     draft.replace_range(start..end, "");
@@ -311,18 +314,12 @@ fn delete_to_line_end_in_widget(edit: &mut WidgetEdit, anchor: &mut usize) {
 }
 
 fn overlay_line_start(draft: &str, at: usize) -> usize {
-    let at = at.min(draft.len());
-    if !draft.is_char_boundary(at) {
-        return at;
-    }
+    let at = clamp_grapheme_boundary(draft, at);
     draft[..at].rfind('\n').map(|i| i + 1).unwrap_or(0)
 }
 
 fn overlay_line_end(draft: &str, at: usize) -> usize {
-    let at = at.min(draft.len());
-    if !draft.is_char_boundary(at) {
-        return at;
-    }
+    let at = clamp_grapheme_boundary(draft, at);
     draft[at..]
         .find('\n')
         .map(|i| at + i)
@@ -363,13 +360,9 @@ fn widget_snap(edit: &WidgetEdit, anchor: usize) -> Option<WidgetDraftSnap> {
 fn apply_widget_snap(edit: &mut WidgetEdit, snap: &WidgetDraftSnap, anchor: &mut usize) {
     if let Some((draft, caret)) = edit.draft_caret_mut() {
         *draft = snap.draft.clone();
-        let mut at = snap.caret.min(draft.len());
-        if at > 0 && !draft.is_char_boundary(at) {
-            at = draft.len();
-        }
-        *caret = at;
+        *caret = clamp_grapheme_boundary(draft, snap.caret);
     }
-    *anchor = snap.anchor.min(snap.draft.len());
+    *anchor = clamp_grapheme_boundary(&snap.draft, snap.anchor);
 }
 
 const WIDGET_UNDO_LIMIT: usize = 64;
@@ -427,17 +420,9 @@ fn redo_widget_history(
 
 /// Byte offset on the previous/next `\n` line, same character column.
 fn vertical_in_draft(draft: &str, at: usize, down: bool) -> usize {
-    let mut at = at.min(draft.len());
-    if at > 0 && !draft.is_char_boundary(at) {
-        at = draft
-            .char_indices()
-            .map(|(i, _)| i)
-            .take_while(|i| *i <= at)
-            .last()
-            .unwrap_or(0);
-    }
+    let at = clamp_grapheme_boundary(draft, at);
     let line_start = draft[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let col = draft[line_start..at].chars().count();
+    let col = draft[line_start..at].graphemes(true).count();
     let (dest_start, dest_end) = if down {
         let line_end = draft[at..]
             .find('\n')
@@ -460,7 +445,7 @@ fn vertical_in_draft(draft: &str, at: usize, down: bool) -> usize {
         (prev_start, prev_end)
     };
     let line = &draft[dest_start..dest_end];
-    for (n, (i, _)) in line.char_indices().enumerate() {
+    for (n, (i, _)) in line.grapheme_indices(true).enumerate() {
         if n == col {
             return dest_start + i;
         }
@@ -482,8 +467,11 @@ fn move_in_widget(
     let Some((draft, caret)) = edit.draft_caret_mut() else {
         return false;
     };
-    let has_sel = *caret != *anchor;
-    let at = (*caret).min(draft.len());
+    let at = clamp_grapheme_boundary(draft, *caret);
+    let anchored = clamp_grapheme_boundary(draft, *anchor);
+    *caret = at;
+    *anchor = anchored;
+    let has_sel = at != anchored;
     let target = match movement {
         CaretMove::Left => {
             if !extend && has_sel {
@@ -568,6 +556,10 @@ pub struct RichEditorView {
     synced_revision: Option<u64>,
     pub selected_range: Range<usize>,
     pub selection_reversed: bool,
+    /// Horizontal intent for repeated rendered Up/Down moves. This is kept
+    /// separately from the source selection because a short wrapped row must
+    /// not permanently change the column restored on the next long row.
+    vertical_preferred_x: Option<f32>,
     /// Cell body selected by the last Cmd-A. Empty cells are collapsed, so
     /// a second Cmd-A cannot be detected from the range alone.
     table_select_all_cell: Option<Range<usize>>,
@@ -581,12 +573,30 @@ pub struct RichEditorView {
     ime: ImeOriginState,
     widget_edit: WidgetEdit,
     widget_preedit: Option<String>,
+    /// Kept alongside an invalid frontmatter draft so the user can correct
+    /// it instead of losing the edit on Enter, Tab, blur, or click-away.
+    frontmatter_error: Option<String>,
     widget_undo: Vec<WidgetDraftSnap>,
     widget_redo: Vec<WidgetDraftSnap>,
+    /// Network requests are document-controlled content, so they need an
+    /// explicit user gesture for each open editor tab.
+    remote_images_authorized: bool,
     remote_pending: HashSet<String>,
     remote_failed: HashSet<String>,
+    /// Local document-controlled images that have passed the background
+    /// preflight. Every value is a validated content-addressed cache copy.
+    local_image_paths: HashMap<std::path::PathBuf, std::path::PathBuf>,
+    local_image_pending: HashSet<std::path::PathBuf>,
+    local_image_checked_revision: HashMap<std::path::PathBuf, u64>,
+    /// `data:` images use the same cache-only GPUI boundary as local files.
+    /// Their full decode, validation, and write happen off the UI thread.
+    data_image_paths: HashMap<String, std::path::PathBuf>,
+    data_image_pending: HashSet<String>,
+    data_image_checked_revision: HashMap<String, u64>,
     _blink_task: Task<()>,
     _remote_fetch_tasks: Vec<Task<()>>,
+    _local_image_tasks: Vec<Task<()>>,
+    _data_image_tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -605,7 +615,11 @@ impl RichEditorView {
             this.commit_widget_edit(cx);
             this.stop_blink(cx);
         });
-        let doc_sub = cx.observe(&document, |_, _, cx| cx.notify());
+        let doc_sub = cx.observe(&document, |this, _, cx| {
+            this.vertical_preferred_x = None;
+            this.ime.clear_visual_navigation();
+            cx.notify();
+        });
         Self {
             document,
             theme,
@@ -615,6 +629,7 @@ impl RichEditorView {
             synced_revision: None,
             selected_range: 0..0,
             selection_reversed: false,
+            vertical_preferred_x: None,
             table_select_all_cell: None,
             marked_range: None,
             preedit: None,
@@ -626,20 +641,44 @@ impl RichEditorView {
             ime: ImeOriginState::default(),
             widget_edit: WidgetEdit::Idle,
             widget_preedit: None,
+            frontmatter_error: None,
             widget_undo: Vec::new(),
             widget_redo: Vec::new(),
+            remote_images_authorized: false,
             remote_pending: HashSet::new(),
             remote_failed: HashSet::new(),
+            local_image_paths: HashMap::new(),
+            local_image_pending: HashSet::new(),
+            local_image_checked_revision: HashMap::new(),
+            data_image_paths: HashMap::new(),
+            data_image_pending: HashSet::new(),
+            data_image_checked_revision: HashMap::new(),
             _blink_task: Task::ready(()),
             _remote_fetch_tasks: Vec::new(),
+            _local_image_tasks: Vec::new(),
+            _data_image_tasks: Vec::new(),
             _subscriptions: vec![focus_sub, blur_sub, doc_sub],
         }
     }
 
     pub fn set_theme(&mut self, theme: EditorTheme, cx: &mut Context<Self>) {
         self.theme = theme;
+        self.vertical_preferred_x = None;
+        self.ime.clear_visual_navigation();
         self.snapshot = None;
         self.synced_revision = None;
+        cx.notify();
+    }
+
+    /// Authorize loading remote image URLs for this document tab.
+    ///
+    /// The permission deliberately is not persisted: opening a Markdown file
+    /// must not send requests to URLs chosen by that file until the reader has
+    /// explicitly asked to load them.
+    pub fn load_remote_images(&mut self, cx: &mut Context<Self>) {
+        self.remote_images_authorized = true;
+        self.remote_failed.clear();
+        self.snapshot = None;
         cx.notify();
     }
 
@@ -680,7 +719,12 @@ impl RichEditorView {
         } else if let Some(outcome) = self.widget_try_wrap(&command, cx) {
             return outcome;
         } else {
-            self.commit_widget_edit(cx);
+            let was_editing = !matches!(self.widget_edit, WidgetEdit::Idle);
+            if was_editing && !self.commit_widget_edit(cx) {
+                // Invalid YAML stays in its overlay; do not let the command
+                // that tried to commit it fall through and mutate the body.
+                return RichOutcome::Noop;
+            }
         }
         let mut caret = self.caret_state();
         let mut outcome = RichOutcome::Noop;
@@ -692,6 +736,8 @@ impl RichEditorView {
         });
         self.restore_caret(caret);
         if outcome != RichOutcome::Noop {
+            self.vertical_preferred_x = None;
+            self.ime.clear_visual_navigation();
             self.reset_blink(cx);
             self.snapshot = None;
             self.synced_revision = None;
@@ -783,10 +829,12 @@ impl RichEditorView {
                 }
             }
             EditorCommand::JumpTo(offset) => {
+                self.vertical_preferred_x = None;
                 self.move_to(offset, false, cx);
                 EditorOutcome::CaretMoved
             }
             EditorCommand::SetSelection { start, end } => {
+                self.vertical_preferred_x = None;
                 let len = self.document.read(cx).buffer.len_bytes();
                 self.table_select_all_cell = None;
                 self.selected_range = start.min(len)..end.min(len);
@@ -795,6 +843,7 @@ impl RichEditorView {
                 EditorOutcome::CaretMoved
             }
             EditorCommand::SelectAll => {
+                self.vertical_preferred_x = None;
                 if select_all_in_widget(&mut self.widget_edit, &mut self.widget_anchor) {
                     self.table_select_all_cell = None;
                     self.reset_blink(cx);
@@ -891,8 +940,11 @@ impl RichEditorView {
                 // Widget overlays own Tab: commit, do not indent the body.
                 // IndentList owns table Tab (cell nav) vs list indent.
                 if widget_owns_tab(&self.widget_edit) {
-                    self.commit_widget_edit(cx);
-                    EditorOutcome::Changed
+                    if self.commit_widget_edit(cx) {
+                        EditorOutcome::Changed
+                    } else {
+                        EditorOutcome::Noop
+                    }
                 } else if self.apply_rich(RichCommand::IndentList, cx) == RichOutcome::Noop {
                     EditorOutcome::Noop
                 } else {
@@ -901,8 +953,11 @@ impl RichEditorView {
             }
             EditorCommand::Outdent => {
                 if widget_owns_tab(&self.widget_edit) {
-                    self.commit_widget_edit(cx);
-                    EditorOutcome::Changed
+                    if self.commit_widget_edit(cx) {
+                        EditorOutcome::Changed
+                    } else {
+                        EditorOutcome::Noop
+                    }
                 } else if self.apply_rich(RichCommand::OutdentList, cx) == RichOutcome::Noop {
                     EditorOutcome::Noop
                 } else {
@@ -1014,6 +1069,7 @@ impl RichEditorView {
             &mut self.widget_redo,
         ) {
             self.widget_preedit = None;
+            self.frontmatter_error = None;
             self.reset_blink(cx);
             self.snapshot = None;
             cx.notify();
@@ -1031,6 +1087,7 @@ impl RichEditorView {
             &mut self.widget_redo,
         ) {
             self.widget_preedit = None;
+            self.frontmatter_error = None;
             self.reset_blink(cx);
             self.snapshot = None;
             cx.notify();
@@ -1041,6 +1098,7 @@ impl RichEditorView {
     }
 
     fn record_widget_edit(&mut self) {
+        self.frontmatter_error = None;
         push_widget_history(
             &self.widget_edit,
             self.widget_anchor,
@@ -1090,10 +1148,29 @@ impl RichEditorView {
         cx.notify();
     }
 
+    /// Prefer the last painted WYSIWYG glyph geometry for a one-row vertical
+    /// move. The rich engine remains the fallback when the virtualized list
+    /// has not painted the relevant row yet (or during the first frame).
+    fn rendered_vertical_caret(&mut self, source: &str, cursor: usize, delta: i32) -> usize {
+        if let Some(target) =
+            self.ime
+                .visual_vertical_target(cursor, delta, self.vertical_preferred_x)
+        {
+            self.vertical_preferred_x = Some(target.preferred_x);
+            if let Some(source) = target.source {
+                return source;
+            }
+        }
+        self.engine.vertical_caret(source, cursor, delta)
+    }
+
     fn move_caret(&mut self, movement: CaretMove, extend: bool, cx: &mut Context<Self>) {
         let source = self.document.read(cx).buffer.content();
         self.engine.sync(self.document.read(cx));
         let cursor = self.cursor_offset();
+        if !matches!(movement, CaretMove::Up | CaretMove::Down) {
+            self.vertical_preferred_x = None;
+        }
         let target = match movement {
             CaretMove::Left => {
                 if !extend && !self.selected_range.is_empty() {
@@ -1109,25 +1186,8 @@ impl RichEditorView {
                     self.engine.next_caret(&source, cursor)
                 }
             }
-            CaretMove::Home => {
-                let start = source[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                self.engine.clamp_raw_prefix(
-                    &source,
-                    self.engine.snap_caret(start, Bias::Right),
-                    Bias::Right,
-                )
-            }
-            CaretMove::End => {
-                let end = source[cursor..]
-                    .find('\n')
-                    .map(|i| cursor + i)
-                    .unwrap_or(source.len());
-                self.engine.clamp_raw_prefix(
-                    &source,
-                    self.engine.snap_caret(end, Bias::Left),
-                    Bias::Left,
-                )
-            }
+            CaretMove::Home => self.engine.line_start_caret(&source, cursor),
+            CaretMove::End => self.engine.line_end_caret(&source, cursor),
             CaretMove::WordLeft => self.engine.prev_word_caret(&source, cursor),
             CaretMove::WordRight => self.engine.next_word_caret(&source, cursor),
             CaretMove::DocumentHome => self.engine.clamp_raw_prefix(
@@ -1135,13 +1195,9 @@ impl RichEditorView {
                 self.engine.snap_caret(0, Bias::Right),
                 Bias::Right,
             ),
-            CaretMove::DocumentEnd => self.engine.clamp_raw_prefix(
-                &source,
-                self.engine.snap_caret(source.len(), Bias::Left),
-                Bias::Left,
-            ),
-            CaretMove::Up => self.engine.vertical_caret(&source, cursor, -1),
-            CaretMove::Down => self.engine.vertical_caret(&source, cursor, 1),
+            CaretMove::DocumentEnd => self.engine.document_end_caret(&source, cursor),
+            CaretMove::Up => self.rendered_vertical_caret(&source, cursor, -1),
+            CaretMove::Down => self.rendered_vertical_caret(&source, cursor, 1),
             CaretMove::Vertical { delta_lines } => {
                 self.engine.vertical_caret(&source, cursor, delta_lines)
             }
@@ -1230,12 +1286,18 @@ impl RichEditorView {
                 }
             }
         }
+        self.enqueue_data_images(revision, cx);
+        self.enqueue_local_images(base_dir.as_deref(), revision, cx);
         self.enqueue_remote_images(cx);
         let snapshot = Arc::new(RenderSnapshot {
             tree: self.engine.tree().clone(),
             source,
             theme: self.theme.clone(),
             base_dir,
+            local_image_paths: self.local_image_paths.clone(),
+            local_image_pending: self.local_image_pending.clone(),
+            data_image_paths: self.data_image_paths.clone(),
+            data_image_pending: self.data_image_pending.clone(),
             editing_code: match &self.widget_edit {
                 WidgetEdit::CodeInfo { id, draft, .. } => Some((*id, draft.clone())),
                 _ => None,
@@ -1253,6 +1315,9 @@ impl RichEditorView {
     }
 
     fn enqueue_remote_images(&mut self, cx: &mut Context<Self>) {
+        if !self.remote_images_authorized {
+            return;
+        }
         let cache_dir = default_image_cache_dir();
         for url in collect_remote_image_urls(self.engine.tree()) {
             if self.remote_pending.contains(&url) || self.remote_failed.contains(&url) {
@@ -1281,6 +1346,108 @@ impl RichEditorView {
                 });
             });
             self._remote_fetch_tasks.push(task);
+        }
+    }
+
+    /// Decode and validate document `data:` images off the UI thread. Even a
+    /// syntactically local data URL can be megabytes long, so the render path
+    /// only observes this approved cache map and never calls `img(String)`.
+    fn enqueue_data_images(&mut self, revision: u64, cx: &mut Context<Self>) {
+        let urls = collect_data_image_urls(self.engine.tree());
+        let active = urls.iter().cloned().collect::<HashSet<_>>();
+        self.data_image_paths.retain(|url, _| active.contains(url));
+        self.data_image_checked_revision
+            .retain(|url, _| active.contains(url));
+
+        let cache_dir = default_image_cache_dir();
+        for url in urls {
+            if self.data_image_pending.contains(&url)
+                || self.data_image_checked_revision.get(&url) == Some(&revision)
+            {
+                continue;
+            }
+            self.data_image_pending.insert(url.clone());
+            let url_read = url.clone();
+            let url_status = url;
+            let cache_dir = cache_dir.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { materialize_safe_data_image(&url_read, &cache_dir) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.data_image_pending.remove(&url_status);
+                    this.data_image_checked_revision
+                        .insert(url_status.clone(), revision);
+                    match result {
+                        Some(approved) => {
+                            this.data_image_paths.insert(url_status.clone(), approved);
+                        }
+                        None => {
+                            this.data_image_paths.remove(&url_status);
+                        }
+                    }
+                    this.snapshot = None;
+                    cx.notify();
+                });
+            });
+            self._data_image_tasks.push(task);
+        }
+    }
+
+    /// Classify document-controlled local images without ever asking GPUI to
+    /// infer their type first. GPUI treats every non-raster byte stream as an
+    /// SVG candidate, so the preflight must look at content rather than an
+    /// extension. Each document revision re-checks visible paths in the
+    /// background; a previous safe SVG cache copy remains visible while that
+    /// work is in flight.
+    fn enqueue_local_images(
+        &mut self,
+        base_dir: Option<&std::path::Path>,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = collect_local_image_paths(self.engine.tree(), base_dir);
+        let active = paths.iter().cloned().collect::<HashSet<_>>();
+        self.local_image_paths
+            .retain(|source, _| active.contains(source));
+        self.local_image_checked_revision
+            .retain(|source, _| active.contains(source));
+
+        let cache_dir = default_image_cache_dir();
+        for source in paths {
+            if self.local_image_pending.contains(&source)
+                || self.local_image_checked_revision.get(&source) == Some(&revision)
+            {
+                continue;
+            }
+            self.local_image_pending.insert(source.clone());
+            let source_read = source.clone();
+            let source_status = source;
+            let cache_dir = cache_dir.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { materialize_safe_local_image(&source_read, &cache_dir) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.local_image_pending.remove(&source_status);
+                    this.local_image_checked_revision
+                        .insert(source_status.clone(), revision);
+                    match result {
+                        Ok(approved) => {
+                            this.local_image_paths
+                                .insert(source_status.clone(), approved);
+                        }
+                        Err(_) => {
+                            this.local_image_paths.remove(&source_status);
+                        }
+                    }
+                    this.snapshot = None;
+                    cx.notify();
+                });
+            });
+            self._local_image_tasks.push(task);
         }
     }
 
@@ -1429,6 +1596,7 @@ impl RichEditorView {
         }
         self.widget_edit = WidgetEdit::Idle;
         self.widget_preedit = None;
+        self.frontmatter_error = None;
         self.widget_selecting = false;
         self.clear_widget_history();
         self.snapshot = None;
@@ -1437,8 +1605,18 @@ impl RichEditorView {
     }
 
     fn commit_widget_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(error) = self.frontmatter_widget_error(cx) {
+            // Do not take `widget_edit`: the draft remains visible and
+            // editable, and a body command cannot accidentally follow it.
+            self.widget_preedit = None;
+            self.widget_selecting = false;
+            self.frontmatter_error = Some(error);
+            cx.notify();
+            return false;
+        }
         self.widget_preedit = None;
         self.widget_selecting = false;
+        self.frontmatter_error = None;
         self.clear_widget_history();
         let edit = std::mem::take(&mut self.widget_edit);
         match edit {
@@ -1471,6 +1649,26 @@ impl RichEditorView {
                 self.apply_rich(RichCommand::SetFrontmatter { raw: draft }, cx);
                 true
             }
+        }
+    }
+
+    fn frontmatter_widget_error(&self, cx: &Context<Self>) -> Option<String> {
+        let source = self.document.read(cx).buffer.content();
+        match &self.widget_edit {
+            WidgetEdit::Frontmatter { key, draft, .. } => {
+                let raw = markrust_core::parse_frontmatter(&source)
+                    .and_then(|info| source.get(info.start_byte..info.end_byte))
+                    .unwrap_or("");
+                markrust_core::upsert_yaml_key(raw, key, draft)
+                    .err()
+                    .map(|error| error.message().to_string())
+            }
+            WidgetEdit::FrontmatterYaml { draft, .. } => {
+                markrust_core::validate_frontmatter_yaml(draft)
+                    .err()
+                    .map(|error| error.message().to_string())
+            }
+            WidgetEdit::Idle | WidgetEdit::CodeInfo { .. } | WidgetEdit::ImageAlt { .. } => None,
         }
     }
 
@@ -1520,6 +1718,10 @@ impl RichEditorView {
         self.click_source(source, extend, window, cx);
         true
     }
+
+    fn finish_widget_before_switch(&mut self, cx: &mut Context<Self>) -> bool {
+        matches!(self.widget_edit, WidgetEdit::Idle) || self.commit_widget_edit(cx)
+    }
 }
 
 impl WysiwygHost for RichEditorView {
@@ -1531,6 +1733,7 @@ impl WysiwygHost for RichEditorView {
         cx: &mut Context<Self>,
     ) {
         self.commit_widget_edit(cx);
+        self.vertical_preferred_x = None;
         self.is_selecting = true;
         self.focus_handle.focus(window, cx);
         self.move_to(source, extend, cx);
@@ -1543,6 +1746,7 @@ impl WysiwygHost for RichEditorView {
         cx: &mut Context<Self>,
     ) {
         self.commit_widget_edit(cx);
+        self.vertical_preferred_x = None;
         self.is_selecting = false;
         self.focus_handle.focus(window, cx);
         self.apply_editor_command(
@@ -1556,6 +1760,7 @@ impl WysiwygHost for RichEditorView {
 
     fn drag_source(&mut self, source: usize, cx: &mut Context<Self>) {
         if self.is_selecting {
+            self.vertical_preferred_x = None;
             self.move_to(source, true, cx);
         }
     }
@@ -1603,7 +1808,9 @@ impl WysiwygHost for RichEditorView {
     }
 
     fn edit_code_info(&mut self, id: NodeId, cx: &mut Context<Self>) {
-        self.commit_widget_edit(cx);
+        if !self.finish_widget_before_switch(cx) {
+            return;
+        }
         self.engine.sync(self.document.read(cx));
         let draft = self
             .engine
@@ -1623,7 +1830,9 @@ impl WysiwygHost for RichEditorView {
     }
 
     fn edit_image_alt(&mut self, source_range: Range<usize>, alt: &str, cx: &mut Context<Self>) {
-        self.commit_widget_edit(cx);
+        if !self.finish_widget_before_switch(cx) {
+            return;
+        }
         self.widget_edit = WidgetEdit::ImageAlt {
             range: source_range,
             draft: alt.to_string(),
@@ -1637,7 +1846,9 @@ impl WysiwygHost for RichEditorView {
     }
 
     fn edit_frontmatter_field(&mut self, key: &'static str, current: &str, cx: &mut Context<Self>) {
-        self.commit_widget_edit(cx);
+        if !self.finish_widget_before_switch(cx) {
+            return;
+        }
         self.widget_edit = WidgetEdit::Frontmatter {
             key,
             draft: current.to_string(),
@@ -1646,12 +1857,15 @@ impl WysiwygHost for RichEditorView {
         self.widget_anchor = current.len();
         self.widget_selecting = false;
         self.widget_preedit = None;
+        self.frontmatter_error = None;
         self.snapshot = None;
         cx.notify();
     }
 
     fn edit_frontmatter_yaml(&mut self, current: &str, cx: &mut Context<Self>) {
-        self.commit_widget_edit(cx);
+        if !self.finish_widget_before_switch(cx) {
+            return;
+        }
         self.widget_edit = WidgetEdit::FrontmatterYaml {
             draft: current.to_string(),
             caret: current.len(),
@@ -1659,12 +1873,16 @@ impl WysiwygHost for RichEditorView {
         self.widget_anchor = current.len();
         self.widget_selecting = false;
         self.widget_preedit = None;
+        self.frontmatter_error = None;
         self.snapshot = None;
         cx.notify();
     }
 
     fn open_table_menu(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.commit_widget_edit(cx);
+        if !self.finish_widget_before_switch(cx) {
+            return;
+        }
+        self.vertical_preferred_x = None;
         self.focus_handle.focus(window, cx);
         self.move_to(source, false, cx);
         cx.notify();
@@ -1764,7 +1982,9 @@ impl WysiwygHost for RichEditorView {
         font_size: f32,
         line_height: f32,
         caret_bounds: Option<Bounds<Pixels>>,
+        visual_lines: Vec<VisualLine>,
     ) {
+        self.ime.report_visual_lines(layout.clone(), visual_lines);
         self.ime.report_leaf(ImeLeafHit {
             layout,
             bounds: element_bounds,
@@ -1780,8 +2000,10 @@ impl WysiwygHost for RichEditorView {
 
     fn sync_ime_cursor(&mut self, window: &mut Window) {
         // GPUI: invalidate_character_coordinates → next frame selected_bounds
-        // → PlatformWindow::update_ime_position. TestWindow swallows that
-        // call; take_platform_push is the in-repo record of the request.
+        // → PlatformWindow::update_ime_position. On macOS that call discards
+        // the Bounds and invalidates; AppKit then pulls bounds_for_range
+        // (firstRectForCharacterRange:). TestWindow swallows the push;
+        // take_platform_push is the in-repo record of the request.
         if self.ime.take_platform_push().is_some() {
             window.invalidate_character_coordinates();
         }
@@ -1992,6 +2214,7 @@ impl Render for RichEditorView {
             WidgetEdit::FrontmatterYaml { draft, .. } => Some(draft.clone()),
             _ => None,
         };
+        let frontmatter_error = self.frontmatter_error.clone();
         let in_table = self.engine.table_pos(self.cursor_offset()).is_some();
         div()
             .size_full()
@@ -2397,6 +2620,7 @@ impl Render for RichEditorView {
                     &info,
                     editing_fm.as_ref().map(|(k, d)| (*k, d.as_str())),
                     editing_yaml.as_deref(),
+                    frontmatter_error.as_deref(),
                 )
             }))
             .when(in_table, |root| {
@@ -2501,6 +2725,7 @@ fn frontmatter_panel(
     info: &markrust_core::FrontmatterInfo,
     editing_fm: Option<(&'static str, &str)>,
     editing_yaml: Option<&str>,
+    error: Option<&str>,
 ) -> gpui::AnyElement {
     let field = |key: &'static str, placeholder: &str, stored: Option<&str>| -> String {
         match editing_fm {
@@ -2551,6 +2776,14 @@ fn frontmatter_panel(
                         .text_color(theme.secondary_text)
                         .child("Frontmatter"),
                 )
+                .when_some(error, |panel, message| {
+                    panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.accent)
+                            .child(message.to_string()),
+                    )
+                })
                 .child(frontmatter_field_row(FmField {
                     editor: editor.clone(),
                     theme,
@@ -2847,14 +3080,17 @@ mod tests {
             !widget_wraps_draft(&chip()),
             "language chip is an identifier, not a wrap target"
         );
+        assert!(
+            widget_owns_wrap(&caption()) && widget_wraps_draft(&caption()),
+            "image captions are Markdown text and may be formatted"
+        );
         for (edit, label) in [
-            (caption(), "image caption"),
             (frontmatter_title(), "frontmatter field"),
             (yaml(), "frontmatter YAML"),
         ] {
             assert!(
-                widget_owns_wrap(&edit) && widget_wraps_draft(&edit),
-                "{label} must own wrap and apply it to the draft"
+                widget_owns_wrap(&edit) && !widget_wraps_draft(&edit),
+                "{label} must consume wrap without writing Markdown syntax into YAML"
             );
         }
         assert!(
@@ -2903,11 +3139,11 @@ mod tests {
         let mut title = frontmatter_title();
         assert_eq!(
             apply_wrap_to_widget(&mut title, WrapKind::Italic),
-            WidgetWrapResult::Applied
+            WidgetWrapResult::Ignored
         );
         match &title {
             WidgetEdit::Frontmatter { draft, .. } => {
-                assert_eq!(draft, "*Hi*", "title italic, got {draft:?}")
+                assert_eq!(draft, "Hi", "title must stay a YAML scalar, got {draft:?}")
             }
             other => panic!("expected Frontmatter, got {other:?}"),
         }
@@ -2915,11 +3151,14 @@ mod tests {
         let mut yaml_edit = yaml();
         assert_eq!(
             apply_wrap_to_widget(&mut yaml_edit, WrapKind::Code),
-            WidgetWrapResult::Applied
+            WidgetWrapResult::Ignored
         );
         match &yaml_edit {
             WidgetEdit::FrontmatterYaml { draft, .. } => {
-                assert_eq!(draft, "`title: Hi`", "YAML code wrap, got {draft:?}")
+                assert_eq!(
+                    draft, "title: Hi",
+                    "YAML must not gain backticks, got {draft:?}"
+                )
             }
             other => panic!("expected FrontmatterYaml, got {other:?}"),
         }
@@ -2981,15 +3220,15 @@ mod tests {
         };
         assert_eq!(
             apply_wrap_to_widget(&mut empty_fm, WrapKind::Bold),
-            WidgetWrapResult::Applied
+            WidgetWrapResult::Ignored
         );
         let mut fm_anchor = empty_fm.caret();
         insert_into_widget(&mut empty_fm, &mut fm_anchor, "Hi");
         match &empty_fm {
             WidgetEdit::Frontmatter { draft, .. } => {
                 assert_eq!(
-                    draft, "**Hi**",
-                    "empty frontmatter wrap types inside, got {draft:?}"
+                    draft, "Hi",
+                    "frontmatter typing remains a YAML scalar after a consumed wrap shortcut, got {draft:?}"
                 )
             }
             other => panic!("expected Frontmatter, got {other:?}"),
@@ -3318,10 +3557,7 @@ mod tests {
             other => panic!("expected FrontmatterYaml, got {other:?}"),
         }
         assert_eq!(anchor, "alpha ".len());
-        assert_eq!(
-            body, 12..12,
-            "overlay word-delete must not mutate the body"
-        );
+        assert_eq!(body, 12..12, "overlay word-delete must not mutate the body");
 
         let mut yaml = WidgetEdit::FrontmatterYaml {
             draft: "alpha beta\ngamma extra".into(),
@@ -3661,6 +3897,72 @@ mod tests {
     }
 
     #[test]
+    fn overlay_editing_keeps_extended_graphemes_atomic() {
+        for (cluster, label) in [
+            ("e\u{301}", "combining accent"),
+            ("👩\u{200d}💻", "ZWJ emoji"),
+        ] {
+            let draft = format!("{cluster}x");
+            let mut edit = WidgetEdit::ImageAlt {
+                range: 0..0,
+                draft: draft.clone(),
+                caret: 0,
+            };
+
+            // A click/IME offset may be a scalar boundary within a single
+            // visible glyph. It must normalize to a real caret boundary.
+            edit.set_caret(cluster.chars().next().expect(label).len_utf8());
+            assert_eq!(
+                edit.caret(),
+                0,
+                "inner {label} boundary must not become a visible caret stop"
+            );
+
+            let mut anchor = edit.caret();
+            assert!(move_in_widget(
+                &mut edit,
+                &mut anchor,
+                CaretMove::Right,
+                false
+            ));
+            assert_eq!(edit.caret(), cluster.len(), "Right skips one {label}");
+            assert!(move_in_widget(
+                &mut edit,
+                &mut anchor,
+                CaretMove::Left,
+                false
+            ));
+            assert_eq!(edit.caret(), 0, "Left skips one {label}");
+
+            edit.set_caret(cluster.len());
+            anchor = edit.caret();
+            delete_before_in_widget(&mut edit, &mut anchor);
+            match &edit {
+                WidgetEdit::ImageAlt { draft, caret, .. } => {
+                    assert_eq!(draft, "x", "Backspace removes one {label}");
+                    assert_eq!(*caret, 0);
+                }
+                other => panic!("expected image caption, got {other:?}"),
+            }
+
+            let mut delete = WidgetEdit::ImageAlt {
+                range: 0..0,
+                draft,
+                caret: 0,
+            };
+            let mut delete_anchor = 0;
+            delete_after_in_widget(&mut delete, &mut delete_anchor);
+            match &delete {
+                WidgetEdit::ImageAlt { draft, caret, .. } => {
+                    assert_eq!(draft, "x", "Delete removes one {label}");
+                    assert_eq!(*caret, 0);
+                }
+                other => panic!("expected image caption, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn overlay_undo_rewinds_draft_not_the_body() {
         let mut edit = caption();
         let mut anchor = edit.caret();
@@ -3743,6 +4045,36 @@ mod tests {
             false
         ));
         assert_eq!(caption_edit.caret(), 3, "single-line overlay Up is a no-op");
+    }
+
+    #[test]
+    fn overlay_vertical_navigation_preserves_grapheme_column() {
+        let combining = "e\u{301}";
+        let draft = format!("{combining}\nab");
+        let mut edit = WidgetEdit::FrontmatterYaml {
+            draft,
+            caret: combining.len(),
+        };
+        let mut anchor = edit.caret();
+
+        assert!(move_in_widget(
+            &mut edit,
+            &mut anchor,
+            CaretMove::Down,
+            false
+        ));
+        assert_eq!(
+            edit.caret(),
+            combining.len() + 2,
+            "Down from one visible combining glyph must land after one visible glyph"
+        );
+
+        assert!(move_in_widget(&mut edit, &mut anchor, CaretMove::Up, false));
+        assert_eq!(
+            edit.caret(),
+            combining.len(),
+            "Up must return to the end of the same visible grapheme"
+        );
     }
 
     #[test]

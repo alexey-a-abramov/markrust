@@ -235,7 +235,7 @@ import CodeBlock from '../components/CodeBlock.astro';
       <div class="container">
         <header class="band">
           <p class="label">06 — Release</p>
-          <p class="band__aside">v0.1.0 · rustc 1.96+</p>
+          <p class="band__aside">v0.1 alpha · rustc 1.96+</p>
         </header>
         <h2>Download</h2>
         <table class="release">
@@ -251,26 +251,25 @@ import CodeBlock from '../components/CodeBlock.astro';
             <tr>
               <td>macOS</td>
               <td><code>aarch64</code> · <code>x86_64</code></td>
-              <td>available</td>
-              <td><a href="https://github.com/alexey-a-abramov/markrust/releases/latest">Releases →</a></td>
+              <td>build from source</td>
+              <td><a href="/docs/building">Build →</a></td>
             </tr>
             <tr>
               <td>Linux</td>
               <td><code>x86_64</code></td>
-              <td>available</td>
-              <td><a href="https://github.com/alexey-a-abramov/markrust/releases/latest">Releases →</a></td>
+              <td>build from source</td>
+              <td><a href="/docs/building">Build →</a></td>
             </tr>
             <tr>
               <td>Windows</td>
               <td><code>—</code></td>
-              <td>planned v0.2</td>
+              <td>not yet supported</td>
               <td><span class="muted">—</span></td>
             </tr>
           </tbody>
         </table>
         <div class="download__install">
-          <p class="label">package managers</p>
-          <CodeBlock code={`brew tap alexey-a-abramov/markrust\nbrew install markrust`} terminal />
+          <p class="label">from source</p>
           <CodeBlock code="cargo install --git https://github.com/alexey-a-abramov/markrust markrust" terminal />
         </div>
       </div>

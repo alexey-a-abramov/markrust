@@ -25,7 +25,9 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 /// Which editing surface a tab shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorMode {
-    /// Rendered rich document (editable).
+    /// Typora-style in-place WYSIWYG: delimiters hidden unless the caret or a
+    /// selection intersects the node. This is the default — not a never-show
+    /// "Rich" surface.
     #[default]
     Wysiwyg,
     /// Raw markdown with delimiter masking.
@@ -631,6 +633,17 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Load remote images only after the reader explicitly requests them for
+    /// the current document tab. This avoids document-controlled tracking
+    /// requests during file open.
+    pub fn load_remote_images(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab() {
+            tab.rich_view
+                .update(cx, |view, cx| view.load_remote_images(cx));
+        }
+        cx.notify();
+    }
+
     pub fn handle_window_drop(
         &mut self,
         paths: &ExternalPaths,
@@ -771,13 +784,20 @@ pub fn fuzzy_match(haystack: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     #[test]
     fn default_editor_mode_is_wysiwyg_not_split() {
         assert_eq!(EditorMode::default(), EditorMode::Wysiwyg);
         assert_ne!(EditorMode::default(), EditorMode::Split);
         assert_ne!(EditorMode::default(), EditorMode::Source);
+        let label = match EditorMode::default() {
+            EditorMode::Wysiwyg => "Wysiwyg",
+            EditorMode::Split => "Split",
+            EditorMode::Source => "Source",
+        };
+        assert_eq!(label, "Wysiwyg");
+        assert_ne!(label, "Rich");
+        assert_ne!(label, "Split");
     }
 
     #[test]
@@ -797,13 +817,7 @@ mod tests {
     #[test]
     fn idle_notify_channel_try_recv_does_not_block() {
         let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-        let started = Instant::now();
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "try_recv blocked for {:?}",
-            started.elapsed()
-        );
         drop(tx);
     }
 

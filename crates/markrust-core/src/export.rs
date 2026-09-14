@@ -8,10 +8,28 @@ use std::path::{Path, PathBuf};
 
 use comrak::{markdown_to_html, Options};
 
+/// Controls whether an HTML export can include content that is unsafe for
+/// untrusted Markdown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HtmlExportPolicy {
+    /// Omit raw HTML and neutralize URL schemes that Comrak considers dangerous.
+    #[default]
+    Safe,
+    /// Preserve the historical Comrak unsafe-rendering behavior for Markdown
+    /// that the caller trusts. GFM tag filtering remains enabled, but permitted
+    /// raw HTML and dangerous Markdown URL schemes are preserved.
+    Trusted,
+}
+
 /// Render Markdown source to an HTML fragment using GFM extensions plus
 /// Typora extras that the rich tree also parses (footnotes, description lists,
 /// dollar math, GitHub alerts, wikilinks).
 pub fn markdown_to_html_gfm(source: &str) -> String {
+    markdown_to_html_gfm_with_policy(source, HtmlExportPolicy::default())
+}
+
+/// Render Markdown source to an HTML fragment using GFM extensions and `policy`.
+pub fn markdown_to_html_gfm_with_policy(source: &str, policy: HtmlExportPolicy) -> String {
     let mut options = Options::default();
     options.extension.strikethrough = true;
     options.extension.table = true;
@@ -26,13 +44,23 @@ pub fn markdown_to_html_gfm(source: &str) -> String {
     options.extension.wikilinks_title_after_pipe = true;
     options.extension.tagfilter = true;
     options.extension.front_matter_delimiter = Some("---".into());
-    options.render.unsafe_ = true;
-    markdown_to_html(source, &options)
+    options.render.unsafe_ = matches!(policy, HtmlExportPolicy::Trusted);
+    let parse_input = crate::frontmatter::comrak_parse_input(source);
+    markdown_to_html(parse_input.as_ref(), &options)
 }
 
 /// Write Markdown source to an HTML file at `output`.
 pub fn write_markdown_to_html_file(source: &str, output: &Path) -> io::Result<()> {
-    let html = markdown_to_html_gfm(source);
+    write_markdown_to_html_file_with_policy(source, output, HtmlExportPolicy::default())
+}
+
+/// Write Markdown source to an HTML file at `output` using `policy`.
+pub fn write_markdown_to_html_file_with_policy(
+    source: &str,
+    output: &Path,
+    policy: HtmlExportPolicy,
+) -> io::Result<()> {
+    let html = markdown_to_html_gfm_with_policy(source, policy);
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -45,6 +73,17 @@ pub fn export_content_to_html(
     input_path: Option<&Path>,
     output: Option<&Path>,
 ) -> io::Result<PathBuf> {
+    export_content_to_html_with_policy(source, input_path, output, HtmlExportPolicy::default())
+}
+
+/// Export Markdown source to HTML using `policy`, inferring the output path from
+/// `input_path` when needed.
+pub fn export_content_to_html_with_policy(
+    source: &str,
+    input_path: Option<&Path>,
+    output: Option<&Path>,
+    policy: HtmlExportPolicy,
+) -> io::Result<PathBuf> {
     let out_path = output
         .map(PathBuf::from)
         .or_else(|| input_path.map(|p| p.with_extension("html")))
@@ -54,14 +93,24 @@ pub fn export_content_to_html(
                 "output path required when source has no file path",
             )
         })?;
-    write_markdown_to_html_file(source, &out_path)?;
+    write_markdown_to_html_file_with_policy(source, &out_path, policy)?;
     Ok(out_path)
 }
 
 /// Read a Markdown file and write HTML to `output` (or `<stem>.html` beside the source).
 pub fn export_file_to_html(input: &Path, output: Option<&Path>) -> io::Result<PathBuf> {
+    export_file_to_html_with_policy(input, output, HtmlExportPolicy::default())
+}
+
+/// Read a Markdown file and write HTML to `output` (or `<stem>.html` beside the
+/// source) using `policy`.
+pub fn export_file_to_html_with_policy(
+    input: &Path,
+    output: Option<&Path>,
+    policy: HtmlExportPolicy,
+) -> io::Result<PathBuf> {
     let source = fs::read_to_string(input)?;
-    export_content_to_html(&source, Some(input), output)
+    export_content_to_html_with_policy(&source, Some(input), output, policy)
 }
 
 #[cfg(test)]
@@ -77,11 +126,77 @@ mod tests {
     }
 
     #[test]
-    fn exports_frontmatter_without_rendering_fence() {
-        let md = "---\ntitle: Test\n---\n\n# Body\n";
+    fn safe_export_omits_raw_html_and_dangerous_urls() {
+        let md = concat!(
+            "<script>alert('nope')</script>\n\n",
+            "<span class=\"badge\">raw HTML</span>\n\n",
+            "[bad link](javascript:alert(1))\n\n",
+            "![bad image](javascript:alert(2))\n",
+        );
         let html = markdown_to_html_gfm(md);
-        assert!(html.contains("<h1>Body</h1>") || html.contains("Body</h1>"));
-        assert!(!html.contains("title: Test"));
+
+        assert_eq!(HtmlExportPolicy::default(), HtmlExportPolicy::Safe);
+        assert!(!html.contains("<script"), "script must not render: {html}");
+        assert!(
+            !html.contains("<span class=\"badge\">"),
+            "raw HTML must not render: {html}"
+        );
+        assert!(
+            !html.contains("javascript:"),
+            "dangerous URLs must not render: {html}"
+        );
+    }
+
+    #[test]
+    fn trusted_export_preserves_benign_raw_html() {
+        let html = markdown_to_html_gfm_with_policy(
+            "<span class=\"badge\">trusted HTML</span>",
+            HtmlExportPolicy::Trusted,
+        );
+
+        assert!(
+            html.contains("<span class=\"badge\">trusted HTML</span>"),
+            "trusted raw HTML must render: {html}"
+        );
+    }
+
+    #[test]
+    fn write_and_file_exports_default_to_safe_policy() {
+        let dir = crate::test_support::TempDir::new("export-policy");
+        let md = "<span class=\"badge\">raw HTML</span>";
+
+        let written = dir.join("written.html");
+        write_markdown_to_html_file(md, &written).unwrap();
+        let written_html = fs::read_to_string(&written).unwrap();
+        assert!(
+            !written_html.contains("<span class=\"badge\">"),
+            "default writer must be safe: {written_html}"
+        );
+
+        let input = dir.join("input.md");
+        fs::write(&input, md).unwrap();
+        let exported = dir.join("exported.html");
+        export_file_to_html(&input, Some(&exported)).unwrap();
+        let exported_html = fs::read_to_string(&exported).unwrap();
+        assert!(
+            !exported_html.contains("<span class=\"badge\">"),
+            "default file export must be safe: {exported_html}"
+        );
+    }
+
+    #[test]
+    fn exports_frontmatter_without_rendering_fence() {
+        for md in [
+            "---\ntitle: Test\n---\n\n# Body\n",
+            "---\ntitle: Test\n...\n\n# Body\n",
+        ] {
+            let html = markdown_to_html_gfm(md);
+            assert!(
+                html.contains("<h1>Body</h1>") || html.contains("Body</h1>"),
+                "{md:?} html={html}"
+            );
+            assert!(!html.contains("title: Test"), "{md:?} html={html}");
+        }
     }
 
     #[test]

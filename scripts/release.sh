@@ -16,15 +16,15 @@ echo "==> cargo fmt --check"
 cargo fmt --all -- --check
 
 echo "==> cargo clippy"
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 
 echo "==> cargo test"
-cargo test --workspace
+cargo test --locked --workspace
 
 echo "==> release build (markrust binary)"
-cargo build --release -p markrust
+cargo build --locked --release -p markrust
 
-VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c '
+VERSION="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
 import json, sys
 for pkg in json.load(sys.stdin)["packages"]:
     if pkg["name"] == "markrust":

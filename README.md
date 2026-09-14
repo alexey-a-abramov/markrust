@@ -2,11 +2,11 @@
 
 Fast, native, local-first Markdown workspace for developers.
 
-MarkRust is a free, open-source editor that keeps documents as plain UTF-8 Markdown on disk while rendering a true WYSIWYG view (bold is bold). Source mode with Typora-style delimiter masking and a side-by-side split are optional (`Cmd/Ctrl+Shift+M`).
+MarkRust is a free, open-source editor that keeps documents as plain UTF-8 Markdown on disk while rendering a true WYSIWYG view (Typora-style: delimiters hidden unless the caret or a selection intersects the node). Source mode with delimiter masking and a side-by-side split are optional (`Cmd/Ctrl+Shift+M`).
 
 ## Status
 
-**v0.1.0** — MVP editor with GPUI workspace shell, file tree, outline, command palette, autosave, and 29+ unit tests.
+**v0.1.0 alpha** — MVP editor with GPUI workspace shell, file tree, outline, command palette, autosave, and a broad automated Rust and website test suite.
 
 ## Screenshots
 
@@ -17,31 +17,19 @@ MarkRust is a free, open-source editor that keeps documents as plain UTF-8 Markd
 
 ## Install
 
-### GitHub Releases (recommended)
+### GitHub Releases
 
-Download a prebuilt binary for your platform from the [latest release](https://github.com/alexey-a-abramov/markrust/releases/latest):
+Prebuilt release archives are not published yet. Follow the
+[releases page](https://github.com/alexey-a-abramov/markrust/releases) for the
+first tagged alpha; until then, build from source below.
 
-| Platform | Archive |
-|---|---|
-| macOS (Apple Silicon) | `markrust-macos-aarch64.tar.gz` |
-| macOS (Intel) | `markrust-macos-x86_64.tar.gz` |
-| Linux (x86_64) | `markrust-linux-x86_64.tar.gz` |
-
-```bash
-tar xzf markrust-*.tar.gz
-install -m 755 markrust ~/.local/bin/   # or /usr/local/bin
-```
-
-Windows builds are planned for v0.2.
+Windows builds are planned after the v0.1 alpha release gate.
 
 ### Homebrew
 
-```bash
-brew tap alexey-a-abramov/markrust
-brew install markrust
-```
-
-The formula template lives in [`packaging/homebrew/markrust.rb`](packaging/homebrew/markrust.rb). After the first release, copy it into the [`homebrew-markrust`](https://github.com/alexey-a-abramov/homebrew-markrust) tap and update the SHA256 checksums.
+The Homebrew tap is not published yet. The formula template lives in
+[`packaging/homebrew/markrust.rb`](packaging/homebrew/markrust.rb) and needs
+release-archive SHA256 checksums before it can be installed.
 
 ### Cargo
 
@@ -51,7 +39,7 @@ The formula template lives in [`packaging/homebrew/markrust.rb`](packaging/homeb
 cargo install --git https://github.com/alexey-a-abramov/markrust markrust
 ```
 
-Once published:
+After the package is published:
 
 ```bash
 cargo install markrust
@@ -97,7 +85,7 @@ bash scripts/release.sh
 | `Cmd/Ctrl+Z` | Undo |
 | `Cmd/Ctrl+Shift+Z` | Redo |
 | `Cmd/Ctrl+P` | Command palette |
-| `Cmd/Ctrl+Shift+M` | Cycle Rich / Source / Split |
+| `Cmd/Ctrl+Shift+M` | Cycle WYSIWYG / Source / Split |
 | `Cmd/Ctrl+Shift+T` | Toggle light/dark theme |
 | `Cmd/Ctrl+C` / `X` | Copy / cut as Markdown (empty caret copies/cuts the current block) |
 | `Cmd/Ctrl+B` / `I` / `E` / `K` | Bold / italic / code / link |
@@ -130,7 +118,9 @@ cargo run -p markrust -- --version
 cargo run -p markrust            # launches GUI
 ```
 
-CI runs `fmt`, `clippy`, and `tests` on every push/PR. Pushing a `v*` tag triggers a GitHub Release with macOS and Linux binaries.
+CI runs `fmt`, `clippy`, Rust tests, and website tests on every push/PR. A
+`v*` tag builds release archives; publishing them remains part of the v0.1
+release gate.
 
 ## Website
 
@@ -142,7 +132,8 @@ pnpm dev              # http://localhost:4321
 pnpm build            # output → website/dist/
 ```
 
-Site: [markrust.org](https://markrust.org) (when deployed).
+Site: [markrust.org](https://markrust.org) (when deployed). The GitHub Pages
+and custom-domain handoff is in [the deployment guide](docs/deployment.md).
 
 ## License
 

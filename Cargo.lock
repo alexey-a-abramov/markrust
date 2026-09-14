@@ -3500,15 +3500,19 @@ dependencies = [
  "ropey",
  "similar",
  "thiserror 2.0.20",
+ "unicode-segmentation",
+ "yaml-rust",
 ]
 
 [[package]]
 name = "markrust-editor"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "criterion",
  "dirs",
  "gpui",
+ "image",
  "markrust-core",
  "pretty_assertions",
  "reqwest",

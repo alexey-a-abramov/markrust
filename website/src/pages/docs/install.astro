@@ -22,17 +22,16 @@ const headings = [
   </ul>
 
   <h2 id="releases">GitHub Releases</h2>
-  <p>Download a prebuilt binary from the <a href="https://github.com/alexey-a-abramov/markrust/releases/latest">latest release</a>:</p>
-  <CodeBlock code={`tar xzf markrust-macos-aarch64.tar.gz\ninstall -m 755 markrust ~/.local/bin/`} terminal />
+  <p>Prebuilt release archives are not published yet. Follow the <a href="https://github.com/alexey-a-abramov/markrust/releases">releases page</a> for the first tagged alpha. Until then, <a href="/docs/building">build from source</a>.</p>
 
   <h2 id="homebrew">Homebrew</h2>
-  <CodeBlock code={`brew tap alexey-a-abramov/markrust\nbrew install markrust`} terminal />
+  <p>The Homebrew tap is not published yet. It will be available after release archives and their checksums are published.</p>
 
   <h2 id="cargo">Cargo</h2>
   <p>The desktop binary depends on GPUI from a pinned git revision:</p>
   <CodeBlock code="cargo install --git https://github.com/alexey-a-abramov/markrust markrust" terminal />
   <Callout type="note">
-    <p>Once GPUI is available on crates.io, <code>cargo install markrust</code> will work without the git URL.</p>
+    <p>After the package is published and GPUI is available on crates.io, <code>cargo install markrust</code> will work without the git URL.</p>
   </Callout>
 
   <h2 id="build">Build from source</h2>

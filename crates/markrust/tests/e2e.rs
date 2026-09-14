@@ -65,6 +65,62 @@ fn cli_export_via_assert_cmd_and_library() {
 }
 
 #[test]
+fn cli_export_is_safe_by_default_and_can_trust_raw_html() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("markrust-cli-export-policy-{nanos}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("input.md");
+    std::fs::write(
+        &input,
+        concat!(
+            "<script>alert('nope')</script>\n\n",
+            "<span class=\"badge\">trusted HTML</span>\n\n",
+            "[bad link](javascript:alert(1))\n\n",
+            "![bad image](javascript:alert(2))\n",
+        ),
+    )
+    .unwrap();
+
+    let safe_output = dir.join("safe.html");
+    let mut safe = Command::cargo_bin("markrust").unwrap();
+    safe.args([
+        "export",
+        input.to_str().unwrap(),
+        "--output",
+        safe_output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    let safe_html = std::fs::read_to_string(&safe_output).unwrap();
+    assert!(!safe_html.contains("<script"), "{safe_html}");
+    assert!(!safe_html.contains("<span class=\"badge\">"), "{safe_html}");
+    assert!(!safe_html.contains("javascript:"), "{safe_html}");
+
+    let trusted_output = dir.join("trusted.html");
+    let mut trusted = Command::cargo_bin("markrust").unwrap();
+    trusted
+        .args([
+            "export",
+            "--unsafe-html",
+            input.to_str().unwrap(),
+            "--output",
+            trusted_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let trusted_html = std::fs::read_to_string(&trusted_output).unwrap();
+    assert!(
+        trusted_html.contains("<span class=\"badge\">trusted HTML</span>"),
+        "{trusted_html}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn parse_args_does_not_select_gui_for_version() {
     assert_eq!(parse_args(&["-V".into()]), CliAction::Version);
 }
@@ -77,6 +133,7 @@ fn cli_help_via_assert_cmd() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage"), "{stdout}");
     assert!(stdout.contains("export"), "{stdout}");
+    assert!(stdout.contains("--unsafe-html"), "{stdout}");
     assert!(
         stdout.contains("--version") || stdout.contains("-V"),
         "{stdout}"

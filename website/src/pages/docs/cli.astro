@@ -17,9 +17,10 @@ const headings = [
   <p>Launches the MarkRust editor. This is the default when no subcommand is given.</p>
 
   <h2 id="export">Export</h2>
-  <CodeBlock code={`markrust export README.md\nmarkrust export README.md -o dist/README.html`} terminal />
+  <CodeBlock code={`markrust export README.md\nmarkrust export README.md -o dist/README.html\nmarkrust export trusted.md --unsafe-html`} terminal />
   <p>Converts a Markdown file to HTML using comrak with GFM extensions. Output defaults to a <code>.html</code> file beside the source.</p>
+  <p>Exports are safe by default: raw HTML and dangerous URL schemes are omitted. Use <code>--unsafe-html</code> only for Markdown you trust and intentionally want to preserve raw HTML and dangerous URLs; GFM tag filtering still applies.</p>
 
   <h2 id="flags">Flags</h2>
-  <CodeBlock code={`markrust --version\nmarkrust --help\nmarkrust --gui    # explicit GUI launch`} terminal />
+  <CodeBlock code={`markrust --version\nmarkrust --help\nmarkrust --gui    # explicit GUI launch\nmarkrust export --unsafe-html trusted.md`} terminal />
 </DocsLayout>

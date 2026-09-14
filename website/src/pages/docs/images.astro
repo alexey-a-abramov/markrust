@@ -10,5 +10,10 @@ import DocsLayout from '../../layouts/DocsLayout.astro';
   <p>Drop an image file onto the editor. MarkRust copies it to an <code>assets/</code> subdirectory (when possible) and inserts a relative image reference at the cursor.</p>
 
   <h2>Rendering</h2>
-  <p>When syntax delimiters are masked, images display alt text with a placeholder indicator. Full inline image rendering is planned for a future release.</p>
+  <p>Local images are resolved relative to the document and render as pixels in WYSIWYG mode. Before they reach the native decoder, MarkRust applies size, format, and pixel-budget checks and uses a verified cache copy. If an image cannot be loaded, it keeps an alt-text placeholder instead.</p>
+  <p>Image <code>data:</code> URLs follow the same validation and cache-copy path; MarkRust never passes a document-controlled URI directly to the native image loader.</p>
+
+  <h2>Remote images</h2>
+  <p>Opening a Markdown file never sends remote-image requests automatically. To load a document’s remote images, click <strong>Load images</strong> in the toolbar or choose <strong>Load remote images</strong> from the Command Palette. Permission applies only to the current tab and is not saved.</p>
+  <p>For privacy and safety, MarkRust only fetches public <code>https://</code> image URLs. It rejects insecure HTTP, local and private-network addresses, unsafe redirects, oversized or over-dimensioned images, non-image responses, and unsafe SVG content before writing a verified cache copy.</p>
 </DocsLayout>

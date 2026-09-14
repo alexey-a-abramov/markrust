@@ -7,6 +7,8 @@
 
 use std::ops::Range;
 
+use markrust_core::rich::engine::list_marker_on_line;
+
 /// Inline wrap applied to a source selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WrapKind {
@@ -319,31 +321,7 @@ fn strip_list_marker_line(slice: &str) -> Option<String> {
 }
 
 fn list_marker_width(line: &str) -> usize {
-    let indent = line
-        .bytes()
-        .take_while(|b| *b == b' ' || *b == b'\t')
-        .count();
-    let rest = &line[indent..];
-    let marker = if rest.starts_with(['-', '*', '+']) && rest.as_bytes().get(1) == Some(&b' ') {
-        2
-    } else if let Some(end) = rest.find(['.', ')']) {
-        if !rest[..end].is_empty() && rest[..end].bytes().all(|b| b.is_ascii_digit()) {
-            end + 2
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-    if marker == 0 {
-        return 0;
-    }
-    let mut take = indent + marker;
-    let after = &line.get(take..).unwrap_or("");
-    if after.starts_with("[ ] ") || after.starts_with("[x] ") || after.starts_with("[X] ") {
-        take += 4;
-    }
-    take.min(line.len())
+    list_marker_on_line(line).len()
 }
 
 /// Leading `>` markers (optional space after each), so indent lands inside the quote.
@@ -453,6 +431,20 @@ mod tests {
         assert!(out.text.starts_with("- hello"), "{:?}", out.text);
         let para = outdent_selection("- hello", 2..2).unwrap();
         assert_eq!(para.text.trim(), "hello");
+        let tabbed = outdent_selection("-\titem", 2..2).unwrap();
+        assert_eq!(
+            tabbed.text.trim(),
+            "item",
+            "outdent must strip tab-padded `-\\t`, got {:?}",
+            tabbed.text
+        );
+        let padded = outdent_selection("-   item", 4..4).unwrap();
+        assert_eq!(
+            padded.text.trim(),
+            "item",
+            "outdent must strip 3-space padding, got {:?}",
+            padded.text
+        );
     }
 
     #[test]

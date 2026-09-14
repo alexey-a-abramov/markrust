@@ -22,7 +22,10 @@ use std::time::{Duration, Instant};
 use comrak::nodes::{AstNode, NodeValue};
 use comrak::{parse_document, Arena};
 
-use crate::rich::import::{math_outer_range, parse_options, LineStarts};
+use crate::rich::import::{
+    math_outer_range, parse_options, recover_indented_code_range, LineStarts,
+};
+use crate::rich::tree::math_visible_range;
 use crate::spans::{DelimiterSpan, SyntaxKind, SyntaxNodeSpan, TableRowKind};
 
 /// Snapshot sent to the background parser thread.
@@ -42,12 +45,31 @@ pub struct ParseUpdate {
 /// Extract syntax spans from Markdown source using the comrak AST.
 pub fn extract_syntax_spans(source: &str) -> Vec<SyntaxNodeSpan> {
     let arena = Arena::new();
-    let root = parse_document(&arena, source, &parse_options());
+    let parse_input = crate::frontmatter::comrak_parse_input(source);
+    let root = parse_document(&arena, parse_input.as_ref(), &parse_options());
     let lines = LineStarts::new(source);
     let mut spans = Vec::new();
     collect_spans(root, source, &lines, &mut spans);
     collect_eqeq_highlights(root, source, &lines, &mut spans);
     collect_emoji_shortcodes(root, source, &lines, &mut spans);
+    if let Some(info) = crate::parse_frontmatter(source) {
+        let range = info.start_byte..info.end_byte.min(source.len());
+        let has_fm = spans
+            .iter()
+            .any(|s| s.kind == SyntaxKind::Frontmatter && s.end_byte > s.start_byte);
+        if !has_fm && range.end > range.start {
+            spans.retain(|s| s.kind != SyntaxKind::Frontmatter);
+            spans.push(make_span(
+                SyntaxKind::Frontmatter,
+                range.clone(),
+                frontmatter_delims(source, &range),
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+    }
     spans.sort_by_key(|span| (span.start_byte, span.end_byte));
     spans
 }
@@ -140,14 +162,13 @@ fn collect_spans<'a>(
         }
         NodeValue::Math(math) => {
             let full = math_outer_range(source, range.clone(), math.display_math);
-            let inner_start = range.start.max(full.start);
-            let inner_end = range.end.min(full.end);
+            let vis = math_visible_range(source, math.display_math, full.clone());
             let mut delimiter_spans = Vec::new();
-            if full.start < inner_start {
-                delimiter_spans.push(DelimiterSpan::new(full.start, inner_start));
+            if full.start < vis.start {
+                delimiter_spans.push(DelimiterSpan::new(full.start, vis.start));
             }
-            if inner_end < full.end {
-                delimiter_spans.push(DelimiterSpan::new(inner_end, full.end));
+            if vis.end < full.end {
+                delimiter_spans.push(DelimiterSpan::new(vis.end, full.end));
             }
             spans.push(make_span(
                 SyntaxKind::Math,
@@ -204,6 +225,11 @@ fn collect_spans<'a>(
             ));
         }
         NodeValue::CodeBlock(cb) => {
+            let range = if cb.fenced {
+                range
+            } else {
+                recover_indented_code_range(source, range, 0)
+            };
             let language = {
                 let lang = cb.info.split_whitespace().next().unwrap_or("").trim();
                 if lang.is_empty() {
@@ -590,7 +616,7 @@ fn frontmatter_delims(source: &str, range: &std::ops::Range<usize>) -> Vec<Delim
     }
     if let Some(last) = slice.trim_end_matches(['\r', '\n']).rfind('\n') {
         let close = slice[last + 1..].trim_end_matches(['\r', '\n']);
-        if close.starts_with("---") {
+        if close.starts_with("---") || close.starts_with("...") {
             let start = range.start + last + 1;
             out.push(DelimiterSpan::new(start, start + close.len()));
         }
@@ -964,9 +990,14 @@ mod tests {
 
     #[test]
     fn extracts_frontmatter() {
-        let spans = extract_syntax_spans("---\ntitle: X\n---\n\n# Hi");
-        assert!(has_kind(&spans, SyntaxKind::Frontmatter));
-        assert!(has_kind(&spans, SyntaxKind::Heading));
+        for source in ["---\ntitle: X\n---\n\n# Hi", "---\ntitle: X\n...\n\n# Hi"] {
+            let spans = extract_syntax_spans(source);
+            assert!(
+                has_kind(&spans, SyntaxKind::Frontmatter),
+                "frontmatter span missing, {source:?}"
+            );
+            assert!(has_kind(&spans, SyntaxKind::Heading), "{source:?}");
+        }
     }
 
     #[test]
@@ -1069,6 +1100,35 @@ mod tests {
             "$$E=mc^2$$"
         );
         assert_eq!(delim_text(source, maths[1]), vec!["$$", "$$"]);
+    }
+
+    #[test]
+    fn extracts_multiline_display_math_wrapping_newlines_as_delimiters() {
+        for source in [
+            "$$\nE=mc^2\n$$",
+            "> $$\n> E=mc^2\n> $$",
+            "- $$\n  E=mc^2\n  $$",
+        ] {
+            let spans = extract_syntax_spans(source);
+            let math = spans
+                .iter()
+                .find(|s| s.kind == SyntaxKind::Math)
+                .unwrap_or_else(|| panic!("math in {source:?}: {spans:?}"));
+            let slice = &source[math.start_byte..math.end_byte];
+            assert!(
+                slice.contains("$$") && slice.contains("E=mc^2"),
+                "span must cover delimiters and formula, {source:?} got {slice:?}"
+            );
+            let delims = delim_text(source, math);
+            assert!(
+                delims.iter().any(|d| d.contains("$$") && d.contains('\n')),
+                "wrapping newlines must mask with `$$`, {source:?} got {delims:?}"
+            );
+            assert!(
+                !delims.iter().any(|d| d.contains("E=mc^2")),
+                "formula must not be delimiter chrome, {source:?} got {delims:?}"
+            );
+        }
     }
 
     #[test]
@@ -1214,6 +1274,14 @@ mod tests {
             has_kind(&spans, SyntaxKind::CodeBlock) || has_kind(&spans, SyntaxKind::BlockQuote)
         );
         assert!(has_kind(&spans, SyntaxKind::BlockQuote));
+        let code = spans
+            .iter()
+            .find(|s| s.kind == SyntaxKind::CodeBlock)
+            .expect("indented code span");
+        assert_eq!(
+            code.start_byte, 0,
+            "indented-code span must include the opening indent, got {code:?}"
+        );
     }
 
     #[test]

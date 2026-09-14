@@ -12,8 +12,82 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+permissions:
+  contents: read
+
 jobs:
+  verify:
+    name: release verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96
+          components: rustfmt, clippy
+
+      - name: Install Linux GUI dependencies
+        run: bash scripts/install-linux-deps.sh
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run Rust test suite
+        run: cargo test --locked --workspace
+
+  verify-macos:
+    name: native macOS release verification
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96
+
+      - name: Run native Rust test suite
+        run: cargo test --locked --workspace
+
+      - name: Build and smoke native release binary
+        run: |
+          cargo build --locked --release -p markrust
+          ./target/release/markrust --version
+
+  verify-website:
+    name: website release verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install website dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm --dir website exec playwright install --with-deps chromium
+
+      - name: Run website unit + e2e tests
+        run: pnpm --dir website test
+
   build:
+    needs: [verify, verify-macos, verify-website]
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +102,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: markrust-linux-x86_64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -41,8 +116,15 @@ jobs:
         if: runner.os == 'Linux'
         run: bash scripts/install-linux-deps.sh
 
-      - name: Build release binary
-        run: cargo build --release -p markrust --target ${{ matrix.target }}
+      # Build and execute a binary for the runner's own architecture first.
+      # A cross-compiled artifact can prove it links, but cannot prove it starts.
+      - name: Build and smoke native release binary
+        run: |
+          cargo build --locked --release -p markrust
+          ./target/release/markrust --version
+
+      - name: Build target release binary
+        run: cargo build --locked --release -p markrust --target ${{ matrix.target }}
 
       - name: Package archive
         shell: bash
@@ -50,16 +132,24 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/markrust" dist/
           tar czf "${{ matrix.artifact }}.tar.gz" -C dist markrust
+          if command -v shasum >/dev/null; then
+            shasum -a 256 "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+          else
+            sha256sum "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
 
   release:
-    needs: build
+    needs: [verify, verify-macos, verify-website, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -68,8 +158,23 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Verify archive checksums
+        shell: bash
+        run: |
+          shopt -s nullglob
+          checksums=(artifacts/*.sha256)
+          test "${#checksums[@]}" -gt 0
+          for checksum in "${checksums[@]}"; do
+            (
+              cd "$(dirname "$checksum")"
+              sha256sum -c "$(basename "$checksum")"
+            )
+          done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.tar.gz
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.tar.gz.sha256
           generate_release_notes: true

@@ -97,7 +97,10 @@ impl LineIndex {
         }
 
         for start in &self.line_starts {
-            if *start < byte_offset {
+            // Inserting at the start of an existing line extends that line;
+            // its start stays at `byte_offset`. In particular, inserting a
+            // newline there must retain the empty line before the old body.
+            if *start <= byte_offset {
                 new_starts.push(*start);
             } else {
                 new_starts.push(*start + text.len());
@@ -149,6 +152,21 @@ mod tests {
         let mut index = LineIndex::from_rope(&Rope::from_str("ab"));
         index.on_insert(2, "\ncd");
         assert_eq!(index.line_starts, vec![0, 3]);
+    }
+
+    #[test]
+    fn inserting_newline_at_existing_line_start_keeps_the_empty_line() {
+        let mut rope = Rope::from_str("*\r\n*\n");
+        let mut index = LineIndex::from_rope(&rope);
+
+        // Offset 5 is the start of the trailing empty line. Keeping that
+        // start yields a distinct empty line for each of the two final LFs.
+        index.on_insert(5, "\n");
+        rope.insert(rope.byte_to_char(5), "\n");
+
+        assert_eq!(index.line_starts(), &[0, 3, 5, 6]);
+        assert_matches_rebuild(&index, &rope);
+        assert_round_trip(&rope.to_string());
     }
 
     #[test]

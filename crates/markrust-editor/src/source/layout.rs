@@ -1024,6 +1024,36 @@ mod tests {
     }
 
     #[test]
+    fn multiline_display_math_masks_wrapping_newlines_when_caret_outside() {
+        let content = "see\n$$\nE=mc^2\n$$\nhere";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let layout =
+            build_display_layout(content, &spans, &[Caret::new(0)], &[], &EditorTheme::dark());
+        let masked: Vec<_> = layout
+            .segments
+            .iter()
+            .filter(|s| matches!(s.style, SegmentStyle::Delimiter { visible: false }))
+            .collect();
+        assert!(
+            !masked.is_empty(),
+            "expected masked $$ / wrapping newlines, segments={:?}",
+            layout.segments
+        );
+        let masked_bytes: String = masked
+            .iter()
+            .map(|s| &content[s.doc_start..s.doc_end])
+            .collect();
+        assert!(
+            masked_bytes.contains("$$"),
+            "$$ must be masked, got {masked_bytes:?}"
+        );
+        assert!(
+            !masked_bytes.contains("E=mc^2"),
+            "formula must not be masked, got {masked_bytes:?}"
+        );
+    }
+
+    #[test]
     fn math_dollars_reveal_when_caret_inside() {
         let content = "see $x^2$ here";
         let spans = markrust_core::extract_syntax_spans(content);

@@ -9,6 +9,7 @@
 pub mod command;
 pub mod emoji;
 pub mod engine;
+pub mod entities;
 pub mod escape;
 pub mod import;
 pub mod input_rules;
@@ -17,14 +18,18 @@ pub mod serialize;
 pub mod tree;
 
 pub use command::{
-    apply_rich_command, code_body_source_map, place_caret_for_click_below, table_select_all_range,
-    BlockType, CaretState, RichCommand, RichError, RichOutcome,
+    apply_rich_command, code_body_source_map, html_block_literal_source_map,
+    place_caret_for_click_below, table_select_all_range, BlockType, CaretState, RichCommand,
+    RichError, RichOutcome,
 };
 pub use emoji::{lookup_emoji, lookup_shortcode};
 pub use engine::{
     blank_caret_gap_after_last, blank_caret_gap_at, blank_caret_gap_before, blank_caret_gaps,
-    caret_for_click_below_content, Bias, BlockSpan, BlockSplice, RichEngine, TablePos,
+    caret_for_click_below_content, line_prefix_parts, list_marker_on_line,
+    tagfilter_widget_ranges_in, Bias, BlockSpan, BlockSplice, LinePrefixParts, RichEngine,
+    TablePos,
 };
+pub use entities::{is_decoded_backslash_escape, is_decoded_character_reference};
 pub use import::import_markdown;
 pub use input_rules::{
     input_rule_breaks_table, match_input_rule, match_input_rule_with, InputRule,
@@ -32,14 +37,19 @@ pub use input_rules::{
 pub use save::{save_candidates, DiffHunk, SaveCandidates};
 pub use serialize::{serialize_block, serialize_tree, SerializeMode};
 pub use tree::{
-    find_alert_chrome, is_toc_marker, wiki_visible_range, AlertChrome, AlertKind, Block, BlockKind,
-    BreakStyle, ColumnAlign, FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs,
-    MarkFidelity, MarkSet, NodeId, PrefixBlank, RichTree,
+    alert_title_range, code_span_visible_range, emoji_visible_range, expand_around_html_phrasing,
+    expand_around_markdown_link, expand_link_and_html_chrome, expand_marks_and_link_chrome,
+    find_alert_chrome, grow_mark_delimiters, is_toc_marker, link_reference_def_chrome,
+    markdown_link_chrome, markdown_link_dest_parts, math_visible_range, toc_visible_range,
+    wiki_visible_range, AlertChrome, AlertKind, Block, BlockKind, BreakStyle, ColumnAlign,
+    FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs, LinkReferenceDefChrome,
+    MarkFidelity, MarkSet, MarkdownLinkChrome, NodeId, PrefixBlank, RichTree,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
 
     fn import(source: &str) -> RichTree {
         import_markdown(source, &mut IdGen::default())
@@ -75,18 +85,35 @@ mod tests {
 
     #[test]
     fn frontmatter_is_root_state_not_a_block() {
-        let source = "---\ntitle: Test\n---\n\n# Heading\n";
-        let tree = import(source);
-        let fm = tree.frontmatter.expect("frontmatter present");
-        assert!(fm.raw.contains("title: Test"));
-        assert_eq!(tree.blocks.len(), 1);
-        assert!(matches!(
-            tree.blocks[0].kind,
-            BlockKind::Heading {
-                level: 1,
-                style: HeadingStyle::Atx
-            }
-        ));
+        for source in [
+            "---\ntitle: Test\n---\n\n# Heading\n",
+            "---\ntitle: Test\n...\n\n# Heading\n",
+        ] {
+            let tree = import(source);
+            let fm = tree.frontmatter.as_ref().expect("frontmatter present");
+            assert!(fm.raw.contains("title: Test"), "{source:?}");
+            assert!(
+                fm.raw.contains("---") || fm.raw.contains("..."),
+                "fences must stay in raw, {source:?} raw={:?}",
+                fm.raw
+            );
+            assert_eq!(tree.blocks.len(), 1, "{source:?}");
+            assert!(
+                matches!(
+                    tree.blocks[0].kind,
+                    BlockKind::Heading {
+                        level: 1,
+                        style: HeadingStyle::Atx
+                    }
+                ),
+                "{source:?}"
+            );
+            let title = source.find("Test").unwrap();
+            assert!(
+                title < super::engine::frontmatter_body_start(&tree),
+                "YAML title must sit inside the panel range, {source:?}"
+            );
+        }
     }
 
     #[test]
@@ -157,6 +184,43 @@ mod tests {
     }
 
     #[test]
+    fn list_item_x_at_eol_without_space_is_not_a_task() {
+        let tree = import("- [x]\n");
+        let item = &tree.blocks[0].children[0];
+        assert!(
+            matches!(item.kind, BlockKind::ListItem { task: None }),
+            "GFM requires a space after `]`, got {:?}",
+            item.kind
+        );
+        let para = item
+            .children
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Paragraph))
+            .expect("paragraph");
+        let text: String = para
+            .inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("[x]"),
+            "[x] at EOL must stay list-item text, got {text:?}"
+        );
+
+        let real = import("- [x] done\n");
+        assert!(
+            matches!(
+                real.blocks[0].children[0].kind,
+                BlockKind::ListItem { task: Some(true) }
+            ),
+            "real task with a space after `]` must stay a task"
+        );
+    }
+
+    #[test]
     fn code_block_keeps_fence_fidelity_and_literal() {
         let source = "~~~~rust\nfn main() {}\n~~~~\n";
         let tree = import(source);
@@ -178,6 +242,74 @@ mod tests {
             tree.blocks[0].code_body_range(source),
             body..body + "fn main() {}".len()
         );
+    }
+
+    #[test]
+    fn indented_code_source_range_includes_opening_indent() {
+        for source in ["    indented\n", "\tindented\n"] {
+            let tree = import(source);
+            let block = &tree.blocks[0];
+            match &block.kind {
+                BlockKind::CodeBlock { fence: None, .. } => {}
+                other => panic!("expected indented code, {source:?} got {other:?}"),
+            }
+            assert!(
+                block.source_range.start < source.find("indented").expect("body"),
+                "block must cover the opening indent, {source:?} range={:?}",
+                block.source_range
+            );
+            let body = block.code_body_range(source);
+            assert_eq!(
+                &source[body.start..body.start + "indented".len()],
+                "indented",
+                "body must start at content, {source:?} body={body:?}"
+            );
+            assert_eq!(
+                source.as_bytes().get(block.source_range.start),
+                source.as_bytes().first(),
+                "recovered start must be the indent byte, {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cm_opening_indent_is_in_source_range() {
+        for source in [" # Title\n", " ```\nfoo\n```\n", " ---\n", " Title\n ===\n"] {
+            let tree = import(source);
+            assert_eq!(
+                tree.blocks[0].source_range.start, 0,
+                "0–3 space indent must be in the block span, {source:?} range={:?}",
+                tree.blocks[0].source_range
+            );
+            assert_eq!(source.as_bytes().first(), Some(&b' '), "{source:?}");
+        }
+
+        let quoted = ">  # Title\n";
+        let tree = import(quoted);
+        let heading = tree.blocks[0]
+            .children
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Heading { .. }))
+            .expect("quoted heading");
+        assert!(
+            heading.source_range.start > 0,
+            "must not steal `>` into the heading, range={:?}",
+            heading.source_range
+        );
+        assert_eq!(
+            quoted.as_bytes().get(heading.source_range.start),
+            Some(&b' '),
+            "heading span starts on the extra indent after `>`, range={:?}",
+            heading.source_range
+        );
+        assert_eq!(quoted.as_bytes().first(), Some(&b'>'));
+
+        let four = "    # Title\n";
+        let tree = import(four);
+        match &tree.blocks[0].kind {
+            BlockKind::CodeBlock { fence: None, .. } => {}
+            other => panic!("four spaces must stay indented code, got {other:?}"),
+        }
     }
 
     #[test]
@@ -258,6 +390,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inline_svg_is_one_opaque_image() {
+        let source = "hello <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"><rect width=\"8\" height=\"8\" fill=\"#f00\"/></svg> world\n";
+        let tree = import(source);
+        let svg = tree.blocks[0]
+            .inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::OpaqueInline { raw, .. } => Some(raw.as_ref()),
+                _ => None,
+            })
+            .expect("merged svg");
+        assert!(
+            svg.contains("<svg") && svg.contains("</svg>"),
+            "split HtmlInlines must merge into one svg widget, got {svg:?}"
+        );
+        assert!(
+            crate::html_visual::html_inline_image(svg).is_some(),
+            "merged svg must classify as an image, got {svg:?}"
+        );
+        assert_eq!(
+            tree.blocks[0]
+                .inlines
+                .iter()
+                .filter(|i| matches!(i, Inline::OpaqueInline { raw, .. } if raw.contains("<svg")))
+                .count(),
+            1,
+            "must not leave split svg tags, {:?}",
+            inline_debug(&tree)
+        );
+    }
+
     fn walk_blocks<'a>(blocks: &'a [Block], out: &mut Vec<&'a Block>) {
         for b in blocks {
             out.push(b);
@@ -289,6 +453,757 @@ mod tests {
             preserve("Hello[^1]\n\n[^1]: the note\n"),
             "Hello[^1]\n\n[^1]: the note\n"
         );
+    }
+
+    #[test]
+    fn link_reference_definition_is_a_wysiwyg_block() {
+        let source = "[hello][ref]\n\n[ref]: https://e.com\n";
+        let tree = import(source);
+        assert_eq!(tree.blocks.len(), 2, "paragraph + definition, got {tree:?}");
+        match &tree.blocks[1].kind {
+            BlockKind::LinkReferenceDefinition { label, url, title } => {
+                assert_eq!(label, "ref");
+                assert_eq!(url, "https://e.com");
+                assert!(title.is_none());
+            }
+            other => panic!("expected link reference definition, got {other:?}"),
+        }
+        assert_eq!(
+            &source[tree.blocks[1].source_range.clone()],
+            "[ref]: https://e.com"
+        );
+        assert_eq!(preserve(source), source);
+        let dest_run = tree.blocks[1].inlines.iter().find_map(|i| match i {
+            Inline::Run {
+                text,
+                link: Some(link),
+                ..
+            } => Some((text.as_str(), link.url.as_str())),
+            _ => None,
+        });
+        assert_eq!(dest_run, Some(("https://e.com", "https://e.com")));
+        let hello = tree.blocks[0].inlines.iter().find_map(|i| match i {
+            Inline::Run {
+                text,
+                link: Some(link),
+                ..
+            } if text == "hello" => Some(link.url.as_str()),
+            _ => None,
+        });
+        assert_eq!(hello, Some("https://e.com"));
+    }
+
+    #[test]
+    fn unused_link_reference_definition_is_still_a_block() {
+        let source = "[ref]: https://e.com\n";
+        let tree = import(source);
+        assert_eq!(tree.blocks.len(), 1);
+        assert!(matches!(
+            tree.blocks[0].kind,
+            BlockKind::LinkReferenceDefinition { .. }
+        ));
+        assert_eq!(preserve(source), source);
+    }
+
+    #[test]
+    fn empty_link_reference_definition_is_still_a_block() {
+        let source = "[hello][ref]\n\n[ref]: \n";
+        let tree = import(source);
+        assert!(
+            tree.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::LinkReferenceDefinition { .. })),
+            "empty `[ref]: ` must stay a definition block, got {:?}",
+            tree.blocks.iter().map(|b| &b.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(preserve(source), source);
+    }
+
+    #[test]
+    fn link_reference_dest_backslash_wrap_stays_one_definition() {
+        let source = "[hello][ref]\n\n[ref]: https://ex.com/pa\\\nth\n";
+        let tree = import(source);
+        let def = tree.blocks.iter().find_map(|b| match &b.kind {
+            BlockKind::LinkReferenceDefinition { url, .. } => Some(url.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            def,
+            Some("https://ex.com/path"),
+            "dest wrap must concatenate, got {def:?} blocks={:?}",
+            tree.blocks.iter().map(|b| &b.kind).collect::<Vec<_>>()
+        );
+        let hello = tree.blocks.iter().find_map(|b| {
+            b.inlines.iter().find_map(|i| match i {
+                Inline::Run {
+                    text,
+                    link: Some(link),
+                    ..
+                } if text == "hello" => Some(link.url.as_str()),
+                _ => None,
+            })
+        });
+        assert_eq!(hello, Some("https://ex.com/path"));
+        assert_eq!(preserve(source), source);
+    }
+
+    #[test]
+    fn link_reference_dest_does_not_swallow_following_setext() {
+        let source = "[foo]: /url\nbar\n===\n[foo]\n";
+        let tree = import(source);
+        let def = tree.blocks.iter().find_map(|b| match &b.kind {
+            BlockKind::LinkReferenceDefinition { url, .. } => Some(url.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            def,
+            Some("/url"),
+            "must not wrap dest into `bar`, got {def:?}"
+        );
+        assert!(
+            tree.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading { .. })),
+            "setext `bar` / `===` must survive, got {:?}",
+            tree.blocks.iter().map(|b| &b.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(preserve(source), source);
+    }
+
+    #[test]
+    fn image_reference_definition_is_a_block() {
+        let source = "![cat][ref]\n\n[ref]: a.png\n";
+        let tree = import(source);
+        assert!(
+            tree.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::LinkReferenceDefinition { .. })),
+            "image ref dest must be a block, got {:?}",
+            tree.blocks.iter().map(|b| &b.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(preserve(source), source);
+    }
+
+    #[test]
+    fn quoted_and_list_reference_definitions_round_trip() {
+        for source in [
+            "> [hello][ref]\n>\n> [ref]: https://e.com\n",
+            "- [hello][ref]\n  [ref]: https://e.com\n",
+        ] {
+            let tree = import(source);
+            assert!(
+                tree.blocks.iter().any(has_link_ref_def),
+                "quoted/list definition must be a block in {source:?}"
+            );
+            assert_eq!(preserve(source), source, "preserve {source:?}");
+        }
+    }
+
+    fn linked_text_url(blocks: &[Block], needle: &str) -> Option<String> {
+        for block in blocks {
+            for inline in &block.inlines {
+                if let Inline::Run {
+                    text,
+                    link: Some(link),
+                    ..
+                } = inline
+                {
+                    if text == needle {
+                        return Some(link.url.clone());
+                    }
+                }
+            }
+            if let Some(url) = linked_text_url(&block.children, needle) {
+                return Some(url);
+            }
+        }
+        None
+    }
+
+    fn linked_image_url(blocks: &[Block], alt: &str) -> Option<String> {
+        for block in blocks {
+            for inline in &block.inlines {
+                if let Inline::Image { alt: a, url, .. } = inline {
+                    if a == alt {
+                        return Some(url.clone());
+                    }
+                }
+            }
+            if let Some(url) = linked_image_url(&block.children, alt) {
+                return Some(url);
+            }
+        }
+        None
+    }
+
+    fn run_has_link(blocks: &[Block], needle: &str) -> bool {
+        linked_text_url(blocks, needle).is_some()
+    }
+
+    #[test]
+    fn nested_list_reference_links_keep_link_attrs() {
+        for source in [
+            "- [hello][ref]\n  [ref]: https://e.com\n",
+            "> - [hello][ref]\n>   [ref]: https://e.com\n",
+            "- [x] [hello][ref]\n  [ref]: https://e.com\n",
+            "- [x] done\n- [hello][ref]\n  [ref]: https://e.com\n",
+            "> [hello][ref]\n> [ref]: https://e.com\n",
+        ] {
+            let tree = import(source);
+            assert!(
+                tree.blocks.iter().any(has_link_ref_def),
+                "definition must stay a block in {source:?}"
+            );
+            assert_eq!(
+                linked_text_url(&tree.blocks, "hello").as_deref(),
+                Some("https://e.com"),
+                "[hello][ref] must keep Link attrs after nested def recovery, {source:?}"
+            );
+            assert_eq!(preserve(source), source, "preserve {source:?}");
+        }
+
+        let image = "- ![cat][ref]\n  [ref]: a.png\n";
+        let tree = import(image);
+        assert!(tree.blocks.iter().any(has_link_ref_def));
+        assert_eq!(
+            linked_image_url(&tree.blocks, "cat").as_deref(),
+            Some("a.png"),
+            "list-item ![cat][ref] must stay an image after nested def recovery"
+        );
+        assert_eq!(preserve(image), image);
+
+        let collapsed = "- [foo][]\n  [foo]: https://e.com\n";
+        let tree = import(collapsed);
+        assert_eq!(
+            linked_text_url(&tree.blocks, "foo").as_deref(),
+            Some("https://e.com"),
+            "collapsed list-item [foo][] must keep Link attrs"
+        );
+
+        let shortcut = "- [foo]\n  [foo]: https://e.com\n";
+        let tree = import(shortcut);
+        assert_eq!(
+            linked_text_url(&tree.blocks, "foo").as_deref(),
+            Some("https://e.com"),
+            "shortcut list-item [foo] must keep Link attrs"
+        );
+
+        let task = "- [x] done\n  [x]: https://e.com\n";
+        let tree = import(task);
+        assert!(
+            !run_has_link(&tree.blocks, "x") && !run_has_link(&tree.blocks, "[x]"),
+            "- [x] done must not become a shortcut-ref, got {:?}",
+            tree.blocks
+        );
+        assert!(
+            tree.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::BulletList { .. })
+                    && b.children
+                        .iter()
+                        .any(|item| matches!(item.kind, BlockKind::ListItem { task: Some(true) }))),
+            "- [x] done must stay a task, got {:?}",
+            tree.blocks
+        );
+        assert_eq!(preserve(task), task);
+
+        let inline_x = "- [x](https://e.com)\n";
+        let tree = import(inline_x);
+        assert_eq!(
+            linked_text_url(&tree.blocks, "x").as_deref(),
+            Some("https://e.com")
+        );
+        assert!(
+            !tree.blocks.iter().any(|b| b
+                .children
+                .iter()
+                .any(|item| { matches!(item.kind, BlockKind::ListItem { task: Some(_) }) })),
+            "- [x](url) must not be a task"
+        );
+    }
+
+    fn linked_run_marks(blocks: &[Block], needle: &str) -> Option<(MarkSet, String)> {
+        for block in blocks {
+            for inline in &block.inlines {
+                if let Inline::Run {
+                    text,
+                    marks,
+                    link: Some(link),
+                    ..
+                } = inline
+                {
+                    if text == needle {
+                        return Some((*marks, link.url.clone()));
+                    }
+                }
+            }
+            if let Some(found) = linked_run_marks(&block.children, needle) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn nested_reference_links_keep_inner_marks_and_nested_list_indent() {
+        for source in [
+            "- [**hello**][ref]\n  [ref]: https://e.com\n",
+            "- [x] [**hello**][ref]\n  [ref]: https://e.com\n",
+            "> - [**hello**][ref]\n>   [ref]: https://e.com\n",
+        ] {
+            let tree = import(source);
+            let (marks, url) = linked_run_marks(&tree.blocks, "hello").unwrap_or_else(|| {
+                panic!(
+                    "nested [**hello**][ref] must keep bold Link attrs, {source:?} {:?}",
+                    tree.blocks
+                )
+            });
+            assert!(
+                marks.contains(MarkSet::BOLD),
+                "label emphasis must not flatten, {source:?} marks={marks:?}"
+            );
+            assert_eq!(url, "https://e.com");
+            assert!(
+                tree.blocks.iter().any(has_link_ref_def),
+                "definition must stay a block in {source:?}"
+            );
+            assert_eq!(preserve(source), source, "preserve {source:?}");
+        }
+
+        let code = "- [`hello`][ref]\n  [ref]: https://e.com\n";
+        let tree = import(code);
+        let (marks, url) = linked_run_marks(&tree.blocks, "hello").expect("code-label ref");
+        assert!(
+            marks.contains(MarkSet::CODE),
+            "code label must stay code, got {marks:?}"
+        );
+        assert_eq!(url, "https://e.com");
+        assert_eq!(preserve(code), code);
+
+        let image = "- ![*cat*][ref]\n  [ref]: a.png\n";
+        let tree = import(image);
+        assert_eq!(
+            linked_image_url(&tree.blocks, "cat").as_deref(),
+            Some("a.png"),
+            "nested ![ *cat* ][ref] must stay an image, got {:?}",
+            tree.blocks
+        );
+        assert!(tree.blocks.iter().any(has_link_ref_def));
+        assert_eq!(preserve(image), image);
+
+        for source in [
+            "- outer\n  - [hello][ref]\n    [ref]: https://e.com\n",
+            "1. outer\n   1. [hello][ref]\n      [ref]: https://e.com\n",
+            "> - outer\n>   - [hello][ref]\n>     [ref]: https://e.com\n",
+        ] {
+            let tree = import(source);
+            assert_eq!(
+                linked_text_url(&tree.blocks, "hello").as_deref(),
+                Some("https://e.com"),
+                "nested-list [hello][ref] must keep Link attrs, {source:?}"
+            );
+            assert!(
+                tree.blocks.iter().any(has_link_ref_def),
+                "nested-list definition must peel, {source:?}"
+            );
+            assert_eq!(preserve(source), source, "preserve {source:?}");
+        }
+
+        let unused = "- outer\n  - done\n    [ref]: https://e.com\n\n[ref]\n";
+        let tree = import(unused);
+        assert!(
+            linked_text_url(&tree.blocks, "ref").is_none()
+                && linked_text_url(&tree.blocks, "[ref]").is_none(),
+            "unused nested [ref]: must not resolve a later shortcut (182), got {:?}",
+            tree.blocks
+        );
+        assert_eq!(preserve(unused), unused);
+
+        let code_span = "- `[hello][ref]`\n  [ref]: https://e.com\n";
+        let tree = import(code_span);
+        assert!(
+            linked_text_url(&tree.blocks, "hello").is_none(),
+            "inline code `[hello][ref]` must not become a link, got {:?}",
+            tree.blocks
+        );
+        assert_eq!(preserve(code_span), code_span);
+    }
+
+    fn wrapping_image_link(blocks: &[Block], alt: &str) -> Option<(String, String)> {
+        for block in blocks {
+            for inline in &block.inlines {
+                if let Inline::Image {
+                    alt: a,
+                    url,
+                    link: Some(link),
+                    ..
+                } = inline
+                {
+                    if a == alt {
+                        return Some((url.clone(), link.url.clone()));
+                    }
+                }
+            }
+            if let Some(found) = wrapping_image_link(&block.children, alt) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn image_run_marks(blocks: &[Block], alt: &str) -> Option<MarkSet> {
+        for block in blocks {
+            for inline in &block.inlines {
+                if let Inline::Image { alt: a, marks, .. } = inline {
+                    if a == alt {
+                        return Some(*marks);
+                    }
+                }
+            }
+            if let Some(found) = image_run_marks(&block.children, alt) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn dest_shortcut_eaten(blocks: &[Block]) -> bool {
+        linked_text_url(blocks, "ref").is_some() || linked_text_url(blocks, "[ref]").is_some()
+    }
+
+    #[test]
+    fn nested_reference_siblings_keep_link_attrs() {
+        for source in [
+            "> - outer\n>   - [hello][ref]\n>     [ref]: https://e.com\n",
+            "- [ ] [**hello**][ref]\n  [ref]: https://e.com\n",
+            "1. [**hello**][ref]\n   [ref]: https://e.com\n",
+        ] {
+            let tree = import(source);
+            let (marks, url) = linked_run_marks(&tree.blocks, "hello").unwrap_or_else(|| {
+                panic!(
+                    "quoted/task/ordered nested ref must keep Link attrs, {source:?} {:?}",
+                    tree.blocks
+                )
+            });
+            if source.contains("**hello**") {
+                assert!(
+                    marks.contains(MarkSet::BOLD),
+                    "marked label must stay bold, {source:?} marks={marks:?}"
+                );
+            }
+            assert_eq!(url, "https://e.com");
+            assert!(
+                !dest_shortcut_eaten(&tree.blocks),
+                "dest [ref] must not become a shortcut, {source:?} {:?}",
+                tree.blocks
+            );
+            assert_eq!(preserve(source), source, "preserve {source:?}");
+        }
+
+        for source in [
+            "- outer\n  - [foo][]\n    [foo]: https://e.com\n",
+            "- outer\n  - [foo]\n    [foo]: https://e.com\n",
+            "> - outer\n>   - [foo][]\n>     [foo]: https://e.com\n",
+            "> - outer\n>   - [foo]\n>     [foo]: https://e.com\n",
+            "> [foo]\n> [foo]: https://e.com\n",
+            "- [foo]\n  [foo]: https://e.com\n",
+        ] {
+            let tree = import(source);
+            assert_eq!(
+                linked_text_url(&tree.blocks, "foo").as_deref(),
+                Some("https://e.com"),
+                "collapsed/shortcut nested ref must keep Link attrs, {source:?} {:?}",
+                tree.blocks
+            );
+            assert!(
+                tree.blocks.iter().any(has_link_ref_def),
+                "definition must peel, {source:?}"
+            );
+            assert_eq!(preserve(source), source, "preserve {source:?}");
+        }
+
+        let bold_alt = "- ![**cat**][ref]\n  [ref]: a.png\n";
+        let tree = import(bold_alt);
+        assert_eq!(
+            linked_image_url(&tree.blocks, "cat").as_deref(),
+            Some("a.png"),
+            "![**cat**][ref] must stay an image, got {:?}",
+            tree.blocks
+        );
+        let marks = image_run_marks(&tree.blocks, "cat").expect("image marks");
+        assert!(
+            marks.contains(MarkSet::BOLD),
+            "image alt emphasis must not flatten, marks={marks:?} {:?}",
+            tree.blocks
+        );
+        assert!(
+            !dest_shortcut_eaten(&tree.blocks),
+            "image dest [ref] must not become a shortcut, {:?}",
+            tree.blocks
+        );
+        assert_eq!(preserve(bold_alt), bold_alt);
+
+        for source in [
+            "- [![cat](a.png)][ref]\n  [ref]: https://e.com\n",
+            "> - [![cat](a.png)][ref]\n>   [ref]: https://e.com\n",
+            "- [x] [![cat](a.png)][ref]\n  [ref]: https://e.com\n",
+            "- [ ] [![cat](a.png)][ref]\n  [ref]: https://e.com\n",
+            "- outer\n  - [![cat](a.png)][ref]\n    [ref]: https://e.com\n",
+            "[![cat](a.png)][ref]\n[ref]: https://e.com\n",
+            "- [![cat][pic]][ref]\n  [pic]: a.png\n  [ref]: https://e.com\n",
+        ] {
+            let tree = import(source);
+            let (img_url, wrap_url) =
+                wrapping_image_link(&tree.blocks, "cat").unwrap_or_else(|| {
+                    panic!(
+                        "[![cat]…][ref] must keep wrapping Link attrs, {source:?} {:?}",
+                        tree.blocks
+                    )
+                });
+            assert_eq!(img_url, "a.png");
+            assert_eq!(wrap_url, "https://e.com");
+            assert!(
+                !dest_shortcut_eaten(&tree.blocks),
+                "wrapping dest [ref] must not become a shortcut, {source:?} {:?}",
+                tree.blocks
+            );
+            assert_eq!(preserve(source), source, "preserve {source:?}");
+        }
+    }
+
+    #[test]
+    fn titled_link_dest_parts_skip_wrapping_chrome() {
+        for (source, url, title) in [
+            (
+                "[label](https://e.com \"title\")\n",
+                "https://e.com",
+                "title",
+            ),
+            ("[label](https://e.com 'title')\n", "https://e.com", "title"),
+            ("[label](https://e.com (title))\n", "https://e.com", "title"),
+            (
+                "[label](<https://e.com> \"title\")\n",
+                "https://e.com",
+                "title",
+            ),
+            ("![alt](a.png \"title\")\n", "a.png", "title"),
+        ] {
+            let span = 0..source.trim_end().len();
+            let chrome = markdown_link_chrome(source, span).expect("chrome");
+            let parts = markdown_link_dest_parts(source, chrome.dest).expect("dest parts");
+            assert_eq!(&source[parts.url.clone()], url, "url inner, {source:?}");
+            let title_range = parts.title.clone().expect("title inner");
+            assert_eq!(
+                &source[title_range.clone()],
+                title,
+                "title inner, {source:?}"
+            );
+            let dest_open = source.find('(').expect("(");
+            assert_eq!(
+                parts.snap(dest_open),
+                Some(parts.url.start),
+                "`(` snaps onto the URL, {source:?}"
+            );
+            let quote = source[..title_range.start]
+                .rfind(['"', '\'', '('])
+                .expect("title opener");
+            assert_eq!(
+                parts.snap(quote),
+                Some(title_range.start),
+                "title opener snaps onto title inner, {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn emphasis_wrapping_a_link_keeps_marks_and_expands_outer() {
+        for (source, want_mark) in [
+            ("**[hello](https://e.com)**\n", MarkSet::BOLD),
+            ("*[hello](https://e.com)*\n", MarkSet::ITALIC),
+            ("~~[hello](https://e.com)~~\n", MarkSet::STRIKE),
+            ("[**hello**](https://e.com)\n", MarkSet::BOLD),
+        ] {
+            let tree = import(source);
+            let (marks, url) = linked_run_marks(&tree.blocks, "hello")
+                .unwrap_or_else(|| panic!("expected linked hello, {source:?} {:?}", tree.blocks));
+            assert_eq!(url, "https://e.com");
+            assert!(
+                marks.contains(want_mark),
+                "{source:?} marks={marks:?} want {want_mark:?}"
+            );
+            let hello = source.find("hello").expect("hello");
+            let inner = hello..hello + "hello".len();
+            let link = LinkAttrs {
+                url: url.clone(),
+                title: None,
+                autolink: false,
+                angle: false,
+                group: 1,
+            };
+            let outer = expand_marks_and_link_chrome(
+                source,
+                inner,
+                Some(&link),
+                0,
+                source.trim_end().len(),
+            );
+            let slice = &source[outer.clone()];
+            assert!(
+                slice.starts_with("**[")
+                    || slice.starts_with("*[")
+                    || slice.starts_with("~~[")
+                    || slice.starts_with("[**"),
+                "outer must include wrapping marks and `[`, {source:?} got {slice:?}"
+            );
+            assert!(
+                slice.contains("https://e.com"),
+                "outer must include dest, {source:?} got {slice:?}"
+            );
+        }
+
+        let nested = "***[hello](https://e.com)***\n";
+        let hello = nested.find("hello").expect("hello");
+        let link = LinkAttrs {
+            url: "https://e.com".into(),
+            title: None,
+            autolink: false,
+            angle: false,
+            group: 1,
+        };
+        let outer = expand_marks_and_link_chrome(
+            nested,
+            hello..hello + "hello".len(),
+            Some(&link),
+            0,
+            nested.trim_end().len(),
+        );
+        assert_eq!(
+            &nested[outer], "***[hello](https://e.com)***",
+            "nested `***` wrapping a link must expand as dest chrome"
+        );
+
+        let html = "**<b>hello</b>**\n";
+        let hello = html.find("hello").expect("hello");
+        let outer = expand_marks_and_link_chrome(
+            html,
+            hello..hello + "hello".len(),
+            None,
+            0,
+            html.trim_end().len(),
+        );
+        assert_eq!(
+            &html[outer], "**<b>hello</b>**",
+            "wrap marks around HTML phrasing must expand as dest chrome"
+        );
+
+        let linked_html = "[<b>hello</b>](https://e.com)\n";
+        let hello = linked_html.find("hello").expect("hello");
+        let link = LinkAttrs {
+            url: "https://e.com".into(),
+            title: None,
+            autolink: false,
+            angle: false,
+            group: 1,
+        };
+        let outer = expand_marks_and_link_chrome(
+            linked_html,
+            hello..hello + "hello".len(),
+            Some(&link),
+            0,
+            linked_html.trim_end().len(),
+        );
+        assert_eq!(
+            &linked_html[outer], "[<b>hello</b>](https://e.com)",
+            "link wrapping HTML phrasing must expand dest around tags"
+        );
+    }
+
+    fn has_link_ref_def(block: &Block) -> bool {
+        matches!(block.kind, BlockKind::LinkReferenceDefinition { .. })
+            || block.children.iter().any(has_link_ref_def)
+    }
+
+    #[test]
+    fn lazy_paragraph_ref_def_does_not_resolve_later_shortcut() {
+        // CommonMark example 182: a definition cannot interrupt a paragraph.
+        let source = "Foo\n[bar]: /baz\n\n[bar]\n";
+        let tree = import(source);
+        assert!(
+            linked_text_url(&tree.blocks, "bar").is_none(),
+            "later `[bar]` must stay text, got {:?}",
+            tree.blocks
+        );
+        assert_eq!(preserve(source), source);
+        let escaped = "\\[foo]\n\n[foo]: /url \"title\"\n";
+        let tree = import(escaped);
+        assert!(
+            linked_text_url(&tree.blocks, "foo").is_none(),
+            "escaped `\\[foo]` must not become a shortcut-ref"
+        );
+        assert_eq!(preserve(escaped), escaped);
+    }
+
+    #[test]
+    fn unmatched_footnote_ref_imports_as_opaque() {
+        let source = "Hello[^1] world\n";
+        let tree = import(source);
+        assert_eq!(
+            inline_debug(&tree),
+            vec!["run:Hello", "html:[^1]", "run: world"],
+            "unmatched [^1] must import as a footnote-ref opaque, got {:?}",
+            inline_debug(&tree)
+        );
+        assert_eq!(preserve(source), source);
+
+        let linked = import("Hello[^1](https://e.com)\n");
+        assert!(
+            linked.blocks[0].inlines.iter().any(|i| match i {
+                Inline::Run {
+                    link: Some(l),
+                    text,
+                    ..
+                } => l.url == "https://e.com" && (text == "^1" || text.contains("^1")),
+                _ => false,
+            }),
+            "[^1](url) must stay a link, got {:?}",
+            inline_debug(&linked)
+        );
+        assert!(
+            !linked.blocks[0].inlines.iter().any(|i| match i {
+                Inline::OpaqueInline { raw, .. } => {
+                    crate::html_visual::footnote_ref_label(raw).is_some()
+                }
+                _ => false,
+            }),
+            "[^1](url) must not become a footnote ref, got {:?}",
+            inline_debug(&linked)
+        );
+
+        let code = import("`[^1]`\n");
+        assert!(
+            !code.blocks[0].inlines.iter().any(|i| match i {
+                Inline::OpaqueInline { raw, .. } => {
+                    crate::html_visual::footnote_ref_label(raw).is_some()
+                }
+                _ => false,
+            }),
+            "inline code must not become a footnote, got {:?}",
+            inline_debug(&code)
+        );
+        assert_eq!(preserve("`[^1]`\n"), "`[^1]`\n");
+
+        let escaped = import("Hello\\[^1]\n");
+        assert!(
+            !escaped.blocks[0].inlines.iter().any(|i| match i {
+                Inline::OpaqueInline { raw, .. } => {
+                    crate::html_visual::footnote_ref_label(raw).is_some()
+                }
+                _ => false,
+            }),
+            "escaped \\[^1] must stay text, got {:?}",
+            inline_debug(&escaped)
+        );
+        assert_eq!(preserve("Hello\\[^1]\n"), "Hello\\[^1]\n");
     }
 
     #[test]
@@ -622,6 +1537,16 @@ mod tests {
                 other => panic!("expected Toc for {source:?}, got {other:?}"),
             }
             assert_eq!(preserve(source), source, "{source:?}");
+            let inner = toc_visible_range(source, tree.blocks[0].source_range.clone());
+            let name = &source[inner.clone()];
+            assert!(
+                name.eq_ignore_ascii_case("toc"),
+                "TOC inner must be the name, {source:?} got {name:?}"
+            );
+            assert!(
+                !name.contains('[') && !name.contains(']'),
+                "TOC brackets are dest chrome, {source:?} inner {name:?}"
+            );
         }
         let mixed = "# One\n\n[TOC]\n\n## Two\n";
         let tree = import(mixed);
@@ -797,6 +1722,7 @@ mod tests {
         assert_eq!(link_run.1.url, "https://e.com");
         assert_eq!(link_run.1.title.as_deref(), Some("T"));
         assert!(!link_run.1.autolink);
+        assert!(!link_run.1.angle);
         let image = inlines.iter().find_map(|i| match i {
             Inline::Image { alt, url, .. } => Some((alt.clone(), url.clone())),
             _ => None,
@@ -807,6 +1733,337 @@ mod tests {
             _ => None,
         });
         assert_eq!(auto.as_deref(), Some("https://auto.link"));
+        let auto_attrs = inlines.iter().find_map(|i| match i {
+            Inline::Run { link: Some(l), .. } if l.autolink => Some(l.clone()),
+            _ => None,
+        });
+        assert!(
+            auto_attrs.is_some_and(|l| l.angle),
+            "angle-bracket autolink must set LinkAttrs.angle"
+        );
+
+        let email = import("<user@example.com>\n");
+        let email_link = email.blocks[0].inlines.iter().find_map(|i| match i {
+            Inline::Run { link: Some(l), .. } => Some(l.clone()),
+            _ => None,
+        });
+        assert!(
+            email_link.as_ref().is_some_and(|l| l.angle),
+            "email autolink `<>` must set angle, got {email_link:?}"
+        );
+
+        let bare = import("https://example.com\n");
+        let bare_link = bare.blocks[0].inlines.iter().find_map(|i| match i {
+            Inline::Run { link: Some(l), .. } => Some(l.clone()),
+            _ => None,
+        });
+        assert!(
+            bare_link.as_ref().is_some_and(|l| l.autolink && !l.angle),
+            "bare GFM autolink must not set angle, got {bare_link:?}"
+        );
+    }
+
+    fn first_link_run(tree: &RichTree) -> Option<(&str, &LinkAttrs, Range<usize>)> {
+        fn walk(blocks: &[Block]) -> Option<(&str, &LinkAttrs, Range<usize>)> {
+            for b in blocks {
+                for inline in &b.inlines {
+                    if let Inline::Run {
+                        text,
+                        link: Some(l),
+                        source_range,
+                        ..
+                    } = inline
+                    {
+                        return Some((text.as_str(), l, source_range.clone()));
+                    }
+                }
+                if let Some(found) = walk(&b.children) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(&tree.blocks)
+    }
+
+    /// Comrak reports GFM `www.` / bare URL / email sourcepos as `0..1`.
+    /// Import recovers the literal so caret/click map onto the URL.
+    #[test]
+    fn gfm_extended_autolink_source_range_is_the_url_literal() {
+        let cases = [
+            (
+                "see www.example.com now\n",
+                "www.example.com",
+                "http://www.example.com",
+            ),
+            (
+                "see https://example.com now\n",
+                "https://example.com",
+                "https://example.com",
+            ),
+            (
+                "see user@example.com now\n",
+                "user@example.com",
+                "mailto:user@example.com",
+            ),
+            (
+                "> www.example.com\n",
+                "www.example.com",
+                "http://www.example.com",
+            ),
+            (
+                "- www.example.com\n",
+                "www.example.com",
+                "http://www.example.com",
+            ),
+            (
+                "www.example.com\n",
+                "www.example.com",
+                "http://www.example.com",
+            ),
+            (
+                "see www.example.com. now\n",
+                "www.example.com",
+                "http://www.example.com",
+            ),
+        ];
+        for (source, needle, url) in cases {
+            let tree = import(source);
+            let (text, link, range) = first_link_run(&tree).expect(source);
+            assert_eq!(text, needle, "{source:?}");
+            assert_eq!(link.url, url, "{source:?}");
+            assert!(
+                !link.angle,
+                "GFM extended autolink must not invent `<>`, {source:?} got {link:?}"
+            );
+            if needle.contains("://") {
+                assert!(
+                    link.autolink,
+                    "scheme autolink dest equals visible text, {source:?} got {link:?}"
+                );
+            } else {
+                assert!(
+                    !link.autolink,
+                    "www/email dest is http:// or mailto: (not the visible text), {source:?} got {link:?}"
+                );
+            }
+            assert_eq!(
+                source.get(range.clone()).unwrap_or(""),
+                needle,
+                "source_range must be the URL literal, {source:?} got {range:?}"
+            );
+            let start = source.find(needle).expect(needle);
+            assert_eq!(range, start..start + needle.len(), "{source:?}");
+            // Neighbor runs must not overlap the URL (that panics next_caret).
+            fn overlaps(blocks: &[Block], url: &Range<usize>) -> Vec<Range<usize>> {
+                let mut out = Vec::new();
+                for b in blocks {
+                    for inline in &b.inlines {
+                        let r = inline.source_range();
+                        if r != *url && r.start < url.end && r.end > url.start {
+                            out.push(r);
+                        }
+                    }
+                    out.extend(overlaps(&b.children, url));
+                }
+                out
+            }
+            let hit = overlaps(&tree.blocks, &range);
+            assert!(
+                hit.is_empty(),
+                "neighbor runs must not overlap the autolink, {source:?} {hit:?}"
+            );
+        }
+
+        let wrapped_src = "see [www.example.com](https://e.com) now\n";
+        let wrapped = import(wrapped_src);
+        let (text, link, range) = first_link_run(&wrapped).expect("markdown www label");
+        assert!(
+            !link.autolink,
+            "markdown `[www](url)` must not become a GFM autolink, got {link:?} text={text:?}"
+        );
+        assert_eq!(link.url, "https://e.com");
+        assert!(
+            wrapped_src
+                .get(range.clone())
+                .is_some_and(|s| !s.is_empty()),
+            "label run must have a real source slice, got {range:?}"
+        );
+    }
+
+    #[test]
+    fn two_gfm_www_autolinks_keep_distinct_ranges() {
+        let source = "www.a.com and www.b.com\n";
+        let tree = import(source);
+        let mut urls = Vec::new();
+        fn collect(blocks: &[Block], out: &mut Vec<(String, Range<usize>)>) {
+            for b in blocks {
+                for inline in &b.inlines {
+                    if let Inline::Run {
+                        text,
+                        link: Some(_),
+                        source_range,
+                        ..
+                    } = inline
+                    {
+                        out.push((text.clone(), source_range.clone()));
+                    }
+                }
+                collect(&b.children, out);
+            }
+        }
+        collect(&tree.blocks, &mut urls);
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        assert_eq!(urls[0].0, "www.a.com");
+        assert_eq!(urls[1].0, "www.b.com");
+        assert_eq!(&source[urls[0].1.clone()], "www.a.com");
+        assert_eq!(&source[urls[1].1.clone()], "www.b.com");
+        assert!(
+            urls[0].1.end <= urls[1].1.start,
+            "autolinks must not overlap, {urls:?}"
+        );
+    }
+
+    #[test]
+    fn character_reference_runs_keep_entity_source_range() {
+        let cases = [
+            ("A&amp;B\n", "&amp;", "&"),
+            ("A&amp;\n", "&amp;", "&"),
+            ("hello &amp;\n", "&amp;", "&"),
+            ("A&lt;B\n", "&lt;", "<"),
+            ("A&gt;B\n", "&gt;", ">"),
+            ("A&quot;B\n", "&quot;", "\""),
+            ("A&#39;B\n", "&#39;", "'"),
+            ("A&#123;B\n", "&#123;", "{"),
+            ("A&#x7B;B\n", "&#x7B;", "{"),
+            ("A&#38;\n", "&#38;", "&"),
+            ("> A&amp;B\n", "&amp;", "&"),
+            ("> A&amp;\n", "&amp;", "&"),
+            ("- A&amp;B\n", "&amp;", "&"),
+            ("- A&amp;\n", "&amp;", "&"),
+            ("[A&amp;B](https://e.com)\n", "&amp;", "&"),
+            ("[A&amp;](https://e.com)\n", "&amp;", "&"),
+            ("| A&amp;B | x |\n| --- | --- |\n", "&amp;", "&"),
+            ("| A&amp; | x |\n| --- | --- |\n", "&amp;", "&"),
+        ];
+        for (source, literal, decoded) in cases {
+            let tree = import(source);
+            let found = first_entity_run(&tree, source, literal);
+            let (text, range) = found.unwrap_or_else(|| {
+                let mut runs = Vec::new();
+                dump_runs(&tree.blocks, source, &mut runs);
+                panic!("entity run in {source:?}, runs={runs:?}")
+            });
+            assert_eq!(text, decoded, "{source:?}");
+            assert_eq!(
+                source.get(range.clone()).unwrap_or(""),
+                literal,
+                "source_range must be the entity literal, {source:?} got {range:?}"
+            );
+        }
+
+        let code = import("`A&amp;B`\n");
+        let code_run = code.blocks[0].inlines.iter().find_map(|i| match i {
+            Inline::Run { text, marks, .. } if marks.contains(MarkSet::CODE) => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            code_run.as_deref(),
+            Some("A&amp;B"),
+            "code spans must keep the entity literal, got {code_run:?}"
+        );
+    }
+
+    #[test]
+    fn backslash_escape_runs_keep_source_range() {
+        let cases = [
+            "A\\*B\n",
+            "A\\*\n",
+            "> A\\*B\n",
+            "- A\\*B\n",
+            "[A\\*B](https://e.com)\n",
+            "| A\\*B | x |\n| --- | --- |\n",
+        ];
+        for source in cases {
+            let tree = import(source);
+            let found = first_entity_run(&tree, source, "\\*");
+            let (text, range) = found.unwrap_or_else(|| {
+                let mut runs = Vec::new();
+                dump_runs(&tree.blocks, source, &mut runs);
+                panic!("escape run in {source:?}, runs={runs:?}")
+            });
+            assert_eq!(text, "*", "{source:?}");
+            assert_eq!(
+                source.get(range.clone()).unwrap_or(""),
+                "\\*",
+                "source_range must be the escape literal, {source:?} got {range:?}"
+            );
+        }
+
+        let escaped = "A\\\\\n";
+        let tree = import(escaped);
+        let found = first_entity_run(&tree, escaped, "\\\\");
+        let (text, range) = found.unwrap_or_else(|| {
+            let mut runs = Vec::new();
+            dump_runs(&tree.blocks, escaped, &mut runs);
+            panic!("escape run in {escaped:?}, runs={runs:?}")
+        });
+        assert_eq!(text, "\\", "{escaped:?}");
+        assert_eq!(
+            escaped.get(range.clone()).unwrap_or(""),
+            "\\\\",
+            "last-in-line `\\\\` source_range must be the escape literal, got {range:?}"
+        );
+    }
+
+    fn first_entity_run(
+        tree: &RichTree,
+        source: &str,
+        literal: &str,
+    ) -> Option<(String, Range<usize>)> {
+        fn walk(blocks: &[Block], source: &str, literal: &str) -> Option<(String, Range<usize>)> {
+            for b in blocks {
+                for inline in &b.inlines {
+                    if let Inline::Run {
+                        text,
+                        source_range,
+                        marks,
+                        ..
+                    } = inline
+                    {
+                        if marks.contains(MarkSet::CODE) {
+                            continue;
+                        }
+                        if source.get(source_range.clone()) == Some(literal) {
+                            return Some((text.clone(), source_range.clone()));
+                        }
+                    }
+                }
+                if let Some(found) = walk(&b.children, source, literal) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(&tree.blocks, source, literal)
+    }
+
+    fn dump_runs(blocks: &[Block], source: &str, out: &mut Vec<(String, String, Range<usize>)>) {
+        for b in blocks {
+            for inline in &b.inlines {
+                if let Inline::Run {
+                    text, source_range, ..
+                } = inline
+                {
+                    out.push((
+                        text.clone(),
+                        source.get(source_range.clone()).unwrap_or("").to_string(),
+                        source_range.clone(),
+                    ));
+                }
+            }
+            dump_runs(&b.children, source, out);
+        }
     }
 
     #[test]
@@ -858,6 +2115,21 @@ mod tests {
         );
         assert_ne!(hard.start, 0, "hard break must not start at the paragraph");
         assert_eq!(hard.start, 1, "two-space marker starts after `a`");
+
+        let prev = import(hard_src).blocks[0]
+            .inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::Run {
+                    text, source_range, ..
+                } if text == "a" => Some(source_range.clone()),
+                _ => None,
+            })
+            .expect("run a");
+        assert_eq!(
+            prev.end, hard.start,
+            "previous run must not overlap hard-break dest chrome, run={prev:?} hard={hard:?}"
+        );
     }
 
     #[test]
@@ -915,7 +2187,10 @@ mod tests {
         "text with `code` and ~~strike~~ and [link](https://e.com)\n",
         "<div>\nhtml\n</div>\n\npara\n",
         "Hello[^1]\n\n[^1]: the note\n",
+        "Hello[^1] world\n",
         "Term\n\n: Definition\n",
+        "[hello][ref]\n\n[ref]: https://e.com\n",
+        "[ref]: https://e.com\n",
         "a <b>bold</b> and <br>break\n",
         "See[^1]\n\n[^1]: **bold** inside\n",
         "Term\n\n: **bold** details\n",
@@ -923,6 +2198,7 @@ mod tests {
         "H~2~O and mc^2^ and H<sub>2</sub>O\n",
         "<div>\n**bold** inner\n</div>\n",
         "see $x^2$ and $$E=mc^2$$ costs $5\n",
+        "A&amp;B and A&lt;C\n",
         "> [!NOTE]\n> alert body\n",
         "> [!TIP]\n> tip body\n",
         "> [!IMPORTANT]\n> important body\n",

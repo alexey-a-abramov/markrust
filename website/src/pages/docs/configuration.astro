@@ -11,16 +11,17 @@ const headings = [
 
 <DocsLayout title="Settings" headings={headings}>
   <h2 id="location">Config location</h2>
-  <p>User settings live at:</p>
+  <p>MarkRust uses the operating system’s configuration directory:</p>
   <ul>
-    <li><strong>macOS / Linux:</strong> <code>~/.config/markrust/config.toml</code></li>
+    <li><strong>macOS:</strong> typically <code>~/Library/Application Support/markrust/config.toml</code></li>
+    <li><strong>Linux:</strong> <code>$XDG_CONFIG_HOME/markrust/config.toml</code> (usually <code>~/.config/markrust/config.toml</code>)</li>
   </ul>
 
   <h2 id="options">Options</h2>
-  <CodeBlock code={`theme = "dark"          # "dark" or "light"\nfont_family = "Inter"\nfont_size = 16\nautosave_ms = 1000    # debounce in milliseconds`} lang="toml" filename="config.toml" />
+  <CodeBlock code={`theme = "dark"          # "dark" or "light"\nfont_family = "Inter"\nfont_size = 16\ncode_font_family = "Menlo"\nautosave_ms = 1000    # debounce in milliseconds`} lang="toml" filename="config.toml" />
 
-  <p>Recent workspaces are stored separately in <code>~/.config/markrust/recent.json</code>.</p>
+  <p>Recent workspaces are stored beside the settings as <code>recent.json</code>.</p>
 
   <h2 id="privacy">Privacy</h2>
-  <p>MarkRust collects no telemetry. No analytics, crash reporters, or account systems are included. Configuration and recent-workspace data stay on your machine.</p>
+  <p>MarkRust collects no telemetry and has no analytics, account system, or automatic crash-report upload. If the app panics, it writes a local diagnostic log; configuration and recent-workspace data stay on your machine.</p>
 </DocsLayout>

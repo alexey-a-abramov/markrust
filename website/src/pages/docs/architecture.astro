@@ -18,13 +18,13 @@ const headings = [
   <h2 id="pipeline">Pipeline</h2>
   <ol>
     <li>User input modifies a <code>ropey</code> text buffer</li>
-    <li>Background thread re-parses with <code>tree-sitter-markdown</code></li>
-    <li>Syntax spans with delimiter ranges are extracted</li>
-    <li>Layout engine computes visibility (masked vs revealed delimiters)</li>
-    <li>GPUI paints styled glyph runs each frame</li>
+    <li>A background task parses Markdown with <code>comrak</code> and produces revision-stamped source spans</li>
+    <li><code>RichEngine</code> derives a <code>RichTree</code> for WYSIWYG rendering and edit commands</li>
+    <li>Source mode computes delimiter visibility; WYSIWYG renders the rich tree directly</li>
+    <li>GPUI paints the resulting styled blocks and glyph runs each frame</li>
   </ol>
 
   <h2 id="parsing">Parsing</h2>
-  <p>Tree-sitter provides incremental CST parsing on the hot path. Comrak handles HTML export only — not per-keystroke rendering.</p>
-  <p>See <code>docs/architecture.md</code> in the repository for detailed design notes.</p>
+  <p>Comrak is the shared Markdown grammar for source spans, the WYSIWYG tree, and HTML export. Tree-sitter is used only to highlight supported fenced-code languages.</p>
+  <p>See the repository’s <a href="https://github.com/alexey-a-abramov/markrust/blob/main/docs/architecture.md">architecture reference</a> for detailed design notes.</p>
 </DocsLayout>

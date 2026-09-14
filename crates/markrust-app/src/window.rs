@@ -32,6 +32,7 @@ actions!(
         ToggleOutline,
         CommandPalette,
         ExportHtml,
+        LoadRemoteImages,
         Undo,
         Redo,
         ToggleEditorMode
@@ -208,6 +209,17 @@ impl MarkRustWindow {
         });
     }
 
+    fn load_remote_images(
+        &mut self,
+        _: &LoadRemoteImages,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.load_remote_images(cx);
+        });
+    }
+
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace.update(cx, |workspace, cx| {
             let _ = workspace.dispatch(
@@ -261,7 +273,7 @@ impl Render for MarkRustWindow {
         let workspace = self.workspace.read(cx);
         let theme = workspace.config.editor_theme();
         let mode_label = match workspace.active_tab().map(|tab| tab.mode) {
-            Some(crate::workspace::EditorMode::Wysiwyg) => "Rich",
+            Some(crate::workspace::EditorMode::Wysiwyg) => "Wysiwyg",
             Some(crate::workspace::EditorMode::Split) => "Split",
             _ => "Source",
         };
@@ -312,6 +324,7 @@ impl Render for MarkRustWindow {
             .on_action(cx.listener(Self::toggle_outline))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::export_html))
+            .on_action(cx.listener(Self::load_remote_images))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_drop(cx.listener({
@@ -420,6 +433,14 @@ impl Render for MarkRustWindow {
                         "toolbar-editor-mode",
                         cx.listener(|this, _, window, cx| {
                             this.toggle_editor_mode(&ToggleEditorMode, window, cx)
+                        }),
+                    ))
+                    .child(toolbar_button(
+                        "Load images",
+                        &theme,
+                        "toolbar-load-remote-images",
+                        cx.listener(|this, _, window, cx| {
+                            this.load_remote_images(&LoadRemoteImages, window, cx)
                         }),
                     )),
             )
@@ -818,6 +839,9 @@ impl Render for MarkRustWindow {
                 if fuzzy_match("Export HTML", &query) {
                     commands.push("Export HTML".to_string());
                 }
+                if fuzzy_match("Load remote images", &query) {
+                    commands.push("Load remote images".to_string());
+                }
                 commands.extend((0..tab_count).filter_map(|index| {
                     let title = workspace.tabs[index].title.clone();
                     fuzzy_match(&title, &query).then_some(title)
@@ -862,6 +886,10 @@ impl Render for MarkRustWindow {
                                     if let Ok(path) = ws.read(cx).export_active_html(cx) {
                                         eprintln!("Exported HTML to {}", path.display());
                                     }
+                                } else if title == "Load remote images" {
+                                    ws.update(cx, |workspace, cx| {
+                                        workspace.load_remote_images(cx);
+                                    });
                                 }
                                 ws.update(cx, |workspace, cx| {
                                     workspace.palette_open = false;

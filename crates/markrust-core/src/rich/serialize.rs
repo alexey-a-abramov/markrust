@@ -13,6 +13,7 @@
 
 use std::collections::HashSet;
 
+use super::entities::is_decoded_backslash_escape;
 use super::escape::{escape_text, wrap_inline_code, EscapeContext};
 use super::tree::{
     Block, BlockKind, BreakStyle, ColumnAlign, HeadingStyle, Inline, LinkAttrs, MarkSet, NodeId,
@@ -301,6 +302,17 @@ impl<'a> Ser<'a> {
                 self.emit_children(&block.children, false);
                 self.delim.truncate(saved);
             }
+            BlockKind::LinkReferenceDefinition { label, url, title } => {
+                self.out.push('[');
+                self.out.push_str(label);
+                self.out.push_str("]: ");
+                self.out.push_str(&printable_url(url, title.is_some()));
+                if let Some(t) = title {
+                    self.out.push_str(" \"");
+                    self.out.push_str(&t.replace('"', "\\\""));
+                    self.out.push('"');
+                }
+            }
             BlockKind::DefinitionList => {
                 for (i, item) in block.children.iter().enumerate() {
                     if i > 0 {
@@ -586,6 +598,13 @@ impl<'a> Ser<'a> {
                             fidelity.code_backticks.max(1)
                         };
                         self.out.push_str(&wrap_inline_code(text, ticks));
+                    } else if let Some(slice) = raw
+                        .as_deref()
+                        .filter(|r| is_decoded_backslash_escape(r, text))
+                    {
+                        // Keep `\X` so Normalize of `\&ouml;` / `\*not*` does
+                        // not become an entity or emphasis.
+                        self.out.push_str(slice);
                     } else if let (false, Some(raw)) = (self.normalize(), raw) {
                         self.out.push_str(raw);
                     } else {
@@ -600,18 +619,27 @@ impl<'a> Ser<'a> {
                     }
                 }
                 Inline::Image {
-                    alt, url, title, ..
+                    alt,
+                    url,
+                    title,
+                    marks,
+                    ..
                 } => {
-                    self.out.push_str("![");
-                    self.out.push_str(alt);
-                    self.out.push_str("](");
-                    self.out.push_str(&printable_url(url, title.is_some()));
+                    let mut img = String::from("![");
+                    img.push_str(alt);
+                    img.push_str("](");
+                    img.push_str(&printable_url(url, title.is_some()));
                     if let Some(t) = title {
-                        self.out.push_str(" \"");
-                        self.out.push_str(&t.replace('"', "\\\""));
-                        self.out.push('"');
+                        img.push_str(" \"");
+                        img.push_str(&t.replace('"', "\\\""));
+                        img.push('"');
                     }
-                    self.out.push(')');
+                    img.push(')');
+                    if marks.contains(MarkSet::CODE) {
+                        self.out.push_str(&wrap_inline_code(&img, 1));
+                    } else {
+                        self.out.push_str(&img);
+                    }
                     at_line_start = false;
                 }
                 Inline::Math {
@@ -660,8 +688,12 @@ impl<'a> Ser<'a> {
                     }
                     at_line_start = false;
                 }
-                Inline::OpaqueInline { raw, .. } => {
-                    self.out.push_str(raw);
+                Inline::OpaqueInline { raw, marks, .. } => {
+                    if marks.contains(MarkSet::CODE) {
+                        self.out.push_str(&wrap_inline_code(raw, 1));
+                    } else {
+                        self.out.push_str(raw);
+                    }
                     if !raw.is_empty() {
                         at_line_start = false;
                     }

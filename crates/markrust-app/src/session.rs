@@ -657,6 +657,42 @@ pub fn should_skip_dir(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Test-local directory with a unique name and guaranteed cleanup. Keeping
+    /// this local avoids sharing state between parallel unit tests.
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            let sequence = TEST_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "markrust-app-{prefix}-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create test directory");
+            Self { path }
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn untitled_cannot_save_without_path() {
@@ -731,14 +767,7 @@ mod tests {
 
     #[test]
     fn save_with_review_normalize_rewrites_then_saves() {
-        let dir = std::env::temp_dir().join(format!(
-            "markrust-normalize-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("normalize");
         let path = dir.join("note.md");
         std::fs::write(&path, "Title\n=====\n\npara\n").unwrap();
         let mut workspace = HeadlessWorkspace::new();
@@ -752,7 +781,6 @@ mod tests {
             .unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains("# Title"), "{saved}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -776,8 +804,8 @@ mod tests {
             })
             .unwrap();
         let content = workspace.active().unwrap().editor.content();
-        assert!(content.contains("title: Hello"), "{content}");
-        assert!(content.contains("description: A note"), "{content}");
+        assert!(content.contains("title: \"Hello\""), "{content}");
+        assert!(content.contains("description: \"A note\""), "{content}");
         assert!(content.contains("# Body"), "{content}");
     }
 
@@ -799,24 +827,16 @@ mod tests {
 
     #[test]
     fn open_file_with_remote_image_does_not_block_on_network() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let dir = std::env::temp_dir().join(format!(
-            "markrust-open-remote-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("open-remote");
         let path = dir.join("note.md");
-        std::fs::write(&path, format!("![alt](http://{addr}/hang.png)\n")).unwrap();
+        // Opening only parses Markdown; it must not resolve or contact a
+        // document-controlled URL. A private HTTPS target makes that explicit
+        // without opening a listener (which sandboxed test runners forbid).
+        std::fs::write(&path, "![alt](https://127.0.0.1/hang.png)\n").unwrap();
         let started = std::time::Instant::now();
         let mut workspace = HeadlessWorkspace::new();
         workspace.apply(WorkspaceCommand::OpenFile(path)).unwrap();
         let elapsed = started.elapsed();
-        drop(listener);
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             elapsed < std::time::Duration::from_millis(500),
             "OpenFile blocked on network for {elapsed:?}"
@@ -831,8 +851,7 @@ mod tests {
 
     #[test]
     fn open_launch_path_opens_file_and_parent_folder() {
-        let dir = std::env::temp_dir().join("markrust-open-launch");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TestDir::new("open-launch");
         let path = dir.join("note.md");
         std::fs::write(&path, "# Hello\n").unwrap();
         let mut workspace = HeadlessWorkspace::new();
@@ -853,17 +872,15 @@ mod tests {
 
     #[test]
     fn list_markdown_files_is_bounded_and_timely() {
-        let dir = std::env::temp_dir().join(format!("markrust-list-bound-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut cur = dir.clone();
+        let dir = TestDir::new("list-bound");
+        let mut cur = dir.path().to_path_buf();
         for i in 0..20 {
             cur = cur.join(format!("d{i}"));
             std::fs::create_dir_all(&cur).unwrap();
             std::fs::write(cur.join("n.md"), "x").unwrap();
         }
         let started = std::time::Instant::now();
-        let files = list_markdown_files(&dir);
+        let files = list_markdown_files(dir.path());
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "sidebar walk hung: {:?}",
@@ -875,6 +892,5 @@ mod tests {
             "depth cap failed: {} files",
             files.len()
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

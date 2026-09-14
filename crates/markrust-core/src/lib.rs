@@ -25,9 +25,14 @@ mod test_support;
 pub use buffer::DocumentBuffer;
 pub use document::Document;
 pub use export::{
-    export_content_to_html, export_file_to_html, markdown_to_html_gfm, write_markdown_to_html_file,
+    export_content_to_html, export_content_to_html_with_policy, export_file_to_html,
+    export_file_to_html_with_policy, markdown_to_html_gfm, markdown_to_html_gfm_with_policy,
+    write_markdown_to_html_file, write_markdown_to_html_file_with_policy, HtmlExportPolicy,
 };
-pub use frontmatter::{parse_frontmatter, upsert_yaml_key, FrontmatterInfo};
+pub use frontmatter::{
+    normalize_frontmatter, parse_frontmatter, upsert_yaml_key, validate_frontmatter_yaml,
+    FrontmatterError, FrontmatterInfo,
+};
 pub use line_index::LineIndex;
 pub use merge::{three_way_merge, MergeOutcome};
 pub use mode::DocumentProcessingMode;

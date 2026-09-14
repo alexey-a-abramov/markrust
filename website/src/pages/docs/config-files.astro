@@ -4,13 +4,10 @@ import DocsLayout from '../../layouts/DocsLayout.astro';
 
 <DocsLayout title="Configuration files">
   <h2>User config</h2>
-  <p><code>~/.config/markrust/config.toml</code> — editor preferences (theme, font, autosave interval).</p>
+  <p><code>config.toml</code> in MarkRust’s platform configuration directory — editor preferences (theme, UI and code fonts, autosave interval).</p>
 
   <h2>Recent workspaces</h2>
-  <p><code>~/.config/markrust/recent.json</code> — list of recently opened folder paths.</p>
-
-  <h2>Workspace state</h2>
-  <p><code>.markrust/workspace.json</code> — optional per-project state (open tabs, scroll positions). Gitignored by default.</p>
+  <p><code>recent.json</code> beside the user config — list of recently opened folder paths.</p>
 
   <h2>Document files</h2>
   <p>Your <code>.md</code> files are plain UTF-8. No MarkRust-specific encoding or metadata is embedded in documents.</p>
