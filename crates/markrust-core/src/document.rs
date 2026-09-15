@@ -27,7 +27,16 @@ pub struct Document {
     pub parsed_revision: u64,
     saved_content: String,
     undo: UndoStack,
+    coalescing_blocked: bool,
     parser: BackgroundMarkdownParser,
+}
+
+/// A compound editor action's history boundary. Finish on the same document
+/// after all of the action's splices have been recorded.
+#[derive(Debug)]
+pub struct UndoGroupCheckpoint {
+    depth: usize,
+    selection_before: SelectionSnapshot,
 }
 
 impl Document {
@@ -56,6 +65,7 @@ impl Document {
             parsed_revision: 0,
             saved_content,
             undo: UndoStack::new(),
+            coalescing_blocked: false,
             parser: BackgroundMarkdownParser::new(),
         };
         // Parse on the background worker only. Callers on the GPUI UI thread
@@ -71,6 +81,32 @@ impl Document {
 
     pub fn undo_stack(&self) -> &UndoStack {
         &self.undo
+    }
+
+    /// Start an action such as Paste that must remain separate from typing.
+    /// Nested selection replacements can safely record their own groups;
+    /// this checkpoint does not replace an open undo transaction.
+    pub fn begin_undo_group(&mut self, selection_before: SelectionSnapshot) -> UndoGroupCheckpoint {
+        self.coalescing_blocked = true;
+        UndoGroupCheckpoint {
+            depth: self.undo.undo_depth(),
+            selection_before,
+        }
+    }
+
+    /// Consolidate this action's recorded splices and prevent later typing
+    /// from joining them. An action with no document edits adds no history.
+    pub fn finish_undo_group(
+        &mut self,
+        checkpoint: UndoGroupCheckpoint,
+        selection_after: SelectionSnapshot,
+    ) {
+        self.undo.group_since(
+            checkpoint.depth,
+            checkpoint.selection_before,
+            selection_after,
+        );
+        self.coalescing_blocked = true;
     }
 
     /// Last reconciled on-disk snapshot (load, save, or last merged disk bytes).
@@ -97,6 +133,11 @@ impl Document {
         &mut self,
         range: std::ops::Range<usize>,
     ) -> Option<SelectionSnapshot> {
+        // A pasted input-rule trigger must not absorb typing from before
+        // the explicit Paste boundary into its rewrite/undo step.
+        if self.coalescing_blocked {
+            return None;
+        }
         let last = self.undo.last()?;
         if last.kind != TransactionKind::Typing {
             return None;
@@ -214,7 +255,9 @@ impl Document {
             return;
         }
 
-        if self.try_coalesce(start, end, text, kind, selection_after) {
+        if !std::mem::take(&mut self.coalescing_blocked)
+            && self.try_coalesce(start, end, text, kind, selection_after)
+        {
             if start < end {
                 self.buffer.delete(start, end);
             }
@@ -782,6 +825,76 @@ mod tests {
         let tx = doc.undo_tx().unwrap();
         assert_eq!(doc.buffer.content(), "ab");
         assert_eq!(tx.selection_after, before);
+    }
+
+    #[test]
+    fn explicit_paste_group_is_separate_from_typing_before_and_after() {
+        fn type_at_end(doc: &mut Document, text: &str) {
+            let at = doc.buffer.len_bytes();
+            doc.replace_range_tx(
+                at,
+                at,
+                text,
+                TransactionKind::Typing,
+                SelectionSnapshot::collapsed(at),
+                SelectionSnapshot::collapsed(at + text.len()),
+            );
+        }
+        let mut doc = Document::new("");
+        type_at_end(&mut doc, "a");
+        type_at_end(&mut doc, "b");
+        let paste = doc.begin_undo_group(SelectionSnapshot::collapsed(2));
+        type_at_end(&mut doc, "Café");
+        doc.finish_undo_group(paste, SelectionSnapshot::collapsed("abCafé".len()));
+        type_at_end(&mut doc, "c");
+        type_at_end(&mut doc, "d");
+        assert_eq!(doc.buffer.content(), "abCafécd");
+        assert_eq!(doc.undo_stack().undo_depth(), 3);
+        assert!(doc.undo());
+        assert_eq!(doc.buffer.content(), "abCafé");
+        assert!(doc.undo());
+        assert_eq!(doc.buffer.content(), "ab");
+        assert!(doc.undo());
+        assert_eq!(doc.buffer.content(), "");
+        assert!(doc.redo());
+        assert!(doc.redo());
+        assert!(doc.redo());
+        assert_eq!(doc.buffer.content(), "abCafécd");
+    }
+
+    #[test]
+    fn nested_undo_groups_preserve_outer_selection_and_all_splices() {
+        let mut doc = Document::new("old");
+        let before = SelectionSnapshot {
+            start: 0,
+            end: 3,
+            reversed: true,
+        };
+        let paste = doc.begin_undo_group(before);
+        let replacement = doc.begin_undo_group(before);
+        doc.delete(0, 3);
+        doc.insert(0, "new");
+        doc.finish_undo_group(replacement, SelectionSnapshot::collapsed(3));
+        doc.insert(3, "!");
+        doc.finish_undo_group(paste, SelectionSnapshot::collapsed(4));
+        assert_eq!(doc.undo_stack().undo_depth(), 1);
+        let undo = doc.undo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), "old");
+        assert_eq!(undo.selection_after, before);
+        assert!(doc.redo());
+        assert_eq!(doc.buffer.content(), "new!");
+    }
+
+    #[test]
+    fn undo_group_without_document_edits_preserves_redo() {
+        let mut doc = Document::new("old");
+        doc.insert(3, "!");
+        assert!(doc.undo());
+        let empty = doc.begin_undo_group(SelectionSnapshot::collapsed(3));
+        doc.finish_undo_group(empty, SelectionSnapshot::collapsed(3));
+        assert_eq!(doc.undo_stack().undo_depth(), 0);
+        assert!(doc.redo());
+        assert_eq!(doc.buffer.content(), "old!");
     }
 
     #[test]

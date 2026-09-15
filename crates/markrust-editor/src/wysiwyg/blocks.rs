@@ -70,6 +70,8 @@ pub fn render_top_block<H: WysiwygHost>(
     if snap.tree.blocks.is_empty() {
         let gap = blank_caret_gap_after_last(&snap.tree).unwrap_or(0..snap.tree.source_len);
         return div()
+            .w_full()
+            .min_w_0()
             .px(px(24.))
             .py(px(4.))
             .child(blank_gap_element(snap, gap, editor))
@@ -78,7 +80,7 @@ pub fn render_top_block<H: WysiwygHost>(
     let Some(block) = snap.tree.blocks.get(index) else {
         return div().into_any_element();
     };
-    let mut root = div().px(px(24.)).py(px(4.));
+    let mut root = div().w_full().min_w_0().px(px(24.)).py(px(4.));
     if let Some(gap) = blank_caret_gap_before(&snap.tree, index) {
         root = root.child(blank_gap_element(snap, gap, editor.clone()));
     }
@@ -858,9 +860,15 @@ fn render_list<H: WysiwygHost>(
                     children.push(prefix_blank_element(snap, blank, editor.clone()));
                 }
             }
-            let mut row = div().flex().flex_row().items_start().gap(px(8.));
+            let mut row = div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(8.));
             if hide_pretty && !is_task {
-                row = row.child(div().flex_1().children(children));
+                row = row.child(div().flex_1().min_w_0().children(children));
             } else {
                 let glyph: SharedString = if hide_pretty {
                     SharedString::from("")
@@ -878,6 +886,7 @@ fn render_list<H: WysiwygHost>(
                 let mut marker = div()
                     .id(("task", item_id.0))
                     .min_w(px(20.))
+                    .flex_shrink_0()
                     .text_color(if is_task {
                         theme.accent
                     } else {
@@ -893,12 +902,20 @@ fn render_list<H: WysiwygHost>(
                             editor.update(cx, |host, cx| host.toggle_task(item_id, cx));
                         });
                 }
-                row = row.child(marker).child(div().flex_1().children(children));
+                row = row
+                    .child(marker)
+                    .child(div().flex_1().min_w_0().children(children));
             }
             row.into_any_element()
         })
         .collect();
-    div().flex().flex_col().gap(px(2.)).children(rows)
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .children(rows)
 }
 
 fn render_table<H: WysiwygHost>(
@@ -934,6 +951,7 @@ fn render_table<H: WysiwygHost>(
                 let editor_menu = editor.clone();
                 let mut el = div()
                     .flex_1()
+                    .min_w_0()
                     .px(px(10.))
                     .py(px(6.))
                     .border_1()
@@ -958,7 +976,7 @@ fn render_table<H: WysiwygHost>(
                 el.into_any_element()
             })
             .collect();
-        let mut row_el = div().flex().flex_row();
+        let mut row_el = div().w_full().min_w_0().flex().flex_row();
         if header {
             row_el = row_el.bg(theme.table_header_bg);
         }
@@ -995,6 +1013,8 @@ fn render_table<H: WysiwygHost>(
         }
     }
     div()
+        .w_full()
+        .min_w_0()
         .my(px(6.))
         .rounded_md()
         .overflow_hidden()

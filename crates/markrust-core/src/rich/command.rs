@@ -279,6 +279,25 @@ fn insert_text(
     caret: &mut CaretState,
     text: &str,
 ) -> Result<RichOutcome, RichError> {
+    if caret.range.is_empty() || text.is_empty() {
+        return insert_text_inner(doc, engine, caret, text);
+    }
+    // Deletion must run through Markdown-aware selection expansion before
+    // insertion can resolve its new context (table cells, links, lists).
+    // Keep those splices, but expose the replacement as one user undo step.
+    // Prevent coalescing even when selection clamping makes deletion empty.
+    let undo_group = doc.begin_undo_group(caret.snapshot());
+    let result = insert_text_inner(doc, engine, caret, text);
+    doc.finish_undo_group(undo_group, caret.snapshot());
+    result
+}
+
+fn insert_text_inner(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    text: &str,
+) -> Result<RichOutcome, RichError> {
     if text == "\n" || text == "\r\n" || text == "\r" {
         return split_block(doc, engine, caret);
     }
@@ -7715,6 +7734,81 @@ mod tests {
         caret.restore(tx.selection_after);
         assert_eq!(doc.buffer.content(), "ab");
         assert_eq!(caret.cursor(), after_c.cursor() - 1);
+    }
+
+    #[test]
+    fn replacing_a_backward_grapheme_selection_is_one_undo_step() {
+        let source = "Native 👩🏽‍💻\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.range = "Native".len()..source.len() - 1;
+        caret.reversed = true;
+        let before = caret.snapshot();
+        let replaced = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("Café 👩🏽‍💻".into()),
+        );
+        let after = caret.snapshot();
+        assert_eq!(replaced, "NativeCafé 👩🏽‍💻\n");
+        assert_eq!(doc.undo_stack().undo_depth(), 1);
+        let undo = doc.undo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), source);
+        assert_eq!(undo.selection_after, before);
+        let redo = doc.redo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), replaced);
+        assert_eq!(redo.selection_after, after);
+    }
+
+    #[test]
+    fn replacing_selection_with_multiline_table_text_is_one_undo_step() {
+        let source = "| Name | Value |\n| --- | --- |\n| key | old |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        let start = source.find("old").unwrap();
+        caret.range = start..start + "old".len();
+        let before = caret.snapshot();
+        let replaced = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("first\nsecond".into()),
+        );
+        let after = caret.snapshot();
+        assert!(replaced.contains("first<br>second"), "{replaced:?}");
+        assert_eq!(doc.undo_stack().undo_depth(), 1);
+        let undo = doc.undo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), source);
+        assert_eq!(undo.selection_after, before);
+        let redo = doc.redo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), replaced);
+        assert_eq!(redo.selection_after, after);
+    }
+
+    #[test]
+    fn pasted_input_rule_trigger_does_not_absorb_preceding_typing() {
+        let (mut doc, mut engine, mut caret) = setup("");
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("#".into()),
+        );
+        let before_paste = doc.buffer.content();
+        let before_caret = caret.snapshot();
+        let paste = doc.begin_undo_group(before_caret);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText(" ".into()),
+        );
+        doc.finish_undo_group(paste, caret.snapshot());
+        assert_eq!(doc.undo_stack().undo_depth(), 2);
+        let undo = doc.undo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), before_paste);
+        assert_eq!(undo.selection_after, before_caret);
+        assert!(doc.undo());
+        assert_eq!(doc.buffer.content(), "");
     }
 
     #[test]

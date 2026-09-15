@@ -25,10 +25,22 @@ pnpm --dir website exec playwright install chromium # first time only
 pnpm --dir website test
 ```
 
+## GUI regression tests
+
+Changes to the editor surface also need the native GUI regression suite. On a
+Mac with full Xcode and its Metal toolchain:
+
+```bash
+cargo run --locked -p markrust-app --features gui-tests --example gui_regression -- --output target/gui-regression
+```
+
+This exercises GPUI layout and input with native text shaping and captures the
+rendered output. See [GUI testing](docs/gui-testing.md) for fixtures, pixel
+comparison, baseline review, and the GPU-independent CI command.
+
 ## Manual GUI validation
 
-Headless tests intentionally do not open a native GPUI window. For changes to
-the editor surface, perform a short GUI smoke test on the platform you changed.
+Perform a short native-window smoke test on the platform you changed.
 Before a macOS release, also verify a CJK IME candidate window in a body
 paragraph, wrapped line, table cell, code-language chip, image caption, and
 frontmatter field. Record the OS, IME, build, and result with the release.
@@ -46,6 +58,7 @@ frontmatter field. Record the OS, IME, build, and result with the release.
 - [Architecture](docs/architecture.md)
 - [Delimiter masking](docs/delimiter-masking.md)
 - [WYSIWYG engineering notes](docs/roadmap.md)
+- [GUI testing](docs/gui-testing.md)
 
 ## Licensing
 

@@ -110,6 +110,24 @@ pub struct ImeLeafHit {
     pub caret_bounds: Option<Bounds<Pixels>>,
 }
 
+/// Observations from the real text paint pass, available only to GUI tests.
+#[cfg(feature = "gui-tests")]
+#[derive(Debug, Clone)]
+pub struct PaintedLeafGeometry {
+    pub text: String,
+    pub bounds: Bounds<Pixels>,
+    pub lines: Vec<PaintedLineGeometry>,
+}
+
+#[cfg(feature = "gui-tests")]
+#[derive(Debug, Clone)]
+pub struct PaintedLineGeometry {
+    pub top: f32,
+    pub height: f32,
+    pub left: f32,
+    pub right: f32,
+}
+
 /// Per-frame IME geometry. Leaf/widget hits are cleared at the start of each
 /// render; sticky caret and generation persist across blink-off frames.
 #[derive(Default)]
@@ -145,6 +163,38 @@ pub struct ImeOriginState {
 }
 
 impl ImeOriginState {
+    #[cfg(feature = "gui-tests")]
+    pub fn painted_geometry(&self) -> Vec<PaintedLeafGeometry> {
+        self.leaves
+            .iter()
+            .map(|leaf| PaintedLeafGeometry {
+                text: leaf.layout.text.to_string(),
+                bounds: leaf.bounds,
+                lines: self
+                    .visual_lines
+                    .iter()
+                    .filter(|line| Arc::ptr_eq(&line.layout, &leaf.layout))
+                    .map(|line| PaintedLineGeometry {
+                        top: line.line.top,
+                        height: line.line.height,
+                        left: line
+                            .line
+                            .stops
+                            .iter()
+                            .map(|s| s.x)
+                            .fold(f32::INFINITY, f32::min),
+                        right: line
+                            .line
+                            .stops
+                            .iter()
+                            .map(|s| s.x)
+                            .fold(f32::NEG_INFINITY, f32::max),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     pub fn begin_frame(
         &mut self,
         widget_focused: bool,

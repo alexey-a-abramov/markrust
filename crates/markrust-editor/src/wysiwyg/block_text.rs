@@ -4,15 +4,18 @@
 
 //! Interactive leaf text: wrap-aware hit-testing, caret, and selection paint.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    fill, point, px, relative, rgb, size, App, Bounds, Context, Element, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    SharedString, Style, TextRun, TextStyle, UnderlineStyle, Window, WrappedLine,
+    fill, point, px, relative, rgb, size, App, AvailableSpace, Bounds, Context, Element,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, GlobalElementId,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style, TextRun, TextStyle,
+    UnderlineStyle, Window, WrappedLine,
 };
 use markrust_core::html_visual::{
     classify_opaque_inline, html_block_is_dangerous, html_block_is_hidden_widget,
@@ -3074,9 +3077,15 @@ pub struct Prepaint<H: WysiwygHost> {
     visual_lines: Vec<VisualLine>,
     cursor: Option<PaintQuad>,
     caret_bounds: Option<Bounds<Pixels>>,
-    selection: Option<PaintQuad>,
+    selection: Vec<PaintQuad>,
     _host: std::marker::PhantomData<H>,
 }
+
+/// Keep the final measured glyph layout through prepaint. Rewrapping at
+/// pixel-rounded bounds can otherwise add a line at a fractional threshold
+/// after the layout engine has already reserved the paragraph's height.
+#[derive(Default, Clone)]
+pub struct MeasuredLeafText(Rc<RefCell<Option<Vec<WrappedLine>>>>);
 
 impl<H: WysiwygHost> IntoElement for BlockTextElement<H> {
     type Element = Self;
@@ -3086,7 +3095,7 @@ impl<H: WysiwygHost> IntoElement for BlockTextElement<H> {
 }
 
 impl<H: WysiwygHost> Element for BlockTextElement<H> {
-    type RequestLayoutState = ();
+    type RequestLayoutState = MeasuredLeafText;
     type PrepaintState = Prepaint<H>;
 
     fn id(&self) -> Option<gpui::ElementId> {
@@ -3102,27 +3111,16 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let wrap = (window.viewport_size().width - px(80.)).max(px(120.));
-        let mut style = Style::default();
-        let width = if self.hug_width {
-            let measured = self.measure_unwrapped_width(window);
-            measured.min(wrap).max(px(1.))
-        } else {
-            wrap
-        };
-        let height = self.measure_height(window, width);
-        if self.hug_width {
-            style.size.width = width.into();
-            style.flex_shrink = 0.;
-        } else {
-            style.size.width = relative(1.).into();
-        }
-        style.size.height = height.max(px(self.line_height)).into();
-        style.min_size.height = px(self.line_height).into();
-        let _ = cx;
-        (window.request_layout(style, [], cx), ())
+        request_leaf_text_layout(
+            self.layout.clone(),
+            self.font_size,
+            self.line_height,
+            self.theme.clone(),
+            self.hug_width,
+            window,
+        )
     }
 
     fn prepaint(
@@ -3130,11 +3128,15 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let lines = self.shape(window, bounds.size.width);
+        let lines = request_layout
+            .0
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| self.shape(window, bounds.size.width));
         let host = self.editor.read(cx);
         let caret = host.caret_offset();
         let selected = host.selected_range();
@@ -3212,7 +3214,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
             host.sync_ime_cursor(window);
         });
 
-        if let Some(selection) = prepaint.selection.take() {
+        for selection in prepaint.selection.drain(..) {
             window.paint_quad(selection);
         }
 
@@ -3347,30 +3349,78 @@ impl<H: WysiwygHost> BlockTextElement<H> {
             &self.theme,
         )
     }
+}
 
-    fn measure_height(&self, window: &mut Window, wrap: Pixels) -> Pixels {
-        let lines = self.shape(window, wrap);
-        let lh = px(self.line_height);
-        lines
-            .iter()
-            .map(|l| l.size(lh).height.max(lh))
-            .fold(px(0.), |a, b| a + b)
-            .max(lh)
+/// Measure at the width assigned by the containing block, not the window.
+/// Table cells, list bodies, and the editor pane can all be substantially
+/// narrower than the viewport. Reserving a viewport-sized text height and
+/// only rewrapping during prepaint makes following rows overlap the glyphs.
+fn request_leaf_text_layout(
+    layout: Arc<LeafLayout>,
+    font_size: f32,
+    line_height: f32,
+    theme: EditorTheme,
+    hug_width: bool,
+    window: &mut Window,
+) -> (LayoutId, MeasuredLeafText) {
+    let mut style = Style::default();
+    if !hug_width {
+        style.size.width = relative(1.).into();
     }
-
-    fn measure_unwrapped_width(&self, window: &mut Window) -> Pixels {
-        let lines = self.shape(window, px(100_000.));
-        lines
-            .iter()
-            .map(|l| l.width())
-            .fold(px(0.), |a, b| a.max(b))
-    }
+    style.min_size.width = px(0.).into();
+    style.min_size.height = px(line_height).into();
+    let measured_text = MeasuredLeafText::default();
+    let shared_text = measured_text.clone();
+    let layout_id = window.request_measured_layout(style, move |known, available, window, _cx| {
+        let wrap_width = known.width.or(match available.width {
+            AvailableSpace::Definite(width) => Some(width),
+            AvailableSpace::MinContent => Some(px(1.)),
+            AvailableSpace::MaxContent => None,
+        });
+        let lines =
+            shape_layout_with_wrap(&layout, window, wrap_width, font_size, line_height, &theme);
+        let lh = px(line_height);
+        let mut measured = size(px(0.), px(0.));
+        for line in &lines {
+            let line_size = line.size(lh);
+            measured.width = measured.width.max(line_size.width).ceil();
+            measured.height += line_size.height.max(lh);
+        }
+        let width = known.width.unwrap_or_else(|| {
+            if hug_width {
+                wrap_width.map_or(measured.width, |width| measured.width.min(width))
+            } else {
+                wrap_width.unwrap_or(measured.width)
+            }
+        });
+        *shared_text.0.borrow_mut() = Some(lines);
+        size(width.max(px(0.)), measured.height.max(lh))
+    });
+    (layout_id, measured_text)
 }
 
 fn shape_layout(
     layout: &LeafLayout,
     window: &mut Window,
     wrap_width: Pixels,
+    font_size: f32,
+    line_height: f32,
+    theme: &EditorTheme,
+) -> Vec<WrappedLine> {
+    shape_layout_with_wrap(
+        layout,
+        window,
+        Some(wrap_width),
+        font_size,
+        line_height,
+        theme,
+    )
+}
+
+fn shape_layout_with_wrap(
+    layout: &LeafLayout,
+    window: &mut Window,
+    wrap_width: Option<Pixels>,
     font_size: f32,
     line_height: f32,
     theme: &EditorTheme,
@@ -3410,7 +3460,7 @@ fn shape_layout(
             display,
             px(font_size),
             &runs,
-            Some(wrap_width.max(px(40.))),
+            wrap_width.map(|width| width.max(px(1.))),
             None,
         )
         .unwrap_or_default()
@@ -3549,11 +3599,11 @@ fn paint_carets(
     show_sel: bool,
     caret_color: gpui::Hsla,
     sel_color: gpui::Hsla,
-) -> (Option<PaintQuad>, Option<PaintQuad>, Option<Bounds<Pixels>>) {
+) -> (Vec<PaintQuad>, Option<PaintQuad>, Option<Bounds<Pixels>>) {
     let _ = text_len;
     let mut cursor = None;
     let mut caret_bounds = None;
-    let mut selection = None;
+    let mut selection = Vec::new();
     let mut y = bounds.origin.y;
     let mut offset = 0usize;
     for line in lines {
@@ -3574,28 +3624,61 @@ fn paint_carets(
             }
         }
         if show_sel {
-            let a = vis_sel.start.max(offset);
-            let b = vis_sel.end.min(line_end);
-            if a < b {
-                let pa = line
-                    .position_for_index(a.saturating_sub(offset), line_height)
-                    .unwrap_or(point(px(0.), px(0.)));
-                let pb = line
-                    .position_for_index(b.saturating_sub(offset), line_height)
-                    .unwrap_or(point(px(0.), px(0.)));
-                selection = Some(fill(
-                    Bounds::from_corners(
-                        point(bounds.origin.x + pa.x, y),
-                        point(bounds.origin.x + pb.x.max(pa.x + px(4.)), y + h),
-                    ),
-                    sel_color,
-                ));
+            let row_ends = line
+                .wrap_boundaries()
+                .iter()
+                .map(|boundary| line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+                .chain([line.len()]);
+            for (row_index, row_start, selected) in selected_visual_rows(&vis_sel, offset, row_ends)
+            {
+                // A soft-wrap boundary has two visual caret positions.
+                // Work in the unwrapped glyph coordinates of this row so
+                // its start cannot resolve to the previous row's right edge.
+                let start_x = line.unwrapped_layout.x_for_index(row_start);
+                let left = (line.unwrapped_layout.x_for_index(selected.start) - start_x)
+                    .max(px(0.))
+                    .min(bounds.size.width);
+                let right = (line.unwrapped_layout.x_for_index(selected.end) - start_x)
+                    .max(left)
+                    .min(bounds.size.width);
+                if right > left {
+                    selection.push(fill(
+                        Bounds::new(
+                            point(bounds.origin.x + left, y + line_height * row_index),
+                            size(right - left, line_height),
+                        ),
+                        sel_color,
+                    ));
+                }
             }
         }
         offset = line_end;
         y += h;
     }
     (selection, cursor, caret_bounds)
+}
+
+/// Split a selection at visual wrap boundaries; each returned segment gets
+/// its own one-line-high quad. A single bounding rectangle both highlights
+/// unselected glyphs and loses earlier hard lines when overwritten.
+fn selected_visual_rows(
+    selection: &Range<usize>,
+    line_offset: usize,
+    row_ends: impl IntoIterator<Item = usize>,
+) -> Vec<(usize, usize, Range<usize>)> {
+    let selection =
+        selection.start.saturating_sub(line_offset)..selection.end.saturating_sub(line_offset);
+    let mut row_start = 0;
+    let mut selected = Vec::new();
+    for (row_index, row_end) in row_ends.into_iter().enumerate() {
+        let start = selection.start.max(row_start);
+        let end = selection.end.min(row_end);
+        if start < end {
+            selected.push((row_index, row_start, start..end));
+        }
+        row_start = row_end;
+    }
+    selected
 }
 
 /// Overlay text for a language chip, image caption, or frontmatter field.
@@ -3621,7 +3704,7 @@ pub struct OverlayPrepaint {
     lines: Vec<WrappedLine>,
     display: String,
     cursor: Option<PaintQuad>,
-    selection: Option<PaintQuad>,
+    selection: Vec<PaintQuad>,
 }
 
 impl<H: WysiwygHost> IntoElement for WidgetOverlay<H> {
@@ -3633,7 +3716,7 @@ impl<H: WysiwygHost> IntoElement for WidgetOverlay<H> {
 }
 
 impl<H: WysiwygHost> Element for WidgetOverlay<H> {
-    type RequestLayoutState = ();
+    type RequestLayoutState = MeasuredLeafText;
     type PrepaintState = OverlayPrepaint;
 
     fn id(&self) -> Option<gpui::ElementId> {
@@ -3651,51 +3734,16 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let wrap = (window.viewport_size().width - px(80.)).max(px(120.));
-        let mut style = Style::default();
         let (display, _) = self.display_and_caret(cx);
         let layout = overlay_leaf_layout(&display, self.text_style(), self.italic);
-        let width = if self.hug_width {
-            let lines = shape_layout(
-                &layout,
-                window,
-                px(100_000.),
-                self.font_size,
-                self.line_height,
-                &self.theme,
-            );
-            lines
-                .iter()
-                .map(|l| l.width())
-                .fold(px(0.), |a, b| a.max(b))
-                .min(wrap)
-                .max(px(1.))
-        } else {
-            wrap
-        };
-        let lines = shape_layout(
-            &layout,
-            window,
-            width,
+        request_leaf_text_layout(
+            Arc::new(layout),
             self.font_size,
             self.line_height,
-            &self.theme,
-        );
-        let lh = px(self.line_height);
-        let height = lines
-            .iter()
-            .map(|l| l.size(lh).height.max(lh))
-            .fold(px(0.), |a, b| a + b)
-            .max(lh);
-        if self.hug_width {
-            style.size.width = width.into();
-            style.flex_shrink = 0.;
-        } else {
-            style.size.width = relative(1.).into();
-        }
-        style.size.height = height.into();
-        style.min_size.height = lh.into();
-        (window.request_layout(style, Vec::new(), cx), ())
+            self.theme.clone(),
+            self.hug_width,
+            window,
+        )
     }
 
     fn prepaint(
@@ -3703,7 +3751,7 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
@@ -3711,14 +3759,16 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
         let vis_sel = self.display_sel(cx, display.len());
         let show_sel = self.editing && vis_sel.start != vis_sel.end;
         let layout = overlay_leaf_layout(&display, self.text_style(), self.italic);
-        let lines = shape_layout(
-            &layout,
-            window,
-            bounds.size.width,
-            self.font_size,
-            self.line_height,
-            &self.theme,
-        );
+        let lines = request_layout.0.borrow_mut().take().unwrap_or_else(|| {
+            shape_layout(
+                &layout,
+                window,
+                bounds.size.width,
+                self.font_size,
+                self.line_height,
+                &self.theme,
+            )
+        });
         let focused = self.editor.read(cx).focused(window);
         let caret_visible = self.editor.read(cx).caret_visible();
         let (selection, cursor, caret_bounds) = paint_carets(
@@ -3767,7 +3817,7 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
             );
         }
 
-        if let Some(selection) = prepaint.selection.take() {
+        for selection in prepaint.selection.drain(..) {
             window.paint_quad(selection);
         }
 
@@ -3962,6 +4012,43 @@ mod tests {
         blank_caret_gap_after_last, blank_caret_gap_before, import_markdown, AlertKind, Block,
         BlockKind, IdGen, Inline, RichTree,
     };
+
+    #[test]
+    fn selection_is_split_at_each_visual_row_without_filling_unselected_text() {
+        assert_eq!(
+            selected_visual_rows(&(4..24), 0, [10, 20, 30]),
+            vec![(0, 0, 4..10), (1, 10, 10..20), (2, 20, 20..24)]
+        );
+    }
+
+    #[test]
+    fn selection_at_wrap_boundary_belongs_only_to_the_selected_row() {
+        assert_eq!(
+            selected_visual_rows(&(10..20), 0, [10, 20, 30]),
+            vec![(1, 10, 10..20)]
+        );
+        assert!(selected_visual_rows(&(10..10), 0, [10, 20, 30]).is_empty());
+        assert!(selected_visual_rows(&(31..40), 0, [10, 20, 30]).is_empty());
+    }
+
+    #[test]
+    fn selection_spanning_the_leaf_clips_to_its_actual_visual_rows() {
+        assert_eq!(
+            selected_visual_rows(&(0..100), 0, [0, 10, 20]),
+            vec![(1, 0, 0..10), (2, 10, 10..20)]
+        );
+    }
+
+    #[test]
+    fn selection_across_hard_lines_retains_all_of_their_soft_rows() {
+        let selection = 4..28;
+        let first_line = selected_visual_rows(&selection, 0, [10, 16]);
+        let second_line = selected_visual_rows(&selection, 16, [6, 20]);
+        assert_eq!(first_line, vec![(0, 0, 4..10), (1, 10, 10..16)]);
+        assert_eq!(second_line, vec![(0, 0, 0..6), (1, 6, 6..12)]);
+        assert_eq!(first_line.len() + second_line.len(), 4);
+        assert!(selected_visual_rows(&selection, 36, [10]).is_empty());
+    }
 
     fn layout_for(source: &str) -> LeafLayout {
         let mut ids = IdGen::default();

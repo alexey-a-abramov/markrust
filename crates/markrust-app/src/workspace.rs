@@ -7,18 +7,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use gpui::{AppContext, Context, Entity, ExternalPaths, Task, Window};
+use gpui::{
+    AppContext, Context, Entity, EntityInputHandler, ExternalPaths, Focusable, Task, Window,
+};
 
 use crate::config::{is_markdown, AppConfig, RecentWorkspaces};
 use crate::drop::{
     classify_editor_drop, classify_window_drop, markdown_image_reference, DropIntent,
 };
+use crate::panels::{Panel, PanelLayout};
 use crate::session::{
     classify_external_change, list_markdown_files, normalize_review_decision,
     should_offer_normalize_review, DropTarget, ExternalChangeAction, NormalizeReviewChoice,
     WorkspaceCommand,
 };
-use markrust_core::Document;
+use markrust_core::{Document, SelectionSnapshot};
 use markrust_editor::{EditorCommand, MarkdownEditor, MarkdownEditorView, RichEditorView};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -54,6 +57,8 @@ pub struct Workspace {
     pub next_tab_id: usize,
     pub sidebar_open: bool,
     pub outline_open: bool,
+    pub panel_overlay: Option<Panel>,
+    last_panel_layout: Option<(f32, EditorMode)>,
     pub palette_open: bool,
     pub config: AppConfig,
     pub pending_external_change: Option<(usize, PathBuf)>,
@@ -68,6 +73,24 @@ pub struct Workspace {
 #[allow(dead_code)]
 impl Workspace {
     pub fn new(config: AppConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_recent(config, RecentWorkspaces::load(), window, cx)
+    }
+
+    #[cfg(feature = "gui-tests")]
+    pub(crate) fn new_for_gui_tests(
+        config: AppConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_recent(config, RecentWorkspaces::default(), window, cx)
+    }
+
+    fn new_with_recent(
+        config: AppConfig,
+        recent: RecentWorkspaces,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut workspace = Self {
             root: None,
             tabs: Vec::new(),
@@ -75,10 +98,12 @@ impl Workspace {
             next_tab_id: 1,
             sidebar_open: true,
             outline_open: true,
+            panel_overlay: None,
+            last_panel_layout: None,
             palette_open: false,
             config,
             pending_external_change: None,
-            recent: RecentWorkspaces::load(),
+            recent,
             cached_files: Vec::new(),
             _watcher: None,
             _watcher_task: Task::ready(()),
@@ -167,6 +192,7 @@ impl Workspace {
             WorkspaceCommand::SwitchTab(index) => {
                 if index < self.tabs.len() {
                     self.active_tab = index;
+                    self.focus_active_editor(window, cx);
                     cx.notify();
                 }
             }
@@ -234,21 +260,157 @@ impl Workspace {
         Ok(())
     }
 
-    /// Cycle the active tab between the source and WYSIWYG surfaces.
-    pub fn toggle_editor_mode(&mut self, cx: &mut Context<Self>) {
-        let index = self.active_tab;
-        if let Some(tab) = self.tabs.get_mut(index) {
-            tab.mode = match tab.mode {
+    /// Cycle the active tab through the same modes offered by View and the toolbar.
+    pub fn toggle_editor_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab() {
+            let mode = match tab.mode {
                 EditorMode::Wysiwyg => EditorMode::Source,
                 EditorMode::Source => EditorMode::Split,
                 EditorMode::Split => EditorMode::Wysiwyg,
             };
+            self.set_editor_mode(mode, window, cx);
+        }
+    }
+
+    pub fn set_editor_mode(
+        &mut self,
+        mode: EditorMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            if tab.mode == mode {
+                return;
+            }
+            let from_rich = tab.mode == EditorMode::Wysiwyg
+                || (tab.mode == EditorMode::Split && tab.rich_view.read(cx).is_focused(window));
+            let (range, reversed) = if from_rich {
+                let view = tab.rich_view.read(cx);
+                (view.selected_range.clone(), view.selection_reversed)
+            } else {
+                let editor = tab.editor.read(cx);
+                (editor.selected_range.clone(), editor.selection_reversed)
+            };
+            // Both surfaces address the same Markdown bytes. Carry the caret and
+            // anchor across instead of jumping back to each surface's old caret.
+            if matches!(mode, EditorMode::Source | EditorMode::Split) {
+                tab.editor.update(cx, |editor, cx| {
+                    editor.apply_command(
+                        EditorCommand::SetSelection {
+                            start: range.start,
+                            end: range.end,
+                        },
+                        cx,
+                    );
+                    editor.selection_reversed = reversed;
+                });
+            }
+            if matches!(mode, EditorMode::Wysiwyg | EditorMode::Split) {
+                tab.rich_view.update(cx, |view, cx| {
+                    view.apply_editor_command(
+                        EditorCommand::SetSelection {
+                            start: range.start,
+                            end: range.end,
+                        },
+                        cx,
+                    );
+                    view.selection_reversed = reversed;
+                });
+            }
+            tab.mode = mode;
+            self.focus_active_editor(window, cx);
             cx.notify();
+        }
+    }
+
+    fn focus_active_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab() {
+            match tab.mode {
+                EditorMode::Source => tab.editor.read(cx).focus_handle(cx).focus(window, cx),
+                EditorMode::Wysiwyg | EditorMode::Split => {
+                    tab.rich_view.read(cx).focus_handle(cx).focus(window, cx);
+                }
+            }
+        }
+    }
+
+    /// Paste via the focused editor's input handler so table, link and frontmatter
+    /// drafts receive the text instead of accidentally mutating the document body.
+    pub fn paste(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab() {
+            let id = tab.id;
+            let rich = tab.mode == EditorMode::Wysiwyg
+                || (tab.mode == EditorMode::Split && tab.rich_view.read(cx).is_focused(window));
+            let selection = |cx: &gpui::App| {
+                let (range, reversed) = if rich {
+                    let view = tab.rich_view.read(cx);
+                    (view.selected_range.clone(), view.selection_reversed)
+                } else {
+                    let editor = tab.editor.read(cx);
+                    (editor.selected_range.clone(), editor.selection_reversed)
+                };
+                SelectionSnapshot {
+                    start: range.start,
+                    end: range.end,
+                    reversed,
+                }
+            };
+            let before = selection(cx);
+            let checkpoint = tab
+                .document
+                .update(cx, |doc, _| doc.begin_undo_group(before));
+            if rich {
+                tab.rich_view.update(cx, |view, cx| {
+                    view.replace_text_in_range(None, text, window, cx);
+                });
+            } else {
+                tab.editor.update(cx, |editor, cx| {
+                    editor.replace_text_in_range(None, text, window, cx);
+                });
+            }
+            let after = selection(cx);
+            tab.document
+                .update(cx, |doc, _| doc.finish_undo_group(checkpoint, after));
+            self.schedule_autosave(id, cx);
         }
     }
 
     pub fn active_tab(&self) -> Option<&DocumentTab> {
         self.tabs.get(self.active_tab)
+    }
+
+    pub fn ensure_panel_layout(&mut self, width: f32, cx: &mut Context<Self>) {
+        let mode = self.active_tab().map(|tab| tab.mode).unwrap_or_default();
+        if self.last_panel_layout == Some((width, mode)) {
+            return;
+        }
+        self.last_panel_layout = Some((width, mode));
+        let layout = PanelLayout::fit(width, mode, self.sidebar_open, self.outline_open);
+        self.apply_panel_layout(layout, cx);
+    }
+
+    pub fn toggle_panel(&mut self, panel: Panel, width: f32, cx: &mut Context<Self>) {
+        let mode = self.active_tab().map(|tab| tab.mode).unwrap_or_default();
+        let layout = PanelLayout {
+            sidebar: self.sidebar_open,
+            outline: self.outline_open,
+            overlay: self.panel_overlay,
+        }
+        .toggle(panel, width, mode);
+        self.last_panel_layout = Some((width, mode));
+        self.apply_panel_layout(layout, cx);
+    }
+
+    fn apply_panel_layout(&mut self, layout: PanelLayout, cx: &mut Context<Self>) {
+        if self.sidebar_open != layout.sidebar
+            || self.outline_open != layout.outline
+            || self.panel_overlay != layout.overlay
+        {
+            self.sidebar_open = layout.sidebar;
+            self.outline_open = layout.outline;
+            self.panel_overlay = layout.overlay;
+            cx.notify();
+        }
     }
 
     pub fn new_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -265,6 +427,7 @@ impl Workspace {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         if let Some(index) = self.tab_index_for_path(&path, cx) {
             self.active_tab = index;
+            self.focus_active_editor(window, cx);
             cx.notify();
             return Ok(());
         }
@@ -337,6 +500,7 @@ impl Workspace {
             title,
         });
         self.active_tab = self.tabs.len() - 1;
+        self.focus_active_editor(window, cx);
         spawn_parse_pump(document, cx);
         cx.notify();
     }
@@ -347,6 +511,7 @@ impl Workspace {
         }
         self.tabs.remove(index);
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        self.focus_active_editor(window, cx);
         if self.tabs.is_empty() {
             self.new_document(window, cx);
         }
@@ -744,7 +909,9 @@ fn spawn_parse_pump(document: Entity<Document>, cx: &mut Context<Workspace>) {
             .timer(Duration::from_millis(32))
             .await;
         let done = document.update(cx, |doc, cx| {
-            if !doc.mode.parses_markdown() {
+            // A render or input handler may already have drained this revision.
+            // Stop then too, rather than retaining the tab's document forever.
+            if !doc.mode.parses_markdown() || doc.parsed_revision >= doc.revision() {
                 cx.notify();
                 return true;
             }

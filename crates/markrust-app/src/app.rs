@@ -25,7 +25,7 @@ pub fn run_gui() {
     run_gui_with_open(None);
 }
 
-fn load_bundled_fonts(cx: &mut App) {
+pub(crate) fn load_bundled_fonts(cx: &mut App) {
     let fonts: Vec<Cow<'static, [u8]>> = vec![
         Cow::Borrowed(include_bytes!("../../../assets/fonts/Inter-Regular.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../../../assets/fonts/Inter-Italic.ttf").as_slice()),
@@ -45,6 +45,7 @@ pub fn run_gui_with_open(open_path: Option<PathBuf>) {
         load_bundled_fonts(cx);
         let config = AppConfig::load();
         cx.bind_keys(desktop_key_bindings());
+        crate::menus::init(cx);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
@@ -54,6 +55,7 @@ pub fn run_gui_with_open(open_path: Option<PathBuf>) {
                     ..Default::default()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(680.), px(420.))),
                 icon: load_window_icon(),
                 ..Default::default()
             },
@@ -77,10 +79,21 @@ pub fn run_gui_with_open(open_path: Option<PathBuf>) {
     });
 }
 
-fn desktop_key_bindings() -> Vec<KeyBinding> {
+pub(crate) fn desktop_key_bindings() -> Vec<KeyBinding> {
     vec![
+        KeyBinding::new("cmd-q", crate::menus::Quit, None),
+        KeyBinding::new("cmd-h", crate::menus::Hide, None),
+        KeyBinding::new("alt-cmd-h", crate::menus::HideOthers, None),
+        KeyBinding::new("cmd-m", crate::window::Minimize, None),
+        KeyBinding::new("ctrl-cmd-f", crate::window::ToggleFullScreen, None),
         KeyBinding::new("cmd-s", crate::window::Save, None),
+        KeyBinding::new("cmd-shift-s", crate::window::SaveAs, None),
         KeyBinding::new("cmd-shift-m", crate::window::ToggleEditorMode, None),
+        KeyBinding::new("cmd-1", crate::window::ShowWysiwyg, None),
+        KeyBinding::new("cmd-2", crate::window::ShowSource, None),
+        KeyBinding::new("cmd-3", crate::window::ShowSplit, None),
+        KeyBinding::new("ctrl-cmd-s", crate::window::ToggleSidebar, None),
+        KeyBinding::new("ctrl-cmd-o", crate::window::ToggleOutline, None),
         KeyBinding::new("cmd-o", crate::window::OpenFile, None),
         KeyBinding::new("cmd-shift-o", crate::window::OpenFolder, None),
         KeyBinding::new("cmd-n", crate::window::NewDocument, None),
@@ -143,6 +156,8 @@ fn desktop_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-c", markrust_editor::Copy, None),
         KeyBinding::new("cmd-x", markrust_editor::Cut, None),
         KeyBinding::new("ctrl-x", markrust_editor::Cut, None),
+        KeyBinding::new("cmd-v", crate::window::Paste, None),
+        KeyBinding::new("ctrl-v", crate::window::Paste, None),
         KeyBinding::new("enter", markrust_editor::Enter, None),
         KeyBinding::new("shift-enter", markrust_editor::InsertLineBreak, None),
         KeyBinding::new("cmd-b", markrust_editor::ToggleBold, None),

@@ -13,3 +13,6 @@ mod inline_layout;
 mod view;
 
 pub use view::RichEditorView;
+
+#[cfg(feature = "gui-tests")]
+pub use ime::{PaintedLeafGeometry, PaintedLineGeometry};

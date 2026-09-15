@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Native macOS menu bar and compact monochrome toolbar icons. WYSIWYG, Source,
+  and Split modes have separate selected segments, tooltips, View menu entries,
+  and Cmd-1/2/3 shortcuts; mode changes preserve selection and focus the active
+  editor. Narrow windows collapse or float side panels to keep the document usable.
+- A native GUI regression runner with real text shaping, layout and input
+  assertions, Metal screenshots, explicit pixel-baseline comparison, and a
+  GPU-independent macOS CI lane.
 - WYSIWYG Typora-style intersect-reveal for definition-list `: ` and footnote definitions `[^1]:` (and footnote refs `[^1]`): hidden when the caret is outside the details/def/ref; painted when the caret or a selection intersects. Click on details/body text still maps into the word. Keyboard skip of those markers is unchanged.
 - WYSIWYG Typora-style intersect-reveal for thematic breaks (`---` / `***` / `___` / `* * *`) and HTML-block `<hr>`: the rule paints when the caret is elsewhere; source paints when the caret or a selection intersects. Click on the rule maps to the break; click on a revealed `-` maps onto that source byte. Left/Right/Delete stay one step (not nibbleable dashes or tag bytes).
 - WYSIWYG HTML-block wrapper tags (`<div>` / `</div>`) paint when the caret or a selection intersects the block; inner Markdown (`**bold**`, links, code) still paints as rich text. Tags are not nibbleable.
@@ -32,6 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replacing selected text and using Paste are atomic undo actions: Undo restores
+  the replaced text and selection direction without consuming adjacent typing.
+- Wrapped text reserves height using its actual parent width. Narrow table
+  cells and list items no longer paint over following rows, and selection
+  highlights follow individual visual lines instead of forming tall blocks.
+- Native input remains registered after trailing whitespace and when no
+  painted leaf owns the caret. Typing no longer stops after a space at EOF.
+- Source and Split views expose horizontal scrolling for long unwrapped lines;
+  keyboard navigation and narrower viewports keep the source caret visible.
 - HTML export is now safe by default: raw HTML and dangerous URL schemes are omitted from output. For deliberately trusted Markdown, the CLI provides an explicit `markrust export --unsafe-html …` escape hatch that preserves the prior Comrak behavior.
 - WYSIWYG InsertText on CommonMark `&amp;` / `\*` dest chrome and inline `<br>` interiors skips onto the next visible character (`A&amp;xB`, `A\*xB`, `a<br>xb`), not glue `A&xamp;B` / `A\x*B` / `a<xbr>b`. The widget start still extends the previous word (`Ax&amp;B`, `ax<br>b`). Code spans stay literal. P5 stays 🚧.
 - WYSIWYG InsertText on a thematic `---` / `***` / `___` / `<hr>` widget opens a new paragraph above (`x\n\n---`, not `x---` / a setext heading). Quoted keep `>`. Close-edge / leftover-below / EOF open after; HTML type-6 `<hr>` / type-7 `<br>` keep a blank line so the next paragraph is not swallowed (`<hr>\n\nx`). Atomic Left/Right/Delete stay one step. Empty wrap `****` still fills as `**x**`. P5 stays 🚧.

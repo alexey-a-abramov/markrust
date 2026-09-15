@@ -544,6 +544,11 @@ impl MarkdownEditor {
         self.last_caret_bounds = Some(bounds);
     }
 
+    #[cfg(feature = "gui-tests")]
+    pub fn painted_caret_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.last_caret_bounds
+    }
+
     pub fn sync_ime_cursor(&mut self, window: &mut Window) {
         let Some(origin) = self.last_caret_bounds else {
             return;

@@ -8,10 +8,16 @@ mod app;
 mod config;
 pub mod crash;
 mod drop;
+mod icons;
+mod menus;
+mod panels;
 mod session;
 mod ui;
 mod window;
 mod workspace;
+
+#[cfg(feature = "gui-tests")]
+pub mod visual_tests;
 
 pub use app::{run_gui, run_gui_with_open, GPUI_GIT_REV};
 pub use config::{AppConfig, RecentWorkspaces, ThemeChoice};

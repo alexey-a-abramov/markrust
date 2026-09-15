@@ -2,13 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
     div, fill, point, prelude::*, px, relative, size, App, Bounds, Context, CursorStyle, Element,
     ElementInputHandler, Entity, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ShapedLine,
-    SharedString, Style, TextAlign, TextRun, Window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle,
+    ShapedLine, SharedString, Style, TextAlign, TextRun, Window,
 };
 
 use super::hit_test::{click_byte_offset, invert_doc_to_display};
@@ -23,6 +25,8 @@ use markrust_core::TableRowKind;
 /// GPUI custom element that lays out and paints the Markdown editor surface.
 pub struct EditorElement {
     pub editor: Entity<MarkdownEditor>,
+    scroll_handle: Option<(ScrollHandle, Rc<Cell<Pixels>>)>,
+    reveal_caret: bool,
 }
 
 const EDITOR_GUTTER: f32 = 16.0;
@@ -48,9 +52,30 @@ pub struct EditorPrepaint {
     display_to_doc: Vec<usize>,
 }
 
+/// The same shaped source lines determine intrinsic width and painting.
+pub struct EditorLayout {
+    lines: Vec<LinePaintData>,
+    display_layout: DisplayLayout,
+}
+
 impl EditorElement {
     pub fn new(editor: Entity<MarkdownEditor>) -> Self {
-        Self { editor }
+        Self {
+            editor,
+            scroll_handle: None,
+            reveal_caret: false,
+        }
+    }
+
+    fn with_scroll(
+        mut self,
+        handle: ScrollHandle,
+        viewport_width: Rc<Cell<Pixels>>,
+        reveal_caret: bool,
+    ) -> Self {
+        self.scroll_handle = Some((handle, viewport_width));
+        self.reveal_caret = reveal_caret;
+        self
     }
 }
 
@@ -63,7 +88,7 @@ impl IntoElement for EditorElement {
 }
 
 impl Element for EditorElement {
-    type RequestLayoutState = ();
+    type RequestLayoutState = EditorLayout;
     type PrepaintState = EditorPrepaint;
 
     fn id(&self) -> Option<gpui::ElementId> {
@@ -81,19 +106,45 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        self.editor.update(cx, |editor, cx| {
+            editor.document.update(cx, |doc, _cx| {
+                doc.apply_pending_parse();
+            });
+        });
         let editor = self.editor.read(cx);
         let theme = &editor.theme;
         let content = editor.content(cx);
-        let spans = editor.document.read(cx).syntax_spans.clone();
+        let doc = editor.document.read(cx);
+        let spans = if doc.mode.parses_markdown() {
+            doc.syntax_spans.clone()
+        } else {
+            Vec::new()
+        };
         let carets = editor.carets();
         let selections = editor.selections();
         let display_layout = build_display_layout(&content, &spans, &carets, &selections, theme);
-        let total_height = total_layout_height(&display_layout, theme, &content);
+        let lines = shape_lines(window, &display_layout, theme, &content);
+        let intrinsic_width = lines
+            .iter()
+            .map(|line| line.shaped.width)
+            .fold(px(0.), Pixels::max)
+            + px(EDITOR_GUTTER * 2.);
+        let total_height = lines
+            .last()
+            .map(|line| line.y + line.height)
+            .unwrap_or_else(|| px(theme.line_height_for_font_size(theme.font_size)));
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height =
-            px(total_height.max(theme.line_height_for_font_size(theme.font_size))).into();
-        (window.request_layout(style, [], cx), ())
+        style.min_size.width = intrinsic_width.ceil().into();
+        style.size.height = total_height.into();
+        style.flex_shrink = 0.;
+        (
+            window.request_layout(style, [], cx),
+            EditorLayout {
+                lines,
+                display_layout,
+            },
+        )
     }
 
     fn prepaint(
@@ -101,36 +152,19 @@ impl Element for EditorElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
         let editor = self.editor.read(cx);
         let theme = editor.theme.clone();
-        let content = editor.content(cx);
-        let carets = editor.carets();
-        let selections = editor.selections();
         let cursor_doc = editor.cursor_offset();
         let selected_range = editor.selected_range.clone();
         let cursor_visible = editor.cursor_visible;
         let is_focused = editor.focus_handle.is_focused(window);
 
-        let spans = {
-            let mut spans = Vec::new();
-            self.editor.update(cx, |editor, cx| {
-                editor.document.update(cx, |doc, _| {
-                    doc.apply_pending_parse();
-                    if doc.mode.parses_markdown() {
-                        spans = doc.syntax_spans.clone();
-                    }
-                });
-            });
-            spans
-        };
-
-        let display_layout = build_display_layout(&content, &spans, &carets, &selections, &theme);
-
-        let lines = shape_lines(window, &display_layout, &theme, &content);
+        let display_layout = &request_layout.display_layout;
+        let lines = request_layout.lines.clone();
 
         let cursor_display = display_layout.display_offset_for_doc(cursor_doc);
         let caret_bounds = caret_bounds_for_display(&lines, cursor_display, bounds);
@@ -139,7 +173,7 @@ impl Element for EditorElement {
         } else {
             Some(selection_quad(
                 &lines,
-                &display_layout,
+                display_layout,
                 &selected_range,
                 bounds,
                 theme.selection,
@@ -163,7 +197,7 @@ impl Element for EditorElement {
             caret_bounds,
             blockquote_borders,
             code_block_backgrounds,
-            display_to_doc: invert_doc_to_display(&display_layout),
+            display_to_doc: invert_doc_to_display(display_layout),
         }
     }
 
@@ -241,23 +275,41 @@ impl Element for EditorElement {
                 .collect();
             editor.layout_cache.display_to_doc = prepaint.display_to_doc.clone();
         });
+
+        if let Some((scroll, last_viewport_width)) = &self.scroll_handle {
+            let viewport = scroll.bounds();
+            let resized = last_viewport_width.replace(viewport.size.width) != viewport.size.width;
+            if (self.reveal_caret || resized) && focus_handle.is_focused(window) {
+                let offset = horizontal_caret_scroll_offset(
+                    scroll.offset(),
+                    viewport,
+                    prepaint.caret_bounds,
+                    scroll.max_offset().x,
+                );
+                if offset != scroll.offset() {
+                    scroll.set_offset(offset);
+                    self.editor.update(cx, |_editor, cx| cx.notify());
+                }
+            }
+        }
     }
 }
 
-fn total_layout_height(layout: &DisplayLayout, theme: &EditorTheme, content: &str) -> f32 {
-    let doc_line_ranges = line_byte_ranges(content);
-    let display_ranges = line_byte_ranges(&layout.display_text);
-    let line_count = display_ranges.len().max(doc_line_ranges.len()).max(1);
-    let mut total = 0.0;
-    for index in 0..line_count {
-        let (doc_start, doc_end) = doc_line_ranges
-            .get(index)
-            .copied()
-            .unwrap_or((0, content.len()));
-        let font_size = source_line_font_size(layout, theme, content, doc_start, doc_end);
-        total += theme.line_height_for_font_size(font_size);
-    }
-    total
+fn horizontal_caret_scroll_offset(
+    offset: Point<Pixels>,
+    viewport: Bounds<Pixels>,
+    caret: Bounds<Pixels>,
+    max_offset: Pixels,
+) -> Point<Pixels> {
+    let margin = px(EDITOR_GUTTER).min(viewport.size.width / 2.);
+    let adjustment = if caret.left() < viewport.left() + margin {
+        viewport.left() + margin - caret.left()
+    } else if caret.right() > viewport.right() - margin {
+        viewport.right() - margin - caret.right()
+    } else {
+        px(0.)
+    };
+    point((offset.x + adjustment).clamp(-max_offset, px(0.)), offset.y)
 }
 
 fn x_positions_for_shaped(shaped: &ShapedLine) -> Vec<f32> {
@@ -737,19 +789,49 @@ impl MarkdownEditor {
 /// Render wrapper that attaches keyboard/mouse handlers to the editor element.
 pub struct MarkdownEditorView {
     pub editor: Entity<MarkdownEditor>,
+    scroll_handle: ScrollHandle,
+    scroll_viewport_width: Rc<Cell<Pixels>>,
+    last_revealed_caret: Option<(usize, u64, bool)>,
 }
 
 impl MarkdownEditorView {
     pub fn new(editor: Entity<MarkdownEditor>) -> Self {
-        Self { editor }
+        Self {
+            editor,
+            scroll_handle: ScrollHandle::new(),
+            scroll_viewport_width: Rc::new(Cell::new(px(0.))),
+            last_revealed_caret: None,
+        }
+    }
+
+    #[cfg(feature = "gui-tests")]
+    pub fn horizontal_scroll_state(&self) -> (Bounds<Pixels>, Pixels, Point<Pixels>) {
+        let viewport = self.scroll_handle.bounds();
+        (
+            viewport,
+            viewport.size.width + self.scroll_handle.max_offset().x,
+            self.scroll_handle.offset(),
+        )
     }
 }
 
 impl Render for MarkdownEditorView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.editor.clone();
+        let state = editor.read(cx);
+        let caret_state = (
+            state.cursor_offset(),
+            state.document.read(cx).revision(),
+            state.focus_handle.is_focused(window),
+        );
+        let reveal_caret = self.last_revealed_caret != Some(caret_state);
+        self.last_revealed_caret = Some(caret_state);
         div()
+            .id("source-editor-scroll")
             .size_full()
+            .min_w_0()
+            .overflow_scroll()
+            .track_scroll(&self.scroll_handle)
             .bg(self.editor.read(cx).theme.background)
             .key_context("MarkdownEditor")
             .track_focus(&self.editor.read(cx).focus_handle.clone())
@@ -994,6 +1076,45 @@ impl Render for MarkdownEditorView {
                     editor.update(cx, |e, cx| e.insert_line_break(action, window, cx))
                 }
             })
-            .child(EditorElement::new(editor))
+            .child(EditorElement::new(editor).with_scroll(
+                self.scroll_handle.clone(),
+                self.scroll_viewport_width.clone(),
+                reveal_caret,
+            ))
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    #[test]
+    fn long_line_caret_scrolls_into_view_and_home_restores_left_edge() {
+        let viewport = Bounds::new(point(px(100.), px(50.)), size(px(300.), px(200.)));
+        let end = Bounds::new(point(px(800.), px(70.)), size(px(2.), px(24.)));
+        let offset =
+            horizontal_caret_scroll_offset(point(px(0.), px(-40.)), viewport, end, px(600.));
+        assert_eq!(offset, point(px(-418.), px(-40.)));
+        let home = Bounds::new(point(px(116.) + offset.x, px(70.)), size(px(2.), px(24.)));
+        assert_eq!(
+            horizontal_caret_scroll_offset(offset, viewport, home, px(600.)),
+            point(px(0.), px(-40.))
+        );
+    }
+
+    #[test]
+    fn visible_caret_preserves_manual_scroll_and_offsets_are_bounded() {
+        let viewport = Bounds::new(point(px(0.), px(0.)), size(px(300.), px(200.)));
+        let visible = Bounds::new(point(px(100.), px(50.)), size(px(2.), px(24.)));
+        let offset = point(px(-100.), px(-30.));
+        assert_eq!(
+            horizontal_caret_scroll_offset(offset, viewport, visible, px(600.)),
+            offset
+        );
+        let far = Bounds::new(point(px(2000.), px(50.)), size(px(2.), px(24.)));
+        assert_eq!(
+            horizontal_caret_scroll_offset(offset, viewport, far, px(600.)),
+            point(px(-600.), px(-30.))
+        );
     }
 }

@@ -111,3 +111,21 @@ jobs:
         run: |
           cargo build --locked --release -p markrust
           ./target/release/markrust --version
+
+      # CoreText shaping + real GPUI layout/input, without requiring a GPU on
+      # GitHub's virtual Macs. The same runner captures Metal screenshots on
+      # a developer Mac; see docs/gui-testing.md for reviewed pixel baselines.
+      - name: Native GUI layout and interaction regressions
+        run: >-
+          cargo run --locked -p markrust-app --features gui-tests
+          --example gui_regression -- --geometry-only
+          --output target/gui-regression
+
+      - name: Upload GUI regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-gui-regression
+          path: target/gui-regression/
+          if-no-files-found: warn
+          retention-days: 14

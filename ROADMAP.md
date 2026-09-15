@@ -1,6 +1,6 @@
 # MarkRust roadmap
 
-_Last reviewed: 2026-09-14._
+_Last reviewed: 2026-09-15._
 
 This is the canonical product and execution roadmap. The detailed
 [WYSIWYG engineering notes](docs/roadmap.md) retain design decisions and test
@@ -24,9 +24,10 @@ evidence; they are not a competing priority list.
 - [ ] **Website delivery:** enable the GitHub Pages workflow, verify ownership
   of `markrust.org`, configure the documented DNS records, and enforce HTTPS.
 - [ ] **Release quality:** run formatting, clippy, Rust tests, website tests,
+  native GUI geometry/input regressions, reviewed screenshot comparisons,
   a release binary `--version` smoke test, and a short native GUI smoke pass.
-  The local release build currently needs a macOS installation with the full
-  Xcode toolchain (including `metal`), not Command Line Tools alone.
+  Native builds and screenshot capture require full Xcode and its Metal
+  toolchain. See [GUI testing](docs/gui-testing.md).
 
 ## Shipped in v0.1 alpha
 
@@ -41,6 +42,15 @@ evidence; they are not a competing priority list.
   preflight for local, `data:`, and explicitly loaded remote images.
 - Locked CI/release workflows with deterministic buffer invariants, native
   macOS smoke coverage, checksummed release archives, and website validation.
+- Native macOS menus and compact toolbar icons, with direct WYSIWYG, Source,
+  and Split selection and matching menu commands and keyboard shortcuts.
+  Side panels collapse or float at narrow widths to preserve writing space.
+- Parent-width text measurement for wrapped paragraphs, lists, tables, and
+  editable widgets; selection highlights drawn per visible text row.
+- Scrollable unwrapped Source lines, with horizontal caret-follow on keyboard
+  navigation and resize; atomic selection replacement and clipboard undo.
+- Native GUI regression fixtures and geometry/input checks, with Metal
+  screenshots and explicit baseline comparison for visual review.
 
 ## Improve the quality foundation next
 
@@ -49,6 +59,9 @@ evidence; they are not a competing priority list.
   the virtualized viewport.
 - Add generated edit/undo/selection sequences for the rich-editor state
   machine, extending the deterministic UTF-8 rope and line-index invariants.
+- Extend native GUI fixtures to images, frontmatter drafts, font sizes,
+  display scales, and long-document scrolling. Add AppKit/VoiceOver acceptance
+  and XCTest UI journeys as accessibility semantics and packaging mature.
 - Turn each documented normalize exception into a named fixture with a tracked
   resolution path. Add website link, accessibility, mobile, and visual checks.
 
@@ -71,3 +84,4 @@ search, custom keybindings, and safe remote-content controls.
 - [Architecture](docs/architecture.md) — current module and data-flow design
 - [Contributing](CONTRIBUTING.md) — local validation workflow
 - [Website deployment](docs/deployment.md) — Pages and DNS handoff
+- [GUI testing](docs/gui-testing.md) — native rendering regressions and review

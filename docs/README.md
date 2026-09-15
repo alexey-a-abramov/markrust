@@ -10,6 +10,8 @@ user documentation lives in the [website](../website/).
   strategy, editing surfaces, and persistence model.
 - [Delimiter masking](delimiter-masking.md) — source-mode visibility rules and
   their edge cases.
+- [GUI testing](gui-testing.md) — native layout and interaction regressions,
+  screenshot comparison, and visual review.
 - [WYSIWYG engineering notes](roadmap.md) — detailed design decisions,
   verification evidence, known limitations, and handoff context.
 - [Website deployment](deployment.md) — GitHub Pages workflow, custom-domain

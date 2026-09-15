@@ -56,6 +56,21 @@ jobs:
       - name: Run native Rust test suite
         run: cargo test --locked --workspace
 
+      - name: Verify native GUI layout and input
+        run: >-
+          cargo run --locked -p markrust-app --features gui-tests
+          --example gui_regression -- --geometry-only
+          --output target/gui-regression
+
+      - name: Upload native GUI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gui-regression
+          path: target/gui-regression/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Build and smoke native release binary
         run: |
           cargo build --locked --release -p markrust

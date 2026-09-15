@@ -9,6 +9,9 @@ repository.workspace = true
 homepage.workspace = true
 description = "Text layout and delimiter masking for MarkRust"
 
+[features]
+gui-tests = []
+
 [dependencies]
 markrust-core = { path = "../markrust-core" }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "8166e3d7b8b42d8aaf4d4dee7fcd25ab4ec65105" }

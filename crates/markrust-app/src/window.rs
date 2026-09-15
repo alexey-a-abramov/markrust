@@ -4,25 +4,30 @@
 
 use gpui::{
     actions, div, prelude::*, px, App, Context, Entity, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, PathPromptOptions, PromptButton, PromptLevel, Render, SharedString, Window,
+    FontWeight, PathPromptOptions, PromptButton, PromptLevel, Render, Role, SharedString,
+    Subscription, Window,
 };
 use markrust_core::parse_frontmatter;
 use markrust_editor::outline_headings;
 use std::path::Path;
 
+use crate::icons::Icon;
+use crate::menus::{self, MenuState};
+use crate::panels::{Panel, OUTLINE_WIDTH, SIDEBAR_WIDTH};
 use crate::session::{
     should_offer_normalize_review, DropTarget, NormalizeReviewChoice, WorkspaceCommand,
 };
 use crate::ui::{
-    document_tab, empty_sidebar_state, muted_hint, outline_row, section_header, sidebar_row,
-    toolbar_button,
+    document_tab, empty_sidebar_state, muted_hint, outline_row, panel_layer, section_header,
+    sidebar_row, toolbar_icon_button, ToolbarState,
 };
-use crate::workspace::{fuzzy_match, Workspace};
+use crate::workspace::{fuzzy_match, EditorMode, Workspace};
 
 actions!(
     markrust_app,
     [
         Save,
+        SaveAs,
         OpenFile,
         OpenFolder,
         NewDocument,
@@ -35,7 +40,16 @@ actions!(
         LoadRemoteImages,
         Undo,
         Redo,
-        ToggleEditorMode
+        ToggleEditorMode,
+        ShowWysiwyg,
+        ShowSource,
+        ShowSplit,
+        Paste,
+        About,
+        Help,
+        Minimize,
+        Zoom,
+        ToggleFullScreen
     ]
 );
 
@@ -44,19 +58,31 @@ pub struct MarkRustWindow {
     pub palette_query: String,
     pub palette_selection: usize,
     pub focus_handle: FocusHandle,
+    _workspace_subscription: Subscription,
 }
 
 impl MarkRustWindow {
     pub fn new(workspace: Entity<Workspace>, cx: &mut Context<Self>) -> Self {
+        let subscription = cx.observe(&workspace, |_, _, cx| cx.notify());
         Self {
             workspace,
             palette_query: String::new(),
             palette_selection: 0,
             focus_handle: cx.focus_handle(),
+            _workspace_subscription: subscription,
         }
     }
 
     fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .workspace
+            .read(cx)
+            .active_tab()
+            .is_some_and(|tab| tab.document.read(cx).path.is_none())
+        {
+            self.save_as(&SaveAs, window, cx);
+            return;
+        }
         let candidates = self.workspace.read(cx).normalize_candidates(cx);
         let needs_review = candidates
             .as_ref()
@@ -102,6 +128,60 @@ impl MarkRustWindow {
         self.workspace.update(cx, |workspace, cx| {
             let _ = workspace.dispatch(WorkspaceCommand::Save, window, cx);
         });
+    }
+
+    fn save_as(&mut self, _: &SaveAs, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = self.workspace.read(cx);
+        let Some(tab) = workspace.active_tab() else {
+            return;
+        };
+        let document = tab.document.clone();
+        let directory = document
+            .read(cx)
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .or_else(|| workspace.root.clone())
+            .or_else(dirs::document_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let suggested = if tab.title == "Untitled" {
+            "Untitled.md"
+        } else {
+            &tab.title
+        };
+        let receiver = cx.prompt_for_new_path(&directory, Some(suggested));
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            if let Ok(Ok(Some(path))) = receiver.await {
+                let _ = workspace.update_in(cx, |workspace, window, cx| {
+                    let result = document.update(cx, |doc, cx| {
+                        let result = doc.save_as(path.clone());
+                        cx.notify();
+                        result
+                    });
+                    if let Err(error) = result {
+                        let _response = window.prompt(
+                            PromptLevel::Critical,
+                            "Could not save document",
+                            Some(&error.to_string()),
+                            &[PromptButton::ok("OK")],
+                            cx,
+                        );
+                    } else if let Some(tab) = workspace
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.document == document)
+                    {
+                        tab.title = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "Untitled".into());
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -160,13 +240,56 @@ impl MarkRustWindow {
     fn toggle_editor_mode(
         &mut self,
         _: &ToggleEditorMode,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.workspace.update(cx, |workspace, cx| {
-            workspace.toggle_editor_mode(cx);
+            workspace.toggle_editor_mode(window, cx);
         });
         cx.notify();
+    }
+
+    fn set_editor_mode(&mut self, mode: EditorMode, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.set_editor_mode(mode, window, cx)
+        });
+    }
+
+    fn show_wysiwyg(&mut self, _: &ShowWysiwyg, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_editor_mode(EditorMode::Wysiwyg, window, cx);
+    }
+
+    fn show_source(&mut self, _: &ShowSource, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_editor_mode(EditorMode::Source, window, cx);
+    }
+
+    fn show_split(&mut self, _: &ShowSplit, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_editor_mode(EditorMode::Split, window, cx);
+    }
+
+    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.workspace
+                .update(cx, |workspace, cx| workspace.paste(&text, window, cx));
+        }
+    }
+
+    fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
+        let _response = window.prompt(
+            PromptLevel::Info,
+            "MarkRust",
+            Some(concat!(
+                "Version ",
+                env!("CARGO_PKG_VERSION"),
+                "\nA native Markdown writing app.\nMozilla Public License 2.0"
+            )),
+            &[PromptButton::ok("OK")],
+            cx,
+        );
+    }
+
+    fn help(&mut self, _: &Help, _: &mut Window, cx: &mut Context<Self>) {
+        cx.open_url("https://github.com/alexey-a-abramov/markrust#readme");
     }
 
     fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
@@ -175,17 +298,15 @@ impl MarkRustWindow {
         });
     }
 
-    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace.update(cx, |workspace, cx| {
-            workspace.sidebar_open = !workspace.sidebar_open;
-            cx.notify();
+            workspace.toggle_panel(Panel::Sidebar, f32::from(window.viewport_size().width), cx);
         });
     }
 
-    fn toggle_outline(&mut self, _: &ToggleOutline, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_outline(&mut self, _: &ToggleOutline, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace.update(cx, |workspace, cx| {
-            workspace.outline_open = !workspace.outline_open;
-            cx.notify();
+            workspace.toggle_panel(Panel::Outline, f32::from(window.viewport_size().width), cx);
         });
     }
 
@@ -248,7 +369,22 @@ impl Focusable for MarkRustWindow {
 }
 
 impl Render for MarkRustWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.ensure_panel_layout(f32::from(window.viewport_size().width), cx);
+        });
+        let menu_state = {
+            let workspace = self.workspace.read(cx);
+            MenuState {
+                mode: workspace
+                    .active_tab()
+                    .map(|tab| tab.mode)
+                    .unwrap_or_default(),
+                sidebar_open: workspace.sidebar_open,
+                outline_open: workspace.outline_open,
+            }
+        };
+        menus::sync(menu_state, cx);
         let frontmatter_info = self
             .workspace
             .read(cx)
@@ -272,11 +408,12 @@ impl Render for MarkRustWindow {
 
         let workspace = self.workspace.read(cx);
         let theme = workspace.config.editor_theme();
-        let mode_label = match workspace.active_tab().map(|tab| tab.mode) {
-            Some(crate::workspace::EditorMode::Wysiwyg) => "Wysiwyg",
-            Some(crate::workspace::EditorMode::Split) => "Split",
-            _ => "Source",
-        };
+        let mode = menu_state.mode;
+        let document_title = workspace
+            .active_tab()
+            .map(|tab| tab.title.clone())
+            .unwrap_or_else(|| "MarkRust".into());
+        window.set_window_title(&format!("{document_title} — MarkRust"));
         let active = workspace.active_tab;
         let tab_count = workspace.tabs.len();
         let files = workspace.list_files();
@@ -284,6 +421,8 @@ impl Render for MarkRustWindow {
         let palette_open = workspace.palette_open;
         let sidebar_open = workspace.sidebar_open;
         let outline_open = workspace.outline_open;
+        let sidebar_overlay = workspace.panel_overlay == Some(Panel::Sidebar);
+        let outline_overlay = workspace.panel_overlay == Some(Panel::Outline);
         let external_change = workspace.pending_external_change.clone();
         let source_mode = matches!(
             workspace.active_tab().map(|tab| tab.mode),
@@ -314,12 +453,22 @@ impl Render for MarkRustWindow {
             .track_focus(&self.focus_handle)
             .key_context("MarkRust")
             .on_action(cx.listener(Self::save))
+            .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::new_document))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::toggle_editor_mode))
+            .on_action(cx.listener(Self::show_wysiwyg))
+            .on_action(cx.listener(Self::show_source))
+            .on_action(cx.listener(Self::show_split))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::about))
+            .on_action(cx.listener(Self::help))
+            .on_action(|_: &Minimize, window, _| window.minimize_window())
+            .on_action(|_: &Zoom, window, _| window.zoom_window())
+            .on_action(|_: &ToggleFullScreen, window, _| window.toggle_fullscreen())
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_outline))
             .on_action(cx.listener(Self::command_palette))
@@ -375,72 +524,110 @@ impl Render for MarkRustWindow {
             }))
             .child(
                 div()
+                    .id("document-toolbar")
+                    .role(Role::Toolbar)
+                    .aria_label("Document toolbar")
                     .flex()
                     .items_center()
                     .px_3()
-                    .py_2()
+                    .h(px(46.))
+                    .flex_shrink_0()
                     .gap_1()
                     .bg(theme.chrome_bg)
                     .border_b_1()
                     .border_color(theme.separator)
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .mr_4()
-                            .child("MarkRust"),
-                    )
-                    .child(toolbar_button(
-                        "New",
+                    .child(toolbar_icon_button(
+                        Icon::Sidebar,
+                        "Toggle Sidebar",
+                        "⌃⌘S",
+                        &theme,
+                        "toolbar-sidebar",
+                        ToolbarState::Toggle(sidebar_open),
+                        cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)),
+                    ))
+                    .child(div().w(px(1.)).h(px(18.)).mx_2().bg(theme.separator))
+                    .child(toolbar_icon_button(
+                        Icon::NewDocument,
+                        "New Document",
+                        "⌘N",
                         &theme,
                         "toolbar-new",
+                        ToolbarState::Action,
                         cx.listener(|this, _, window, cx| {
                             this.new_document(&NewDocument, window, cx)
                         }),
                     ))
-                    .child(toolbar_button(
-                        "Open File",
+                    .child(toolbar_icon_button(
+                        Icon::Open,
+                        "Open Document…",
+                        "⌘O",
                         &theme,
                         "toolbar-open-file",
+                        ToolbarState::Action,
                         cx.listener(|this, _, window, cx| this.open_file(&OpenFile, window, cx)),
                     ))
-                    .child(toolbar_button(
-                        "Open Folder",
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_4()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .truncate()
+                            .child(document_title),
+                    )
+                    .child(
+                        div()
+                            .id("editor-mode-picker")
+                            .role(Role::RadioGroup)
+                            .aria_label("Editor mode")
+                            .flex()
+                            .flex_shrink_0()
+                            .gap_px()
+                            .p(px(2.))
+                            .rounded(px(7.))
+                            .bg(theme.tab_inactive)
+                            .border_1()
+                            .border_color(theme.separator)
+                            .child(toolbar_icon_button(
+                                Icon::Wysiwyg,
+                                "WYSIWYG",
+                                "⌘1",
+                                &theme,
+                                "toolbar-mode-wysiwyg",
+                                ToolbarState::Mode(mode == EditorMode::Wysiwyg),
+                                cx.listener(|this, _, window, cx| this.show_wysiwyg(&ShowWysiwyg, window, cx)),
+                            ))
+                            .child(toolbar_icon_button(
+                                Icon::Source,
+                                "Source",
+                                "⌘2",
+                                &theme,
+                                "toolbar-mode-source",
+                                ToolbarState::Mode(mode == EditorMode::Source),
+                                cx.listener(|this, _, window, cx| this.show_source(&ShowSource, window, cx)),
+                            ))
+                            .child(toolbar_icon_button(
+                                Icon::Split,
+                                "Split View",
+                                "⌘3",
+                                &theme,
+                                "toolbar-mode-split",
+                                ToolbarState::Mode(mode == EditorMode::Split),
+                                cx.listener(|this, _, window, cx| this.show_split(&ShowSplit, window, cx)),
+                            )),
+                    )
+                    .child(div().w(px(1.)).h(px(18.)).mx_2().bg(theme.separator))
+                    .child(toolbar_icon_button(
+                        Icon::Outline,
+                        "Toggle Outline",
+                        "⌃⌘O",
                         &theme,
-                        "toolbar-open-folder",
+                        "toolbar-outline",
+                        ToolbarState::Toggle(outline_open),
                         cx.listener(|this, _, window, cx| {
-                            this.open_folder(&OpenFolder, window, cx)
-                        }),
-                    ))
-                    .child(toolbar_button(
-                        "Save",
-                        &theme,
-                        "toolbar-save",
-                        cx.listener(|this, _, window, cx| this.save(&Save, window, cx)),
-                    ))
-                    .child(toolbar_button(
-                        "Theme",
-                        &theme,
-                        "toolbar-theme",
-                        cx.listener(|this, _, window, cx| {
-                            this.toggle_theme(&ToggleTheme, window, cx)
-                        }),
-                    ))
-                    .child(toolbar_button(
-                        mode_label,
-                        &theme,
-                        "toolbar-editor-mode",
-                        cx.listener(|this, _, window, cx| {
-                            this.toggle_editor_mode(&ToggleEditorMode, window, cx)
-                        }),
-                    ))
-                    .child(toolbar_button(
-                        "Load images",
-                        &theme,
-                        "toolbar-load-remote-images",
-                        cx.listener(|this, _, window, cx| {
-                            this.load_remote_images(&LoadRemoteImages, window, cx)
+                            this.toggle_outline(&ToggleOutline, window, cx)
                         }),
                     )),
             )
@@ -485,14 +672,17 @@ impl Render for MarkRustWindow {
             )
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_1()
                     .overflow_hidden()
-                    .child(if sidebar_open {
+                    .child(panel_layer(if sidebar_open {
                         div()
-                            .w(px(260.))
+                            .w(px(SIDEBAR_WIDTH))
+                            .flex_shrink_0()
                             .h_full()
                             .id("sidebar")
+                            .when(sidebar_overlay, |panel| panel.absolute().left_0().top_0().shadow_lg().occlude())
                             .flex()
                             .flex_col()
                             .overflow_y_scroll()
@@ -597,10 +787,11 @@ impl Render for MarkRustWindow {
                             })
                     } else {
                         div().w(px(0.)).id("sidebar-closed")
-                    })
+                    }, sidebar_overlay))
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .h_full()
                             .id("editor-area")
                             .flex()
@@ -730,7 +921,7 @@ impl Render for MarkRustWindow {
                                             div()
                                                 .id("split-source")
                                                 .flex_1()
-                                                .min_w(px(120.))
+                                                .min_w_0()
                                                 .p(px(12.))
                                                 .overflow_hidden()
                                                 .child(tab.editor_view.clone()),
@@ -745,7 +936,7 @@ impl Render for MarkRustWindow {
                                             div()
                                                 .id("split-rich")
                                                 .flex_1()
-                                                .min_w(px(120.))
+                                                .min_w_0()
                                                 .overflow_hidden()
                                                 .child(tab.rich_view.clone()),
                                         )
@@ -753,11 +944,13 @@ impl Render for MarkRustWindow {
                                 }
                             }),
                     )
-                    .child(if outline_open {
+                    .child(panel_layer(if outline_open {
                         div()
-                            .w(px(240.))
+                            .w(px(OUTLINE_WIDTH))
+                            .flex_shrink_0()
                             .h_full()
                             .id("outline-panel")
+                            .when(outline_overlay, |panel| panel.absolute().right_0().top_0().shadow_lg().occlude())
                             .overflow_y_scroll()
                             .bg(theme.sidebar_bg)
                             .border_l_1()
@@ -788,7 +981,7 @@ impl Render for MarkRustWindow {
                             }))
                     } else {
                         div().w(px(0.)).id("outline-closed")
-                    }),
+                    }, outline_overlay)),
             )
             .child({
                 let tab = workspace.active_tab();
@@ -801,7 +994,13 @@ impl Render for MarkRustWindow {
                 let (line, col) = tab
                     .map(|t| {
                         let doc = t.document.read(cx);
-                        let offset = t.editor.read(cx).cursor_offset();
+                        let rich_active = t.mode == EditorMode::Wysiwyg
+                            || (t.mode == EditorMode::Split && t.rich_view.read(cx).is_focused(window));
+                        let offset = if rich_active {
+                            t.rich_view.read(cx).cursor_offset()
+                        } else {
+                            t.editor.read(cx).cursor_offset()
+                        };
                         markrust_editor::cursor_line_col(&doc.buffer.content(), offset)
                     })
                     .unwrap_or((0, 0));
@@ -833,7 +1032,7 @@ impl Render for MarkRustWindow {
                         col + 1
                     ))
             })
-            .child(if palette_open {
+            .child(gpui::deferred(if palette_open {
                 let query = self.palette_query.clone();
                 let mut commands = Vec::new();
                 if fuzzy_match("Export HTML", &query) {
@@ -899,7 +1098,7 @@ impl Render for MarkRustWindow {
                     }))
             } else {
                 div().hidden()
-            })
+            }).with_priority(2))
     }
 }
 

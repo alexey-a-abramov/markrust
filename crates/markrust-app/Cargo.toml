@@ -10,6 +10,13 @@ homepage.workspace = true
 description = "GPUI application shell for MarkRust (not published to crates.io)"
 publish = false
 
+[features]
+gui-tests = ["gpui/test-support", "gpui_platform/test-support", "markrust-editor/gui-tests"]
+
+[[example]]
+name = "gui_regression"
+required-features = ["gui-tests"]
+
 [dependencies]
 markrust-core = { path = "../markrust-core" }
 markrust-editor = { path = "../markrust-editor" }

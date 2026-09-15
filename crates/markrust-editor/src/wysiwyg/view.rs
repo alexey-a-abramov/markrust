@@ -13,10 +13,10 @@ use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 
 use gpui::{
-    canvas, div, list, prelude::*, px, App, Bounds, ClipboardItem, Context, CursorStyle, Entity,
-    EntityInputHandler, FocusHandle, Focusable, ListAlignment, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Render, SharedString, Subscription, Task,
-    UTF16Selection, Window,
+    canvas, div, list, prelude::*, px, App, Bounds, ClipboardItem, Context, CursorStyle,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, ListAlignment,
+    ListState, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Render, SharedString,
+    Subscription, Task, UTF16Selection, Window,
 };
 use markrust_core::rich::{
     apply_rich_command, caret_for_click_below_content, place_caret_for_click_below,
@@ -571,6 +571,8 @@ pub struct RichEditorView {
     cursor_visible: bool,
     focus_handle: FocusHandle,
     ime: ImeOriginState,
+    #[cfg(feature = "gui-tests")]
+    visual_test_bounds: Option<Bounds<Pixels>>,
     widget_edit: WidgetEdit,
     widget_preedit: Option<String>,
     /// Kept alongside an invalid frontmatter draft so the user can correct
@@ -601,6 +603,17 @@ pub struct RichEditorView {
 }
 
 impl RichEditorView {
+    /// Inspect what GPUI actually shaped and painted, not an estimated layout.
+    #[cfg(feature = "gui-tests")]
+    pub fn painted_geometry(&self) -> Vec<super::ime::PaintedLeafGeometry> {
+        self.ime.painted_geometry()
+    }
+
+    #[cfg(feature = "gui-tests")]
+    pub fn painted_viewport_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.visual_test_bounds
+    }
+
     pub fn new(
         document: Entity<Document>,
         theme: EditorTheme,
@@ -639,6 +652,8 @@ impl RichEditorView {
             cursor_visible: true,
             focus_handle,
             ime: ImeOriginState::default(),
+            #[cfg(feature = "gui-tests")]
+            visual_test_bounds: None,
             widget_edit: WidgetEdit::Idle,
             widget_preedit: None,
             frontmatter_error: None,
@@ -2637,8 +2652,28 @@ impl Render for RichEditorView {
                     .child(
                         canvas(
                             |_, _, _| (),
-                            move |bounds, _, window, _cx| {
+                            move |bounds, _, window, cx| {
                                 let editor = catcher.clone();
+                                // Markdown parsing can omit trailing whitespace
+                                // and other source positions from every painted
+                                // leaf. Text input must remain registered there
+                                // (and while the caret's block is offscreen).
+                                // This canvas paints before the body leaves, so
+                                // a precise leaf handler takes precedence later.
+                                // An active frontmatter widget may have already
+                                // painted above the body; preserve its handler.
+                                let view = editor.read(cx);
+                                if matches!(view.widget_edit, WidgetEdit::Idle) {
+                                    window.handle_input(
+                                        &view.focus_handle,
+                                        ElementInputHandler::new(bounds, editor.clone()),
+                                        cx,
+                                    );
+                                }
+                                #[cfg(feature = "gui-tests")]
+                                editor.update(cx, |view, _cx| {
+                                    view.visual_test_bounds = Some(bounds);
+                                });
                                 window.on_mouse_event({
                                     let editor = editor.clone();
                                     move |event: &MouseDownEvent, phase, window, cx| {

@@ -164,6 +164,29 @@ impl UndoStack {
         self.redo.len()
     }
 
+    /// Consolidate only the edits produced by a compound command. Callers
+    /// must start that command with a non-coalescing edit, so no operation
+    /// can have joined the history before `depth`.
+    pub(crate) fn group_since(
+        &mut self,
+        depth: usize,
+        selection_before: SelectionSnapshot,
+        selection_after: SelectionSnapshot,
+    ) {
+        if depth >= self.undo.len() {
+            return;
+        }
+        let mut groups = self.undo.split_off(depth).into_iter();
+        let mut combined = groups.next().expect("depth precedes at least one group");
+        for group in groups {
+            combined.ops.extend(group.ops);
+        }
+        combined.selection_before = selection_before;
+        combined.selection_after = selection_after;
+        combined.kind = TransactionKind::Command;
+        self.undo.push(combined);
+    }
+
     pub fn has_open_transaction(&self) -> bool {
         self.open.is_some()
     }
