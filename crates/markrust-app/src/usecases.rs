@@ -747,10 +747,27 @@ fn capture_snapshot(
     cx.read_entity(workspace, |ws, cx| {
         let tab = ws.active_tab().unwrap();
         let rich = tab.rich_view.read(cx);
+        let editor = tab.editor.read(cx);
         let doc = tab.document.read(cx);
         let source = doc.buffer.content();
-        let caret = rich.cursor_offset();
-        let selection = rich.selected_range.clone();
+        // Read caret / selection from the surface that actually owns
+        // input for the current mode. In Source mode the rich view's
+        // caret/selection is "stale" from the last Wysiwyg/Split visit
+        // and not representative of what the user is interacting with.
+        // (The rich view is still rendered for Split mode and stays in
+        // sync; for Source/Split fall back to whichever surface is
+        // focused, then the source editor.)
+        let (caret, selection) = match tab.mode {
+            EditorMode::Source => {
+                // The source editor is the active surface; its on_action
+                // handlers are the ones that just ran (e.g. cmd-a,
+                // delete, etc.). Source mode collapses to the editor.
+                (editor.cursor_offset(), editor.selected_range.clone())
+            }
+            EditorMode::Wysiwyg | EditorMode::Split => {
+                (rich.cursor_offset(), rich.selected_range.clone())
+            }
+        };
         let mode = tab.mode;
         let blocks = collect_blocks(rich.engine_ref(), &source);
         let viewport_height = rich

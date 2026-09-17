@@ -638,6 +638,15 @@ impl RichEditorView {
         let doc_sub = cx.observe(&document, |this, _, cx| {
             this.vertical_preferred_x = None;
             this.ime.clear_visual_navigation();
+            // Whenever the document mutates we have to mirror its parsed
+            // source into the rich engine so block-level snapshots stay
+            // accurate *regardless* of whether the rich view is currently
+            // being rendered. Without this sync, an empty buffer carved
+            // out of a template in Source mode (alt-cmd-2 → cmd-a →
+            // delete) leaves the block tree pointing at the old ranges
+            // until the view next paints (e.g. the alt-cmd-1 round-trip).
+            // The use-case recorder's per-step JSONL surfaced this.
+            this.engine.sync(this.document.read(cx));
             cx.notify();
         });
         Self {
