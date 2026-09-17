@@ -89,9 +89,12 @@ pub(crate) fn desktop_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-s", crate::window::Save, None),
         KeyBinding::new("cmd-shift-s", crate::window::SaveAs, None),
         KeyBinding::new("cmd-shift-m", crate::window::ToggleEditorMode, None),
-        KeyBinding::new("cmd-1", crate::window::ShowWysiwyg, None),
-        KeyBinding::new("cmd-2", crate::window::ShowSource, None),
-        KeyBinding::new("cmd-3", crate::window::ShowSplit, None),
+        // Mode picker shortcuts moved off Cmd-1/2/3 to free Cmd-1..6 for
+        // ATX heading toggles (the standard set in iA Writer, Typora,
+        // Obsidian).
+        KeyBinding::new("alt-cmd-1", crate::window::ShowWysiwyg, None),
+        KeyBinding::new("alt-cmd-2", crate::window::ShowSource, None),
+        KeyBinding::new("alt-cmd-3", crate::window::ShowSplit, None),
         KeyBinding::new("ctrl-cmd-s", crate::window::ToggleSidebar, None),
         KeyBinding::new("ctrl-cmd-o", crate::window::ToggleOutline, None),
         KeyBinding::new("cmd-o", crate::window::OpenFile, None),
@@ -164,10 +167,49 @@ pub(crate) fn desktop_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-b", markrust_editor::ToggleBold, None),
         KeyBinding::new("cmd-i", markrust_editor::ToggleItalic, None),
         KeyBinding::new("ctrl-i", markrust_editor::ToggleItalic, None),
-        KeyBinding::new("cmd-e", markrust_editor::ToggleCode, None),
-        KeyBinding::new("ctrl-e", markrust_editor::ToggleCode, None),
+        // Inline code moved to Cmd-Option-K / Ctrl-Option-K so Cmd-1..6
+        // can stay reserved for ATX headings.
         KeyBinding::new("cmd-k", markrust_editor::ToggleLink, None),
         KeyBinding::new("ctrl-k", markrust_editor::ToggleLink, None),
+        // Markdown formatting toolbar. Cmd-1..6 are ATX headings (mode
+        // picker moved to Cmd-Option-1/2/3 above). Cmd-Option-C / K are
+        // the block code fence and inline code (which used to live on
+        // Cmd-E / Ctrl-E).
+        KeyBinding::new("cmd-1", markrust_editor::SetHeading1, None),
+        KeyBinding::new("cmd-2", markrust_editor::SetHeading2, None),
+        KeyBinding::new("cmd-3", markrust_editor::SetHeading3, None),
+        KeyBinding::new("cmd-4", markrust_editor::SetHeading4, None),
+        KeyBinding::new("cmd-5", markrust_editor::SetHeading5, None),
+        KeyBinding::new("cmd-6", markrust_editor::SetHeading6, None),
+        KeyBinding::new("alt-cmd-0", markrust_editor::Paragraph, None),
+        KeyBinding::new("shift-cmd-7", markrust_editor::ToggleOrderedList, None),
+        KeyBinding::new("shift-cmd-8", markrust_editor::ToggleUnorderedList, None),
+        KeyBinding::new("shift-cmd-9", markrust_editor::ToggleTaskList, None),
+        KeyBinding::new("shift-cmd-.", markrust_editor::ToggleBlockquote, None),
+        KeyBinding::new("shift-cmd--", markrust_editor::InsertHorizontalRule, None),
+        KeyBinding::new("alt-cmd-c", markrust_editor::InsertCodeBlock, None),
+        KeyBinding::new("alt-cmd-k", markrust_editor::ToggleCode, None),
+        KeyBinding::new("shift-cmd-x", markrust_editor::ToggleStrikethrough, None),
+        KeyBinding::new("shift-cmd-i", markrust_editor::InsertImage, None),
+        KeyBinding::new("alt-cmd-t", markrust_editor::InsertTable, None),
+        // Same shortcuts on Windows/Linux (Ctrl instead of Cmd).
+        KeyBinding::new("ctrl-1", markrust_editor::SetHeading1, None),
+        KeyBinding::new("ctrl-2", markrust_editor::SetHeading2, None),
+        KeyBinding::new("ctrl-3", markrust_editor::SetHeading3, None),
+        KeyBinding::new("ctrl-4", markrust_editor::SetHeading4, None),
+        KeyBinding::new("ctrl-5", markrust_editor::SetHeading5, None),
+        KeyBinding::new("ctrl-6", markrust_editor::SetHeading6, None),
+        KeyBinding::new("alt-ctrl-0", markrust_editor::Paragraph, None),
+        KeyBinding::new("shift-ctrl-7", markrust_editor::ToggleOrderedList, None),
+        KeyBinding::new("shift-ctrl-8", markrust_editor::ToggleUnorderedList, None),
+        KeyBinding::new("shift-ctrl-9", markrust_editor::ToggleTaskList, None),
+        KeyBinding::new("shift-ctrl-.", markrust_editor::ToggleBlockquote, None),
+        KeyBinding::new("shift-ctrl--", markrust_editor::InsertHorizontalRule, None),
+        KeyBinding::new("alt-ctrl-c", markrust_editor::InsertCodeBlock, None),
+        KeyBinding::new("alt-ctrl-k", markrust_editor::ToggleCode, None),
+        KeyBinding::new("shift-ctrl-x", markrust_editor::ToggleStrikethrough, None),
+        KeyBinding::new("shift-ctrl-i", markrust_editor::InsertImage, None),
+        KeyBinding::new("alt-ctrl-t", markrust_editor::InsertTable, None),
         KeyBinding::new("tab", markrust_editor::Indent, Some("RichEditor")),
         KeyBinding::new("tab", markrust_editor::Indent, Some("MarkdownEditor")),
         KeyBinding::new("shift-tab", markrust_editor::Outdent, Some("RichEditor")),
@@ -445,6 +487,94 @@ mod tests {
         assert_eq!(
             action_for("delete"),
             markrust_editor::Delete::name_for_type()
+        );
+    }
+
+    #[test]
+    fn markdown_toolbar_shortcuts_are_bound() {
+        // The Markdown editing toolbar mirrors these shortcuts — see
+        // `format_toolbar` in window.rs. If you add a new toolbar button,
+        // bind a default shortcut here too.
+        assert_eq!(
+            action_for("cmd-1"),
+            markrust_editor::SetHeading1::name_for_type(),
+            "Cmd-1 toggles Heading 1"
+        );
+        assert_eq!(
+            action_for("cmd-2"),
+            markrust_editor::SetHeading2::name_for_type()
+        );
+        assert_eq!(
+            action_for("cmd-3"),
+            markrust_editor::SetHeading3::name_for_type()
+        );
+        assert_eq!(
+            action_for("cmd-4"),
+            markrust_editor::SetHeading4::name_for_type()
+        );
+        assert_eq!(
+            action_for("cmd-5"),
+            markrust_editor::SetHeading5::name_for_type()
+        );
+        assert_eq!(
+            action_for("cmd-6"),
+            markrust_editor::SetHeading6::name_for_type()
+        );
+        assert_eq!(
+            action_for("shift-cmd-8"),
+            markrust_editor::ToggleUnorderedList::name_for_type()
+        );
+        assert_eq!(
+            action_for("shift-cmd-7"),
+            markrust_editor::ToggleOrderedList::name_for_type()
+        );
+        assert_eq!(
+            action_for("shift-cmd-9"),
+            markrust_editor::ToggleTaskList::name_for_type()
+        );
+        assert_eq!(
+            action_for("shift-cmd-."),
+            markrust_editor::ToggleBlockquote::name_for_type()
+        );
+        assert_eq!(
+            action_for("shift-cmd--"),
+            markrust_editor::InsertHorizontalRule::name_for_type()
+        );
+        assert_eq!(
+            action_for("alt-cmd-c"),
+            markrust_editor::InsertCodeBlock::name_for_type()
+        );
+        assert_eq!(
+            action_for("alt-cmd-k"),
+            markrust_editor::ToggleCode::name_for_type(),
+            "Inline code moves from Cmd-E to Cmd-Option-K"
+        );
+        assert_eq!(
+            action_for("shift-cmd-x"),
+            markrust_editor::ToggleStrikethrough::name_for_type()
+        );
+        assert_eq!(
+            action_for("shift-cmd-i"),
+            markrust_editor::InsertImage::name_for_type()
+        );
+        assert_eq!(
+            action_for("alt-cmd-t"),
+            markrust_editor::InsertTable::name_for_type()
+        );
+
+        // The mode picker was moved off Cmd-1..3 to make room for headings.
+        assert_eq!(
+            action_for("alt-cmd-1"),
+            crate::window::ShowWysiwyg::name_for_type(),
+            "Mode picker is now Cmd-Option-1"
+        );
+        assert_eq!(
+            action_for("alt-cmd-2"),
+            crate::window::ShowSource::name_for_type()
+        );
+        assert_eq!(
+            action_for("alt-cmd-3"),
+            crate::window::ShowSplit::name_for_type()
         );
     }
 }

@@ -1076,6 +1076,106 @@ impl Render for MarkdownEditorView {
                     editor.update(cx, |e, cx| e.insert_line_break(action, window, cx))
                 }
             })
+            // Block-level commands: the source editor routes these through
+            // the headless dispatcher (Noop for the WYSIWYG-only ones), but
+            // keeping the bindings live ensures menus and keyboard shortcuts
+            // resolve without crashing even when Source mode is active.
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SetHeading1, window, cx| {
+                    editor.update(cx, |e, cx| e.set_heading_1(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SetHeading2, window, cx| {
+                    editor.update(cx, |e, cx| e.set_heading_2(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SetHeading3, window, cx| {
+                    editor.update(cx, |e, cx| e.set_heading_3(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SetHeading4, window, cx| {
+                    editor.update(cx, |e, cx| e.set_heading_4(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SetHeading5, window, cx| {
+                    editor.update(cx, |e, cx| e.set_heading_5(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::SetHeading6, window, cx| {
+                    editor.update(cx, |e, cx| e.set_heading_6(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::Paragraph, window, cx| {
+                    editor.update(cx, |e, cx| e.paragraph(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::ToggleBlockquote, window, cx| {
+                    editor.update(cx, |e, cx| e.toggle_blockquote(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::ToggleUnorderedList, window, cx| {
+                    editor.update(cx, |e, cx| e.toggle_unordered_list(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::ToggleOrderedList, window, cx| {
+                    editor.update(cx, |e, cx| e.toggle_ordered_list(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::ToggleTaskList, window, cx| {
+                    editor.update(cx, |e, cx| e.toggle_task_list(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::ToggleStrikethrough, window, cx| {
+                    editor.update(cx, |e, cx| e.toggle_strikethrough(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::InsertHorizontalRule, window, cx| {
+                    editor.update(cx, |e, cx| e.insert_horizontal_rule(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::InsertCodeBlock, window, cx| {
+                    editor.update(cx, |e, cx| e.insert_code_block(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::InsertImage, window, cx| {
+                    editor.update(cx, |e, cx| e.insert_image(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &crate::editor::InsertTable, window, cx| {
+                    editor.update(cx, |e, cx| e.insert_table(action, window, cx))
+                }
+            })
             .child(EditorElement::new(editor).with_scroll(
                 self.scroll_handle.clone(),
                 self.scroll_viewport_width.clone(),

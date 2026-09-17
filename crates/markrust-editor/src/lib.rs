@@ -22,14 +22,18 @@ pub use headless::{
     HeadlessEditor,
 };
 pub use highlight::{highlight_code_block, HighlightKind, HighlightSpan};
+pub use markrust_core::rich::BlockType;
 pub use source::editor::MarkdownEditor;
 pub use source::editor::{
     Backspace, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordLeft,
     DeleteWordRight, DocumentEnd, DocumentHome, Down, End, Enter, Escape, Home, Indent,
-    InsertLineBreak, Left, Outdent, PageDown, PageUp, Right, SelectAll, SelectDocumentEnd,
-    SelectDocumentHome, SelectDown, SelectEnd, SelectHome, SelectLeft, SelectPageDown,
-    SelectPageUp, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, ToggleBold, ToggleCode,
-    ToggleItalic, ToggleLink, Up, WordLeft, WordRight,
+    InsertCodeBlock, InsertHorizontalRule, InsertImage, InsertLineBreak, InsertTable, Left,
+    Outdent, PageDown, PageUp, Paragraph, Right, SelectAll, SelectDocumentEnd, SelectDocumentHome,
+    SelectDown, SelectEnd, SelectHome, SelectLeft, SelectPageDown, SelectPageUp, SelectRight,
+    SelectUp, SelectWordLeft, SelectWordRight, SetHeading1, SetHeading2, SetHeading3, SetHeading4,
+    SetHeading5, SetHeading6, ToggleBlockquote, ToggleBold, ToggleCode, ToggleItalic, ToggleLink,
+    ToggleOrderedList, ToggleStrikethrough, ToggleTaskList, ToggleUnorderedList, Up, WordLeft,
+    WordRight,
 };
 pub use source::element::{EditorElement, MarkdownEditorView};
 pub use source::layout::{

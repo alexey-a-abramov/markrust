@@ -4,6 +4,7 @@
 
 use std::ops::Range;
 
+use markrust_core::rich::BlockType;
 use markrust_core::Document;
 use markrust_core::{SelectionSnapshot, TransactionKind};
 use unicode_segmentation::UnicodeSegmentation;
@@ -63,6 +64,35 @@ pub enum EditorCommand {
     Wrap(WrapKind),
     Indent,
     Outdent,
+    /// Change the current block to a paragraph or ATX heading (1..=6).
+    /// Only handled by the WYSIWYG surface; returns Noop in source mode.
+    SetBlockType(BlockType),
+    /// Toggle a blockquote on the current block. WYSIWYG only.
+    ToggleBlockquote,
+    /// Toggle a bullet (`ordered = false`) or ordered (`ordered = true`) list
+    /// on the current block. WYSIWYG only.
+    ToggleList {
+        ordered: bool,
+    },
+    /// Convert the current bullet item into a GFM task list item by inserting
+    /// `- [ ] ` so the input rule can pick it up. Works in either surface.
+    ToggleTaskList,
+    /// Toggle GFM strikethrough (`~~...~~`). WYSIWYG only.
+    ToggleStrikethrough,
+    /// Insert a thematic break (`---`) at the caret, surrounded by blank
+    /// lines so the next paragraph is not swallowed.
+    InsertHorizontalRule,
+    /// Insert a fenced code block at the caret with the caret between the
+    /// fences. WYSIWYG only (source mode users can type the fences).
+    InsertCodeBlock,
+    /// Insert an image with placeholder alt/url and the caret on `url`.
+    /// WYSIWYG only.
+    InsertImage,
+    /// Insert a small GFM table (header row + 3 body rows × 2 columns) with
+    /// the caret in the first body cell. WYSIWYG only.
+    InsertTable,
+    /// Reset the current block to a plain paragraph. WYSIWYG only.
+    Paragraph,
 }
 
 /// Outcome of applying an [`EditorCommand`].
@@ -336,6 +366,21 @@ pub fn apply_editor_command(
         EditorCommand::Wrap(kind) => Ok(apply_wrap(document, state, kind)),
         EditorCommand::Indent => Ok(apply_indent(document, state)),
         EditorCommand::Outdent => Ok(apply_outdent(document, state)),
+        // Block-level commands are WYSIWYG-only in the current design: the
+        // source surface lets authors type the delimiters directly and
+        // delimiter masking already shows the marks. Toolbar buttons are
+        // disabled in source, but we still return Noop here in case anything
+        // reaches the source editor with one of these.
+        EditorCommand::SetBlockType(_)
+        | EditorCommand::ToggleBlockquote
+        | EditorCommand::ToggleList { .. }
+        | EditorCommand::ToggleStrikethrough
+        | EditorCommand::InsertHorizontalRule
+        | EditorCommand::InsertCodeBlock
+        | EditorCommand::InsertImage
+        | EditorCommand::InsertTable
+        | EditorCommand::Paragraph => Ok(EditorOutcome::Noop),
+        EditorCommand::ToggleTaskList => Ok(apply_toggle_task_list(document, state)),
     }
 }
 
@@ -381,6 +426,17 @@ fn apply_outdent(document: &mut Document, state: &mut EditorState) -> EditorOutc
         Some(edit) => apply_wrap_edit(document, state, edit),
         None => EditorOutcome::Noop,
     }
+}
+
+/// Insert a GFM task-list marker (`- [ ] `) at the caret. The rich engine's
+/// input rule picks this up and turns the line into a task item; in source
+/// mode it stays a literal bullet line that the user can extend.
+fn apply_toggle_task_list(document: &mut Document, state: &mut EditorState) -> EditorOutcome {
+    const MARKER: &str = "- [ ] ";
+    // Only insert when the caret is collapsed; otherwise we replace the
+    // selection with the marker, which matches the wrap-style toggles.
+    replace_selection(document, state, MARKER);
+    EditorOutcome::Changed
 }
 
 fn apply_wrap_edit(
@@ -1035,5 +1091,57 @@ mod tests {
         editor.apply(EditorCommand::SelectAll).unwrap();
         editor.apply(EditorCommand::Wrap(WrapKind::Code)).unwrap();
         assert!(editor.content().contains('`'), "{}", editor.content());
+    }
+
+    // --- Block-level command tests: the source editor routes these
+    // through the headless dispatcher, which returns Noop for the
+    // WYSIWYG-only variants and a Changed outcome for ToggleTaskList
+    // (which inserts the marker into the source buffer). The rich view
+    // does the actual structural work; its tests live alongside the
+    // engine in markrust-core.
+
+    #[test]
+    fn block_commands_are_noop_in_source_mode() {
+        let cases: Vec<EditorCommand> = vec![
+            EditorCommand::SetBlockType(BlockType::Paragraph),
+            EditorCommand::SetBlockType(BlockType::Heading(2)),
+            EditorCommand::ToggleBlockquote,
+            EditorCommand::ToggleList { ordered: false },
+            EditorCommand::ToggleList { ordered: true },
+            EditorCommand::ToggleStrikethrough,
+            EditorCommand::InsertHorizontalRule,
+            EditorCommand::InsertCodeBlock,
+            EditorCommand::InsertImage,
+            EditorCommand::InsertTable,
+        ];
+        let mut editor = HeadlessEditor::new("hello world\n");
+        let baseline = editor.content();
+        for cmd in cases {
+            let outcome = editor.apply(cmd.clone()).unwrap();
+            assert_eq!(
+                outcome,
+                EditorOutcome::Noop,
+                "{cmd:?} must be a Noop in source mode"
+            );
+            assert_eq!(
+                editor.content(),
+                baseline,
+                "{cmd:?} must not mutate the source buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_task_list_inserts_marker_in_source() {
+        let mut editor = HeadlessEditor::new("");
+        editor.apply(EditorCommand::ToggleTaskList).unwrap();
+        assert_eq!(editor.content(), "- [ ] ");
+        // Replace selection with the marker when one is active: the wrap
+        // toggles also replace a selection, so this stays symmetric.
+        editor
+            .apply(EditorCommand::SetSelection { start: 0, end: 6 })
+            .unwrap();
+        editor.apply(EditorCommand::ToggleTaskList).unwrap();
+        assert_eq!(editor.content(), "- [ ] ");
     }
 }

@@ -9,10 +9,13 @@ use gpui::{
 };
 use markrust_editor::EditorTheme;
 
+#[derive(Clone)]
 pub enum ToolbarState {
     Action,
     Toggle(bool),
     Mode(bool),
+    /// Disabled action button (greyed out + tooltip still visible).
+    Disabled,
 }
 
 /// Floating compact-window panels paint above the document while keeping
@@ -38,10 +41,18 @@ pub fn toolbar_icon_button(
     let theme = theme.clone();
     let tooltip_theme = theme.clone();
     let selected = matches!(state, ToolbarState::Toggle(true) | ToolbarState::Mode(true));
+    let disabled = matches!(state, ToolbarState::Disabled);
     let role = if matches!(state, ToolbarState::Mode(_)) {
         Role::RadioButton
     } else {
         Role::Button
+    };
+    let icon_color = if selected {
+        theme.text
+    } else if disabled {
+        theme.secondary_text.opacity(0.45)
+    } else {
+        theme.sidebar_text
     };
     div()
         .id(id)
@@ -64,7 +75,9 @@ pub fn toolbar_icon_button(
         .flex_shrink_0()
         .rounded(px(5.))
         .when(selected, |s| s.bg(theme.tab_active).shadow_sm())
-        .hover(move |s| s.bg(theme.toolbar_button_hover))
+        .when(!disabled, |s| {
+            s.hover(move |s| s.bg(theme.toolbar_button_hover))
+        })
         .tooltip(move |_, cx| {
             cx.new(|_| ToolbarTooltip {
                 label,
@@ -73,12 +86,8 @@ pub fn toolbar_icon_button(
             })
             .into()
         })
-        .child(icon.render(if selected {
-            theme.text
-        } else {
-            theme.sidebar_text
-        }))
-        .on_click(on_click)
+        .child(icon.render(icon_color))
+        .when(!disabled, |button| button.on_click(on_click))
 }
 
 struct ToolbarTooltip {

@@ -15,6 +15,7 @@ use crate::headless::{apply_editor_command, CaretMove, EditorCommand, EditorOutc
 use crate::masking::{Caret, Selection};
 use crate::theme::EditorTheme;
 use crate::wrap::WrapKind;
+use markrust_core::rich::BlockType;
 
 actions!(
     markrust_editor,
@@ -60,7 +61,27 @@ actions!(
         Indent,
         InsertLineBreak,
         Outdent,
-        Escape
+        Escape,
+        // Block-level commands: dispatched to the active document; the
+        // source editor returns Noop for the WYSIWYG-only ones (they light
+        // up in the rich view), and `ToggleTaskList` is the exception that
+        // works in both surfaces.
+        SetHeading1,
+        SetHeading2,
+        SetHeading3,
+        SetHeading4,
+        SetHeading5,
+        SetHeading6,
+        Paragraph,
+        ToggleBlockquote,
+        ToggleUnorderedList,
+        ToggleOrderedList,
+        ToggleTaskList,
+        ToggleStrikethrough,
+        InsertHorizontalRule,
+        InsertCodeBlock,
+        InsertImage,
+        InsertTable
     ]
 );
 
@@ -486,6 +507,159 @@ impl MarkdownEditor {
 
     pub fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
         self.apply_command(EditorCommand::Outdent, cx);
+    }
+
+    // --- Block-level commands: the source editor lets authors type the
+    // delimiters directly, so we route these through the headless dispatcher
+    // which already returns Noop for the WYSIWYG-only variants. The toolbar
+    // disables them in Source mode, but the bindings remain live so the
+    // menu and keyboard shortcut paths still resolve.
+
+    pub fn set_heading_1(&mut self, _: &SetHeading1, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apply_command(EditorCommand::SetBlockType(BlockType::Heading(1)), cx)
+            == EditorOutcome::Noop
+        {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn set_heading_2(&mut self, _: &SetHeading2, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apply_command(EditorCommand::SetBlockType(BlockType::Heading(2)), cx)
+            == EditorOutcome::Noop
+        {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn set_heading_3(&mut self, _: &SetHeading3, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apply_command(EditorCommand::SetBlockType(BlockType::Heading(3)), cx)
+            == EditorOutcome::Noop
+        {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn set_heading_4(&mut self, _: &SetHeading4, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apply_command(EditorCommand::SetBlockType(BlockType::Heading(4)), cx)
+            == EditorOutcome::Noop
+        {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn set_heading_5(&mut self, _: &SetHeading5, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apply_command(EditorCommand::SetBlockType(BlockType::Heading(5)), cx)
+            == EditorOutcome::Noop
+        {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn set_heading_6(&mut self, _: &SetHeading6, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apply_command(EditorCommand::SetBlockType(BlockType::Heading(6)), cx)
+            == EditorOutcome::Noop
+        {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn paragraph(&mut self, _: &Paragraph, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apply_command(EditorCommand::Paragraph, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn toggle_blockquote(
+        &mut self,
+        _: &ToggleBlockquote,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::ToggleBlockquote, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn toggle_unordered_list(
+        &mut self,
+        _: &ToggleUnorderedList,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::ToggleList { ordered: false }, cx)
+            == EditorOutcome::Noop
+        {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn toggle_ordered_list(
+        &mut self,
+        _: &ToggleOrderedList,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::ToggleList { ordered: true }, cx)
+            == EditorOutcome::Noop
+        {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn toggle_task_list(
+        &mut self,
+        _: &ToggleTaskList,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::ToggleTaskList, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn toggle_strikethrough(
+        &mut self,
+        _: &ToggleStrikethrough,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::ToggleStrikethrough, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn insert_horizontal_rule(
+        &mut self,
+        _: &InsertHorizontalRule,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::InsertHorizontalRule, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn insert_code_block(
+        &mut self,
+        _: &InsertCodeBlock,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_command(EditorCommand::InsertCodeBlock, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn insert_image(&mut self, _: &InsertImage, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apply_command(EditorCommand::InsertImage, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
+    }
+
+    pub fn insert_table(&mut self, _: &InsertTable, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apply_command(EditorCommand::InsertTable, cx) == EditorOutcome::Noop {
+            window.play_system_bell();
+        }
     }
 
     pub fn insert_line_break(

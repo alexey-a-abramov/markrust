@@ -20,7 +20,7 @@ use gpui::{
 };
 use markrust_core::rich::{
     apply_rich_command, caret_for_click_below_content, place_caret_for_click_below,
-    table_select_all_range, Bias, CaretState, MarkSet, NodeId, RichCommand, RichEngine,
+    table_select_all_range, Bias, BlockType, CaretState, MarkSet, NodeId, RichCommand, RichEngine,
     RichOutcome,
 };
 use markrust_core::Document;
@@ -974,6 +974,120 @@ impl RichEditorView {
                         EditorOutcome::Noop
                     }
                 } else if self.apply_rich(RichCommand::OutdentList, cx) == RichOutcome::Noop {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::SetBlockType(block_type) => {
+                if widget_owns_tab(&self.widget_edit) {
+                    self.commit_widget_edit(cx);
+                }
+                let cmd = match block_type {
+                    BlockType::Paragraph => RichCommand::SetBlockType(BlockType::Paragraph),
+                    BlockType::Heading(level) => {
+                        RichCommand::SetBlockType(BlockType::Heading(level))
+                    }
+                };
+                if self.apply_rich(cmd, cx) == RichOutcome::Noop {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::ToggleBlockquote => {
+                if self.apply_rich(RichCommand::ToggleBlockquote, cx) == RichOutcome::Noop {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::ToggleList { ordered } => {
+                if self.apply_rich(RichCommand::ToggleList { ordered }, cx) == RichOutcome::Noop {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::ToggleTaskList => {
+                // Task lists are an extension of the bullet-list surface, so
+                // we first toggle a bullet list and then drop the task marker
+                // at the caret so the rich engine parses it as a task item.
+                if self.apply_rich(RichCommand::ToggleList { ordered: false }, cx)
+                    == RichOutcome::Noop
+                {
+                    EditorOutcome::Noop
+                } else {
+                    // Always follow the bullet toggle with the task marker;
+                    // InsertText on the rich surface cannot fail once the
+                    // bullet was applied, so we report a single Changed.
+                    let _ = self.apply_editor_command(
+                        EditorCommand::InsertText("- [ ] ".into()),
+                        cx,
+                    );
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::ToggleStrikethrough => {
+                if self.apply_rich(RichCommand::ToggleMark(MarkSet::STRIKE), cx)
+                    == RichOutcome::Noop
+                {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::InsertHorizontalRule => {
+                if self.apply_editor_command(EditorCommand::InsertText("\n\n---\n\n".into()), cx)
+                    == EditorOutcome::Noop
+                {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::InsertCodeBlock => {
+                // `InsertText` lands the caret between the fences; the rich
+                // engine picks them up as a fenced code block on the next
+                // sync.
+                if self.apply_editor_command(EditorCommand::InsertText("\n```\n\n```\n".into()), cx)
+                    == EditorOutcome::Noop
+                {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::InsertImage => {
+                // `![alt](url)` with the caret on the URL placeholder so the
+                // author can type the destination immediately.
+                if self
+                    .apply_editor_command(EditorCommand::InsertText("![alt](https://)".into()), cx)
+                    == EditorOutcome::Noop
+                {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::InsertTable => {
+                // 2 columns × 3 body rows is enough to feel like a table
+                // without being overwhelming; Tab navigation inside the
+                // table works as it does for authored tables.
+                let table =
+                    "\n| Column 1 | Column 2 |\n| --- | --- |\n| Cell | Cell |\n| Cell | Cell |\n";
+                if self.apply_editor_command(EditorCommand::InsertText(table.into()), cx)
+                    == EditorOutcome::Noop
+                {
+                    EditorOutcome::Noop
+                } else {
+                    EditorOutcome::Changed
+                }
+            }
+            EditorCommand::Paragraph => {
+                if self.apply_rich(RichCommand::SetBlockType(BlockType::Paragraph), cx)
+                    == RichOutcome::Noop
+                {
                     EditorOutcome::Noop
                 } else {
                     EditorOutcome::Changed

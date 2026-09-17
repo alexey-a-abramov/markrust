@@ -88,6 +88,25 @@ pub(crate) fn application_menus(state: MenuState) -> Vec<Menu> {
             MenuItem::action("Italic", markrust_editor::ToggleItalic),
             MenuItem::action("Inline Code", markrust_editor::ToggleCode),
             MenuItem::action("Link…", markrust_editor::ToggleLink),
+            MenuItem::action("Strikethrough", markrust_editor::ToggleStrikethrough),
+            MenuItem::separator(),
+            MenuItem::action("Heading 1", markrust_editor::SetHeading1),
+            MenuItem::action("Heading 2", markrust_editor::SetHeading2),
+            MenuItem::action("Heading 3", markrust_editor::SetHeading3),
+            MenuItem::action("Heading 4", markrust_editor::SetHeading4),
+            MenuItem::action("Heading 5", markrust_editor::SetHeading5),
+            MenuItem::action("Heading 6", markrust_editor::SetHeading6),
+            MenuItem::action("Paragraph", markrust_editor::Paragraph),
+            MenuItem::separator(),
+            MenuItem::action("Bulleted List", markrust_editor::ToggleUnorderedList),
+            MenuItem::action("Numbered List", markrust_editor::ToggleOrderedList),
+            MenuItem::action("Task List", markrust_editor::ToggleTaskList),
+            MenuItem::action("Blockquote", markrust_editor::ToggleBlockquote),
+            MenuItem::action("Horizontal Rule", markrust_editor::InsertHorizontalRule),
+            MenuItem::separator(),
+            MenuItem::action("Code Block", markrust_editor::InsertCodeBlock),
+            MenuItem::action("Image…", markrust_editor::InsertImage),
+            MenuItem::action("Table", markrust_editor::InsertTable),
             MenuItem::separator(),
             MenuItem::action("Indent", markrust_editor::Indent),
             MenuItem::action("Outdent", markrust_editor::Outdent),
@@ -143,6 +162,128 @@ mod tests {
                 EditorMode::Split => <ShowSplit as gpui::Action>::name_for_type(),
             };
             assert_eq!(action.name(), expected);
+        }
+    }
+
+    #[test]
+    fn format_menu_exposes_every_toolbar_command() {
+        // The Format menu mirrors the Markdown editing toolbar. When you
+        // add a new toolbar button, also add the corresponding entry below
+        // (and vice versa) — this test guards against drift.
+        use gpui::Action;
+        let menus = application_menus(MenuState::default());
+        let format = menus.iter().find(|menu| menu.name == "Format").unwrap();
+        let expected: &[(&str, std::borrow::Cow<'static, str>)] = &[
+            (
+                "Bold",
+                std::borrow::Cow::Borrowed(<markrust_editor::ToggleBold as Action>::name_for_type()),
+            ),
+            (
+                "Italic",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::ToggleItalic as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Inline Code",
+                std::borrow::Cow::Borrowed(<markrust_editor::ToggleCode as Action>::name_for_type()),
+            ),
+            (
+                "Link…",
+                std::borrow::Cow::Borrowed(<markrust_editor::ToggleLink as Action>::name_for_type()),
+            ),
+            (
+                "Strikethrough",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::ToggleStrikethrough as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Heading 1",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::SetHeading1 as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Heading 2",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::SetHeading2 as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Heading 3",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::SetHeading3 as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Bulleted List",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::ToggleUnorderedList as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Numbered List",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::ToggleOrderedList as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Task List",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::ToggleTaskList as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Blockquote",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::ToggleBlockquote as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Horizontal Rule",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::InsertHorizontalRule as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Code Block",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::InsertCodeBlock as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Image…",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::InsertImage as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Table",
+                std::borrow::Cow::Borrowed(
+                    <markrust_editor::InsertTable as Action>::name_for_type(),
+                ),
+            ),
+            (
+                "Indent",
+                std::borrow::Cow::Borrowed(<markrust_editor::Indent as Action>::name_for_type()),
+            ),
+            (
+                "Outdent",
+                std::borrow::Cow::Borrowed(<markrust_editor::Outdent as Action>::name_for_type()),
+            ),
+        ];
+        for (label, action_name) in expected {
+            let found = format.items.iter().any(|item| match item {
+                MenuItem::Action {
+                    name: n, action: a, ..
+                } => n.as_ref() == *label && a.name() == *action_name,
+                _ => false,
+            });
+            assert!(
+                found,
+                "Format menu is missing `{label}` (action {action_name})"
+            );
         }
     }
 }

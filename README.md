@@ -88,7 +88,18 @@ bash scripts/release.sh
 | `Cmd/Ctrl+Shift+M` | Cycle WYSIWYG / Source / Split |
 | `Cmd/Ctrl+Shift+T` | Toggle light/dark theme |
 | `Cmd/Ctrl+C` / `X` | Copy / cut as Markdown (empty caret copies/cuts the current block) |
-| `Cmd/Ctrl+B` / `I` / `E` / `K` | Bold / italic / code / link |
+| `Cmd/Ctrl+B` / `I` / `K` | Bold / italic / link |
+| `Cmd/Ctrl+Option+K` | Inline code |
+| `Cmd/Ctrl+Option+C` | Code block |
+| `Cmd/Ctrl+1` … `6` | Heading 1 … 6 (mode picker is `Cmd/Ctrl+Option+1` … `3`) |
+| `Cmd/Ctrl+Option+0` | Paragraph |
+| `Cmd/Ctrl+Shift+7` / `8` / `9` | Numbered / bulleted / task list |
+| `Cmd/Ctrl+Shift+.` | Blockquote |
+| `Cmd/Ctrl+Shift+-` | Horizontal rule |
+| `Cmd/Ctrl+Shift+X` | Strikethrough |
+| `Cmd/Ctrl+Shift+I` | Image |
+| `Cmd/Ctrl+Option+T` | Table |
+| `Tab` / `Shift+Tab` (rich surface) | Indent / outdent |
 | `Option+Left` / `Right` (or `Ctrl+Left` / `Right`) | Move by word |
 | `Option+Shift+Left` / `Right` (or `Ctrl+Shift+Left` / `Right`) | Select by word |
 | `Option+Backspace` / `Delete` (or `Ctrl+Backspace` / `Delete`) | Delete by word |

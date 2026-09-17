@@ -8,7 +8,10 @@ use gpui::{
     Subscription, Window,
 };
 use markrust_core::parse_frontmatter;
+use markrust_core::rich::BlockType;
 use markrust_editor::outline_headings;
+use markrust_editor::theme::EditorTheme;
+use markrust_editor::EditorCommand;
 use std::path::Path;
 
 use crate::icons::Icon;
@@ -368,6 +371,237 @@ impl Focusable for MarkRustWindow {
     }
 }
 
+impl MarkRustWindow {
+    /// Compact Markdown formatting row that lives between the document
+    /// toolbar and the tab strip. Inline marks are always live; block-level
+    /// commands grey out whenever the caret is in a surface that cannot
+    /// route them (Source mode, or Split mode with the source pane focused).
+    fn format_toolbar(
+        theme: &EditorTheme,
+        block_enabled: bool,
+        workspace_entity: Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let separator = || {
+            div()
+                .w(px(1.))
+                .h(px(18.))
+                .mx_2()
+                .bg(theme.separator)
+                .into_any_element()
+        };
+
+        let dispatch = |cmd: EditorCommand| {
+            let ws = workspace_entity.clone();
+            cx.listener(move |this, _, window, cx| {
+                let _ = ws; // keep the captured entity alive across the closure
+                this.workspace.update(cx, |workspace, cx| {
+                    let _ = workspace.dispatch(WorkspaceCommand::Editor(cmd.clone()), window, cx);
+                });
+            })
+        };
+
+        let block_state = if block_enabled {
+            ToolbarState::Action
+        } else {
+            ToolbarState::Disabled
+        };
+
+        div()
+            .id("format-toolbar")
+            .role(Role::Toolbar)
+            .aria_label("Formatting toolbar")
+            .flex()
+            .items_center()
+            .px_3()
+            .h(px(36.))
+            .flex_shrink_0()
+            .gap_1()
+            .bg(theme.chrome_bg)
+            .border_b_1()
+            .border_color(theme.separator)
+            // --- Inline marks (always live) ---
+            .child(toolbar_icon_button(
+                Icon::Bold,
+                "Bold",
+                "⌘B",
+                theme,
+                "fmt-bold",
+                ToolbarState::Action,
+                dispatch(EditorCommand::Wrap(markrust_editor::WrapKind::Bold)),
+            ))
+            .child(toolbar_icon_button(
+                Icon::Italic,
+                "Italic",
+                "⌘I",
+                theme,
+                "fmt-italic",
+                ToolbarState::Action,
+                dispatch(EditorCommand::Wrap(markrust_editor::WrapKind::Italic)),
+            ))
+            .child(toolbar_icon_button(
+                Icon::Code,
+                "Inline Code",
+                "⌘⌥K",
+                theme,
+                "fmt-code",
+                ToolbarState::Action,
+                dispatch(EditorCommand::Wrap(markrust_editor::WrapKind::Code)),
+            ))
+            .child(toolbar_icon_button(
+                Icon::Link,
+                "Link",
+                "⌘K",
+                theme,
+                "fmt-link",
+                ToolbarState::Action,
+                dispatch(EditorCommand::Wrap(markrust_editor::WrapKind::Link)),
+            ))
+            .child(separator())
+            // --- Block-level (WYSIWYG only) ---
+            .child(toolbar_icon_button(
+                Icon::Heading1,
+                "Heading 1",
+                "⌘1",
+                theme,
+                "fmt-h1",
+                block_state.clone(),
+                dispatch(EditorCommand::SetBlockType(BlockType::Heading(1))),
+            ))
+            .child(toolbar_icon_button(
+                Icon::Heading2,
+                "Heading 2",
+                "⌘2",
+                theme,
+                "fmt-h2",
+                block_state.clone(),
+                dispatch(EditorCommand::SetBlockType(BlockType::Heading(2))),
+            ))
+            .child(toolbar_icon_button(
+                Icon::Heading3,
+                "Heading 3",
+                "⌘3",
+                theme,
+                "fmt-h3",
+                block_state.clone(),
+                dispatch(EditorCommand::SetBlockType(BlockType::Heading(3))),
+            ))
+            .child(toolbar_icon_button(
+                Icon::Paragraph,
+                "Paragraph",
+                "⌘⌥0",
+                theme,
+                "fmt-paragraph",
+                block_state.clone(),
+                dispatch(EditorCommand::Paragraph),
+            ))
+            .child(toolbar_icon_button(
+                Icon::Quote,
+                "Blockquote",
+                "⌘⇧.",
+                theme,
+                "fmt-quote",
+                block_state.clone(),
+                dispatch(EditorCommand::ToggleBlockquote),
+            ))
+            .child(toolbar_icon_button(
+                Icon::UnorderedList,
+                "Bulleted List",
+                "⌘⇧8",
+                theme,
+                "fmt-ul",
+                block_state.clone(),
+                dispatch(EditorCommand::ToggleList { ordered: false }),
+            ))
+            .child(toolbar_icon_button(
+                Icon::OrderedList,
+                "Numbered List",
+                "⌘⇧7",
+                theme,
+                "fmt-ol",
+                block_state.clone(),
+                dispatch(EditorCommand::ToggleList { ordered: true }),
+            ))
+            .child(toolbar_icon_button(
+                Icon::TaskList,
+                "Task List",
+                "⌘⇧9",
+                theme,
+                "fmt-task",
+                block_state.clone(),
+                dispatch(EditorCommand::ToggleTaskList),
+            ))
+            .child(separator())
+            .child(toolbar_icon_button(
+                Icon::HorizontalRule,
+                "Horizontal Rule",
+                "⌘⇧-",
+                theme,
+                "fmt-hr",
+                block_state.clone(),
+                dispatch(EditorCommand::InsertHorizontalRule),
+            ))
+            .child(toolbar_icon_button(
+                Icon::CodeBlock,
+                "Code Block",
+                "⌘⌥C",
+                theme,
+                "fmt-codeblock",
+                block_state.clone(),
+                dispatch(EditorCommand::InsertCodeBlock),
+            ))
+            .child(separator())
+            .child(toolbar_icon_button(
+                Icon::Strikethrough,
+                "Strikethrough",
+                "⌘⇧X",
+                theme,
+                "fmt-strike",
+                block_state.clone(),
+                dispatch(EditorCommand::ToggleStrikethrough),
+            ))
+            .child(toolbar_icon_button(
+                Icon::Image,
+                "Image",
+                "⌘⇧I",
+                theme,
+                "fmt-image",
+                block_state.clone(),
+                dispatch(EditorCommand::InsertImage),
+            ))
+            .child(toolbar_icon_button(
+                Icon::Table,
+                "Table",
+                "⌘⌥T",
+                theme,
+                "fmt-table",
+                block_state.clone(),
+                dispatch(EditorCommand::InsertTable),
+            ))
+            .child(separator())
+            // --- Indent / Outdent (always live) ---
+            .child(toolbar_icon_button(
+                Icon::Indent,
+                "Indent",
+                "Tab",
+                theme,
+                "fmt-indent",
+                ToolbarState::Action,
+                dispatch(EditorCommand::Indent),
+            ))
+            .child(toolbar_icon_button(
+                Icon::Outdent,
+                "Outdent",
+                "⇧Tab",
+                theme,
+                "fmt-outdent",
+                ToolbarState::Action,
+                dispatch(EditorCommand::Outdent),
+            ))
+            .into_any_element()
+    }
+}
+
 impl Render for MarkRustWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.workspace.update(cx, |workspace, cx| {
@@ -428,6 +662,18 @@ impl Render for MarkRustWindow {
             workspace.active_tab().map(|tab| tab.mode),
             Some(crate::workspace::EditorMode::Source)
         );
+        // Block-level Markdown formatting only lives on the rich view, so
+        // the toolbar greys those buttons out unless the rich surface owns
+        // the caret. Inline marks and indents still work in Source mode
+        // because delimiter-masking already shows the marks.
+        let rich_focused = workspace
+            .active_tab()
+            .is_some_and(|tab| tab.rich_view.read(cx).is_focused(window));
+        let block_enabled = match mode {
+            EditorMode::Wysiwyg => true,
+            EditorMode::Split => rich_focused,
+            EditorMode::Source => false,
+        };
         let fm_for_window = if source_mode {
             frontmatter_info.clone()
         } else {
@@ -438,6 +684,10 @@ impl Render for MarkRustWindow {
         let active_doc_path = workspace
             .active_tab()
             .and_then(|tab| tab.document.read(cx).path.clone());
+        // Drop the read borrow before mutating `cx` for the format-toolbar
+        // listeners below. The tab-strip closures re-acquire the borrow as
+        // needed.
+        let _ = workspace;
 
         let ws_drop = workspace_entity.clone();
         let ws_editor_drop = workspace_entity.clone();
@@ -593,7 +843,7 @@ impl Render for MarkRustWindow {
                             .child(toolbar_icon_button(
                                 Icon::Wysiwyg,
                                 "WYSIWYG",
-                                "⌘1",
+                                "⌘⌥1",
                                 &theme,
                                 "toolbar-mode-wysiwyg",
                                 ToolbarState::Mode(mode == EditorMode::Wysiwyg),
@@ -602,7 +852,7 @@ impl Render for MarkRustWindow {
                             .child(toolbar_icon_button(
                                 Icon::Source,
                                 "Source",
-                                "⌘2",
+                                "⌘⌥2",
                                 &theme,
                                 "toolbar-mode-source",
                                 ToolbarState::Mode(mode == EditorMode::Source),
@@ -611,7 +861,7 @@ impl Render for MarkRustWindow {
                             .child(toolbar_icon_button(
                                 Icon::Split,
                                 "Split View",
-                                "⌘3",
+                                "⌘⌥3",
                                 &theme,
                                 "toolbar-mode-split",
                                 ToolbarState::Mode(mode == EditorMode::Split),
@@ -631,6 +881,12 @@ impl Render for MarkRustWindow {
                         }),
                     )),
             )
+            .child(Self::format_toolbar(
+                &theme,
+                block_enabled,
+                workspace_entity.clone(),
+                cx,
+            ))
             .child(
                 div()
                     .flex()
@@ -642,6 +898,7 @@ impl Render for MarkRustWindow {
                     .border_b_1()
                     .border_color(theme.separator)
                     .children((0..tab_count).map(|index| {
+                        let workspace = self.workspace.read(cx);
                         let tab = &workspace.tabs[index];
                         let dirty = tab.document.read(cx).dirty;
                         let label = if dirty {
@@ -899,6 +1156,7 @@ impl Render for MarkRustWindow {
                                 )
                             })
                             .child({
+                                let workspace = self.workspace.read(cx);
                                 let tab =
                                     workspace.active_tab().unwrap_or_else(|| &workspace.tabs[0]);
                                 match tab.mode {
@@ -984,6 +1242,7 @@ impl Render for MarkRustWindow {
                     }, outline_overlay)),
             )
             .child({
+                let workspace = self.workspace.read(cx);
                 let tab = workspace.active_tab();
                 let path = tab
                     .and_then(|t| t.document.read(cx).path.clone())
@@ -1042,6 +1301,7 @@ impl Render for MarkRustWindow {
                     commands.push("Load remote images".to_string());
                 }
                 commands.extend((0..tab_count).filter_map(|index| {
+                    let workspace = self.workspace.read(cx);
                     let title = workspace.tabs[index].title.clone();
                     fuzzy_match(&title, &query).then_some(title)
                 }));

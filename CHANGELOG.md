@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Markdown editing toolbar sitting between the document toolbar and the tab strip. Inline marks (Bold, Italic, Inline Code, Link) work in both Source and WYSIWYG; block commands (Heading 1–6, Paragraph, Blockquote, Bulleted/Numbered/Task List, Horizontal Rule, Code Block, Strikethrough, Image, Table) are enabled only on the rich surface and greyed out with a tooltip in Source mode. Indent / Outdent are always live. New keyboard shortcuts: `Cmd/Ctrl+1..6` for headings (mode picker moved to `Cmd/Ctrl+Option+1..3`), `Cmd/Ctrl+Option+0` for Paragraph, `Cmd/Ctrl+Shift+7/8/9` for lists, `Cmd/Ctrl+Shift+.` for blockquote, `Cmd/Ctrl+Shift+-` for horizontal rule, `Cmd/Ctrl+Option+C` for code block, `Cmd/Ctrl+Option+K` for inline code (was `Cmd/Ctrl+E`), `Cmd/Ctrl+Shift+X` for strikethrough, `Cmd/Ctrl+Shift+I` for image, `Cmd/Ctrl+Option+T` for table. The Format menu mirrors every toolbar entry.
 - Native macOS menu bar and compact monochrome toolbar icons. WYSIWYG, Source,
   and Split modes have separate selected segments, tooltips, View menu entries,
   and Cmd-1/2/3 shortcuts; mode changes preserve selection and focus the active
