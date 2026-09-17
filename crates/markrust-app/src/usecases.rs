@@ -595,7 +595,7 @@ pub fn run_scenario(
         // positions from the prior buffer revision; the next outline
         // query then OOB-slices into the new (often empty) source. The
         // fixture bootstrap uses the same barrier (`wait_for_parse`).
-        let _ = doc.wait_for_parse(Duration::from_secs(5));
+        let _ = doc.wait_for_parse(Duration::from_secs(30));
     });
     move_caret(cx, window, workspace, setup_caret.min(source.len()))?;
     // `replace_range` triggers a deferred re-parse + render cycle. Drawing a

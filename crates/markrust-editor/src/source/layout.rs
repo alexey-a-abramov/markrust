@@ -699,7 +699,16 @@ pub fn outline_headings(spans: &[SyntaxNodeSpan], content: &str) -> Vec<(usize, 
         .filter(|span| span.kind == SyntaxKind::Heading)
         .map(|span| {
             let level = heading_level(span);
-            let title = content[span.start_byte..span.end_byte]
+            // Parser-produced byte offsets may be stale relative to the
+            // current buffer (the parse pump runs in the background), so
+            // we clamp the slice to the current content and the nearest
+            // char boundary on either end. Slicing through a multi-byte
+            // UTF-8 codepoint panics at the indexing site.
+            let start = span.start_byte.min(content.len());
+            let end = span.end_byte.min(content.len());
+            let start = floor_char_boundary(content, start);
+            let end = floor_char_boundary(content, end);
+            let title = content[start..end]
                 .trim()
                 .trim_start_matches('#')
                 .trim()
@@ -707,6 +716,20 @@ pub fn outline_headings(spans: &[SyntaxNodeSpan], content: &str) -> Vec<(usize, 
             (span.start_byte, level, title)
         })
         .collect()
+}
+
+/// Return the nearest byte offset `\u{<= n}` that falls on a UTF-8 char
+/// boundary. Matches the unsafe `floor_char_boundary` API slated for
+/// stabilisation; we hand-roll it to keep MSRV tools happy.
+fn floor_char_boundary(content: &str, n: usize) -> usize {
+    if n >= content.len() {
+        return content.len();
+    }
+    let mut i = n;
+    while i > 0 && !content.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 #[cfg(test)]

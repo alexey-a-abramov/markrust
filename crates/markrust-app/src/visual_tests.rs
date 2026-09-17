@@ -210,6 +210,13 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     let usecases_seed = options.usecases_seed.unwrap_or(0xC0DE_FEED_BEEF_C0DE);
     let usecases_count = options.usecases_count.unwrap_or(500);
     let mut total_usecases = 0usize;
+    // `check_input_selection_and_modes` writes "Café 👩🏽‍💻" to the headless
+    // clipboard as part of its Paste round-trip. Generated usecase scenarios
+    // that exercise cmd-shift-c / cmd-v then paste that emoji-laden string
+    // into the buffer, which trips `outline_headings`'s byte slice into the
+    // multi-byte `👩` codepoint (until the layout patch makes it char-safe).
+    // Start the loop from a known empty clipboard.
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(String::new())));
     for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
         for (name, _) in FIXTURES {
             if options.filter.as_ref().is_some_and(|filter| filter != name) {
