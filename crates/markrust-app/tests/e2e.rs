@@ -15,7 +15,7 @@ use markrust_app::{
     WorkspaceCommand,
 };
 use markrust_core::markdown_to_html_gfm;
-use markrust_editor::{EditorCommand, VisibilityState, WrapKind};
+use markrust_editor::{BlockType, EditorCommand, VisibilityState, WrapKind};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -420,4 +420,98 @@ fn open_large_markdown_file_does_not_hang() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("opening a markdown file hung");
     assert!(len > 10_000, "fixture too small: {len}");
+}
+
+#[test]
+fn toolbar_inline_wraps_route_through_dispatch() {
+    // The Markdown toolbar wraps Bold / Italic / Code / Link via
+    // Wrap(WrapKind). They must round-trip through WorkspaceCommand::Editor
+    // exactly as the keyboard shortcut path does.
+    let mut workspace = HeadlessWorkspace::new();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+            "hello".into(),
+        )))
+        .unwrap();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::SetSelection {
+            start: 0,
+            end: 5,
+        }))
+        .unwrap();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::Wrap(
+            WrapKind::Bold,
+        )))
+        .unwrap();
+    assert_eq!(workspace.active().unwrap().editor.content(), "**hello**");
+    // Wrapping again with italic appends `*` around the existing
+    // delimiters — it does not recurse into nested marks. The result is
+    // three asterisks on each side, which the rich engine renders as
+    // bold-and-italic.
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::SelectAll))
+        .unwrap();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::Wrap(
+            WrapKind::Italic,
+        )))
+        .unwrap();
+    assert_eq!(workspace.active().unwrap().editor.content(), "***hello***");
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::SelectAll))
+        .unwrap();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::Wrap(
+            WrapKind::Code,
+        )))
+        .unwrap();
+    let content = workspace.active().unwrap().editor.content();
+    assert!(
+        content.contains('`'),
+        "inline code must be wrapped: {content}"
+    );
+}
+
+#[test]
+fn toolbar_block_commands_are_noop_in_source_mode() {
+    // Toolbar dispatch in Source mode routes to the source editor which
+    // returns Noop for block commands. The buffer must not change.
+    let mut workspace = HeadlessWorkspace::new();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+            "hello\n".into(),
+        )))
+        .unwrap();
+    let baseline = workspace.active().unwrap().editor.content();
+    for cmd in [
+        EditorCommand::SetBlockType(BlockType::Paragraph),
+        EditorCommand::SetBlockType(BlockType::Heading(2)),
+        EditorCommand::ToggleBlockquote,
+        EditorCommand::ToggleList { ordered: false },
+        EditorCommand::ToggleList { ordered: true },
+        EditorCommand::ToggleStrikethrough,
+        EditorCommand::InsertHorizontalRule,
+        EditorCommand::InsertCodeBlock,
+        EditorCommand::InsertImage,
+        EditorCommand::InsertTable,
+    ] {
+        workspace
+            .apply(WorkspaceCommand::Editor(cmd.clone()))
+            .unwrap();
+        assert_eq!(
+            workspace.active().unwrap().editor.content(),
+            baseline,
+            "{cmd:?} must not mutate the source buffer"
+        );
+    }
+}
+
+#[test]
+fn toolbar_task_list_inserts_marker_in_source() {
+    let mut workspace = HeadlessWorkspace::new();
+    workspace
+        .apply(WorkspaceCommand::Editor(EditorCommand::ToggleTaskList))
+        .unwrap();
+    assert_eq!(workspace.active().unwrap().editor.content(), "- [ ] ");
 }

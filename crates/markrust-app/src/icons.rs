@@ -86,13 +86,17 @@ impl Icon {
                 r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12a3.5 3.5 0 0 0 5 0l3-3a3.5 3.5 0 0 0-5-5l-1 1M12 8a3.5 3.5 0 0 0-5 0l-3 3a3.5 3.5 0 0 0 5 5l1-1"/></svg>"#
             }
             Self::Heading1 => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 4.5v11M11 4.5v11M4.5 10H11M14 7v8.5h2"/></svg>"#
+                // H with an underline that doubles as the 1's foot — gives
+                // H1 its own silhouette distinct from H2 / H3.
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5v11M9 4.5v11M3 10H9M11.5 7v8M11.5 7l3.5 2M11.5 15l3.5-2"/></svg>"#
             }
             Self::Heading2 => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 4.5v11M11 4.5v11M4.5 10H11M14 5.5h5l-3 3a3 3 0 0 0 3 5h0a3 3 0 0 1-3 3h-2"/></svg>"#
+                // H with a 2 that hangs off its right (top + belly).
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5v11M9 4.5v11M3 10H9M11.5 6.5h6l-3.5 4h0a3.5 3.5 0 0 1 3.5 3.5v1h-7"/></svg>"#
             }
             Self::Heading3 => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 4.5v11M11 4.5v11M4.5 10H11M14.5 5.5h4a2.5 2.5 0 0 1 0 5h-3a2.5 2.5 0 0 0 0 5h4"/></svg>"#
+                // H with two stacked semicircles (the two bumps of 3).
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5v11M9 4.5v11M3 10H9M12 6.5h4.5a2.5 2.5 0 0 1 0 5h-3.5a2.5 2.5 0 0 0 0 5h4.5"/></svg>"#
             }
             Self::Paragraph => {
                 r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4.5h8M7 10h8M7 15.5h5M5 4.5v11"/></svg>"#
@@ -125,10 +129,13 @@ impl Icon {
                 r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="15" height="13" rx="1.5"/><path d="M2.5 9h15M2.5 14h15M8 3.5v13"/></svg>"#
             }
             Self::Indent => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.5h6M11 10h6M11 15.5h6M3 10h2m0 0L7 8m-2 2 2 2"/></svg>"#
+                // Right-pointing chevron with two text lines: content
+                // moves one tab stop inward.
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h5M3 15h5M11 6l4 4-4 4"/></svg>"#
             }
             Self::Outdent => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5h6M3 10h6M3 15.5h6M13 10H7m0 0 2-2m-2 2 2 2"/></svg>"#
+                // Left-pointing chevron: content moves one tab stop out.
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5h5M12 15h5M9 6l-4 4 4 4"/></svg>"#
             }
         }
     }

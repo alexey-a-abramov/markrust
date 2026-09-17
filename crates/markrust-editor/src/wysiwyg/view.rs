@@ -1021,10 +1021,8 @@ impl RichEditorView {
                     // Always follow the bullet toggle with the task marker;
                     // InsertText on the rich surface cannot fail once the
                     // bullet was applied, so we report a single Changed.
-                    let _ = self.apply_editor_command(
-                        EditorCommand::InsertText("- [ ] ".into()),
-                        cx,
-                    );
+                    let _ =
+                        self.apply_editor_command(EditorCommand::InsertText("- [ ] ".into()), cx);
                     EditorOutcome::Changed
                 }
             }
