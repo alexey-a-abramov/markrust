@@ -614,6 +614,13 @@ impl RichEditorView {
         self.visual_test_bounds
     }
 
+    /// Borrow the rich engine for inspection (tests, debug overlays).
+    /// Production code should drive the engine through `apply_rich` /
+    /// `apply_editor_command` instead of mutating it directly.
+    pub fn engine_ref(&self) -> &RichEngine {
+        &self.engine
+    }
+
     pub fn new(
         document: Entity<Document>,
         theme: EditorTheme,

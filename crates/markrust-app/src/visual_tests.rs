@@ -41,6 +41,8 @@ struct Options {
     update_baselines: bool,
     geometry_only: bool,
     filter: Option<String>,
+    usecases_seed: Option<u64>,
+    usecases_count: Option<usize>,
 }
 
 impl Options {
@@ -51,6 +53,8 @@ impl Options {
             update_baselines: false,
             geometry_only: false,
             filter: None,
+            usecases_seed: None,
+            usecases_count: None,
         };
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
@@ -60,7 +64,23 @@ impl Options {
                 "--filter" => options.filter = Some(args.next().context("--filter needs a fixture name")?),
                 "--update-baselines" => options.update_baselines = true,
                 "--geometry-only" => options.geometry_only = true,
-                _ => bail!("Unknown argument {arg}. Use --output PATH, --baseline PATH, --update-baselines, --geometry-only, or --filter NAME."),
+                "--usecases-seed" => {
+                    options.usecases_seed = Some(
+                        args.next()
+                            .context("--usecases-seed needs a u64")?
+                            .parse()
+                            .context("--usecases-seed must be a u64")?,
+                    );
+                }
+                "--usecases-count" => {
+                    options.usecases_count = Some(
+                        args.next()
+                            .context("--usecases-count needs a usize")?
+                            .parse()
+                            .context("--usecases-count must be a usize")?,
+                    );
+                }
+                _ => bail!("Unknown argument {arg}. Use --output PATH, --baseline PATH, --update-baselines, --geometry-only, --filter NAME, --usecases-seed N, or --usecases-count N."),
             }
         }
         ensure!(
@@ -183,6 +203,58 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
             case_result?;
         }
     }
+
+    // Use-case matrix: 500+ deterministic scenarios + 8 curated ones
+    // (including the user-requested Enter-on-empty-task-list case).
+    // Traces land in `<output>/usecases/<name>.jsonl`.
+    let usecases_seed = options.usecases_seed.unwrap_or(0xC0DE_FEED_BEEF_C0DE);
+    let usecases_count = options.usecases_count.unwrap_or(500);
+    let mut total_usecases = 0usize;
+    for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
+        for (name, _) in FIXTURES {
+            if options.filter.as_ref().is_some_and(|filter| filter != name) {
+                continue;
+            }
+            let (window, workspace) = open_fixture(&mut cx, "", theme)?;
+            let usecase_result: Result<usize> = (|| {
+                let n = crate::usecases::run_all(
+                    &mut cx,
+                    window,
+                    &workspace,
+                    usecases_seed,
+                    usecases_count,
+                    &options.output,
+                )?;
+                Ok(n)
+            })();
+            match usecase_result {
+                Ok(n) => total_usecases += n,
+                Err(err) => {
+                    cx.update_window(window.into(), |_, window, _| window.remove_window())?;
+                    drop(workspace);
+                    cx.advance_clock(Duration::from_secs(2));
+                    cx.run_until_parked();
+                    return Err(err.context(format!(
+                        "usecases for fixture `{name}` ({}) failed",
+                        theme_name(theme)
+                    )));
+                }
+            }
+            cx.update_window(window.into(), |_, window, _| window.remove_window())?;
+            drop(workspace);
+            // 500 scenarios per fixture route every state change through
+            // workspace-bound tasks. The drain mirrors the baseline loop:
+            // drop the entity first so GPUI unregisters its handle, then
+            // let the autosave / parse pumps quiesce before the next
+            // fixture open — otherwise the auto-save task retains the
+            // workspace's Document entity and the next iteration panics
+            // with "Leaked handle for entity Document".
+            cx.advance_clock(Duration::from_secs(2));
+            cx.run_until_parked();
+        }
+    }
+    println!("PASS usecases: {total_usecases} scenarios total");
+
     println!(
         "PASS: {snapshots} native GUI states; geometry{}{}",
         if checked_input {

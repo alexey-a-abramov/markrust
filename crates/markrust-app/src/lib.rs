@@ -17,6 +17,8 @@ mod window;
 mod workspace;
 
 #[cfg(feature = "gui-tests")]
+pub mod usecases;
+#[cfg(feature = "gui-tests")]
 pub mod visual_tests;
 
 pub use app::{run_gui, run_gui_with_open, GPUI_GIT_REV};
