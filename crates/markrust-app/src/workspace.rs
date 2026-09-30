@@ -8,7 +8,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use gpui::{
-    AppContext, Context, Entity, EntityInputHandler, ExternalPaths, Focusable, Task, Window,
+    AppContext, Context, Entity, EntityInputHandler, ExternalPaths, Focusable, Subscription, Task,
+    Window,
 };
 
 use crate::config::{is_markdown, AppConfig, RecentWorkspaces};
@@ -39,6 +40,25 @@ pub enum EditorMode {
     Split,
 }
 
+/// The editing surface that last owned input in a document tab. Unlike window
+/// focus, this survives a tab switch or a temporary toolbar/panel interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditingPane {
+    Source,
+    #[default]
+    Wysiwyg,
+}
+
+impl EditorMode {
+    pub fn editing_pane(self, remembered: EditingPane) -> EditingPane {
+        match self {
+            Self::Source => EditingPane::Source,
+            Self::Wysiwyg => EditingPane::Wysiwyg,
+            Self::Split => remembered,
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub struct DocumentTab {
     pub id: usize,
@@ -47,7 +67,22 @@ pub struct DocumentTab {
     pub editor_view: Entity<MarkdownEditorView>,
     pub rich_view: Entity<RichEditorView>,
     pub mode: EditorMode,
+    pub editing_pane: EditingPane,
     pub title: String,
+    _focus_subscriptions: Vec<Subscription>,
+}
+
+impl DocumentTab {
+    pub fn active_editing_pane(&self, window: &Window, cx: &gpui::App) -> EditingPane {
+        let remembered = if self.rich_view.read(cx).is_focused(window) {
+            EditingPane::Wysiwyg
+        } else if self.editor.read(cx).focus_handle(cx).is_focused(window) {
+            EditingPane::Source
+        } else {
+            self.editing_pane
+        };
+        self.mode.editing_pane(remembered)
+    }
 }
 
 pub struct Workspace {
@@ -127,15 +162,11 @@ impl Workspace {
     ) -> anyhow::Result<()> {
         match command {
             WorkspaceCommand::Editor(editor_command) => {
-                let mode = self.active_tab().map(|t| t.mode);
+                self.remember_active_editing_pane(window, cx);
                 let tab_id = self.active_tab().map(|t| t.id);
-                let use_rich = match mode {
-                    Some(EditorMode::Wysiwyg) => true,
-                    Some(EditorMode::Split) => self
-                        .active_tab()
-                        .is_some_and(|tab| tab.rich_view.read(cx).is_focused(window)),
-                    _ => false,
-                };
+                let use_rich = self
+                    .active_tab()
+                    .is_some_and(|tab| tab.active_editing_pane(window, cx) == EditingPane::Wysiwyg);
                 if use_rich {
                     if let Some(tab) = self.tabs.get(self.active_tab) {
                         tab.rich_view.update(cx, |view, cx| {
@@ -195,6 +226,7 @@ impl Workspace {
             }
             WorkspaceCommand::SwitchTab(index) => {
                 if index < self.tabs.len() {
+                    self.remember_active_editing_pane(window, cx);
                     self.active_tab = index;
                     self.focus_active_editor(window, cx);
                     cx.notify();
@@ -225,11 +257,15 @@ impl Workspace {
                 }
             }
             WorkspaceCommand::EditFrontmatter => {
-                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    tab.mode = EditorMode::Source;
+                // Use the same transition as the mode picker: a direct mode
+                // assignment can leave a hidden rich editor owning keyboard
+                // input and retain Split's literal-source layout.
+                self.set_editor_mode(EditorMode::Source, window, cx);
+                if let Some(tab) = self.active_tab() {
                     tab.editor.update(cx, |editor, cx| {
                         editor.apply_command(EditorCommand::JumpTo(0), cx);
                     });
+                    tab.editor.read(cx).focus_handle(cx).focus(window, cx);
                     cx.notify();
                 }
             }
@@ -282,12 +318,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.remember_active_editing_pane(window, cx);
+        if self.active_tab().is_some_and(|tab| tab.mode == mode) {
+            self.focus_active_editor(window, cx);
+            return;
+        }
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            if tab.mode == mode {
-                return;
-            }
-            let from_rich = tab.mode == EditorMode::Wysiwyg
-                || (tab.mode == EditorMode::Split && tab.rich_view.read(cx).is_focused(window));
+            let from_rich = tab.active_editing_pane(window, cx) == EditingPane::Wysiwyg;
             let (range, reversed) = if from_rich {
                 let view = tab.rich_view.read(cx);
                 (view.selected_range.clone(), view.selection_reversed)
@@ -326,6 +363,11 @@ impl Workspace {
             }
             let rich_view = tab.rich_view.clone();
             tab.mode = mode;
+            tab.editing_pane = mode.editing_pane(if from_rich {
+                EditingPane::Wysiwyg
+            } else {
+                EditingPane::Source
+            });
             self.focus_active_editor(window, cx);
             if matches!(mode, EditorMode::Wysiwyg | EditorMode::Split) {
                 rich_view.update(cx, |view, cx| view.request_caret_reveal(cx));
@@ -336,22 +378,31 @@ impl Workspace {
 
     fn focus_active_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_tab() {
-            match tab.mode {
-                EditorMode::Source => tab.editor.read(cx).focus_handle(cx).focus(window, cx),
-                EditorMode::Wysiwyg | EditorMode::Split => {
+            match tab.mode.editing_pane(tab.editing_pane) {
+                EditingPane::Source => tab.editor.read(cx).focus_handle(cx).focus(window, cx),
+                EditingPane::Wysiwyg => {
                     tab.rich_view.read(cx).focus_handle(cx).focus(window, cx);
                 }
             }
         }
     }
 
+    fn remember_active_editing_pane(&mut self, window: &Window, cx: &gpui::App) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            // Focus subscriptions can arrive after a tab transition (or not
+            // fire for an inactive test window). Capture the actual owner
+            // before it is replaced, rather than depending on those events.
+            tab.editing_pane = tab.active_editing_pane(window, cx);
+        }
+    }
+
     /// Paste via the focused editor's input handler so table, link and frontmatter
     /// drafts receive the text instead of accidentally mutating the document body.
     pub fn paste(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_active_editing_pane(window, cx);
         if let Some(tab) = self.active_tab() {
             let id = tab.id;
-            let rich = tab.mode == EditorMode::Wysiwyg
-                || (tab.mode == EditorMode::Split && tab.rich_view.read(cx).is_focused(window));
+            let rich = tab.active_editing_pane(window, cx) == EditingPane::Wysiwyg;
             let selection = |cx: &gpui::App| {
                 let (range, reversed) = if rich {
                     let view = tab.rich_view.read(cx);
@@ -437,6 +488,7 @@ impl Workspace {
     ) -> anyhow::Result<()> {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         if let Some(index) = self.tab_index_for_path(&path, cx) {
+            self.remember_active_editing_pane(window, cx);
             self.active_tab = index;
             self.focus_active_editor(window, cx);
             cx.notify();
@@ -489,6 +541,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.remember_active_editing_pane(window, cx);
         let title = path
             .as_ref()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -504,6 +557,25 @@ impl Workspace {
         });
         let id = self.next_tab_id;
         self.next_tab_id += 1;
+        let source_focus = editor.read(cx).focus_handle(cx);
+        let rich_focus = rich_view.read(cx).focus_handle(cx);
+        let source_subscription =
+            cx.on_focus(&source_focus, window, move |workspace, window, cx| {
+                if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == id) {
+                    if tab.editor.read(cx).focus_handle(cx).is_focused(window) {
+                        tab.editing_pane = EditingPane::Source;
+                        cx.notify();
+                    }
+                }
+            });
+        let rich_subscription = cx.on_focus(&rich_focus, window, move |workspace, window, cx| {
+            if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == id) {
+                if tab.rich_view.read(cx).is_focused(window) {
+                    tab.editing_pane = EditingPane::Wysiwyg;
+                    cx.notify();
+                }
+            }
+        });
         self.tabs.push(DocumentTab {
             id,
             document: document.clone(),
@@ -511,7 +583,9 @@ impl Workspace {
             editor_view,
             rich_view,
             mode: EditorMode::default(),
+            editing_pane: EditingPane::default(),
             title,
+            _focus_subscriptions: vec![source_subscription, rich_subscription],
         });
         self.active_tab = self.tabs.len() - 1;
         self.focus_active_editor(window, cx);
@@ -523,6 +597,7 @@ impl Workspace {
         if self.tabs.len() <= 1 {
             return;
         }
+        self.remember_active_editing_pane(window, cx);
         self.tabs.remove(index);
         if index < self.active_tab {
             self.active_tab -= 1;
@@ -998,6 +1073,21 @@ mod tests {
         assert_eq!(label, "Wysiwyg");
         assert_ne!(label, "Rich");
         assert_ne!(label, "Split");
+    }
+
+    #[test]
+    fn split_restores_the_last_focused_pane() {
+        for pane in [EditingPane::Source, EditingPane::Wysiwyg] {
+            assert_eq!(EditorMode::Split.editing_pane(pane), pane);
+        }
+    }
+
+    #[test]
+    fn single_surface_modes_only_focus_the_visible_editor() {
+        for pane in [EditingPane::Source, EditingPane::Wysiwyg] {
+            assert_eq!(EditorMode::Source.editing_pane(pane), EditingPane::Source);
+            assert_eq!(EditorMode::Wysiwyg.editing_pane(pane), EditingPane::Wysiwyg);
+        }
     }
 
     #[test]

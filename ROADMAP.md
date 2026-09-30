@@ -1,6 +1,6 @@
 # MarkRust roadmap
 
-_Last reviewed: 2026-09-15._
+_Last reviewed: 2026-09-30._
 
 This is the canonical product and execution roadmap. The detailed
 [WYSIWYG engineering notes](docs/roadmap.md) retain design decisions and test
@@ -51,17 +51,31 @@ evidence; they are not a competing priority list.
   navigation and resize; atomic selection replacement and clipboard undo.
 - Native GUI regression fixtures and geometry/input checks, with Metal
   screenshots and explicit baseline comparison for visual review.
+- Per-action UI observations connect actual focus, selection direction,
+  document/layout revisions, nested context and source-backed glyph geometry.
+  Offline evidence timelines and optional frame capture support visual review.
+- Source multi-row selection and code-highlight layering; canonical
+  frontmatter focus transitions and remembered Split input pane per tab.
+- Shared-document caret repair after cross-pane changes, including reversed
+  and Unicode selections. WYSIWYG markup hints can be disabled without changing
+  the Markdown; deep editing retains its viewport anchor.
 
 ## Improve the quality foundation next
 
 - Complete viewport-edge vertical navigation: scroll, paint, then resolve a
   target row instead of falling back to source-line movement when it is outside
   the virtualized viewport.
-- Add generated edit/undo/selection sequences for the rich-editor state
-  machine, extending the deterministic UTF-8 rope and line-index invariants.
+- Expand deterministic action generation with structured edit/undo/selection
+  sequences. All generated journeys now check state-to-render contracts;
+  prioritize deeper transition coverage rather than scenario counts alone.
+- Make the command palette a complete keyboard-driven command surface, with
+  editable search, arrow/Enter/Escape handling and actual tab activation.
+  Its current shell is not a finished interaction.
 - Extend native GUI fixtures to images, frontmatter drafts, font sizes,
   display scales, and long-document scrolling. Add AppKit/VoiceOver acceptance
   and XCTest UI journeys as accessibility semantics and packaging mature.
+- Rebase inactive pane selections through edit deltas, beyond current safe
+  bounds/grapheme repair, to retain semantic position after edits before them.
 - Turn each documented normalize exception into a named fixture with a tracked
   resolution path. Add website link, accessibility, mobile, and visual checks.
 

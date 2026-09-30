@@ -19,22 +19,70 @@ renders directly to images. It does not need Screen Recording permission or
 open a window on the desktop. The normal editor binary does not include this
 test harness.
 
-The default run uses 20 scenarios per fixture and theme, combining curated
+The default run uses 32 scenarios per theme, combining curated
 journeys with deterministic generated action sequences. For a longer local
 stress run, pass `--usecases-count 500`; the CI gate keeps the bounded default
 so failures produce evidence promptly.
 
-The use-case runner also records each fixture action and the resulting editor
-model in `<output>/usecases/*.jsonl`: source, selection, mode, rendered blocks,
-and viewport state. A failed invariant keeps the trace and, when Metal capture
-is available, a `.failure.png` of the final frame. These are test-fixture
-artifacts, not a recorder for real documents or production keystrokes.
+The use-case runner records each fixture action and the resulting editor model
+in `<output>/<theme>/journeys/usecases/`. Each journey gets a `.jsonl` trace,
+machine-readable `.report.json`, and an offline `.review.html` timeline. A
+failure keeps the first failing frame and, when Metal is available, its
+`.failure.png`. Light and dark evidence do not overwrite one another. Journeys
+declare their own document templates; they are not repeated for each screenshot
+fixture. `--filter` limits screenshot fixtures, not the action matrix.
+These are test-fixture artifacts, not production document or keystroke logs.
 
 For a quick local check while working on navigation:
 
 ```bash
 cargo run --locked -p markrust-app --features gui-tests --example gui_regression -- --geometry-only --filter paragraph --usecases-count 12 --output target/gui-regression-smoke
 ```
+
+For a visual action-by-action review, capture every frame explicitly:
+
+```bash
+cargo run --locked -p markrust-app --features gui-tests --example gui_regression -- --filter paragraph --record-frames --usecases-count 20 --output target/gui-review
+```
+
+Open a generated `.review.html` in a browser. Its timeline joins the screenshot,
+source change, selection direction, input owner, context and response delta.
+It has no network dependencies. `--record-frames` needs Metal and cannot be
+combined with `--geometry-only`; ordinary CI still writes the state timeline.
+
+## State-to-render contracts
+
+The observation layer reads the real `Document`, editor views, GPUI focus and
+painted scene. It does not implement another parser, virtual DOM or editing
+engine. Source-backed glyph caret stops connect Markdown byte ranges to native
+text rows. Nested context identifies selected list items or table cells, not
+just a top-level block; its revision is explicit when the rich pane is hidden.
+
+Every curated and generated action checks:
+
+- Input belongs to a visible pane; Split restores the last active pane per tab.
+- Selection endpoints are valid UTF-8 boundaries and the caret matches the
+  active edge, including reversed selections.
+- Visible Source and rich layouts represent the current document revision.
+- Split shows literal source; WYSIWYG follows the chosen markup-hint policy.
+- Navigation, focus, mode and hint changes do not mutate Markdown bytes.
+- Mode and hint changes preserve selection and caret position.
+- Selection scene quads cover the expected shaped glyph rows, without missing,
+  extra, stale, tall or incorrectly clipped highlights.
+- Wrapped rows do not overlap, including rows within the same text leaf;
+  opaque code backgrounds cannot paint over selection.
+
+Each journey starts with a fresh document, undo history, WYSIWYG focus and
+known hint policy. Checks run immediately after each settled action, and the
+trace is flushed before an assertion. This prevents a later action from
+concealing an earlier bad state. Generated journeys use the same contracts;
+they are not merely crash smoke tests. Fault-injection unit tests verify that
+the geometry/state oracles reject deliberately broken observations.
+
+The JSON schema is versioned (`ui.schema_version`). `response` records which
+document, selection, focus, mode and viewport properties changed. This is the
+small, inspectable in-memory logical model used by the test runner; there is
+no always-on recorder, telemetry or user-content logging in the shipped app.
 
 ## What belongs in this suite
 
@@ -47,6 +95,8 @@ cargo run --locked -p markrust-app --features gui-tests --example gui_regression
 - Geometry assertions: painted rows must fit their allocated height, avoid
   unrelated rows, and stay inside the editor's available width.
 - Rendered screenshots for review and comparison with approved baselines.
+- Source/Split partial multi-line selection, code selection layering,
+  reversed Unicode selection, pane restoration and shared-document deletion.
 
 When a visual bug is reported, add a small Markdown fixture that reproduces
 it. Preserve the problematic structure and line lengths; remove unrelated
@@ -133,6 +183,8 @@ The window design follows Apple's guidance on
 and [segmented controls](https://developer.apple.com/design/human-interface-guidelines/segmented-controls):
 put commands in the menu bar, keep frequent toolbar actions compact, and give
 each view-mode segment a consistent icon, tooltip, and visible selected state.
+Focus and selection are distinct state in the observer, consistent with
+[Apple's focus and selection guidance](https://developer.apple.com/design/human-interface-guidelines/focus-and-selection/).
 
 ## Related
 

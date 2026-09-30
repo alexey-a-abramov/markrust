@@ -24,7 +24,7 @@ use crate::ui::{
     document_tab, empty_sidebar_state, muted_hint, outline_row, panel_layer, section_header,
     sidebar_row, toolbar_icon_button, ToolbarState,
 };
-use crate::workspace::{fuzzy_match, EditorMode, Workspace};
+use crate::workspace::{fuzzy_match, EditingPane, EditorMode, Workspace};
 
 actions!(
     markrust_app,
@@ -683,12 +683,12 @@ impl Render for MarkRustWindow {
         // the toolbar greys those buttons out unless the rich surface owns
         // the caret. Inline marks and indents still work in Source mode
         // because delimiter-masking already shows the marks.
-        let rich_focused = workspace
+        let rich_active = workspace
             .active_tab()
-            .is_some_and(|tab| tab.rich_view.read(cx).is_focused(window));
+            .is_some_and(|tab| tab.active_editing_pane(window, cx) == EditingPane::Wysiwyg);
         let block_enabled = match mode {
             EditorMode::Wysiwyg => true,
-            EditorMode::Split => rich_focused,
+            EditorMode::Split => rich_active,
             EditorMode::Source => false,
         };
         let fm_for_window = if source_mode {
@@ -1254,9 +1254,7 @@ impl Render for MarkRustWindow {
                                     cx.listener(move |_, _, window, cx| {
                                         let _ = ws.update(cx, |workspace, cx| {
                                             let source_focused = workspace.active_tab().is_some_and(|tab| {
-                                                tab.mode == EditorMode::Source
-                                                    || (tab.mode == EditorMode::Split
-                                                        && tab.editor.read(cx).focus_handle(cx).is_focused(window))
+                                                tab.active_editing_pane(window, cx) == EditingPane::Source
                                             });
                                             workspace.dispatch(
                                                 WorkspaceCommand::JumpToHeading { offset },
@@ -1298,8 +1296,7 @@ impl Render for MarkRustWindow {
                 let (line, col) = tab
                     .map(|t| {
                         let doc = t.document.read(cx);
-                        let rich_active = t.mode == EditorMode::Wysiwyg
-                            || (t.mode == EditorMode::Split && t.rich_view.read(cx).is_focused(window));
+                        let rich_active = t.active_editing_pane(window, cx) == EditingPane::Wysiwyg;
                         let offset = if rich_active {
                             t.rich_view.read(cx).cursor_offset()
                         } else {

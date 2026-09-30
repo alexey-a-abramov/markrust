@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <title>MarkRust UI evidence</title>
+  <style>
+    :root { color-scheme: light dark; font: 14px/1.45 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; --bg: #f4f5f7; --panel: #fff; --text: #20232a; --muted: #626a79; --line: #dbe0e7; --accent: #1766d0; --selected: #b9d7ff; --pass: #147343; --fail: #b43b31; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #181b20; --panel: #22262c; --text: #eceff4; --muted: #a5aebc; --line: #3b424d; --accent: #85b8ff; --selected: #294e7b; --pass: #79d2a1; --fail: #ffafa6; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    header { padding: 20px 24px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    h1 { margin: 0 0 5px; font-size: 21px; overflow-wrap: anywhere; }
+    h2 { margin: 0 0 12px; font-size: 15px; }
+    p { margin: 6px 0; }
+    .muted { color: var(--muted); }
+    .status { font-weight: 600; }
+    .pass { color: var(--pass); } .fail { color: var(--fail); }
+    #failure { white-space: pre-wrap; color: var(--fail); overflow-wrap: anywhere; }
+    nav { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 14px 24px; position: sticky; top: 0; background: var(--panel); border-bottom: 1px solid var(--line); z-index: 2; }
+    button, select { font: inherit; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; }
+    button:disabled { opacity: .45; } button:not(:disabled) { cursor: pointer; }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+    #frame-picker { max-width: 620px; flex: 1; min-width: 200px; }
+    a { color: var(--accent); }
+    main { padding: 18px 24px 30px; display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(300px, 1fr); gap: 16px; }
+    section { min-width: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 16px; }
+    .wide { grid-column: 1 / -1; }
+    .visual { align-self: start; }
+    #screenshot { display: block; width: 100%; height: auto; border: 1px solid var(--line); border-radius: 5px; margin-top: 10px; }
+    #screenshot[hidden] { display: none; }
+    .states { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .state { padding: 8px 10px; border-radius: 6px; background: var(--bg); overflow-wrap: anywhere; }
+    .state small { display: block; color: var(--muted); }
+    .state strong { font-weight: 550; }
+    #response { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip { border: 1px solid var(--line); border-radius: 20px; padding: 3px 8px; }
+    .changed { border-color: var(--accent); color: var(--accent); }
+    pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    pre { margin: 10px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    #source { max-height: 320px; overflow: auto; white-space: pre; padding: 12px; background: var(--bg); border-radius: 5px; line-height: 1.6; }
+    #source .selected { background: var(--selected); }
+    #source .caret { display: inline-block; height: 1.2em; border-left: 2px solid var(--accent); vertical-align: text-bottom; }
+    .diff { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .diff pre { padding: 10px; background: var(--bg); border-radius: 5px; max-height: 170px; overflow: auto; }
+    #context ul { padding-left: 20px; margin: 5px 0; }
+    #context li { margin: 5px 0; }
+    details { margin-top: 12px; }
+    summary { cursor: pointer; }
+    #raw { max-height: 520px; overflow: auto; background: var(--bg); padding: 12px; border-radius: 5px; }
+    @media (max-width: 850px) { main { grid-template-columns: minmax(0, 1fr); padding: 12px; } header, nav { padding-left: 16px; padding-right: 16px; } .diff { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<header>
+  <h1 id="title">MarkRust UI evidence</h1>
+  <p id="status" class="status"></p>
+  <p class="muted">Fixture-only offline review: user action → editor state → native paint. No documents are sent anywhere.</p>
+  <p id="failure" hidden></p>
+</header>
+<nav aria-label="Evidence timeline">
+  <button id="previous" aria-label="Previous action">← Previous</button>
+  <label for="frame-picker">Frame</label>
+  <select id="frame-picker"></select>
+  <button id="next" aria-label="Next action">Next →</button>
+  <span id="elapsed" class="muted"></span>
+  <a id="trace-link">JSONL trace</a>
+  <a id="report-link">Contract report</a>
+</nav>
+<main>
+  <section class="visual">
+    <h2>Visible result</h2>
+    <p id="frame-note" class="muted"></p>
+    <img id="screenshot" alt="Captured MarkRust fixture frame" hidden>
+    <p id="paint-summary" class="muted"></p>
+  </section>
+  <section>
+    <h2>Editor understands its state</h2>
+    <div id="states" class="states"></div>
+    <h2 style="margin-top: 16px">System response</h2>
+    <div id="response"></div>
+    <h2 style="margin-top: 16px">Active semantic context</h2>
+    <div id="context"></div>
+  </section>
+  <section class="wide">
+    <h2>Source and active selection</h2>
+    <p id="selection-note" class="muted"></p>
+    <pre id="source" tabindex="0" aria-label="Fixture Markdown source with selection"></pre>
+    <details open>
+      <summary>Source change from the preceding action</summary>
+      <p id="diff-note" class="muted"></p>
+      <div id="diff" class="diff">
+        <div><strong>Before</strong><pre id="before"></pre></div>
+        <div><strong>After</strong><pre id="after"></pre></div>
+      </div>
+    </details>
+    <details>
+      <summary>Raw observed model</summary>
+      <pre id="raw" tabindex="0"></pre>
+    </details>
+  </section>
+</main>
+<script type="application/json" id="evidence-data">MARKRUST_EVIDENCE_JSON</script>
+<script>
+  'use strict';
+  const evidence = JSON.parse(document.getElementById('evidence-data').textContent);
+  const snapshots = evidence.snapshots || [];
+  const element = id => document.getElementById(id);
+  const text = (id, value) => { element(id).textContent = value; };
+  const clean = target => target.replaceChildren();
+  const label = value => typeof value === 'string' ? value : JSON.stringify(value);
+  const range = value => value ? `${value.start}…${value.end}` : 'not observed';
+  function actionLabel(action) {
+    if (!action) return 'Initial state';
+    return action.kind + (action.value === undefined ? '' : ': ' + label(action.value));
+  }
+  function state(name, value) {
+    const card = document.createElement('div'); card.className = 'state';
+    const key = document.createElement('small'); key.textContent = name;
+    const content = document.createElement('strong'); content.textContent = value;
+    card.append(key, content); element('states').append(card);
+  }
+  function tree(nodes, parent) {
+    if (!nodes.length) return;
+    const list = document.createElement('ul');
+    for (const node of nodes) {
+      const item = document.createElement('li');
+      item.textContent = `${node.kind} · bytes ${range(node.source_range)}${node.caret_inside ? ' · caret' : ''}${node.selection_intersects ? ' · selected' : ''}`;
+      tree(node.children || [], item); list.append(item);
+    }
+    parent.append(list);
+  }
+  function byteIndex(source, offset) {
+    let bytes = 0, index = 0;
+    const encoder = new TextEncoder();
+    for (const character of source) {
+      if (bytes >= offset) break;
+      const length = encoder.encode(character).length;
+      if (bytes + length > offset) break;
+      bytes += length; index += character.length;
+    }
+    return index;
+  }
+  function showSource(snapshot) {
+    const source = snapshot.source || '';
+    const selected = snapshot.selection || {start: 0, end: 0};
+    const start = byteIndex(source, selected.start), end = byteIndex(source, selected.end);
+    const container = element('source'); clean(container);
+    container.append(document.createTextNode(source.slice(0, start)));
+    const active = document.createElement('span');
+    active.className = start === end ? 'caret' : 'selected';
+    active.textContent = source.slice(start, end); container.append(active);
+    container.append(document.createTextNode(source.slice(end)));
+    // Keep the active source context visible without moving the review page.
+    container.scrollTop = Math.max(0, active.offsetTop - container.offsetTop - container.clientHeight / 2);
+    container.scrollLeft = Math.max(0, active.offsetLeft - container.offsetLeft - container.clientWidth / 2);
+    const pane = snapshot.ui && (snapshot.ui.input_owner === 'source' ? snapshot.ui.source_pane : snapshot.ui.rich_pane);
+    text('selection-note', `UTF-8 byte range ${range(selected)} · active caret ${snapshot.caret} · ${pane && pane.reversed ? 'reversed selection' : 'forward selection'} · ${snapshot.line_count} source lines`);
+  }
+  function showDiff(before, after) {
+    if (before === undefined) {
+      text('diff-note', 'Starting fixture; no preceding action.'); element('diff').hidden = true; return;
+    }
+    if (before === after) {
+      text('diff-note', 'Source unchanged. This action may change focus, selection, mode, or viewport.'); element('diff').hidden = true; return;
+    }
+    const a = Array.from(before), b = Array.from(after);
+    let prefix = 0, suffix = 0;
+    while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix++;
+    while (suffix < a.length - prefix && suffix < b.length - prefix && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++;
+    function excerpt(chars) {
+      const start = Math.max(0, prefix - 100), end = Math.min(chars.length, chars.length - suffix + 100);
+      return (start > 0 ? '…' : '') + chars.slice(start, end).join('') + (end < chars.length ? '…' : '');
+    }
+    text('diff-note', `${a.length - prefix - suffix} characters replaced by ${b.length - prefix - suffix}; nearby context shown.`);
+    text('before', excerpt(a)); text('after', excerpt(b)); element('diff').hidden = false;
+  }
+  function showFrame(index) {
+    const snapshot = snapshots[index]; if (!snapshot) return;
+    element('frame-picker').value = String(index);
+    element('previous').disabled = index === 0; element('next').disabled = index === snapshots.length - 1;
+    text('elapsed', `${snapshot.timestamp_ms} ms since scenario start`);
+    const ui = snapshot.ui; clean(element('states'));
+    state('Action', index === 0 ? 'Initial state' : actionLabel(snapshot.action));
+    state('Mode', snapshot.mode);
+    state('Input owner', ui ? label(ui.input_owner) : 'not observed');
+    state('Markup hints', ui ? (ui.markup_hints ? 'shown near active context' : 'hidden') : 'not observed');
+    state('Revisions: document / rich / source', ui ? `${ui.document_revision} / ${ui.rich_render_revision ?? '—'} / ${ui.source_render_revision ?? '—'}` : 'not observed');
+    state('Panels', ui ? `Sidebar ${ui.sidebar ? 'open' : 'closed'} · Outline ${ui.outline ? 'open' : 'closed'}${ui.overlay ? ' · floating ' + ui.overlay : ''}${ui.palette ? ' · palette open' : ''}` : 'not observed');
+    state('Visible panes', ui ? [ui.rich_pane.visible ? 'WYSIWYG' : '', ui.source_pane.visible ? (ui.raw_source ? 'literal source' : 'styled source') : ''].filter(Boolean).join(' + ') : 'not observed');
+    state('Caret geometry', `Rich: ${snapshot.caret_visible ?? 'not active'} · Source: ${snapshot.source_caret_visible ?? 'not active'}`);
+    clean(element('response'));
+    if (snapshot.response) {
+      for (const [key, value] of Object.entries(snapshot.response)) {
+        const chip = document.createElement('span'); chip.className = 'chip' + (value ? ' changed' : '');
+        chip.textContent = key.replaceAll('_', ' ') + ': ' + (value ? 'yes' : 'no'); element('response').append(chip);
+      }
+    } else text('response', 'Starting state; no action response yet.');
+    clean(element('context')); tree(ui ? ui.context : [], element('context'));
+    if (!ui || !ui.context.length) text('context', 'No source-backed block intersects the active context.');
+    showSource(snapshot); showDiff(index > 0 ? snapshots[index - 1].source : undefined, snapshot.source);
+    text('raw', JSON.stringify(snapshot, null, 2));
+    const image = element('screenshot'); image.hidden = true;
+    if (evidence.frames) {
+      text('frame-note', 'Native screenshot after this action.');
+      image.src = `${evidence.scenario}.step-${String(snapshot.step).padStart(3, '0')}.png`; image.hidden = false;
+    } else if (evidence.error && index === snapshots.length - 1) {
+      text('frame-note', 'Screenshot after the failing action (when capture was available). If dispatch or drawing failed, the model below is the last completed step; see the failure description.');
+      image.src = `${evidence.scenario}.failure.png`; image.hidden = false;
+    } else text('frame-note', 'No frame recorded. Use --record-frames for a screenshot at every action. Geometry and semantic state remain available below.');
+    text('paint-summary', ui ? `${ui.painted_rich.length} source-backed rich leaves · ${ui.painted_source.length} source rows · ${ui.painted_selection.length} clipped selection rectangles` : 'Native paint observations were not available.');
+  }
+  text('title', evidence.scenario); document.title = evidence.scenario + ' — MarkRust UI evidence';
+  text('status', evidence.error ? 'Contract failure' : 'Contracts passed');
+  element('status').classList.add(evidence.error ? 'fail' : 'pass');
+  if (evidence.error) { element('failure').hidden = false; text('failure', evidence.error); }
+  element('trace-link').href = evidence.scenario + '.jsonl';
+  element('report-link').href = evidence.scenario + '.report.json';
+  snapshots.forEach((snapshot, index) => {
+    const option = document.createElement('option'); option.value = String(index);
+    option.textContent = `${snapshot.step}. ${index === 0 ? 'Initial state' : actionLabel(snapshot.action)}`;
+    element('frame-picker').append(option);
+  });
+  element('frame-picker').addEventListener('change', event => showFrame(Number(event.target.value)));
+  element('previous').addEventListener('click', () => showFrame(Number(element('frame-picker').value) - 1));
+  element('next').addEventListener('click', () => showFrame(Number(element('frame-picker').value) + 1));
+  element('screenshot').addEventListener('error', () => { element('screenshot').hidden = true; text('frame-note', 'Screenshot unavailable for this frame. Semantic and geometry evidence is still recorded.'); });
+  if (snapshots.length) showFrame(evidence.error ? snapshots.length - 1 : 0);
+  else {
+    element('previous').disabled = true; element('next').disabled = true; element('frame-picker').disabled = true;
+    text('frame-note', 'The scenario failed before a state could be captured. See the contract failure above.');
+  }
+</script>
+</body>
+</html>

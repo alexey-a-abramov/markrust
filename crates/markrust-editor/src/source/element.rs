@@ -3,6 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::cell::Cell;
+#[cfg(feature = "gui-tests")]
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -30,6 +32,8 @@ pub struct EditorElement {
     pub editor: Entity<MarkdownEditor>,
     scroll_handle: Option<(ScrollHandle, SharedViewportSize)>,
     reveal_caret: bool,
+    #[cfg(feature = "gui-tests")]
+    paint_observation: Option<Rc<RefCell<SourcePaintGeometry>>>,
 }
 
 const EDITOR_GUTTER: f32 = 16.0;
@@ -47,7 +51,7 @@ struct LinePaintData {
 
 pub struct EditorPrepaint {
     lines: Vec<LinePaintData>,
-    selection: Option<PaintQuad>,
+    selection: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
     caret_bounds: Bounds<Pixels>,
     blockquote_borders: Vec<PaintQuad>,
@@ -59,6 +63,27 @@ pub struct EditorPrepaint {
 pub struct EditorLayout {
     lines: Vec<LinePaintData>,
     display_layout: DisplayLayout,
+    #[cfg(feature = "gui-tests")]
+    revision: u64,
+}
+
+/// Source observations come from the same shaped rows and paint pass as the UI.
+#[cfg(feature = "gui-tests")]
+#[derive(Clone, Debug, Default)]
+pub struct SourcePaintGeometry {
+    pub revision: Option<u64>,
+    pub rows: Vec<SourcePaintRow>,
+    pub selection_bounds: Vec<Bounds<Pixels>>,
+}
+
+#[cfg(feature = "gui-tests")]
+#[derive(Clone, Debug)]
+pub struct SourcePaintRow {
+    /// Source range including its hard newline, when present.
+    pub source_range: Range<usize>,
+    pub bounds: Bounds<Pixels>,
+    /// Source-backed glyph caret stops in window coordinates.
+    pub caret_stops: Vec<(usize, f32)>,
 }
 
 impl EditorElement {
@@ -67,6 +92,8 @@ impl EditorElement {
             editor,
             scroll_handle: None,
             reveal_caret: false,
+            #[cfg(feature = "gui-tests")]
+            paint_observation: None,
         }
     }
 
@@ -78,6 +105,12 @@ impl EditorElement {
     ) -> Self {
         self.scroll_handle = Some((handle, viewport_size));
         self.reveal_caret = reveal_caret;
+        self
+    }
+
+    #[cfg(feature = "gui-tests")]
+    fn with_paint_observation(mut self, observation: Rc<RefCell<SourcePaintGeometry>>) -> Self {
+        self.paint_observation = Some(observation);
         self
     }
 }
@@ -118,6 +151,8 @@ impl Element for EditorElement {
         let theme = &editor.theme;
         let content = editor.content(cx);
         let doc = editor.document.read(cx);
+        #[cfg(feature = "gui-tests")]
+        let revision = doc.revision();
         let spans = if doc.mode.parses_markdown() {
             doc.syntax_spans.clone()
         } else {
@@ -150,6 +185,8 @@ impl Element for EditorElement {
             EditorLayout {
                 lines,
                 display_layout,
+                #[cfg(feature = "gui-tests")]
+                revision,
             },
         )
     }
@@ -176,15 +213,15 @@ impl Element for EditorElement {
         let cursor_display = display_layout.display_offset_for_doc(cursor_doc);
         let caret_bounds = caret_bounds_for_display(&lines, cursor_display, bounds);
         let selection = if selected_range.is_empty() {
-            None
+            Vec::new()
         } else {
-            Some(selection_quad(
+            selection_quads(
                 &lines,
                 display_layout,
                 &selected_range,
                 bounds,
                 theme.selection,
-            ))
+            )
         };
 
         let cursor = if is_focused && cursor_visible {
@@ -213,7 +250,7 @@ impl Element for EditorElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
@@ -230,8 +267,52 @@ impl Element for EditorElement {
             editor.sync_ime_cursor(window);
         });
 
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection);
+        #[cfg(not(feature = "gui-tests"))]
+        let _ = request_layout;
+
+        #[cfg(feature = "gui-tests")]
+        if let Some(observation) = &self.paint_observation {
+            let content_len = self.editor.read(cx).document.read(cx).buffer.len_bytes();
+            let rows = prepaint
+                .lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    let source_end = prepaint
+                        .lines
+                        .get(index + 1)
+                        .map(|next| next.doc_line_start)
+                        .unwrap_or(content_len);
+                    let caret_stops = line
+                        .shaped
+                        .text
+                        .char_indices()
+                        .map(|(offset, _)| offset)
+                        .chain([line.shaped.text.len()])
+                        .map(|offset| {
+                            let source = request_layout
+                                .display_layout
+                                .doc_offset_for_display(line.display_line_start + offset);
+                            let x =
+                                bounds.left() + px(EDITOR_GUTTER) + line.shaped.x_for_index(offset);
+                            (source, f32::from(x))
+                        })
+                        .collect();
+                    SourcePaintRow {
+                        source_range: line.doc_line_start..source_end,
+                        bounds: Bounds::new(
+                            point(bounds.left() + px(EDITOR_GUTTER), bounds.top() + line.y),
+                            size(line.shaped.width(), line.height),
+                        ),
+                        caret_stops,
+                    }
+                })
+                .collect();
+            *observation.borrow_mut() = SourcePaintGeometry {
+                revision: Some(request_layout.revision),
+                rows,
+                selection_bounds: prepaint.selection.iter().map(|quad| quad.bounds).collect(),
+            };
         }
 
         for background in prepaint.code_block_backgrounds.drain(..) {
@@ -240,6 +321,10 @@ impl Element for EditorElement {
 
         for border in prepaint.blockquote_borders.drain(..) {
             window.paint_quad(border);
+        }
+
+        for selection in prepaint.selection.drain(..) {
+            window.paint_quad(selection);
         }
 
         let gutter = px(EDITOR_GUTTER);
@@ -687,38 +772,68 @@ fn cursor_quad(
     )
 }
 
-fn selection_quad(
+fn selection_quads(
     lines: &[LinePaintData],
     layout: &DisplayLayout,
     range: &Range<usize>,
     bounds: Bounds<Pixels>,
     color: gpui::Hsla,
-) -> PaintQuad {
+) -> Vec<PaintQuad> {
     let start = layout.display_offset_for_doc(range.start);
     let end = layout.display_offset_for_doc(range.end);
-    let (start_x, start_y, start_height) = position_for_display_offset(lines, start);
-    let (end_x, end_y, end_height) = position_for_display_offset(lines, end);
     let gutter = px(EDITOR_GUTTER);
-    if (f32::from(start_y) - f32::from(end_y)).abs() < 0.5 {
+    selected_source_rows(
+        &(start..end),
+        lines.iter().enumerate().map(|(index, line)| {
+            (
+                line.display_line_start,
+                line.display_line_start + line.shaped.text.len(),
+                lines
+                    .get(index + 1)
+                    .map(|next| next.display_line_start)
+                    .unwrap_or(layout.display_text.len()),
+            )
+        }),
+    )
+    .into_iter()
+    .map(|(index, selected, newline)| {
+        let line = &lines[index];
+        let left = line.shaped.x_for_index(selected.start);
+        let right = line.shaped.x_for_index(selected.end) + if newline { px(2.) } else { px(0.) };
         fill(
-            Bounds::from_corners(
-                point(bounds.left() + gutter + start_x, bounds.top() + start_y),
-                point(
-                    bounds.left() + gutter + end_x,
-                    bounds.top() + start_y + start_height,
-                ),
+            Bounds::new(
+                point(bounds.left() + gutter + left, bounds.top() + line.y),
+                size((right - left).max(px(0.)), line.height),
             ),
             color,
         )
-    } else {
-        fill(
-            Bounds::from_corners(
-                point(bounds.left() + gutter + start_x, bounds.top() + start_y),
-                point(bounds.right(), bounds.top() + end_y + end_height),
-            ),
-            color,
-        )
+    })
+    .collect()
+}
+
+/// Keep partial first/last lines and selected newlines independent. A single
+/// bounding rectangle highlights unselected text while missing later prefixes.
+fn selected_source_rows(
+    selection: &Range<usize>,
+    rows: impl IntoIterator<Item = (usize, usize, usize)>,
+) -> Vec<(usize, Range<usize>, bool)> {
+    if selection.is_empty() {
+        return Vec::new();
     }
+    rows.into_iter()
+        .enumerate()
+        .filter_map(|(index, (start, text_end, next_start))| {
+            let selected_start = selection.start.max(start).min(text_end);
+            let selected_end = selection.end.min(text_end).max(start);
+            let newline =
+                text_end < next_start && selection.start <= text_end && selection.end > text_end;
+            (selected_start < selected_end || newline).then_some((
+                index,
+                selected_start.saturating_sub(start)..selected_end.saturating_sub(start),
+                newline,
+            ))
+        })
+        .collect()
 }
 
 fn position_for_display_offset(
@@ -823,6 +938,8 @@ pub struct MarkdownEditorView {
     scroll_handle: ScrollHandle,
     scroll_viewport_size: SharedViewportSize,
     last_revealed_caret: Option<(usize, u64, bool)>,
+    #[cfg(feature = "gui-tests")]
+    paint_observation: Rc<RefCell<SourcePaintGeometry>>,
 }
 
 impl MarkdownEditorView {
@@ -832,6 +949,8 @@ impl MarkdownEditorView {
             scroll_handle: ScrollHandle::new(),
             scroll_viewport_size: Rc::new(Cell::new((px(0.), px(0.)))),
             last_revealed_caret: None,
+            #[cfg(feature = "gui-tests")]
+            paint_observation: Rc::new(RefCell::new(SourcePaintGeometry::default())),
         }
     }
 
@@ -843,6 +962,11 @@ impl MarkdownEditorView {
             viewport.size.width + self.scroll_handle.max_offset().x,
             self.scroll_handle.offset(),
         )
+    }
+
+    #[cfg(feature = "gui-tests")]
+    pub fn painted_geometry(&self) -> SourcePaintGeometry {
+        self.paint_observation.borrow().clone()
     }
 }
 
@@ -1207,17 +1331,72 @@ impl Render for MarkdownEditorView {
                     editor.update(cx, |e, cx| e.insert_table(action, window, cx))
                 }
             })
-            .child(EditorElement::new(editor).with_scroll(
-                self.scroll_handle.clone(),
-                self.scroll_viewport_size.clone(),
-                reveal_caret,
-            ))
+            .child({
+                let element = EditorElement::new(editor).with_scroll(
+                    self.scroll_handle.clone(),
+                    self.scroll_viewport_size.clone(),
+                    reveal_caret,
+                );
+                #[cfg(feature = "gui-tests")]
+                let element = element.with_paint_observation(self.paint_observation.clone());
+                element
+            })
     }
 }
 
 #[cfg(test)]
 mod scroll_tests {
     use super::*;
+
+    #[test]
+    fn multiline_selection_keeps_partial_edges_and_complete_middle_line() {
+        assert_eq!(
+            selected_source_rows(&(3..25), [(0, 10, 11), (11, 21, 22), (22, 32, 32)]),
+            vec![(0, 3..10, true), (1, 0..10, true), (2, 0..3, false)]
+        );
+    }
+
+    #[test]
+    fn selection_ending_at_next_line_start_does_not_highlight_that_line() {
+        assert_eq!(
+            selected_source_rows(&(2..11), [(0, 10, 11), (11, 21, 21)]),
+            vec![(0, 2..10, true)]
+        );
+    }
+
+    #[test]
+    fn selection_of_empty_line_or_only_a_newline_has_visible_marker() {
+        assert_eq!(
+            selected_source_rows(&(3..5), [(0, 3, 4), (4, 4, 5), (5, 8, 8)]),
+            vec![(0, 3..3, true), (1, 0..0, true)]
+        );
+    }
+
+    #[test]
+    fn single_line_selection_is_limited_to_selected_glyphs() {
+        assert_eq!(
+            selected_source_rows(&(13..17), [(0, 10, 11), (11, 21, 21)]),
+            vec![(1, 2..6, false)]
+        );
+        assert!(selected_source_rows(&(13..13), [(0, 10, 11), (11, 21, 21)]).is_empty());
+    }
+
+    #[test]
+    fn unicode_selection_row_offsets_remain_byte_based() {
+        let text = "Café 👩🏽‍💻\nnext";
+        let newline = text.find('\n').unwrap();
+        let emoji = text.find('👩').unwrap();
+        assert_eq!(
+            selected_source_rows(
+                &(emoji..text.len() - 2),
+                [
+                    (0, newline, newline + 1),
+                    (newline + 1, text.len(), text.len())
+                ],
+            ),
+            vec![(0, emoji..newline, true), (1, 0..2, false)]
+        );
+    }
 
     #[test]
     fn long_line_caret_scrolls_into_view_and_home_restores_left_edge() {

@@ -45,6 +45,7 @@ struct Options {
     filter: Option<String>,
     usecases_seed: Option<u64>,
     usecases_count: Option<usize>,
+    record_frames: bool,
 }
 
 impl Options {
@@ -57,6 +58,7 @@ impl Options {
             filter: None,
             usecases_seed: None,
             usecases_count: None,
+            record_frames: false,
         };
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
@@ -66,6 +68,7 @@ impl Options {
                 "--filter" => options.filter = Some(args.next().context("--filter needs a fixture name")?),
                 "--update-baselines" => options.update_baselines = true,
                 "--geometry-only" => options.geometry_only = true,
+                "--record-frames" => options.record_frames = true,
                 "--usecases-seed" => {
                     options.usecases_seed = Some(
                         args.next()
@@ -82,7 +85,7 @@ impl Options {
                             .context("--usecases-count must be a usize")?,
                     );
                 }
-                _ => bail!("Unknown argument {arg}. Use --output PATH, --baseline PATH, --update-baselines, --geometry-only, --filter NAME, --usecases-seed N, or --usecases-count N."),
+                _ => bail!("Unknown argument {arg}. Use --output PATH, --baseline PATH, --update-baselines, --geometry-only, --record-frames, --filter NAME, --usecases-seed N, or --usecases-count N."),
             }
         }
         ensure!(
@@ -92,6 +95,10 @@ impl Options {
         ensure!(
             !options.geometry_only || options.baseline.is_none(),
             "--geometry-only cannot compare or update screenshots"
+        );
+        ensure!(
+            !options.geometry_only || !options.record_frames,
+            "--record-frames requires Metal screenshots; omit --geometry-only"
         );
         ensure!(
             options
@@ -174,6 +181,9 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
                         &mut cx, window, &workspace, markdown, theme, &options,
                     )?;
                     check_source_horizontal_access(&mut cx, window, &workspace, theme, &options)?;
+                    snapshots += check_source_selection_geometry(
+                        &mut cx, window, &workspace, theme, &options,
+                    )?;
                     snapshots += 3;
                     checked_input = true;
                 }
@@ -212,59 +222,50 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
 
     // Use-case matrix: deterministic generated scenarios and curated journeys,
     // including the requested Enter-on-empty-task-list case.
-    // Traces land in `<output>/usecases/<name>.jsonl`.
+    // Each journey declares its own template. Run once per theme, rather than
+    // repeating identical journeys for every unrelated screenshot fixture.
+    // Traces land in `<output>/<theme>/journeys/usecases/<name>.jsonl`.
     let usecases_seed = options.usecases_seed.unwrap_or(0xC0DE_FEED_BEEF_C0DE);
-    let usecases_count = options.usecases_count.unwrap_or(20);
+    let usecases_count = options.usecases_count.unwrap_or(32);
     let mut total_usecases = 0usize;
-    // `check_input_selection_and_modes` writes "Café 👩🏽‍💻" to the headless
-    // clipboard as part of its Paste round-trip. Generated usecase scenarios
-    // that exercise cmd-shift-c / cmd-v then paste that emoji-laden string
-    // into the buffer, which trips `outline_headings`'s byte slice into the
-    // multi-byte `👩` codepoint (until the layout patch makes it char-safe).
-    // Start the loop from a known empty clipboard.
+    // Fixture clipboard content is declared independently of earlier native
+    // paste probes, so generated journeys do not inherit unrelated input.
     cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(String::new())));
     for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
-        for (name, _) in FIXTURES {
-            if options.filter.as_ref().is_some_and(|filter| filter != name) {
-                continue;
+        let (window, workspace) = open_fixture(&mut cx, "", theme)?;
+        let usecase_result: Result<usize> = (|| {
+            let n = crate::usecases::run_all(
+                &mut cx,
+                window,
+                &workspace,
+                usecases_seed,
+                usecases_count,
+                &options.output.join(theme_name(theme)).join("journeys"),
+                options.record_frames,
+            )?;
+            Ok(n)
+        })();
+        match usecase_result {
+            Ok(n) => total_usecases += n,
+            Err(err) => {
+                cx.update_window(window.into(), |_, window, _| window.remove_window())?;
+                drop(workspace);
+                cx.advance_clock(Duration::from_secs(2));
+                cx.run_until_parked();
+                return Err(err.context(format!("usecases ({}) failed", theme_name(theme))));
             }
-            let (window, workspace) = open_fixture(&mut cx, "", theme)?;
-            let usecase_result: Result<usize> = (|| {
-                let n = crate::usecases::run_all(
-                    &mut cx,
-                    window,
-                    &workspace,
-                    usecases_seed,
-                    usecases_count,
-                    &options.output,
-                )?;
-                Ok(n)
-            })();
-            match usecase_result {
-                Ok(n) => total_usecases += n,
-                Err(err) => {
-                    cx.update_window(window.into(), |_, window, _| window.remove_window())?;
-                    drop(workspace);
-                    cx.advance_clock(Duration::from_secs(2));
-                    cx.run_until_parked();
-                    return Err(err.context(format!(
-                        "usecases for fixture `{name}` ({}) failed",
-                        theme_name(theme)
-                    )));
-                }
-            }
-            cx.update_window(window.into(), |_, window, _| window.remove_window())?;
-            drop(workspace);
-            // Generated scenarios route every state change through
-            // workspace-bound tasks. The drain mirrors the baseline loop:
-            // drop the entity first so GPUI unregisters its handle, then
-            // let the autosave / parse pumps quiesce before the next
-            // fixture open — otherwise the auto-save task retains the
-            // workspace's Document entity and the next iteration panics
-            // with "Leaked handle for entity Document".
-            cx.advance_clock(Duration::from_secs(2));
-            cx.run_until_parked();
         }
+        cx.update_window(window.into(), |_, window, _| window.remove_window())?;
+        drop(workspace);
+        // Generated scenarios route every state change through
+        // workspace-bound tasks. The drain mirrors the baseline loop:
+        // drop the entity first so GPUI unregisters its handle, then
+        // let the autosave / parse pumps quiesce before the next
+        // fixture open — otherwise the auto-save task retains the
+        // workspace's Document entity and the next iteration panics
+        // with "Leaked handle for entity Document".
+        cx.advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
     }
     println!("PASS usecases: {total_usecases} scenarios total");
 
@@ -527,6 +528,113 @@ fn check_source_horizontal_access(
         window.bounds_changed(cx);
     })?;
     draw(cx, window)
+}
+
+/// A partial multi-line code selection must cover only its source-backed
+/// glyphs, remain above the code background, and vanish after deselection.
+fn check_source_selection_geometry(
+    cx: &mut HeadlessAppContext,
+    window: WindowHandle<MarkRustWindow>,
+    workspace: &Entity<Workspace>,
+    theme: ThemeChoice,
+    options: &Options,
+) -> Result<usize> {
+    use crate::visual_contract::{
+        painted_selection_rectangles, validate_selection_layering,
+        validate_source_selection_geometry, Rect,
+    };
+
+    let content = document_text(cx, workspace);
+    let start = content
+        .find("\nCloudSkills/\n")
+        .context("missing source code fixture")?
+        + 3;
+    let end = content
+        .find("marketplace.json")
+        .context("missing third code row")?
+        + 6;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.resize(size(px(720.), px(HEIGHT)));
+        window.bounds_changed(cx);
+    })?;
+    for (shortcut, mode_name) in [("alt-cmd-2", "source"), ("alt-cmd-3", "split")] {
+        keystroke(cx, window, shortcut)?;
+        cx.update_window(window.into(), |_, window, cx| {
+            let editor = workspace.read(cx).active_tab().unwrap().editor.clone();
+            window.focus(&editor.read(cx).focus_handle.clone(), cx);
+            editor.update(cx, |editor, cx| {
+                editor.jump_to(start, cx);
+                editor.select_to(end, cx);
+            });
+        })?;
+        draw(cx, window)?;
+        keystroke(cx, window, "shift-right")?;
+        let expected_selection = start..end + 1;
+        let check = |cx: &mut HeadlessAppContext,
+                     suffix: &str,
+                     expected: &std::ops::Range<usize>|
+         -> Result<()> {
+            let label = format!(
+                "paragraph-{}-{mode_name}-selection-{suffix}",
+                theme_name(theme)
+            );
+            let (selection, geometry, viewport, selection_color, code_color) =
+                cx.read_entity(workspace, |workspace, cx| {
+                    let tab = workspace.active_tab().unwrap();
+                    let editor = tab.editor.read(cx);
+                    let view = tab.editor_view.read(cx);
+                    (
+                        editor.selected_range.clone(),
+                        view.painted_geometry(),
+                        view.horizontal_scroll_state().0,
+                        editor.theme.selection,
+                        editor.theme.code_block_bg,
+                    )
+                });
+            let viewport = Rect::from_bounds(viewport);
+            let painted = cx.update_window(window.into(), |_, window, _| {
+                painted_selection_rectangles(window, selection_color, viewport)
+            })?;
+            std::fs::write(options.output.join(format!("{label}.selection.txt")),
+                format!("source selection: {selection:?}\nviewport: {viewport:?}\npainted: {painted:#?}\nsource rows: {geometry:#?}"))?;
+            if !options.geometry_only {
+                cx.capture_screenshot(window.into())
+                    .context("source selection screenshot failed")?
+                    .save(options.output.join(format!("{label}.png")))?;
+            }
+            ensure!(&selection == expected, "{label}: source keyboard selection differs from expected {expected:?}: {selection:?}");
+            validate_source_selection_geometry(
+                &geometry.rows,
+                &selection,
+                viewport,
+                &painted,
+                &label,
+            )?;
+            cx.update_window(window.into(), |_, window, _| {
+                validate_selection_layering(window, selection_color, code_color, viewport, &label)
+            })??;
+            println!("PASS {label} (source-to-scene coverage and background layering)");
+            Ok(())
+        };
+        check(cx, "partial", &expected_selection)?;
+        keystroke(cx, window, "right")?;
+        check(
+            cx,
+            "collapsed",
+            &(expected_selection.end..expected_selection.end),
+        )?;
+        ensure!(
+            document_text(cx, workspace) == content,
+            "source selection altered document bytes"
+        );
+    }
+    keystroke(cx, window, "alt-cmd-1")?;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.resize(size(px(1200.), px(HEIGHT)));
+        window.bounds_changed(cx);
+    })?;
+    draw(cx, window)?;
+    Ok(4)
 }
 
 /// Exercises every Markdown editing toolbar button via its keyboard
@@ -1100,40 +1208,7 @@ fn geometry(cx: &HeadlessAppContext, workspace: &Entity<Workspace>) -> Vec<Paint
 }
 
 fn validate_geometry(leaves: &[PaintedLeafGeometry], label: &str) -> Result<()> {
-    ensure!(
-        !leaves.is_empty(),
-        "{label}: native paint produced no text leaves"
-    );
-    let mut rectangles = Vec::new();
-    for (index, leaf) in leaves.iter().enumerate() {
-        let left = f32::from(leaf.bounds.left());
-        let right = f32::from(leaf.bounds.right());
-        let top = f32::from(leaf.bounds.top());
-        let bottom = f32::from(leaf.bounds.bottom());
-        ensure!(
-            !leaf.lines.is_empty(),
-            "{label}: leaf {index} has no shaped rows: {:?}",
-            leaf.text
-        );
-        for row in &leaf.lines {
-            ensure!(row.top >= top - 1. && row.top + row.height <= bottom + 1.,
-                "{label}: glyph rows overflow allocated leaf height: leaf={:?}, allocated={top:.1}..{bottom:.1}, row={:.1}..{:.1}", leaf.text, row.top, row.top + row.height);
-            ensure!(row.left >= left - 1. && row.right <= right + 1.,
-                "{label}: text escapes horizontal leaf bounds: leaf={:?}, allocated={left:.1}..{right:.1}, glyphs={:.1}..{:.1}", leaf.text, row.left, row.right);
-            rectangles.push((index, row.left, row.top, row.right, row.top + row.height));
-        }
-    }
-    for (position, &(a, al, at, ar, ab)) in rectangles.iter().enumerate() {
-        for &(b, bl, bt, br, bb) in &rectangles[position + 1..] {
-            ensure!(
-                a == b || ar.min(br) - al.max(bl) <= 1. || ab.min(bb) - at.max(bt) <= 1.,
-                "{label}: text in different leaves overlaps: {:?} and {:?}",
-                leaves[a].text,
-                leaves[b].text
-            );
-        }
-    }
-    Ok(())
+    crate::visual_contract::validate_text_geometry(leaves, label)
 }
 
 fn capture(
@@ -1348,41 +1423,59 @@ fn check_input_selection_and_modes(
         "Cmd-A failed to select all document text"
     );
     let label = format!("paragraph-{}-selection", theme_name(theme));
-    let selected_geometry = geometry(cx, workspace);
-    let color = cx.read_entity(workspace, |workspace, cx| {
-        workspace
-            .active_tab()
-            .unwrap()
-            .rich_view
-            .read(cx)
-            .theme
-            .selection
-    });
-    let (selection_rects, scale) = cx.update_window(window.into(), |_, window, _| {
-        (
+    let check_painted_selection = |cx: &mut HeadlessAppContext, label: &str| -> Result<()> {
+        use crate::visual_contract::{validate_selection_geometry, Rect};
+
+        let leaves = geometry(cx, workspace);
+        let (selection, viewport, color) = cx.read_entity(workspace, |workspace, cx| {
+            let view = workspace.active_tab().unwrap().rich_view.read(cx);
+            (
+                view.selected_range.clone(),
+                view.painted_viewport_bounds(),
+                view.theme.selection,
+            )
+        });
+        let viewport = Rect::from_bounds(viewport.context("selection viewport was not painted")?);
+        let painted = cx.update_window(window.into(), |_, window, _| {
+            let scale = window.scale_factor();
             window
                 .painted_quads()
                 .into_iter()
                 .filter(|quad| quad.background == color.into())
-                .collect::<Vec<_>>(),
-            window.scale_factor(),
-        )
-    })?;
-    ensure!(!selection_rects.is_empty(), "selection was not painted");
-    ensure!(
-        selection_rects.iter().all(|quad| selected_geometry
-            .iter()
-            .flat_map(|leaf| &leaf.lines)
-            .any(|line| {
-                (quad.bounds.origin.y.0 / scale - line.top).abs() <= 1.
-                    && quad.bounds.size.height.0 / scale <= line.height + 1.
-            })),
-        "selection uses one tall rectangle across wrapped rows"
-    );
+                .filter_map(|quad| {
+                    // Verify what the scene actually exposes after clipping,
+                    // not the selection painter's own intermediate geometry.
+                    let rect = Rect {
+                        left: quad.bounds.left().0.max(quad.content_mask.bounds.left().0) / scale,
+                        top: quad.bounds.top().0.max(quad.content_mask.bounds.top().0) / scale,
+                        right: quad
+                            .bounds
+                            .right()
+                            .0
+                            .min(quad.content_mask.bounds.right().0)
+                            / scale,
+                        bottom: quad
+                            .bounds
+                            .bottom()
+                            .0
+                            .min(quad.content_mask.bounds.bottom().0)
+                            / scale,
+                    };
+                    (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
+                })
+                .collect::<Vec<_>>()
+        })?;
+        std::fs::write(options.output.join(format!("{label}.selection.txt")),
+            format!("source selection: {selection:?}\nviewport: {viewport:?}\npainted: {painted:#?}\nleaves: {leaves:#?}"))?;
+        validate_selection_geometry(&leaves, &selection, viewport, &painted, label)
+    };
+    check_painted_selection(cx, &label)?;
     capture(cx, window, workspace, &label, options, true)?;
     keystroke(cx, window, "right")?;
+    check_painted_selection(cx, &format!("{label}-collapsed"))?;
     keystroke(cx, window, "shift-left")?;
     keystroke(cx, window, "shift-left")?;
+    check_painted_selection(cx, &format!("{label}-partial"))?;
     let before_selection = cx.read_entity(workspace, |workspace, cx| {
         let view = workspace.active_tab().unwrap().rich_view.read(cx);
         (view.selected_range.clone(), view.selection_reversed)

@@ -115,6 +115,8 @@ pub struct ImeLeafHit {
 #[derive(Debug, Clone)]
 pub struct PaintedLeafGeometry {
     pub text: String,
+    /// Source bytes represented by this leaf, excluding neighboring blocks.
+    pub source_range: Range<usize>,
     pub bounds: Bounds<Pixels>,
     pub lines: Vec<PaintedLineGeometry>,
 }
@@ -122,10 +124,14 @@ pub struct PaintedLeafGeometry {
 #[cfg(feature = "gui-tests")]
 #[derive(Debug, Clone)]
 pub struct PaintedLineGeometry {
+    pub visible_start: usize,
+    pub visible_end: usize,
     pub top: f32,
     pub height: f32,
     pub left: f32,
     pub right: f32,
+    /// Actual glyph positions mapped to Markdown bytes, not a second parser.
+    pub stops: Vec<VisualCaretStop>,
 }
 
 /// Per-frame IME geometry. Leaf/widget hits are cleared at the start of each
@@ -169,12 +175,26 @@ impl ImeOriginState {
             .iter()
             .map(|leaf| PaintedLeafGeometry {
                 text: leaf.layout.text.to_string(),
+                source_range: leaf
+                    .layout
+                    .source_at
+                    .first()
+                    .copied()
+                    .unwrap_or(leaf.layout.block_start)
+                    ..leaf
+                        .layout
+                        .source_at
+                        .last()
+                        .copied()
+                        .unwrap_or(leaf.layout.block_start),
                 bounds: leaf.bounds,
                 lines: self
                     .visual_lines
                     .iter()
                     .filter(|line| Arc::ptr_eq(&line.layout, &leaf.layout))
                     .map(|line| PaintedLineGeometry {
+                        visible_start: line.line.visible_start,
+                        visible_end: line.line.visible_end,
                         top: line.line.top,
                         height: line.line.height,
                         left: line
@@ -189,6 +209,7 @@ impl ImeOriginState {
                             .iter()
                             .map(|s| s.x)
                             .fold(f32::NEG_INFINITY, f32::max),
+                        stops: line.line.stops.clone(),
                     })
                     .collect(),
             })

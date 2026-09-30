@@ -8,11 +8,10 @@
 //! actions (keystrokes, raw text insertion, caret jumps, selections).
 //! For each action, the runner captures a `Snapshot` of the editor's
 //! state (caret, selection, mode, source, rendered top-level blocks,
-//! viewport) and writes it as a JSON line. After all actions, a set
-//! of `Invariant`s is checked against the final snapshot so regressions
-//! surface as a single failing assertion with a trace file alongside.
+//! viewport) and writes it as a JSON line. Semantic and transition contracts
+//! are checked after every action, including generated smoke journeys.
 //!
-//! The generator is deterministic per `seed` and produces 500+ scenarios
+//! The generator is deterministic per `seed` and can produce larger matrices
 //! by mixing document templates with action sequences; curated
 //! scenarios cover the small handful of behaviours users actually
 //! notice (Enter on an empty task item, mode switching, etc.).
@@ -21,15 +20,18 @@ use std::fs;
 use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
 use gpui::{AppContext, Entity, Focusable, HeadlessAppContext, Keystroke, Modifiers, WindowHandle};
 use markrust_core::rich::BlockKind;
 use serde::Serialize;
 
+use crate::observation::{InputOwner, Observation};
+use crate::session::WorkspaceCommand;
 use crate::window::MarkRustWindow;
 use crate::workspace::{EditorMode, Workspace};
+use markrust_editor::EditorCommand;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -71,8 +73,21 @@ pub struct Snapshot {
     pub source_viewport_offset_y: Option<f32>,
     pub source_viewport_y: Option<(f32, f32)>,
     pub source_caret_y: Option<(f32, f32)>,
-    /// Monotonic timestamp in milliseconds since UNIX epoch.
+    /// Semantic state and source-mapped observations from the real paint pass.
+    pub ui: Option<Observation>,
+    /// Response delta from the preceding frame, independent of timestamps.
+    pub response: Option<Response>,
+    /// Monotonic elapsed milliseconds since this scenario began.
     pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct Response {
+    pub document_changed: bool,
+    pub selection_changed: bool,
+    pub focus_changed: bool,
+    pub mode_changed: bool,
+    pub viewport_changed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -101,6 +116,14 @@ pub enum Action {
     JumpTo(usize),
     /// Focus the raw source pane in Split mode.
     FocusSource,
+    FocusRich,
+    SelectRange {
+        start: usize,
+        end: usize,
+    },
+    NewTab,
+    SwitchTab(usize),
+    EditFrontmatter,
 }
 
 impl Action {
@@ -110,6 +133,11 @@ impl Action {
             Action::InsertText(s) => format!("insert-text: {s:?}"),
             Action::JumpTo(o) => format!("jump-to: {o}"),
             Action::FocusSource => "focus-source".into(),
+            Action::FocusRich => "focus-wysiwyg".into(),
+            Action::SelectRange { start, end } => format!("select-range: {start}..{end}"),
+            Action::NewTab => "new-tab".into(),
+            Action::SwitchTab(index) => format!("switch-tab: {index}"),
+            Action::EditFrontmatter => "edit-frontmatter".into(),
         }
     }
 }
@@ -147,6 +175,8 @@ pub enum DocumentTemplate {
         paragraphs: usize,
     },
     Mixed,
+    Frontmatter,
+    Unicode,
 }
 
 impl DocumentTemplate {
@@ -231,6 +261,8 @@ impl DocumentTemplate {
                 s.push_str("trailing paragraph.\n");
                 s
             }
+            DocumentTemplate::Frontmatter => "---\ntitle: Example\n---\n\n# Body\n\nText.\n".into(),
+            DocumentTemplate::Unicode => "Café 👩🏽‍💻 **bold**\n\nSecond paragraph.\n".into(),
         }
     }
 }
@@ -276,6 +308,9 @@ pub enum Invariant {
     SourceCaretVisibleFromStep(usize),
     /// The source viewport must stay away from the document start from this step.
     SourceViewportScrolledFromStep(usize),
+    InputOwnedBy(InputOwner),
+    SourceEquals(String),
+    RichDisplayNotContains(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +323,9 @@ pub enum Invariant {
 /// item + Enter exits the list).
 pub fn curated_scenarios() -> Vec<Scenario> {
     let mixed_source = DocumentTemplate::Mixed.render();
+    let unicode_source = DocumentTemplate::Unicode.render();
+    let emoji_start = unicode_source.find('👩').unwrap();
+    let emoji_end = emoji_start + "👩🏽‍💻".len();
     let code_body = mixed_source
         .find("let x = 1;")
         .expect("mixed fixture contains a fenced code body");
@@ -387,7 +425,131 @@ pub fn curated_scenarios() -> Vec<Scenario> {
                 Action::Keystroke("alt-cmd-3".into()),
                 Action::Keystroke("alt-cmd-1".into()),
             ],
-            invariants: vec![Invariant::Mode(vec![EditorMode::Wysiwyg])],
+            invariants: vec![
+                Invariant::Mode(vec![EditorMode::Wysiwyg]),
+                Invariant::SourceEquals(mixed_source.clone()),
+            ],
+        },
+        Scenario {
+            name: "reversed_unicode_selection_survives_modes".into(),
+            template: DocumentTemplate::Unicode,
+            setup_caret: None,
+            actions: vec![
+                Action::SelectRange {
+                    start: emoji_end,
+                    end: emoji_start,
+                },
+                Action::Keystroke("alt-cmd-2".into()),
+                Action::Keystroke("alt-cmd-3".into()),
+                Action::Keystroke("alt-cmd-1".into()),
+            ],
+            invariants: vec![
+                Invariant::Selection(emoji_start..emoji_end),
+                Invariant::SourceEquals(unicode_source),
+            ],
+        },
+        Scenario {
+            name: "unicode_selection_replacement_undo_restores_context".into(),
+            template: DocumentTemplate::Unicode,
+            setup_caret: None,
+            actions: vec![
+                Action::SelectRange {
+                    start: emoji_end,
+                    end: emoji_start,
+                },
+                Action::InsertText("X".into()),
+                Action::Keystroke("cmd-z".into()),
+            ],
+            invariants: vec![
+                Invariant::SourceEquals(DocumentTemplate::Unicode.render()),
+                Invariant::Selection(emoji_start..emoji_end),
+            ],
+        },
+        Scenario {
+            name: "markup_hint_toggle_preserves_selected_content".into(),
+            template: DocumentTemplate::Mixed,
+            setup_caret: None,
+            actions: vec![
+                Action::SelectRange { start: 36, end: 40 },
+                Action::Keystroke("alt-cmd-4".into()),
+            ],
+            invariants: vec![
+                Invariant::Selection(36..40),
+                Invariant::SourceEquals(mixed_source.clone()),
+                Invariant::RichDisplayNotContains("**".into()),
+            ],
+        },
+        Scenario {
+            name: "split_source_tab_return_restores_input_owner".into(),
+            template: DocumentTemplate::Mixed,
+            setup_caret: Some(20),
+            actions: vec![
+                Action::Keystroke("alt-cmd-3".into()),
+                Action::FocusSource,
+                Action::SelectRange { start: 20, end: 33 },
+                Action::Keystroke("alt-cmd-3".into()),
+                Action::NewTab,
+                Action::SwitchTab(0),
+            ],
+            invariants: vec![
+                Invariant::Selection(20..33),
+                Invariant::SourceEquals(mixed_source.clone()),
+                Invariant::InputOwnedBy(InputOwner::Source),
+            ],
+        },
+        Scenario {
+            name: "frontmatter_edit_from_split_focuses_visible_source".into(),
+            template: DocumentTemplate::Frontmatter,
+            setup_caret: None,
+            actions: vec![
+                Action::Keystroke("alt-cmd-3".into()),
+                Action::EditFrontmatter,
+                Action::Keystroke("down".into()),
+                Action::Keystroke("end".into()),
+                Action::InsertText(" improved".into()),
+            ],
+            invariants: vec![
+                Invariant::Mode(vec![EditorMode::Source]),
+                Invariant::InputOwnedBy(InputOwner::Source),
+                Invariant::SourceContains("title: Example improved".into()),
+            ],
+        },
+        Scenario {
+            name: "split_delete_in_source_then_type_in_rich".into(),
+            template: DocumentTemplate::Mixed,
+            setup_caret: None,
+            actions: vec![
+                Action::JumpTo(usize::MAX),
+                Action::Keystroke("alt-cmd-3".into()),
+                Action::FocusSource,
+                Action::Keystroke("cmd-a".into()),
+                Action::Keystroke("backspace".into()),
+                Action::FocusRich,
+                Action::InsertText("Fresh".into()),
+            ],
+            invariants: vec![
+                Invariant::SourceEquals("Fresh".into()),
+                Invariant::CaretAt(5),
+            ],
+        },
+        Scenario {
+            name: "split_delete_in_rich_then_type_in_source".into(),
+            template: DocumentTemplate::Mixed,
+            setup_caret: None,
+            actions: vec![
+                Action::Keystroke("alt-cmd-2".into()),
+                Action::JumpTo(usize::MAX),
+                Action::Keystroke("alt-cmd-3".into()),
+                Action::FocusRich,
+                Action::Keystroke("cmd-a".into()),
+                Action::Keystroke("backspace".into()),
+                Action::FocusSource,
+                Action::InsertText("Fresh".into()),
+            ],
+            invariants: vec![
+                Invariant::SourceEquals("Fresh".into()),
+                Invariant::CaretAt(5),
+            ],
         },
         Scenario {
             name: "long_document_edit_keeps_caret_visible".into(),
@@ -560,13 +722,9 @@ pub fn generate_scenarios(seed: u64, count: usize) -> Vec<Scenario> {
             .collect::<Vec<_>>();
 
         let name = format!("gen_{:04}_{}", out.len(), short_template_name(&template));
-        // Generated scenarios are smoke tests: we just need the run to
-        // complete without crashing and the trace to capture the
-        // before/after state. The trace file itself is the artifact;
-        // invariants are left empty to avoid spurious failures from
-        // the heuristic block counter over-counting list-item lines
-        // (each list item shows up as its own "block" in the heuristic
-        // but a single `BulletList` block in the rich engine).
+        // Every frame checks focus, UTF-8 selection, revisions, source policy,
+        // selection paint and non-mutating action contracts. Generated smoke
+        // journeys need no template-specific guesses about block counts.
         let invariants: Vec<Invariant> = Vec::new();
 
         out.push(Scenario {
@@ -608,6 +766,8 @@ fn short_template_name(t: &DocumentTemplate) -> &'static str {
         DocumentTemplate::Table { .. } => "table",
         DocumentTemplate::Blockquote { .. } => "quote",
         DocumentTemplate::Mixed => "mixed",
+        DocumentTemplate::Frontmatter => "frontmatter",
+        DocumentTemplate::Unicode => "unicode",
     }
 }
 
@@ -680,11 +840,86 @@ pub fn run_scenario(
     workspace: &Entity<Workspace>,
     scenario: &Scenario,
     output_dir: &Path,
+    record_frames: bool,
+) -> Result<Snapshot> {
+    crate::evidence::validate_name(&scenario.name)?;
+    let result = run_scenario_inner(cx, window, workspace, scenario, output_dir, record_frames);
+    let report = match &result {
+        Ok(snapshot) => serde_json::json!({
+            "scenario": scenario.name, "status": "passed", "checked_steps": snapshot.step + 1,
+            "contracts": ["visible-input-owner", "utf8-selection", "current-render-revision", "mode-policy", "action-response"],
+        }),
+        Err(error) => {
+            if let Ok(screenshot) = cx.capture_screenshot(window.into()) {
+                let _ = screenshot.save(
+                    output_dir
+                        .join("usecases")
+                        .join(format!("{}.failure.png", scenario.name)),
+                );
+            }
+            serde_json::json!({"scenario": scenario.name, "status": "failed", "error": format!("{error:#}")})
+        }
+    };
+    fs::write(
+        output_dir
+            .join("usecases")
+            .join(format!("{}.report.json", scenario.name)),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    let trace = fs::read_to_string(
+        output_dir
+            .join("usecases")
+            .join(format!("{}.jsonl", scenario.name)),
+    )?;
+    let snapshots = trace
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<Vec<Snapshot>, _>>()?;
+    crate::evidence::write_review(
+        &output_dir.join("usecases"),
+        &scenario.name,
+        &snapshots,
+        result
+            .as_ref()
+            .err()
+            .map(|error| format!("{error:#}"))
+            .as_deref(),
+        record_frames,
+    )?;
+    result
+}
+
+fn run_scenario_inner(
+    cx: &mut HeadlessAppContext,
+    window: WindowHandle<MarkRustWindow>,
+    workspace: &Entity<Workspace>,
+    scenario: &Scenario,
+    output_dir: &Path,
+    record_frames: bool,
 ) -> Result<Snapshot> {
     let usecases_dir = output_dir.join("usecases");
     fs::create_dir_all(&usecases_dir)
         .with_context(|| format!("creating usecases output dir {}", usecases_dir.display()))?;
     let trace_path = usecases_dir.join(format!("{}.jsonl", scenario.name));
+    let mut file = fs::File::create(&trace_path)?;
+    let started = Instant::now();
+
+    // Each journey starts with fresh document/history/views and declared UI
+    // policy. A prior Source journey must not turn a WYSIWYG test into Source.
+    cx.update_window(window.into(), |_, window, cx| {
+        workspace.update(cx, |ws, cx| {
+            ws.config.markup_hints_enabled = true;
+            ws.new_document(window, cx);
+            while ws.tabs.len() > 1 {
+                ws.close_tab(0, window, cx);
+            }
+            ws.sidebar_open = false;
+            ws.outline_open = false;
+            ws.panel_overlay = None;
+            ws.palette_open = false;
+            cx.notify();
+        });
+    })?;
 
     // Reset the document to the template's source and place the caret
     // at the requested starting offset (or 0).
@@ -695,13 +930,14 @@ pub fn run_scenario(
         let len = tab.document.read(cx).buffer.len_bytes();
         (len, tab.document.clone())
     });
-    doc_entity.update(cx, |doc, _| {
+    doc_entity.update(cx, |doc, cx| {
         doc.replace_range(0, len, &source);
         // Without draining the parse pump, `syntax_spans` keeps claiming
         // positions from the prior buffer revision; the next outline
         // query then OOB-slices into the new (often empty) source. The
         // fixture bootstrap uses the same barrier (`wait_for_parse`).
         let _ = doc.wait_for_parse(Duration::from_secs(30));
+        cx.notify();
     });
     move_caret(cx, window, workspace, setup_caret.min(source.len()))?;
     // `replace_range` triggers a deferred re-parse + render cycle. Drawing a
@@ -710,31 +946,16 @@ pub fn run_scenario(
     draw(cx, window)?;
 
     let mut snapshots = Vec::with_capacity(scenario.actions.len() + 1);
-    snapshots.push(capture_snapshot(
-        cx,
-        window,
-        workspace,
-        0,
-        &Action::JumpTo(setup_caret),
-    )?);
-
-    for (step, action) in scenario.actions.iter().enumerate() {
-        apply_action(cx, window, workspace, action)?;
-        // Always draw after a dispatch: the existing `keystroke()` helper in
-        // visual_tests uses the same pattern. Without `window.refresh()` /
-        // `window.draw()` the input pipeline's on_action handlers may not
-        // flush their document mutations into the snapshot reader.
-        draw(cx, window)?;
-        snapshots.push(capture_snapshot(cx, window, workspace, step + 1, action)?);
+    let mut initial = capture_snapshot(cx, window, workspace, 0, &Action::JumpTo(setup_caret))?;
+    initial.timestamp_ms = started.elapsed().as_millis() as u64;
+    if record_frames {
+        cx.capture_screenshot(window.into())?
+            .save(usecases_dir.join(format!("{}.step-000.png", scenario.name)))?;
     }
-
-    // Write the trace.
-    let mut file = fs::File::create(&trace_path)
-        .with_context(|| format!("opening usecase trace file {}", trace_path.display()))?;
-    for snap in &snapshots {
-        let line = serde_json::to_string(snap)?;
-        writeln!(file, "{}", line)?;
-    }
+    writeln!(file, "{}", serde_json::to_string(&initial)?)?;
+    file.flush()?;
+    validate_snapshot(&scenario.name, &initial)?;
+    snapshots.push(initial);
 
     let step_invariants: Vec<_> = scenario
         .invariants
@@ -750,20 +971,52 @@ pub fn run_scenario(
         })
         .cloned()
         .collect();
-    for snapshot in snapshots.iter().skip(1) {
-        check_invariants(
-            &format!(
-                "{} step {} ({})",
-                scenario.name,
-                snapshot.step,
-                snapshot.action.describe()
-            ),
-            snapshot,
-            &step_invariants,
-        )?;
-    }
 
-    Ok(snapshots.last().cloned().unwrap())
+    for (step, action) in scenario.actions.iter().enumerate() {
+        let label = format!(
+            "{} step {} ({})",
+            scenario.name,
+            step + 1,
+            action.describe()
+        );
+        apply_action(cx, window, workspace, action)
+            .with_context(|| format!("{label}: dispatch failed"))?;
+        // Always draw after a dispatch: the existing `keystroke()` helper in
+        // visual_tests uses the same pattern. Without `window.refresh()` /
+        // `window.draw()` the input pipeline's on_action handlers may not
+        // flush their document mutations into the snapshot reader.
+        draw(cx, window).with_context(|| {
+            format!("{label}: drawing failed; trace ends at the last completed step")
+        })?;
+        let mut snapshot =
+            capture_snapshot(cx, window, workspace, step + 1, action).with_context(|| {
+                format!("{label}: observation failed; trace ends at the last completed step")
+            })?;
+        let previous = snapshots.last().unwrap();
+        snapshot.timestamp_ms = started.elapsed().as_millis() as u64;
+        snapshot.response = Some(response(previous, &snapshot));
+        if record_frames {
+            cx.capture_screenshot(window.into())?.save(
+                usecases_dir.join(format!("{}.step-{:03}.png", scenario.name, snapshot.step)),
+            )?;
+        }
+        writeln!(file, "{}", serde_json::to_string(&snapshot)?)?;
+        file.flush()?;
+        let label = format!(
+            "{} step {} ({})",
+            scenario.name,
+            snapshot.step,
+            action.describe()
+        );
+        validate_snapshot(&label, &snapshot)?;
+        crate::observation::validate_paint(cx, window, workspace, &label)?;
+        check_response(previous, &snapshot, action).with_context(|| label.clone())?;
+        check_invariants(&label, &snapshot, &step_invariants)?;
+        snapshots.push(snapshot);
+    }
+    let final_snapshot = snapshots.last().cloned().unwrap();
+    check_invariants(&scenario.name, &final_snapshot, &scenario.invariants)?;
+    Ok(final_snapshot)
 }
 
 fn move_caret(
@@ -852,6 +1105,43 @@ fn apply_action(
                 window.focus(&handle, cx);
             })?;
         }
+        Action::FocusRich => {
+            cx.update_window(window.into(), |_, window, cx| {
+                let tab = workspace.read(cx).active_tab().unwrap();
+                window.focus(&tab.rich_view.read(cx).focus_handle(cx), cx);
+            })?;
+        }
+        Action::SelectRange { start, end } => {
+            cx.update_window(window.into(), |_, window, cx| {
+                workspace.update(cx, |ws, cx| {
+                    ws.dispatch(
+                        WorkspaceCommand::Editor(EditorCommand::SetSelection {
+                            start: *start,
+                            end: *end,
+                        }),
+                        window,
+                        cx,
+                    )
+                })
+            })??;
+        }
+        Action::NewTab | Action::SwitchTab(_) | Action::EditFrontmatter => {
+            cx.update_window(window.into(), |_, window, cx| {
+                workspace.update(cx, |ws, cx| match action {
+                    Action::NewTab => {
+                        ws.new_document(window, cx);
+                        Ok(())
+                    }
+                    Action::SwitchTab(index) => {
+                        ws.dispatch(WorkspaceCommand::SwitchTab(*index), window, cx)
+                    }
+                    Action::EditFrontmatter => {
+                        ws.dispatch(WorkspaceCommand::EditFrontmatter, window, cx)
+                    }
+                    _ => unreachable!(),
+                })
+            })??;
+        }
     }
     Ok(())
 }
@@ -881,6 +1171,7 @@ fn capture_snapshot(
     step: usize,
     action: &Action,
 ) -> Result<Snapshot> {
+    let ui = crate::observation::capture(cx, window, workspace)?;
     let source_focused = cx.update_window(window.into(), |_, window, cx| {
         let tab = workspace.read(cx).active_tab().unwrap();
         tab.editor.read(cx).focus_handle.is_focused(window)
@@ -974,10 +1265,9 @@ fn capture_snapshot(
             source_viewport_offset_y,
             source_viewport_y,
             source_caret_y,
-            timestamp_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            ui: Some(ui),
+            response: None,
+            timestamp_ms: 0,
         }
     }))
 }
@@ -1007,7 +1297,7 @@ fn collect_blocks(engine: &markrust_core::rich::RichEngine, source: &str) -> Vec
         .collect()
 }
 
-fn block_kind_label(kind: &BlockKind) -> String {
+pub(crate) fn block_kind_label(kind: &BlockKind) -> String {
     match kind {
         BlockKind::Paragraph => "paragraph".into(),
         BlockKind::Heading { level, .. } => format!("heading({level})"),
@@ -1039,6 +1329,125 @@ fn mode_label(mode: EditorMode) -> String {
         EditorMode::Source => "source".into(),
         EditorMode::Split => "split".into(),
     }
+}
+
+fn response(before: &Snapshot, after: &Snapshot) -> Response {
+    Response {
+        document_changed: before.source != after.source,
+        selection_changed: before.selection != after.selection || before.caret != after.caret,
+        focus_changed: before.ui.as_ref().map(|ui| &ui.input_owner)
+            != after.ui.as_ref().map(|ui| &ui.input_owner),
+        mode_changed: before.mode != after.mode,
+        viewport_changed: before.viewport_first_block != after.viewport_first_block
+            || before.viewport_offset_px != after.viewport_offset_px
+            || before.source_viewport_offset_y != after.source_viewport_offset_y
+            || before
+                .ui
+                .as_ref()
+                .map(|ui| (&ui.rich_pane.viewport, &ui.source_pane.viewport))
+                != after
+                    .ui
+                    .as_ref()
+                    .map(|ui| (&ui.rich_pane.viewport, &ui.source_pane.viewport)),
+    }
+}
+
+fn validate_snapshot(label: &str, snapshot: &Snapshot) -> Result<()> {
+    let ui = snapshot
+        .ui
+        .as_ref()
+        .context("missing semantic UI observation")?;
+    crate::observation::validate(ui, &snapshot.source, &snapshot.mode)
+        .with_context(|| format!("{label}: UI state contract"))
+}
+
+fn check_response(before: &Snapshot, after: &Snapshot, action: &Action) -> Result<()> {
+    let before_ui = before.ui.as_ref().context("missing before-state")?;
+    let after_ui = after.ui.as_ref().context("missing after-state")?;
+    let preserve_source = match action {
+        Action::FocusSource
+        | Action::FocusRich
+        | Action::JumpTo(_)
+        | Action::SelectRange { .. }
+        | Action::EditFrontmatter => true,
+        Action::Keystroke(key) => {
+            key.starts_with("alt-cmd-")
+                && matches!(
+                    key.as_str(),
+                    "alt-cmd-1" | "alt-cmd-2" | "alt-cmd-3" | "alt-cmd-4"
+                )
+                || matches!(
+                    key.rsplit('-').next(),
+                    Some("left" | "right" | "up" | "down" | "home" | "end")
+                )
+        }
+        _ => false,
+    };
+    ensure!(
+        !preserve_source || before.source == after.source,
+        "non-editing action changed Markdown bytes"
+    );
+    match action {
+        Action::FocusSource => ensure!(
+            after_ui.input_owner == InputOwner::Source,
+            "Source did not receive input focus"
+        ),
+        Action::FocusRich => ensure!(
+            after_ui.input_owner == InputOwner::Wysiwyg,
+            "WYSIWYG did not receive body input focus"
+        ),
+        Action::SelectRange { start, end } => {
+            ensure!(
+                after.selection == (start.min(end).to_owned()..start.max(end).to_owned()),
+                "selection action did not select the requested range"
+            );
+            let pane = if after_ui.source_pane.focused {
+                &after_ui.source_pane
+            } else {
+                &after_ui.rich_pane
+            };
+            ensure!(
+                pane.reversed == (start > end),
+                "selection direction was lost"
+            );
+        }
+        Action::Keystroke(key)
+            if matches!(
+                key.as_str(),
+                "alt-cmd-1" | "alt-cmd-2" | "alt-cmd-3" | "alt-cmd-4"
+            ) =>
+        {
+            let expected_mode = match key.as_str() {
+                "alt-cmd-1" => Some("wysiwyg"),
+                "alt-cmd-2" => Some("source"),
+                "alt-cmd-3" => Some("split"),
+                _ => None,
+            };
+            if let Some(mode) = expected_mode {
+                ensure!(
+                    after.mode == mode,
+                    "mode command expected {mode}, got {}",
+                    after.mode
+                );
+            }
+            ensure!(
+                before.selection == after.selection && before.caret == after.caret,
+                "mode/hint change moved selection {:?}/{} to {:?}/{}",
+                before.selection,
+                before.caret,
+                after.selection,
+                after.caret
+            );
+            if key == "alt-cmd-4" {
+                ensure!(
+                    before_ui.markup_hints != after_ui.markup_hints,
+                    "markup hint command did not change display policy"
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,6 +1576,13 @@ pub fn check_invariants(
                     );
                 }
             }
+            Invariant::InputOwnedBy(owner) => ensure!(snapshot.ui.as_ref().is_some_and(|ui| ui.input_owner == *owner),
+                "[{scenario_name}] expected input owner {owner:?}"),
+            Invariant::SourceEquals(expected) => ensure!(snapshot.source == *expected,
+                "[{scenario_name}] document bytes differ from expected result"),
+            Invariant::RichDisplayNotContains(needle) => ensure!(snapshot.ui.as_ref().is_some_and(|ui|
+                ui.painted_rich.iter().all(|leaf| !leaf.text.contains(needle))),
+                "[{scenario_name}] hidden markup {needle:?} is still painted"),
         }
     }
     Ok(())
@@ -1186,25 +1602,13 @@ pub fn run_all(
     seed: u64,
     count: usize,
     output_dir: &Path,
+    record_frames: bool,
 ) -> Result<usize> {
     let scenarios = generate_scenarios(seed, count);
     let curated_len = curated_scenarios().len();
     let mut passed = 0usize;
     for scenario in &scenarios {
-        let snapshot = run_scenario(cx, window, workspace, scenario, output_dir)?;
-        if let Err(error) = check_invariants(&scenario.name, &snapshot, &scenario.invariants) {
-            // The JSONL trace records every action and model response. When a
-            // renderer is available, keep the final painted frame beside it.
-            // Geometry-only CI intentionally has no screenshot renderer.
-            if let Ok(screenshot) = cx.capture_screenshot(window.into()) {
-                let path = output_dir
-                    .join("usecases")
-                    .join(format!("{}.failure.png", scenario.name));
-                let _ = screenshot.save(path);
-            }
-            return Err(error)
-                .with_context(|| format!("scenario `{}` failed invariants", scenario.name));
-        }
+        run_scenario(cx, window, workspace, scenario, output_dir, record_frames)?;
         passed += 1;
     }
     println!(
@@ -1310,6 +1714,8 @@ mod tests {
             source_viewport_offset_y: None,
             source_viewport_y: None,
             source_caret_y: None,
+            ui: None,
+            response: None,
             timestamp_ms: 0,
         };
         let json = serde_json::to_string(&snap).unwrap();

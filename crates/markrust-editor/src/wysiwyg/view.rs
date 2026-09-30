@@ -34,8 +34,8 @@ use super::image::{
 };
 use super::ime::{ImeLeafHit, ImeOriginState, VisualLine};
 use crate::headless::{
-    next_boundary, next_word_end, prev_word_start, previous_boundary, CaretMove, EditorCommand,
-    EditorOutcome,
+    clamp_selection_to_content, next_boundary, next_word_end, prev_word_start, previous_boundary,
+    CaretMove, EditorCommand, EditorOutcome,
 };
 use crate::theme::EditorTheme;
 use crate::wrap::{wrap_selection, WrapKind};
@@ -122,6 +122,18 @@ fn clamp_grapheme_boundary(text: &str, offset: usize) -> usize {
         .take_while(|start| *start <= offset)
         .last()
         .unwrap_or(0)
+}
+
+/// Commands describe anchor and caret offsets, but rendering requires an
+/// ordered range plus a separate direction. Keep both endpoints on complete
+/// visible characters even when a programmatic selection supplies stale bytes.
+fn body_selection_for_offsets(source: &str, start: usize, end: usize) -> CaretState {
+    let mut caret = CaretState {
+        range: start.min(end)..start.max(end),
+        reversed: start > end,
+    };
+    clamp_selection_to_content(source, &mut caret.range, &mut caret.reversed);
+    caret
 }
 
 /// Tab / Shift-Tab while a language chip, image caption, or frontmatter
@@ -558,6 +570,7 @@ pub struct RichEditorView {
     synced_revision: Option<u64>,
     pub selected_range: Range<usize>,
     pub selection_reversed: bool,
+    selection_revision: u64,
     /// Horizontal intent for repeated rendered Up/Down moves. This is kept
     /// separately from the source selection because a short wrapped row must
     /// not permanently change the column restored on the next long row.
@@ -656,6 +669,24 @@ impl RichEditorView {
         self.visual_test_bounds
     }
 
+    /// Revision used by the current immutable render snapshot.
+    #[cfg(feature = "gui-tests")]
+    pub fn test_render_revision(&self) -> Option<u64> {
+        self.synced_revision
+    }
+
+    /// Fixed semantic label only; widget drafts are not diagnostic metadata.
+    #[cfg(feature = "gui-tests")]
+    pub fn test_widget_kind(&self) -> Option<&'static str> {
+        match self.widget_edit {
+            WidgetEdit::Idle => None,
+            WidgetEdit::CodeInfo { .. } => Some("code-info"),
+            WidgetEdit::ImageAlt { .. } => Some("image-alt"),
+            WidgetEdit::Frontmatter { .. } => Some("frontmatter-field"),
+            WidgetEdit::FrontmatterYaml { .. } => Some("frontmatter-yaml"),
+        }
+    }
+
     /// Current list scroll anchor, viewport, and this frame's painted body caret.
     /// A missing caret means that the target is outside the rendered items.
     #[cfg(feature = "gui-tests")]
@@ -690,7 +721,30 @@ impl RichEditorView {
             this.commit_widget_edit(cx);
             this.stop_blink(cx);
         });
+        let selection_revision = document.read(cx).revision();
         let doc_sub = cx.observe(&document, |this, _, cx| {
+            let doc = this.document.read(cx);
+            let revision = doc.revision();
+            if this.selection_revision != revision {
+                // Composition belongs to the previous source context, even
+                // when replacement text has the same length and the caret's
+                // numerical range remains valid. Own edits skip this branch.
+                super::ime::clear_composition(
+                    &mut this.preedit,
+                    &mut this.widget_preedit,
+                    &mut this.marked_range,
+                );
+                let source = doc.buffer.content();
+                if clamp_selection_to_content(
+                    &source,
+                    &mut this.selected_range,
+                    &mut this.selection_reversed,
+                ) {
+                    this.table_select_all_cell = None;
+                    this.pending_caret_reveal = true;
+                }
+                this.selection_revision = revision;
+            }
             this.vertical_preferred_x = None;
             this.ime.clear_visual_navigation();
             // Whenever the document mutates we have to mirror its parsed
@@ -715,6 +769,7 @@ impl RichEditorView {
             synced_revision: None,
             selected_range: 0..0,
             selection_reversed: false,
+            selection_revision,
             vertical_preferred_x: None,
             table_select_all_cell: None,
             marked_range: None,
@@ -846,6 +901,7 @@ impl RichEditorView {
             }
         });
         self.restore_caret(caret);
+        self.selection_revision = self.document.read(cx).revision();
         if outcome != RichOutcome::Noop {
             self.vertical_preferred_x = None;
             self.ime.clear_visual_navigation();
@@ -945,10 +1001,11 @@ impl RichEditorView {
             }
             EditorCommand::SetSelection { start, end } => {
                 self.vertical_preferred_x = None;
-                let len = self.document.read(cx).buffer.len_bytes();
+                let source = self.document.read(cx).buffer.content();
+                let caret = body_selection_for_offsets(&source, start, end);
                 self.table_select_all_cell = None;
-                self.selected_range = start.min(len)..end.min(len);
-                self.selection_reversed = start > end;
+                self.selected_range = caret.range;
+                self.selection_reversed = caret.reversed;
                 self.pending_caret_reveal = true;
                 cx.notify();
                 EditorOutcome::CaretMoved
@@ -1252,6 +1309,7 @@ impl RichEditorView {
             self.table_select_all_cell = None;
             self.selected_range = snap.range();
             self.selection_reversed = snap.reversed;
+            self.selection_revision = self.document.read(cx).revision();
             self.engine.invalidate();
             self.snapshot = None;
             self.pending_caret_reveal = true;
@@ -1274,6 +1332,7 @@ impl RichEditorView {
             self.table_select_all_cell = None;
             self.selected_range = snap.range();
             self.selection_reversed = snap.reversed;
+            self.selection_revision = self.document.read(cx).revision();
             self.engine.invalidate();
             self.snapshot = None;
             self.pending_caret_reveal = true;
@@ -3323,6 +3382,25 @@ fn table_toolbar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_selection_command_orders_a_reversed_unicode_range() {
+        let source = "alpha 👩‍💻 beta\nsecond line";
+        let caret = body_selection_for_offsets(source, 21, 6);
+        assert_eq!(caret.range, 6..21);
+        assert!(caret.reversed);
+    }
+
+    #[test]
+    fn body_selection_command_repairs_grapheme_and_document_boundaries() {
+        let source = "a👩‍💻e\u{301}z";
+        let caret = body_selection_for_offsets(source, 14, 3);
+        assert_eq!(caret.range, 1..12);
+        assert!(caret.reversed);
+        let caret = body_selection_for_offsets(source, usize::MAX, 99);
+        assert_eq!(caret.range, source.len()..source.len());
+        assert!(!caret.reversed);
+    }
     use markrust_core::rich::NodeId;
 
     #[test]

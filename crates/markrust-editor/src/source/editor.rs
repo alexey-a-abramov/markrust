@@ -11,7 +11,10 @@ use gpui::{
 };
 use markrust_core::Document;
 
-use crate::headless::{apply_editor_command, CaretMove, EditorCommand, EditorOutcome, EditorState};
+use crate::headless::{
+    apply_editor_command, clamp_selection_to_content, CaretMove, EditorCommand, EditorOutcome,
+    EditorState,
+};
 use crate::masking::{Caret, Selection};
 use crate::theme::EditorTheme;
 use crate::wrap::WrapKind;
@@ -102,6 +105,7 @@ pub struct MarkdownEditor {
     pub focus_handle: FocusHandle,
     pub selected_range: Range<usize>,
     pub selection_reversed: bool,
+    selection_revision: u64,
     pub marked_range: Option<Range<usize>>,
     pub is_selecting: bool,
     pub cursor_visible: bool,
@@ -128,7 +132,27 @@ impl MarkdownEditor {
         let blur_sub = cx.on_blur(&focus_handle, window, |this, _window, cx| {
             this.stop_blink(cx);
         });
-        let doc_sub = cx.observe(&document, |_, _, cx| cx.notify());
+        let selection_revision = document.read(cx).revision();
+        let doc_sub = cx.observe(&document, |editor, _, cx| {
+            let doc = editor.document.read(cx);
+            let revision = doc.revision();
+            if editor.selection_revision != revision {
+                // Even a same-length external replacement invalidates the
+                // composition's source range. Own IME edits have already
+                // advanced selection_revision and never take this branch.
+                editor.marked_range = None;
+                let content = doc.buffer.content();
+                if clamp_selection_to_content(
+                    &content,
+                    &mut editor.selected_range,
+                    &mut editor.selection_reversed,
+                ) {
+                    editor.last_caret_bounds = None;
+                }
+                editor.selection_revision = revision;
+            }
+            cx.notify();
+        });
 
         Self {
             document,
@@ -136,6 +160,7 @@ impl MarkdownEditor {
             focus_handle,
             selected_range: 0..0,
             selection_reversed: false,
+            selection_revision,
             marked_range: None,
             is_selecting: false,
             cursor_visible: false,
@@ -193,6 +218,10 @@ impl MarkdownEditor {
             }
         });
         self.restore_state(state);
+        // Own commands already return their new selection. In particular,
+        // marked-text input may select inside an in-progress grapheme: the
+        // external-edit repair must not override the IME's active selection.
+        self.selection_revision = self.document.read(cx).revision();
         if outcome != EditorOutcome::Noop {
             self.reset_blink(cx);
         }

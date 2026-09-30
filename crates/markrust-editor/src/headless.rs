@@ -212,7 +212,11 @@ impl HeadlessEditor {
         }
         let len = self.document.buffer.len_bytes();
         self.document.replace_range(0, len, text);
-        self.state.clamp_to(self.document.buffer.len_bytes());
+        clamp_selection_to_content(
+            text,
+            &mut self.state.selected_range,
+            &mut self.state.selection_reversed,
+        );
         self.sync_parse();
     }
 
@@ -330,6 +334,11 @@ pub fn apply_editor_command(
             let selection = Selection::new(start, end);
             state.selected_range = selection.start..selection.end;
             state.selection_reversed = start > end;
+            clamp_selection_to_content(
+                &document.buffer.content(),
+                &mut state.selected_range,
+                &mut state.selection_reversed,
+            );
             Ok(EditorOutcome::CaretMoved)
         }
         EditorCommand::Undo => {
@@ -617,6 +626,51 @@ pub fn next_boundary(content: &str, offset: usize) -> usize {
         .unwrap_or(content.len())
 }
 
+/// Repair a view's own selection after another surface changes the shared
+/// document. This is deliberately not a source-edit rebase: valid offsets stay
+/// put, but stale offsets cannot exceed the text or split a visible character.
+pub(crate) fn clamp_selection_to_content(
+    content: &str,
+    range: &mut Range<usize>,
+    reversed: &mut bool,
+) -> bool {
+    let before = (range.clone(), *reversed);
+    let start = range.start.min(content.len());
+    let end = range.end.min(content.len());
+    let mut repaired_start = if start == content.len() { start } else { 0 };
+    let mut repaired_end = if end == content.len() { end } else { 0 };
+    if start != content.len() || end != content.len() {
+        let scan_through = if start == content.len() {
+            end
+        } else if end == content.len() {
+            start
+        } else {
+            start.max(end)
+        };
+        for (boundary, _) in content.grapheme_indices(true) {
+            if boundary > scan_through {
+                break;
+            }
+            if start != content.len() && boundary <= start {
+                repaired_start = boundary;
+            }
+            if end != content.len() && boundary <= end {
+                repaired_end = boundary;
+            }
+        }
+    }
+    if repaired_start > repaired_end {
+        *range = repaired_end..repaired_start;
+        *reversed = !*reversed;
+    } else {
+        *range = repaired_start..repaired_end;
+    }
+    if range.start == range.end {
+        *reversed = false;
+    }
+    before != (range.clone(), *reversed)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CharKind {
     Word,
@@ -759,6 +813,21 @@ mod tests {
         assert_eq!(editor.state.selected_range, 0..5);
         editor.apply(EditorCommand::Backspace).unwrap();
         assert_eq!(editor.content(), "");
+    }
+
+    #[test]
+    fn selection_command_repairs_unicode_endpoints_and_preserves_direction() {
+        let mut editor = HeadlessEditor::new("a👩‍💻e\u{301}z");
+        editor
+            .apply(EditorCommand::SetSelection { start: 14, end: 3 })
+            .unwrap();
+        assert_eq!(editor.state.selected_range, 1..12);
+        assert!(editor.state.selection_reversed);
+        editor
+            .apply(EditorCommand::SetSelection { start: 2, end: 3 })
+            .unwrap();
+        assert_eq!(editor.state.selected_range, 1..1);
+        assert!(!editor.state.selection_reversed);
     }
 
     #[test]
@@ -1041,6 +1110,78 @@ mod tests {
         assert!(editor.cursor_offset() <= editor.content().len());
         editor.set_content_from_ui("# Title\n\nbody");
         assert_eq!(editor.content(), "# Title\n\nbody");
+    }
+
+    #[test]
+    fn shared_document_emptying_repairs_stale_selection_before_typing() {
+        let mut inactive = EditorState {
+            selected_range: 12..64,
+            selection_reversed: true,
+        };
+        assert!(clamp_selection_to_content(
+            "",
+            &mut inactive.selected_range,
+            &mut inactive.selection_reversed,
+        ));
+        assert_eq!(inactive.selected_range, 0..0);
+        assert!(!inactive.selection_reversed);
+        let mut doc = Document::new("");
+        apply_editor_command(
+            &mut doc,
+            &mut inactive,
+            EditorCommand::InsertText("✓".into()),
+        )
+        .unwrap();
+        assert_eq!(doc.buffer.content(), "✓");
+        assert_eq!(inactive.selected_range, 3..3);
+    }
+
+    #[test]
+    fn shared_document_clamp_preserves_valid_reversed_selection() {
+        let mut range = 1..12;
+        let mut reversed = true;
+        assert!(!clamp_selection_to_content(
+            "a👩‍💻e\u{301}z",
+            &mut range,
+            &mut reversed,
+        ));
+        assert_eq!(range, 1..12);
+        assert!(reversed);
+        assert!(clamp_selection_to_content("abc", &mut range, &mut reversed));
+        assert_eq!(range, 1..3);
+        assert!(reversed);
+    }
+
+    #[test]
+    fn shared_document_clamp_cannot_split_utf8_or_extended_graphemes() {
+        let source = "a👩‍💻e\u{301}z";
+        let mut range = 3..14;
+        let mut reversed = true;
+        assert!(clamp_selection_to_content(
+            source,
+            &mut range,
+            &mut reversed
+        ));
+        assert_eq!(range, 1..12);
+        assert!(reversed);
+        range = 14..14;
+        assert!(clamp_selection_to_content(
+            source,
+            &mut range,
+            &mut reversed
+        ));
+        assert_eq!(range, 12..12);
+        assert!(!reversed);
+    }
+
+    #[test]
+    fn whole_buffer_replacement_repairs_caret_inside_a_new_grapheme() {
+        let mut editor = HeadlessEditor::new("abcd");
+        editor.apply(EditorCommand::JumpTo(2)).unwrap();
+        editor.set_content_from_ui("a👩‍💻z");
+        assert_eq!(editor.state.selected_range, 1..1);
+        editor.apply(EditorCommand::InsertText("x".into())).unwrap();
+        assert_eq!(editor.content(), "ax👩‍💻z");
     }
 
     #[test]

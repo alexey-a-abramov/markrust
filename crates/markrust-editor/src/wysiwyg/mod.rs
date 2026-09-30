@@ -15,4 +15,4 @@ mod view;
 pub use view::RichEditorView;
 
 #[cfg(feature = "gui-tests")]
-pub use ime::{PaintedLeafGeometry, PaintedLineGeometry};
+pub use ime::{PaintedLeafGeometry, PaintedLineGeometry, VisualCaretStop};

@@ -17,7 +17,13 @@ mod window;
 mod workspace;
 
 #[cfg(feature = "gui-tests")]
+mod evidence;
+#[cfg(feature = "gui-tests")]
+pub mod observation;
+#[cfg(feature = "gui-tests")]
 pub mod usecases;
+#[cfg(feature = "gui-tests")]
+mod visual_contract;
 #[cfg(feature = "gui-tests")]
 pub mod visual_tests;
 
