@@ -15,6 +15,7 @@ pub(crate) struct MenuState {
     pub mode: EditorMode,
     pub sidebar_open: bool,
     pub outline_open: bool,
+    pub markup_hints_enabled: bool,
 }
 
 impl Default for MenuState {
@@ -23,6 +24,7 @@ impl Default for MenuState {
             mode: EditorMode::default(),
             sidebar_open: true,
             outline_open: true,
+            markup_hints_enabled: true,
         }
     }
 }
@@ -117,6 +119,9 @@ pub(crate) fn application_menus(state: MenuState) -> Vec<Menu> {
             MenuItem::action("Split View", ShowSplit).checked(state.mode == EditorMode::Split),
             MenuItem::action("Next Editor Mode", ToggleEditorMode),
             MenuItem::separator(),
+            MenuItem::action("Show Markup Hints", ToggleMarkupHints)
+                .checked(state.markup_hints_enabled),
+            MenuItem::separator(),
             MenuItem::action("Show Sidebar", ToggleSidebar).checked(state.sidebar_open),
             MenuItem::action("Show Outline", ToggleOutline).checked(state.outline_open),
             MenuItem::separator(),
@@ -162,6 +167,21 @@ mod tests {
                 EditorMode::Split => <ShowSplit as gpui::Action>::name_for_type(),
             };
             assert_eq!(action.name(), expected);
+        }
+    }
+
+    #[test]
+    fn markup_hints_menu_tracks_the_preference() {
+        for enabled in [true, false] {
+            let menus = application_menus(MenuState {
+                markup_hints_enabled: enabled,
+                ..MenuState::default()
+            });
+            let view = menus.iter().find(|menu| menu.name == "View").unwrap();
+            let item = view.items.iter().find(
+                |item| matches!(item, MenuItem::Action { name, .. } if name == "Show Markup Hints"),
+            );
+            assert_eq!(item.unwrap().is_checked(), enabled);
         }
     }
 

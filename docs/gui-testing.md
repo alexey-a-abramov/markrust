@@ -19,6 +19,23 @@ renders directly to images. It does not need Screen Recording permission or
 open a window on the desktop. The normal editor binary does not include this
 test harness.
 
+The default run uses 20 scenarios per fixture and theme, combining curated
+journeys with deterministic generated action sequences. For a longer local
+stress run, pass `--usecases-count 500`; the CI gate keeps the bounded default
+so failures produce evidence promptly.
+
+The use-case runner also records each fixture action and the resulting editor
+model in `<output>/usecases/*.jsonl`: source, selection, mode, rendered blocks,
+and viewport state. A failed invariant keeps the trace and, when Metal capture
+is available, a `.failure.png` of the final frame. These are test-fixture
+artifacts, not a recorder for real documents or production keystrokes.
+
+For a quick local check while working on navigation:
+
+```bash
+cargo run --locked -p markrust-app --features gui-tests --example gui_regression -- --geometry-only --filter paragraph --usecases-count 12 --output target/gui-regression-smoke
+```
+
 ## What belongs in this suite
 
 - Long prose, links, inline code, nested lists, and narrow table cells.
@@ -35,6 +52,12 @@ When a visual bug is reported, add a small Markdown fixture that reproduces
 it. Preserve the problematic structure and line lengths; remove unrelated
 personal content. Confirm that its assertion fails with the old behavior
 before treating the test as a regression guard.
+
+For focus or scroll bugs, assert the logical response after each meaningful
+action (active pane, selection, caret visibility, and viewport anchor), then
+capture a small number of visual checkpoints. The editor's `Document` and
+render state are the source of truth; tests should inspect that state rather
+than maintain a second model that can drift from the UI.
 
 ## Compare screenshots
 

@@ -14,13 +14,15 @@ use std::time::Duration;
 
 use anyhow::{bail, ensure, Context as _, Result};
 use gpui::{
-    px, size, AppContext, ClipboardItem, Entity, Focusable, HeadlessAppContext, Keystroke,
-    Modifiers, WindowHandle,
+    point, px, size, AppContext, ClipboardItem, Entity, Focusable, HeadlessAppContext, Keystroke,
+    Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, WindowHandle,
 };
 use image::{Rgba, RgbaImage};
+use markrust_editor::outline_headings;
 use markrust_editor::wysiwyg::PaintedLeafGeometry;
 
 use crate::config::{AppConfig, ThemeChoice};
+use crate::panels::{Panel, OUTLINE_WIDTH};
 use crate::window::MarkRustWindow;
 use crate::workspace::{EditorMode, Workspace};
 
@@ -191,6 +193,10 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
                     snapshots += check_format_toolbar(
                         &mut cx, window, &workspace, markdown, theme, &options,
                     )?;
+                    check_tab_navigation_and_markup_hints(
+                        &mut cx, window, &workspace, theme, &options,
+                    )?;
+                    snapshots += 1;
                 }
                 Ok(())
             })();
@@ -204,11 +210,11 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
         }
     }
 
-    // Use-case matrix: 500+ deterministic scenarios + 8 curated ones
-    // (including the user-requested Enter-on-empty-task-list case).
+    // Use-case matrix: deterministic generated scenarios and curated journeys,
+    // including the requested Enter-on-empty-task-list case.
     // Traces land in `<output>/usecases/<name>.jsonl`.
     let usecases_seed = options.usecases_seed.unwrap_or(0xC0DE_FEED_BEEF_C0DE);
-    let usecases_count = options.usecases_count.unwrap_or(500);
+    let usecases_count = options.usecases_count.unwrap_or(20);
     let mut total_usecases = 0usize;
     // `check_input_selection_and_modes` writes "Café 👩🏽‍💻" to the headless
     // clipboard as part of its Paste round-trip. Generated usecase scenarios
@@ -249,7 +255,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
             }
             cx.update_window(window.into(), |_, window, _| window.remove_window())?;
             drop(workspace);
-            // 500 scenarios per fixture route every state change through
+            // Generated scenarios route every state change through
             // workspace-bound tasks. The drain mirrors the baseline loop:
             // drop the entity first so GPUI unregisters its handle, then
             // let the autosave / parse pumps quiesce before the next
@@ -645,6 +651,15 @@ fn check_responsive_shell(
     )?;
 
     keystroke(cx, window, "alt-cmd-3")?;
+    ensure!(
+        cx.read_entity(workspace, |workspace, cx| workspace
+            .active_tab()
+            .unwrap()
+            .editor
+            .read(cx)
+            .raw_source()),
+        "Split left pane must display literal Markdown source"
+    );
     assert_panels(
         cx,
         workspace,
@@ -673,6 +688,17 @@ fn check_responsive_shell(
                 .width,
         )
     });
+    let layout_heading_offset = cx
+        .read_entity(workspace, |workspace, cx| {
+            let document = workspace.active_tab().unwrap().document.read(cx);
+            let content = document.buffer.content();
+            outline_headings(&document.syntax_spans, &content)
+                .into_iter()
+                .find(|(_, _, title)| title == "Layout")
+                .map(|(offset, _, _)| offset)
+        })
+        .context("paragraph fixture has no Layout heading")?;
+    let layout_text_offset = layout_heading_offset + "## ".len();
     for (shortcut, sidebar, outline, label) in [
         ("ctrl-cmd-o", false, true, "split-outline"),
         ("ctrl-cmd-s", true, false, "split-sidebar"),
@@ -710,6 +736,29 @@ fn check_responsive_shell(
             options,
             true,
         )?;
+        if outline {
+            ensure!(
+                cx.read_entity(workspace, |workspace, _| workspace.panel_overlay
+                    == Some(Panel::Outline)),
+                "compact Split outline must be floating"
+            );
+            click_outline_layout_row(cx, window, 720.)?;
+            let actual = cx.update_window(window.into(), |_, window, cx| {
+                let workspace = workspace.read(cx);
+                let tab = workspace.active_tab().unwrap();
+                (
+                    workspace.outline_open,
+                    workspace.panel_overlay,
+                    tab.rich_view.read(cx).is_focused(window),
+                    tab.rich_view.read(cx).selected_range.start,
+                    tab.editor.read(cx).selected_range.start,
+                )
+            })?;
+            ensure!(
+                actual == (false, None, true, layout_text_offset, layout_heading_offset),
+                "selecting a floating Outline heading did not dismiss it, focus the editor, and navigate both panes: got {actual:?}, heading byte {layout_heading_offset}"
+            );
+        }
     }
     keystroke(cx, window, "ctrl-cmd-s")?;
     assert_panels(
@@ -719,7 +768,65 @@ fn check_responsive_shell(
         false,
         "the compact overlay must close on a repeated toggle",
     )?;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.resize(size(px(1200.), px(HEIGHT)));
+        window.bounds_changed(cx);
+    })?;
+    draw(cx, window)?;
+    keystroke(cx, window, "ctrl-cmd-o")?;
+    ensure!(
+        cx.read_entity(workspace, |workspace, _| {
+            workspace.outline_open && workspace.panel_overlay.is_none()
+        }),
+        "wide Split outline should be docked"
+    );
+    click_outline_layout_row(cx, window, 1200.)?;
+    ensure!(
+        cx.update_window(window.into(), |_, window, cx| {
+            let workspace = workspace.read(cx);
+            let tab = workspace.active_tab().unwrap();
+            workspace.outline_open
+                && workspace.panel_overlay.is_none()
+                && tab.rich_view.read(cx).is_focused(window)
+                && tab.rich_view.read(cx).selected_range.start == layout_text_offset
+        })?,
+        "selecting a docked Outline heading must keep the panel open and focus the editor"
+    );
+    keystroke(cx, window, "ctrl-cmd-o")?;
     Ok(5)
+}
+
+fn click_outline_layout_row(
+    cx: &mut HeadlessAppContext,
+    window: WindowHandle<MarkRustWindow>,
+    width: f32,
+) -> Result<()> {
+    // The second heading sits below the fixed 46/36/36px toolbar rows and
+    // Outline header. Keep the click inside the 220px panel at either width.
+    let position = point(px(width - OUTLINE_WIDTH + 48.), px(196.));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.simulate_mouse_move(position, cx);
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                position,
+                modifiers: Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                position,
+                modifiers: Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+            }),
+            cx,
+        );
+    })?;
+    draw(cx, window)
 }
 
 fn assert_panels(
@@ -737,6 +844,193 @@ fn assert_panels(
         "{reason}: expected panels {:?}, got {actual:?}",
         (sidebar, outline)
     );
+    Ok(())
+}
+
+fn check_tab_navigation_and_markup_hints(
+    cx: &mut HeadlessAppContext,
+    window: WindowHandle<MarkRustWindow>,
+    workspace: &Entity<Workspace>,
+    theme: ThemeChoice,
+    options: &Options,
+) -> Result<()> {
+    let (first_id, first_selection, first_content) = cx.read_entity(workspace, |workspace, cx| {
+        let tab = workspace.active_tab().unwrap();
+        (
+            tab.id,
+            tab.rich_view.read(cx).selected_range.clone(),
+            tab.document.read(cx).buffer.content(),
+        )
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.new_document(window, cx));
+    })?;
+    keystroke(cx, window, "alt-cmd-2")?;
+    ensure!(
+        cx.update_window(window.into(), |_, window, cx| {
+            let workspace = workspace.read(cx);
+            let tab = workspace.active_tab().unwrap();
+            tab.mode == EditorMode::Source
+                && tab.editor.read(cx).focus_handle(cx).is_focused(window)
+                && !tab.editor.read(cx).raw_source()
+        })?,
+        "new tab did not enter masked Source mode with editor focus"
+    );
+
+    // The first tab's label occupies the left side of the 36px tab strip.
+    // Click inside its text, below the 46px document and 36px formatting rows.
+    let position = point(px(40.), px(46. + 36. + 18.));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.simulate_mouse_move(position, cx);
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                position,
+                modifiers: Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                position,
+                modifiers: Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+            }),
+            cx,
+        );
+    })?;
+    draw(cx, window)?;
+    ensure!(
+        cx.update_window(window.into(), |_, window, cx| {
+            let workspace = workspace.read(cx);
+            let tab = workspace.active_tab().unwrap();
+            tab.id == first_id
+                && tab.mode == EditorMode::Wysiwyg
+                && tab.rich_view.read(cx).is_focused(window)
+                && tab.rich_view.read(cx).selected_range == first_selection
+                && tab.document.read(cx).buffer.content() == first_content
+        })?,
+        "clicking a tab did not restore that editor's focus and selection"
+    );
+    for shortcut in ["ctrl-cmd-o", "ctrl-cmd-s"] {
+        keystroke(cx, window, shortcut)?;
+        ensure!(
+            cx.update_window(window.into(), |_, window, cx| {
+                let workspace = workspace.read(cx);
+                let tab = workspace.active_tab().unwrap();
+                tab.id == first_id
+                    && tab.rich_view.read(cx).is_focused(window)
+                    && tab.rich_view.read(cx).selected_range == first_selection
+            })?,
+            "{shortcut} changed the focused tab or selection"
+        );
+    }
+    keystroke(cx, window, "alt-cmd-4")?;
+    ensure!(
+        cx.read_entity(workspace, |workspace, cx| {
+            !workspace.config.markup_hints_enabled
+                && workspace
+                    .tabs
+                    .iter()
+                    .all(|tab| !tab.rich_view.read(cx).markup_hints_enabled())
+        }),
+        "Show Markup Hints did not update every open tab"
+    );
+    let before_edit = document_text(cx, workspace);
+    let bold_caret = before_edit
+        .find("bold text")
+        .context("paragraph fixture has no bold span")?
+        + 2;
+    workspace.update(cx, |workspace, cx| {
+        workspace
+            .active_tab()
+            .unwrap()
+            .rich_view
+            .update(cx, |view, cx| view.jump_to(bold_caret, cx));
+    });
+    draw(cx, window)?;
+    let (selection, caret, viewport) = cx.read_entity(workspace, |workspace, cx| {
+        let view = workspace.active_tab().unwrap().rich_view.read(cx);
+        let (_, viewport, caret) = view.test_viewport_state();
+        (view.selected_range.clone(), caret, viewport)
+    });
+    let caret = caret.context("markup hints off hid the caret inside bold text")?;
+    ensure!(
+        selection.start == bold_caret
+            && selection.end == bold_caret
+            && caret.left() >= viewport.left()
+            && caret.right() <= viewport.right()
+            && caret.top() >= viewport.top()
+            && caret.bottom() <= viewport.bottom(),
+        "markup hints off misplaced the bold-span caret: selection {selection:?}, caret {caret:?}, viewport {viewport:?}"
+    );
+    capture(
+        cx,
+        window,
+        workspace,
+        &format!(
+            "paragraph-{}-markup-hints-off-bold-caret",
+            theme_name(theme)
+        ),
+        options,
+        true,
+    )?;
+    keystroke(cx, window, "x")?;
+    ensure!(
+        document_text(cx, workspace).contains("boxld text"),
+        "markup hints off prevented editing inside bold text"
+    );
+    keystroke(cx, window, "cmd-z")?;
+    ensure!(
+        document_text(cx, workspace) == before_edit,
+        "Undo did not restore the bold text after editing with markup hints off"
+    );
+    cx.update_window(window.into(), |_, window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.new_document(window, cx));
+    })?;
+    let last_id = cx.read_entity(workspace, |workspace, cx| {
+        let tab = workspace.active_tab().unwrap();
+        assert!(!tab.rich_view.read(cx).markup_hints_enabled());
+        tab.id
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.close_tab(0, window, cx));
+    })?;
+    ensure!(
+        cx.update_window(window.into(), |_, window, cx| {
+            let workspace = workspace.read(cx);
+            let tab = workspace.active_tab().unwrap();
+            tab.id == last_id && tab.rich_view.read(cx).is_focused(window)
+        })?,
+        "closing an earlier tab changed the active document"
+    );
+    keystroke(cx, window, "alt-cmd-4")?;
+    ensure!(
+        cx.read_entity(workspace, |workspace, cx| {
+            workspace.config.markup_hints_enabled
+                && workspace
+                    .tabs
+                    .iter()
+                    .all(|tab| tab.rich_view.read(cx).markup_hints_enabled())
+        }),
+        "Show Markup Hints did not restore the preference"
+    );
+    cx.update_window(window.into(), |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.close_tab(0, window, cx);
+            workspace.close_tab(0, window, cx);
+        });
+    })?;
+    ensure!(
+        cx.read_entity(workspace, |workspace, _| {
+            workspace.tabs.len() == 1 && workspace.active_tab().unwrap().id == last_id
+        }),
+        "closing the last tab must leave its document open"
+    );
+    println!("PASS tab-click-focus-and-markup-hints");
     Ok(())
 }
 

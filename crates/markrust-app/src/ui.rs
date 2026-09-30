@@ -204,10 +204,12 @@ pub fn document_tab(
         theme.tab_inactive
     };
     let id_string: SharedString = id.into();
+    let debug_id = id_string.to_string();
     let label: SharedString = label.into();
     let close_id = SharedString::from(format!("{id_string}-close"));
     div()
         .id(id_string)
+        .debug_selector(move || debug_id)
         .role(Role::Tab)
         .aria_label(label.clone())
         .aria_selected(active)

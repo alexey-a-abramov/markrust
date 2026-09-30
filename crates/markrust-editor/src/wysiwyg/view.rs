@@ -552,6 +552,8 @@ pub struct RichEditorView {
     pub theme: EditorTheme,
     engine: RichEngine,
     list_state: ListState,
+    markup_hints_enabled: bool,
+    pending_caret_reveal: bool,
     snapshot: Option<Arc<RenderSnapshot>>,
     synced_revision: Option<u64>,
     pub selected_range: Range<usize>,
@@ -602,6 +604,46 @@ pub struct RichEditorView {
     _subscriptions: Vec<Subscription>,
 }
 
+fn reconcile_list_state(
+    list_state: &ListState,
+    splice: Option<(Range<usize>, usize)>,
+    new_count: usize,
+) {
+    let old_count = list_state.item_count();
+    if let Some((range, count)) = splice {
+        if range.start <= range.end
+            && range.end <= old_count
+            && old_count - (range.end - range.start) + count == new_count
+        {
+            if range.len() == count {
+                // Content changed inside the same top-level slots. Retain the
+                // pixel offset within the item currently at the viewport top.
+                list_state.remeasure_items(range);
+            } else {
+                let scroll_top = list_state.logical_scroll_top();
+                let replaced_top = range.contains(&scroll_top.item_ix);
+                let replacement_start = range.start;
+                list_state.splice(range, count);
+                if replaced_top {
+                    list_state.scroll_to(gpui::ListOffset {
+                        item_ix: replacement_start.min(new_count.saturating_sub(1)),
+                        offset_in_item: scroll_top.offset_in_item,
+                    });
+                }
+            }
+            return;
+        }
+    }
+    // The empty-document placeholder has one list item but no tree block,
+    // so its splice cannot be applied directly. A same-size fallback still
+    // keeps the current viewport anchor.
+    if old_count == new_count {
+        list_state.remeasure_items(0..new_count);
+    } else {
+        list_state.splice(0..old_count, new_count);
+    }
+}
+
 impl RichEditorView {
     /// Inspect what GPUI actually shaped and painted, not an estimated layout.
     #[cfg(feature = "gui-tests")]
@@ -612,6 +654,19 @@ impl RichEditorView {
     #[cfg(feature = "gui-tests")]
     pub fn painted_viewport_bounds(&self) -> Option<Bounds<Pixels>> {
         self.visual_test_bounds
+    }
+
+    /// Current list scroll anchor, viewport, and this frame's painted body caret.
+    /// A missing caret means that the target is outside the rendered items.
+    #[cfg(feature = "gui-tests")]
+    pub fn test_viewport_state(
+        &self,
+    ) -> (gpui::ListOffset, Bounds<Pixels>, Option<Bounds<Pixels>>) {
+        (
+            self.list_state.logical_scroll_top(),
+            self.list_state.viewport_bounds(),
+            self.ime.focused_leaf().and_then(|leaf| leaf.caret_bounds),
+        )
     }
 
     /// Borrow the rich engine for inspection (tests, debug overlays).
@@ -654,6 +709,8 @@ impl RichEditorView {
             theme,
             engine: RichEngine::new(),
             list_state: ListState::new(0, ListAlignment::Top, px(512.)),
+            markup_hints_enabled: true,
+            pending_caret_reveal: false,
             snapshot: None,
             synced_revision: None,
             selected_range: 0..0,
@@ -697,7 +754,29 @@ impl RichEditorView {
         self.vertical_preferred_x = None;
         self.ime.clear_visual_navigation();
         self.snapshot = None;
-        self.synced_revision = None;
+        self.list_state.remeasure();
+        self.request_caret_reveal(cx);
+        cx.notify();
+    }
+
+    pub fn markup_hints_enabled(&self) -> bool {
+        self.markup_hints_enabled
+    }
+
+    pub fn set_markup_hints_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.markup_hints_enabled == enabled {
+            return;
+        }
+        self.markup_hints_enabled = enabled;
+        self.snapshot = None;
+        self.ime.clear_visual_navigation();
+        self.list_state.remeasure();
+        self.request_caret_reveal(cx);
+    }
+
+    /// Reveal the current caret after a mode switch or an external selection change.
+    pub fn request_caret_reveal(&mut self, cx: &mut Context<Self>) {
+        self.pending_caret_reveal = true;
         cx.notify();
     }
 
@@ -740,6 +819,7 @@ impl RichEditorView {
         self.table_select_all_cell = None;
         self.selected_range = caret.range;
         self.selection_reversed = caret.reversed;
+        self.pending_caret_reveal = true;
     }
 
     pub fn apply_rich(&mut self, command: RichCommand, cx: &mut Context<Self>) -> RichOutcome {
@@ -771,7 +851,6 @@ impl RichEditorView {
             self.ime.clear_visual_navigation();
             self.reset_blink(cx);
             self.snapshot = None;
-            self.synced_revision = None;
         }
         cx.notify();
         outcome
@@ -870,6 +949,7 @@ impl RichEditorView {
                 self.table_select_all_cell = None;
                 self.selected_range = start.min(len)..end.min(len);
                 self.selection_reversed = start > end;
+                self.pending_caret_reveal = true;
                 cx.notify();
                 EditorOutcome::CaretMoved
             }
@@ -1174,7 +1254,7 @@ impl RichEditorView {
             self.selection_reversed = snap.reversed;
             self.engine.invalidate();
             self.snapshot = None;
-            self.synced_revision = None;
+            self.pending_caret_reveal = true;
             cx.notify();
             EditorOutcome::Changed
         } else {
@@ -1196,7 +1276,7 @@ impl RichEditorView {
             self.selection_reversed = snap.reversed;
             self.engine.invalidate();
             self.snapshot = None;
-            self.synced_revision = None;
+            self.pending_caret_reveal = true;
             cx.notify();
             EditorOutcome::Changed
         } else {
@@ -1287,8 +1367,68 @@ impl RichEditorView {
             self.selected_range = offset..offset;
             self.selection_reversed = false;
         }
+        self.pending_caret_reveal = true;
         self.reset_blink(cx);
         cx.notify();
+    }
+
+    /// First bring the caret's top-level block into the virtualized viewport.
+    /// A second adjustment after its text paints handles tall blocks whose
+    /// caret may still be outside the viewport.
+    fn reveal_caret_item(&self) {
+        if !self.pending_caret_reveal || self.list_state.item_count() == 0 {
+            return;
+        }
+        let blocks = &self.engine.tree().blocks;
+        let caret = self.cursor_offset();
+        let index = blocks
+            .iter()
+            .position(|block| caret <= block.source_range.end)
+            .unwrap_or_else(|| blocks.len().saturating_sub(1));
+        if index >= self.list_state.item_count() {
+            return;
+        }
+        let viewport = self.list_state.viewport_bounds();
+        if let Some(bounds) = self.list_state.bounds_for_item(index) {
+            if bounds.bottom() <= viewport.top() || bounds.top() >= viewport.bottom() {
+                self.list_state.scroll_to_reveal_item(index);
+            }
+        } else if index != self.list_state.logical_scroll_top().item_ix {
+            // An unmeasured item has zero estimated height. Reveal-by-item
+            // advances only as many rows as the list measures each frame;
+            // direct anchoring reaches a distant caret in the next paint.
+            self.list_state.scroll_to(gpui::ListOffset {
+                item_ix: index,
+                offset_in_item: px(0.),
+            });
+        }
+    }
+
+    fn adjust_scroll_to_painted_caret(&mut self, caret: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if !self.pending_caret_reveal || !matches!(self.widget_edit, WidgetEdit::Idle) {
+            return;
+        }
+        let viewport = self.list_state.viewport_bounds();
+        let height = f32::from(viewport.size.height);
+        if height <= 0. {
+            return;
+        }
+        let margin = 12f32.min(height * 0.25);
+        let top = f32::from(viewport.top()) + margin;
+        let bottom = f32::from(viewport.bottom()) - margin;
+        let delta = if f32::from(caret.top()) < top {
+            f32::from(caret.top()) - top
+        } else if f32::from(caret.bottom()) > bottom {
+            f32::from(caret.bottom()) - bottom
+        } else {
+            0.
+        };
+        if delta.abs() > 0.5 {
+            self.list_state.scroll_by(px(delta));
+            cx.notify();
+        } else {
+            self.pending_caret_reveal = false;
+        }
     }
 
     /// Prefer the last painted WYSIWYG glyph geometry for a one-row vertical
@@ -1300,8 +1440,19 @@ impl RichEditorView {
                 .visual_vertical_target(cursor, delta, self.vertical_preferred_x)
         {
             self.vertical_preferred_x = Some(target.preferred_x);
-            if let Some(source) = target.source {
-                return source;
+            if let Some(target_source) = target.source {
+                // A revealed fence or list marker is a painted row but not
+                // an editable caret stop. If move_to would clamp it back to
+                // the current code-body position, use the source-line path
+                // to cross that structural row instead of trapping Up/Down.
+                let snapped = self.engine.clamp_raw_prefix(
+                    source,
+                    self.engine.snap_caret(target_source, Bias::Left),
+                    Bias::Left,
+                );
+                if snapped != cursor {
+                    return target_source;
+                }
             }
         }
         self.engine.vertical_caret(source, cursor, delta)
@@ -1400,7 +1551,7 @@ impl RichEditorView {
             }
         }
         let widget_only = self.synced_revision == Some(revision) && self.snapshot.is_none();
-        let (base_dir, source, old_real) = {
+        let (base_dir, source) = {
             let doc = self.document.read(cx);
             let base_dir = doc
                 .path
@@ -1408,26 +1559,17 @@ impl RichEditorView {
                 .and_then(|p| p.parent())
                 .map(|p| p.to_path_buf());
             let source = doc.buffer.content();
-            let old_real = self.engine.tree().blocks.len();
             self.engine.sync(doc);
-            (base_dir, source, old_real)
+            (base_dir, source)
         };
         let new_real = self.engine.tree().blocks.len();
         let new_count = new_real.max(1);
         if !widget_only {
-            match self.engine.last_splice() {
-                Some(splice) if self.synced_revision.is_some() && old_real > 0 && new_real > 0 => {
-                    self.list_state
-                        .splice(splice.range.clone(), splice.new_count);
-                }
-                _ => {
-                    self.list_state.splice(
-                        0..old_real.max(1).min(new_count.max(old_real.max(1))),
-                        new_count,
-                    );
-                    self.list_state = ListState::new(new_count, ListAlignment::Top, px(512.));
-                }
-            }
+            let splice = self
+                .engine
+                .last_splice()
+                .map(|splice| (splice.range.clone(), splice.new_count));
+            reconcile_list_state(&self.list_state, splice, new_count);
         }
         self.enqueue_data_images(revision, cx);
         self.enqueue_local_images(base_dir.as_deref(), revision, cx);
@@ -1451,6 +1593,7 @@ impl RichEditorView {
             },
             caret,
             selected_range,
+            markup_hints_enabled: self.markup_hints_enabled,
         });
         self.snapshot = Some(snapshot.clone());
         self.synced_revision = Some(revision);
@@ -2137,6 +2280,12 @@ impl WysiwygHost for RichEditorView {
         });
     }
 
+    fn ensure_pending_caret_visible(&mut self, cx: &mut Context<Self>) {
+        if let Some(caret) = self.ime.focused_leaf().and_then(|leaf| leaf.caret_bounds) {
+            self.adjust_scroll_to_painted_caret(caret, cx);
+        }
+    }
+
     fn report_painted_bounds(&mut self, bounds: Bounds<Pixels>) {
         self.ime.report_painted_bounds(bounds);
     }
@@ -2345,6 +2494,7 @@ impl Render for RichEditorView {
             composing,
         );
         let snapshot = self.sync_snapshot(cx);
+        self.reveal_caret_item();
         let theme = self.theme.clone();
         let editor = cx.entity();
         let focus = self.focus_handle.clone();
@@ -3174,6 +3324,51 @@ fn table_toolbar(
 mod tests {
     use super::*;
     use markrust_core::rich::NodeId;
+
+    #[test]
+    fn content_remeasurement_preserves_scroll_inside_active_block() {
+        let list = ListState::new(30, ListAlignment::Top, px(512.));
+        list.scroll_to(gpui::ListOffset {
+            item_ix: 12,
+            offset_in_item: px(84.),
+        });
+
+        reconcile_list_state(&list, Some((12..13, 1)), 30);
+
+        let after = list.logical_scroll_top();
+        assert_eq!(after.item_ix, 12);
+        assert_eq!(after.offset_in_item, px(84.));
+    }
+
+    #[test]
+    fn changed_block_count_keeps_scroll_anchor_near_caret() {
+        let list = ListState::new(30, ListAlignment::Top, px(512.));
+        list.scroll_to(gpui::ListOffset {
+            item_ix: 12,
+            offset_in_item: px(84.),
+        });
+
+        reconcile_list_state(&list, Some((12..13, 2)), 31);
+
+        let after = list.logical_scroll_top();
+        assert_eq!(list.item_count(), 31);
+        assert_eq!(after.item_ix, 12);
+        assert_eq!(after.offset_in_item, px(84.));
+    }
+
+    #[test]
+    fn source_fallback_moves_up_from_fenced_code_body() {
+        let source = "# Top heading\n\nintro paragraph.\n\n- bullet 1\n- bullet 2\n\n```rust\nlet x = 1;\n```\n\n## Sub heading\n";
+        let document = Document::new(source);
+        let mut engine = RichEngine::new();
+        engine.sync(&document);
+        let code_body = source.find("let x = 1;").expect("code body");
+        let prior = engine.vertical_caret(source, code_body, -1);
+        assert!(
+            prior < code_body && prior >= source.find("- bullet 1").unwrap(),
+            "Up from the first code body line should reach the adjacent list, got {prior}"
+        );
+    }
 
     fn chip() -> WidgetEdit {
         WidgetEdit::CodeInfo {

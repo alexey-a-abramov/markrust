@@ -61,6 +61,7 @@ pub struct Workspace {
     last_panel_layout: Option<(f32, EditorMode)>,
     pub palette_open: bool,
     pub config: AppConfig,
+    persist_config: bool,
     pub pending_external_change: Option<(usize, PathBuf)>,
     pub recent: RecentWorkspaces,
     cached_files: Vec<PathBuf>,
@@ -82,7 +83,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_recent(config, RecentWorkspaces::default(), window, cx)
+        let mut workspace = Self::new_with_recent(config, RecentWorkspaces::default(), window, cx);
+        workspace.persist_config = false;
+        workspace
     }
 
     fn new_with_recent(
@@ -102,6 +105,7 @@ impl Workspace {
             last_panel_layout: None,
             palette_open: false,
             config,
+            persist_config: true,
             pending_external_change: None,
             recent,
             cached_files: Vec::new(),
@@ -305,6 +309,9 @@ impl Workspace {
                     editor.selection_reversed = reversed;
                 });
             }
+            tab.editor.update(cx, |editor, cx| {
+                editor.set_raw_source(mode == EditorMode::Split, cx);
+            });
             if matches!(mode, EditorMode::Wysiwyg | EditorMode::Split) {
                 tab.rich_view.update(cx, |view, cx| {
                     view.apply_editor_command(
@@ -317,8 +324,12 @@ impl Workspace {
                     view.selection_reversed = reversed;
                 });
             }
+            let rich_view = tab.rich_view.clone();
             tab.mode = mode;
             self.focus_active_editor(window, cx);
+            if matches!(mode, EditorMode::Wysiwyg | EditorMode::Split) {
+                rich_view.update(cx, |view, cx| view.request_caret_reveal(cx));
+            }
             cx.notify();
         }
     }
@@ -486,7 +497,10 @@ impl Workspace {
         let editor = cx.new(|cx| MarkdownEditor::new(document.clone(), theme, window, cx));
         let editor_view = cx.new(|_| MarkdownEditorView::new(editor.clone()));
         let rich_view = cx.new(|cx| {
-            RichEditorView::new(document.clone(), self.config.editor_theme(), window, cx)
+            let mut view =
+                RichEditorView::new(document.clone(), self.config.editor_theme(), window, cx);
+            view.set_markup_hints_enabled(self.config.markup_hints_enabled, cx);
+            view
         });
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -510,7 +524,11 @@ impl Workspace {
             return;
         }
         self.tabs.remove(index);
-        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        if index < self.active_tab {
+            self.active_tab -= 1;
+        } else {
+            self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        }
         self.focus_active_editor(window, cx);
         if self.tabs.is_empty() {
             self.new_document(window, cx);
@@ -784,7 +802,9 @@ impl Workspace {
 
     pub fn toggle_theme(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.config.toggle_theme();
-        let _ = self.config.save();
+        if self.persist_config {
+            let _ = self.config.save();
+        }
         let theme = self.config.editor_theme();
         for tab in &self.tabs {
             tab.editor.update(cx, |editor, cx| {
@@ -793,6 +813,19 @@ impl Workspace {
             });
             tab.rich_view.update(cx, |view, cx| {
                 view.set_theme(theme.clone(), cx);
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_markup_hints(&mut self, cx: &mut Context<Self>) {
+        self.config.markup_hints_enabled = !self.config.markup_hints_enabled;
+        if self.persist_config {
+            let _ = self.config.save();
+        }
+        for tab in &self.tabs {
+            tab.rich_view.update(cx, |view, cx| {
+                view.set_markup_hints_enabled(self.config.markup_hints_enabled, cx);
             });
         }
         cx.notify();

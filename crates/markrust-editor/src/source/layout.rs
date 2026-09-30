@@ -113,6 +113,41 @@ pub fn build_display_layout(
     layout
 }
 
+/// Keep every Markdown byte visible in the source half of Split view. The
+/// regular Source view retains its in-place delimiter projection.
+pub fn build_raw_display_layout(
+    content: &str,
+    spans: &[SyntaxNodeSpan],
+    carets: &[Caret],
+    selections: &[Selection],
+    theme: &EditorTheme,
+) -> DisplayLayout {
+    let delimiter_entries = compute_delimiter_entries(carets, selections, spans);
+    let highlight_spans = collect_code_highlights(content, spans);
+    let mut segments = build_segments(
+        content,
+        spans,
+        &delimiter_entries,
+        &highlight_spans,
+        carets,
+        selections,
+        theme,
+    );
+    for segment in &mut segments {
+        if matches!(segment.style, SegmentStyle::Delimiter { .. }) {
+            segment.style = SegmentStyle::Delimiter { visible: true };
+        }
+    }
+    DisplayLayout {
+        display_text: content.to_owned(),
+        doc_to_display: (0..=content.len()).map(Some).collect(),
+        segments,
+        highlight_spans,
+        blockquote_lines: blockquote_line_starts(content, spans),
+        code_block_lines: code_block_line_starts(content, spans),
+    }
+}
+
 fn collect_code_highlights(content: &str, spans: &[SyntaxNodeSpan]) -> Vec<HighlightSpan> {
     let mut highlights = Vec::new();
     for span in spans {
@@ -736,6 +771,29 @@ fn floor_char_boundary(content: &str, n: usize) -> usize {
 mod tests {
     use super::*;
     use markrust_core::{DelimiterSpan, SyntaxKind, SyntaxNodeSpan};
+
+    #[test]
+    fn split_source_preserves_literal_markdown_and_unicode_offsets() {
+        let content = "# Café 👩🏽‍💻\n\n- [x] task **bold** :smile:\n\n| A | B |\n| --- | --- |\n";
+        let spans = markrust_core::extract_syntax_spans(content);
+        let layout = build_raw_display_layout(
+            content,
+            &spans,
+            &[Caret::new(content.len())],
+            &[],
+            &EditorTheme::dark(),
+        );
+        assert_eq!(layout.display_text, content);
+        assert!(layout
+            .segments
+            .iter()
+            .all(|segment| !matches!(segment.style, SegmentStyle::Delimiter { visible: false })));
+        for (byte, _) in content.char_indices() {
+            assert_eq!(layout.display_offset_for_doc(byte), byte);
+            assert_eq!(layout.doc_offset_for_display(byte), byte);
+        }
+        assert_eq!(layout.display_offset_for_doc(content.len()), content.len());
+    }
 
     fn bold_span(start: usize, end: usize) -> SyntaxNodeSpan {
         SyntaxNodeSpan {

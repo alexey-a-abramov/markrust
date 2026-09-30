@@ -120,6 +120,7 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
         caret_bounds: Option<Bounds<Pixels>>,
         visual_lines: Vec<VisualLine>,
     );
+    fn ensure_pending_caret_visible(&mut self, cx: &mut Context<Self>);
     fn report_painted_bounds(&mut self, bounds: Bounds<Pixels>);
     /// Push the resolved IME origin to the platform (not only `bounds_for_range`).
     fn sync_ime_cursor(&mut self, window: &mut Window);
@@ -2145,17 +2146,17 @@ pub fn build_leaf_layout_inlines(
                 source_at.resize(text.len() + 1, src.start);
             }
             source_at[text.len()] = src.start;
-            let nchars = s.chars().count().max(1);
-            for (i, (off, _)) in s.char_indices().enumerate() {
-                if off == 0 {
-                    continue;
+            if src.len() == s.len() {
+                source_at.extend((1..s.len()).map(|off| src.start + off));
+            } else {
+                let nchars = s.chars().count().max(1);
+                for (i, (off, ch)) in s.char_indices().enumerate() {
+                    let mapped = src.start + (src.len() * i / nchars);
+                    if off > 0 {
+                        source_at.push(mapped);
+                    }
+                    source_at.extend(std::iter::repeat_n(mapped, ch.len_utf8() - 1));
                 }
-                let mapped = if src.len() == s.len() {
-                    src.start + off
-                } else {
-                    src.start + (src.len() * i / nchars)
-                };
-                source_at.push(mapped);
             }
             text.push_str(s);
             runs.push(run);
@@ -2884,8 +2885,9 @@ pub fn build_leaf_layout_inlines(
     }
     if text.is_empty() {
         source_at = vec![block_range.start, block_range.start];
-    } else if source_at.len() == text.len() {
-        source_at.push(paint_end_src);
+    } else {
+        source_at.resize(text.len() + 1, paint_end_src);
+        source_at[text.len()] = paint_end_src;
     }
     while source_at.len() < text.len() + 1 {
         source_at.push(*source_at.last().unwrap_or(&block_range.end));
@@ -3198,7 +3200,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
                 cx,
             );
         }
-        self.editor.update(cx, |host, _cx| {
+        self.editor.update(cx, |host, cx| {
             host.report_leaf(
                 layout,
                 bounds,
@@ -3211,6 +3213,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
                 },
                 std::mem::take(&mut prepaint.visual_lines),
             );
+            host.ensure_pending_caret_visible(cx);
             host.sync_ime_cursor(window);
         });
 
@@ -4055,6 +4058,16 @@ mod tests {
         let tree = import_markdown(source, &mut ids);
         let block = &tree.blocks[0];
         layout_of_source(block, source, &RevealState::HIDDEN)
+    }
+
+    #[test]
+    fn utf8_paragraph_end_remains_a_painted_caret_stop() {
+        let source = "Paragraph 120.\n✓";
+        let layout = layout_for(source);
+        assert_eq!(layout.source_at.len(), layout.text.len() + 1);
+        assert!(layout.contains_source(source.len()));
+        assert_eq!(layout.visible_for_source(source.len()), layout.text.len());
+        assert_eq!(layout.source_for_visible(layout.text.len()), source.len());
     }
 
     fn layout_of(block: &Block) -> LeafLayout {

@@ -44,6 +44,7 @@ actions!(
         Undo,
         Redo,
         ToggleEditorMode,
+        ToggleMarkupHints,
         ShowWysiwyg,
         ShowSource,
         ShowSplit,
@@ -252,6 +253,17 @@ impl MarkRustWindow {
         cx.notify();
     }
 
+    fn toggle_markup_hints(
+        &mut self,
+        _: &ToggleMarkupHints,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.toggle_markup_hints(cx);
+        });
+    }
+
     fn set_editor_mode(&mut self, mode: EditorMode, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace.update(cx, |workspace, cx| {
             workspace.set_editor_mode(mode, window, cx)
@@ -325,10 +337,14 @@ impl MarkRustWindow {
     }
 
     fn export_html(&mut self, _: &ExportHtml, window: &mut Window, cx: &mut Context<Self>) {
+        crate::crash::record_export_started();
         self.workspace.update(cx, |workspace, cx| {
             match workspace.dispatch(WorkspaceCommand::ExportHtml { output: None }, window, cx) {
-                Ok(()) => {}
-                Err(error) => eprintln!("Export failed: {error}"),
+                Ok(()) => crate::crash::record_export_succeeded(),
+                Err(error) => {
+                    crate::crash::record_export_failed(&error);
+                    eprintln!("MarkRust HTML export failed; see diagnostics log");
+                }
             }
         });
     }
@@ -616,6 +632,7 @@ impl Render for MarkRustWindow {
                     .unwrap_or_default(),
                 sidebar_open: workspace.sidebar_open,
                 outline_open: workspace.outline_open,
+                markup_hints_enabled: workspace.config.markup_hints_enabled,
             }
         };
         menus::sync(menu_state, cx);
@@ -710,6 +727,7 @@ impl Render for MarkRustWindow {
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::toggle_editor_mode))
+            .on_action(cx.listener(Self::toggle_markup_hints))
             .on_action(cx.listener(Self::show_wysiwyg))
             .on_action(cx.listener(Self::show_source))
             .on_action(cx.listener(Self::show_split))
@@ -913,10 +931,13 @@ impl Render for MarkRustWindow {
                             &theme,
                             index == active,
                             SharedString::from(format!("tab-{index}")),
-                            cx.listener(move |_, _, _, cx| {
+                            cx.listener(move |_, _, window, cx| {
                                 ws.update(cx, |workspace, cx| {
-                                    workspace.active_tab = index;
-                                    cx.notify();
+                                    let _ = workspace.dispatch(
+                                        WorkspaceCommand::SwitchTab(index),
+                                        window,
+                                        cx,
+                                    );
                                 });
                             }),
                             cx.listener(move |_, _, window, cx| {
@@ -1167,11 +1188,14 @@ impl Render for MarkRustWindow {
                                         .into_any_element(),
                                     crate::workspace::EditorMode::Source => div()
                                         .flex_1()
+                                        .min_h_0()
                                         .p(px(24.))
+                                        .overflow_hidden()
                                         .child(tab.editor_view.clone())
                                         .into_any_element(),
                                     crate::workspace::EditorMode::Split => div()
                                         .flex_1()
+                                        .min_h_0()
                                         .flex()
                                         .flex_row()
                                         .overflow_hidden()
@@ -1180,6 +1204,7 @@ impl Render for MarkRustWindow {
                                                 .id("split-source")
                                                 .flex_1()
                                                 .min_w_0()
+                                                .min_h_0()
                                                 .p(px(12.))
                                                 .overflow_hidden()
                                                 .child(tab.editor_view.clone()),
@@ -1228,11 +1253,31 @@ impl Render for MarkRustWindow {
                                     SharedString::from(format!("outline-item-{offset}")),
                                     cx.listener(move |_, _, window, cx| {
                                         let _ = ws.update(cx, |workspace, cx| {
+                                            let source_focused = workspace.active_tab().is_some_and(|tab| {
+                                                tab.mode == EditorMode::Source
+                                                    || (tab.mode == EditorMode::Split
+                                                        && tab.editor.read(cx).focus_handle(cx).is_focused(window))
+                                            });
                                             workspace.dispatch(
                                                 WorkspaceCommand::JumpToHeading { offset },
                                                 window,
                                                 cx,
-                                            )
+                                            )?;
+                                            if workspace.panel_overlay == Some(Panel::Outline) {
+                                                workspace.toggle_panel(
+                                                    Panel::Outline,
+                                                    f32::from(window.viewport_size().width),
+                                                    cx,
+                                                );
+                                            }
+                                            if let Some(tab) = workspace.active_tab() {
+                                                if source_focused {
+                                                    window.focus(&tab.editor.read(cx).focus_handle(cx), cx);
+                                                } else {
+                                                    window.focus(&tab.rich_view.read(cx).focus_handle(cx), cx);
+                                                }
+                                            }
+                                            Ok::<_, anyhow::Error>(())
                                         });
                                     }),
                                 )
@@ -1340,11 +1385,9 @@ impl Render for MarkRustWindow {
                             .cursor_pointer()
                             .child(title.clone())
                             .id(("palette-item", index))
-                            .on_click(cx.listener(move |_, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 if title == "Export HTML" {
-                                    if let Ok(path) = ws.read(cx).export_active_html(cx) {
-                                        eprintln!("Exported HTML to {}", path.display());
-                                    }
+                                    this.export_html(&ExportHtml, window, cx);
                                 } else if title == "Load remote images" {
                                     ws.update(cx, |workspace, cx| {
                                         workspace.load_remote_images(cx);

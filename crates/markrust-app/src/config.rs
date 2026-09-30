@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_AUTOSAVE_MS: u64 = 1000;
 
+fn default_markup_hints_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub theme: ThemeChoice,
@@ -15,6 +19,8 @@ pub struct AppConfig {
     pub font_size: f32,
     pub code_font_family: String,
     pub autosave_ms: u64,
+    #[serde(default = "default_markup_hints_enabled")]
+    pub markup_hints_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,6 +38,7 @@ impl Default for AppConfig {
             font_size: 16.0,
             code_font_family: "Menlo".into(),
             autosave_ms: DEFAULT_AUTOSAVE_MS,
+            markup_hints_enabled: true,
         }
     }
 }
@@ -155,6 +162,16 @@ mod tests {
     fn default_config_has_autosave() {
         assert_eq!(AppConfig::default().autosave_ms, DEFAULT_AUTOSAVE_MS);
         assert_eq!(AppConfig::default().font_family, "Inter");
+        assert!(AppConfig::default().markup_hints_enabled);
+    }
+
+    #[test]
+    fn older_config_keeps_markup_hints_enabled() {
+        let config: AppConfig = toml::from_str(
+            "theme = 'dark'\nfont_family = 'Inter'\nfont_size = 16.0\ncode_font_family = 'Menlo'\nautosave_ms = 1000\n",
+        )
+        .unwrap();
+        assert!(config.markup_hints_enabled);
     }
 
     #[test]

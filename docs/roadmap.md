@@ -226,7 +226,7 @@ Earlier P5 (still in):
 - **gpui font-kit**: `gpui_platform` must keep `features = ["font-kit"]` or macOS gets a silent `NoopTextSystem` and renders no text at all.
 - **gpui run invariants**: `TextRun`s passed to `shape_line`/`StyledText::with_runs` must exactly tile the text on char boundaries; tree-sitter *code* highlight spans nest/overlap and must be sanitized first (see `wysiwyg/blocks.rs::code_runs` and `source/element.rs::build_runs_for_line`).
 - **Visual verification**: run the app, `screencapture -x out.png` (needs sandbox disabled → permission prompt), read the PNG. Launching the app steals focus — batch checks and kill instances promptly; every panic-abort also spawns a macOS crash dialog for the user.
-- **Panic analysis**: panics append structured reports (message, location, full backtrace) to `~/Library/Logs/MarkRust/panics.log` via `markrust_app::crash::install_panic_logger()`. Check that file first when the app dies; it is written before the crash dialog appears.
+- **Crash analysis**: the bounded, private [desktop diagnostic journal](logging.md) records lifecycle/open outcomes and best-effort Rust panic locations without document text or paths. macOS DiagnosticReports cover native crashes. Previous `panics.log` data is preserved but may contain sensitive details.
 - `cargo test/build` piped to `grep`/`tail` masks exit codes — check `pipestatus` or run unpiped.
 
 ## Historical note

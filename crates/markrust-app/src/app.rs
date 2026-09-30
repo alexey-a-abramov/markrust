@@ -6,10 +6,12 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures::{channel::mpsc, StreamExt};
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 use gpui_platform::application;
 
 use crate::config::AppConfig;
+use crate::crash::{self, OpenOrigin};
 use crate::window::MarkRustWindow;
 use crate::workspace::Workspace;
 
@@ -33,15 +35,29 @@ pub(crate) fn load_bundled_fonts(cx: &mut App) {
         Cow::Borrowed(include_bytes!("../../../assets/fonts/Inter-Bold.ttf").as_slice()),
         Cow::Borrowed(include_bytes!("../../../assets/fonts/Inter-BoldItalic.ttf").as_slice()),
     ];
-    if let Err(error) = cx.text_system().add_fonts(fonts) {
-        eprintln!("Failed to load bundled Inter fonts: {error}");
+    if cx.text_system().add_fonts(fonts).is_err() {
+        crash::record_fonts_load_failed();
+        eprintln!("Failed to load bundled Inter fonts");
     }
 }
 
 /// Launch the desktop editor, optionally opening a file or workspace folder.
 pub fn run_gui_with_open(open_path: Option<PathBuf>) {
-    crate::crash::install_panic_logger();
-    application().run(move |cx: &mut App| {
+    crash::install_panic_logger();
+    crash::record_application_started();
+    let app = application();
+    let (open_tx, mut open_rx) = mpsc::unbounded::<PathBuf>();
+    app.on_open_urls(move |urls| {
+        for url in urls {
+            if let Some(path) = url::Url::parse(&url)
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+            {
+                let _ = open_tx.unbounded_send(path);
+            }
+        }
+    });
+    app.run(move |cx: &mut App| {
         load_bundled_fonts(cx);
         let config = AppConfig::load();
         cx.bind_keys(desktop_key_bindings());
@@ -65,18 +81,54 @@ pub fn run_gui_with_open(open_path: Option<PathBuf>) {
                 let workspace = cx.new(|cx| {
                     let mut workspace = Workspace::new(config, window, cx);
                     if let Some(path) = open_path {
-                        if let Err(error) = workspace.open_launch_path(path, window, cx) {
-                            eprintln!("Failed to open path: {error}");
+                        let target = crash::open_target(&path);
+                        crash::record_open_started(OpenOrigin::Launch, target);
+                        match workspace.open_launch_path(path, window, cx) {
+                            Ok(()) => crash::record_open_succeeded(OpenOrigin::Launch, target),
+                            Err(error) => {
+                                crash::record_open_failed(OpenOrigin::Launch, target, &error);
+                                eprintln!("Failed to open document; see MarkRust diagnostics");
+                            }
                         }
                     }
                     workspace
                 });
-                cx.new(|cx| MarkRustWindow::new(workspace, cx))
+                cx.new(|cx| {
+                    let open_workspace = workspace.clone();
+                    cx.spawn_in(window, async move |_, cx| {
+                        while let Some(path) = open_rx.next().await {
+                            let _ = open_workspace.update_in(cx, |workspace, window, cx| {
+                                let target = crash::open_target(&path);
+                                crash::record_open_started(OpenOrigin::Finder, target);
+                                match workspace.open_launch_path(path, window, cx) {
+                                    Ok(()) => {
+                                        crash::record_open_succeeded(OpenOrigin::Finder, target)
+                                    }
+                                    Err(error) => {
+                                        crash::record_open_failed(
+                                            OpenOrigin::Finder,
+                                            target,
+                                            &error,
+                                        );
+                                        eprintln!(
+                                            "Failed to open document; see MarkRust diagnostics"
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    })
+                    .detach();
+                    let window = MarkRustWindow::new(workspace, cx);
+                    crash::record_window_ready();
+                    window
+                })
             },
         )
         .expect("failed to open MarkRust window");
         cx.activate(true);
     });
+    crash::record_application_stopped();
 }
 
 pub(crate) fn desktop_key_bindings() -> Vec<KeyBinding> {
@@ -95,6 +147,7 @@ pub(crate) fn desktop_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-cmd-1", crate::window::ShowWysiwyg, None),
         KeyBinding::new("alt-cmd-2", crate::window::ShowSource, None),
         KeyBinding::new("alt-cmd-3", crate::window::ShowSplit, None),
+        KeyBinding::new("alt-cmd-4", crate::window::ToggleMarkupHints, None),
         KeyBinding::new("ctrl-cmd-s", crate::window::ToggleSidebar, None),
         KeyBinding::new("ctrl-cmd-o", crate::window::ToggleOutline, None),
         KeyBinding::new("cmd-o", crate::window::OpenFile, None),

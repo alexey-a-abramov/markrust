@@ -60,6 +60,20 @@ pub struct RenderSnapshot {
     pub editing_image: Option<(Range<usize>, String)>,
     pub caret: usize,
     pub selected_range: Range<usize>,
+    pub markup_hints_enabled: bool,
+}
+
+impl RenderSnapshot {
+    fn reveal_state(&self) -> RevealState {
+        if self.markup_hints_enabled {
+            RevealState {
+                caret: self.caret,
+                selection: self.selected_range.clone(),
+            }
+        } else {
+            RevealState::HIDDEN
+        }
+    }
 }
 
 pub fn render_top_block<H: WysiwygHost>(
@@ -138,10 +152,7 @@ fn prefix_blank_element<H: WysiwygHost>(
     let theme = &snap.theme;
     let font_size = theme.font_size;
     let line_height = theme.line_height_for_font_size(font_size);
-    let reveal = RevealState {
-        caret: snap.caret,
-        selection: snap.selected_range.clone(),
-    };
+    let reveal = snap.reveal_state();
     let text_style = base_text_style(theme, font_size, FontWeight::NORMAL);
     BlockTextElement {
         editor,
@@ -230,10 +241,7 @@ fn render_block<H: WysiwygHost>(
                 .is_some_and(|(id, _)| *id == block.id);
             let mut code_style = base_text_style(theme, theme.font_size * 0.9, FontWeight::NORMAL);
             code_style.font_family = theme.code_font_family.clone().into();
-            let reveal = RevealState {
-                caret: snap.caret,
-                selection: snap.selected_range.clone(),
-            };
+            let reveal = snap.reveal_state();
             let mut layout =
                 build_code_block_layout(&body, &snap.source, block, &code_style, theme);
             let hl = code_runs(&body, &language, theme);
@@ -334,10 +342,7 @@ fn render_block<H: WysiwygHost>(
             render_nested_inlines(snap, block, theme.font_size, FontWeight::SEMIBOLD, editor)
         }
         BlockKind::DefinitionDetails => {
-            let reveal = RevealState {
-                caret: snap.caret,
-                selection: snap.selected_range.clone(),
-            };
+            let reveal = snap.reveal_state();
             let hosts = chrome_hosts_for(&snap.tree, block.id);
             let show_colon = reveal.intersects(&block.source_range)
                 || revealed_details_prefix(&snap.source, block, &reveal, &hosts);
@@ -368,10 +373,7 @@ fn render_alert<H: WysiwygHost>(
     };
     let theme = &snap.theme;
     let accent = theme.alert_accent(*kind);
-    let reveal = RevealState {
-        caret: snap.caret,
-        selection: snap.selected_range.clone(),
-    };
+    let reveal = snap.reveal_state();
     let show_chrome = !chrome_range.is_empty() && reveal.intersects(chrome_range);
     let header = if show_chrome {
         let slice = snap.source.get(chrome_range.clone()).unwrap_or("");
@@ -437,10 +439,7 @@ fn render_toc<H: WysiwygHost>(
     editor: Entity<H>,
 ) -> AnyElement {
     let theme = &snap.theme;
-    let reveal = RevealState {
-        caret: snap.caret,
-        selection: snap.selected_range.clone(),
-    };
+    let reveal = snap.reveal_state();
     if reveal.intersects(&block.source_range) {
         return paragraph_element(snap, block, theme.font_size, FontWeight::NORMAL, editor);
     }
@@ -502,10 +501,7 @@ fn render_thematic_break<H: WysiwygHost>(
     editor: Entity<H>,
 ) -> AnyElement {
     let theme = &snap.theme;
-    let reveal = RevealState {
-        caret: snap.caret,
-        selection: snap.selected_range.clone(),
-    };
+    let reveal = snap.reveal_state();
     if reveal.intersects(&block.source_range) {
         let text_style = base_text_style(theme, theme.font_size, FontWeight::NORMAL);
         let hosts = chrome_hosts_for(&snap.tree, block.id);
@@ -582,10 +578,7 @@ fn render_opaque<H: WysiwygHost>(
     match project_html_block(raw) {
         HtmlBlockVisual::Hidden => {
             let text_style = base_text_style(theme, theme.font_size, FontWeight::NORMAL);
-            let reveal = RevealState {
-                caret: snap.caret,
-                selection: snap.selected_range.clone(),
-            };
+            let reveal = snap.reveal_state();
             let layout = layout_html_block(&snap.source, block, &text_style, theme, &reveal);
             if layout.text.is_empty() {
                 return div().into_any_element();
@@ -617,10 +610,7 @@ fn render_opaque<H: WysiwygHost>(
             runs,
         } => {
             let text_style = base_text_style(theme, theme.font_size, FontWeight::NORMAL);
-            let reveal = RevealState {
-                caret: snap.caret,
-                selection: snap.selected_range.clone(),
-            };
+            let reveal = snap.reveal_state();
             let layout = build_html_block_layout(
                 &text,
                 &source_at,
@@ -652,10 +642,7 @@ fn render_footnote_def_nested<H: WysiwygHost>(
     editor: Entity<H>,
 ) -> AnyElement {
     let theme = &snap.theme;
-    let reveal = RevealState {
-        caret: snap.caret,
-        selection: snap.selected_range.clone(),
-    };
+    let reveal = snap.reveal_state();
     let hosts = chrome_hosts_for(&snap.tree, block.id);
     let show_source = reveal.intersects(&block.source_range)
         || revealed_footnote_prefix(&snap.source, block, &reveal, &hosts);
@@ -838,10 +825,7 @@ fn render_list<H: WysiwygHost>(
                 BlockKind::ListItem { task } => *task,
                 _ => None,
             };
-            let reveal = RevealState {
-                caret: snap.caret,
-                selection: snap.selected_range.clone(),
-            };
+            let reveal = snap.reveal_state();
             let item_revealed = reveal.intersects(&item.source_range);
             let paints_marker_in_leaf = item
                 .children
@@ -925,10 +909,7 @@ fn render_table<H: WysiwygHost>(
     editor: Entity<H>,
 ) -> AnyElement {
     let theme = snap.theme.clone();
-    let reveal = RevealState {
-        caret: snap.caret,
-        selection: snap.selected_range.clone(),
-    };
+    let reveal = snap.reveal_state();
     let show_align = reveal.intersects(&table.source_range);
     let align_line = show_align
         .then(|| table_alignment_line(&snap.source, table))
@@ -1041,10 +1022,7 @@ fn paragraph_element<H: WysiwygHost>(
     let theme = &snap.theme;
     let text_style = base_text_style(theme, font_size, base_weight);
     let line_height = theme.line_height_for_font_size(font_size);
-    let reveal = RevealState {
-        caret: snap.caret,
-        selection: snap.selected_range.clone(),
-    };
+    let reveal = snap.reveal_state();
     let hosts = chrome_hosts_for(&snap.tree, block.id);
     let flow = classify_paragraph(&block.inlines);
     let role = image_role(flow).unwrap_or(ImageRole::Inline);
@@ -1516,4 +1494,33 @@ fn text_runs_from_highlights(
         runs.push(style.to_run(body.len()));
     }
     runs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markup_hint_toggle_only_changes_reveal_state() {
+        let mut snapshot = RenderSnapshot {
+            tree: RichTree::default(),
+            source: "**bold**".into(),
+            theme: EditorTheme::dark(),
+            base_dir: None,
+            local_image_paths: HashMap::new(),
+            local_image_pending: HashSet::new(),
+            data_image_paths: HashMap::new(),
+            data_image_pending: HashSet::new(),
+            editing_code: None,
+            editing_image: None,
+            caret: 3,
+            selected_range: 3..3,
+            markup_hints_enabled: true,
+        };
+        assert!(snapshot.reveal_state().intersects(&(0..8)));
+
+        snapshot.markup_hints_enabled = false;
+        assert!(!snapshot.reveal_state().intersects(&(0..8)));
+        assert_eq!(snapshot.caret, 3, "the editable source caret is unchanged");
+    }
 }

@@ -1479,11 +1479,16 @@ fn find_matching_close(s: &str, open_start: usize, name: &str) -> Option<usize> 
     let lower = s.to_ascii_lowercase();
     let open = format!("<{name}");
     let close = format!("</{name}>");
+    let bytes = lower.as_bytes();
+    let open_bytes = open.as_bytes();
+    let close_bytes = close.as_bytes();
     let gt = s.get(open_start..)?.find('>')? + open_start;
     let mut i = gt + 1;
     let mut depth = 1i32;
-    while i < lower.len() && depth > 0 {
-        if lower[i..].starts_with(&close) {
+    while i < bytes.len() && depth > 0 {
+        // Scan bytes: UTF-8 content may put `i` inside a code point, while
+        // tag delimiters are ASCII and safe to match at any byte offset.
+        if bytes[i..].starts_with(close_bytes) {
             depth -= 1;
             if depth == 0 {
                 return Some(i + close.len());
@@ -1491,9 +1496,9 @@ fn find_matching_close(s: &str, open_start: usize, name: &str) -> Option<usize> 
             i += close.len();
             continue;
         }
-        if lower[i..].starts_with(&open) {
+        if bytes[i..].starts_with(open_bytes) {
             let after = i + open.len();
-            let next = lower.as_bytes().get(after).copied();
+            let next = bytes.get(after).copied();
             if next.is_none() || matches!(next, Some(b'>' | b'/' | b'\t' | b'\n' | b'\r' | b' ')) {
                 depth += 1;
             }
@@ -2771,6 +2776,15 @@ mod tests {
             }
             other => panic!("expected svg image, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unicode_svg_content_does_not_break_tag_matching_or_caret_projection() {
+        let raw = "<svg xmlns=\"http://www.w3.org/2000/svg\"><title>… café</title><svg><text>👩🏽‍💻</text></svg></svg>";
+        assert_eq!(find_matching_close(raw, 0, "svg"), Some(raw.len()));
+        assert!(is_safe_svg_document(raw));
+        assert!(html_inline_svg(raw).is_some());
+        assert!(!opaque_inline_is_caret_chrome(raw));
     }
 
     #[test]

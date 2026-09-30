@@ -284,6 +284,12 @@ impl ImeOriginState {
 
         let mut current: Option<(usize, usize, usize, bool)> = None;
         for (index, entry) in self.visual_lines.iter().enumerate() {
+            // visible_for_source clamps offsets outside this leaf to an edge.
+            // Without this ownership check, a caret in a code block can be
+            // mistaken for the end of a short heading far above it.
+            if !entry.layout.contains_source(caret) {
+                continue;
+            }
             let visible = entry.layout.visible_for_source(caret);
             if visible < entry.line.visible_start || visible > entry.line.visible_end {
                 continue;
@@ -839,6 +845,45 @@ mod tests {
             .visual_vertical_target(11, -1, Some(second.preferred_x))
             .expect("upward wrapped-row target");
         assert_eq!(up.source, Some(7));
+    }
+
+    #[test]
+    fn vertical_navigation_from_raw_block_ignores_unrelated_short_leaves() {
+        let mut ime = ImeOriginState::default();
+        ime.begin_frame(false, 133, None);
+        for (text, source_start, top) in [
+            ("Top", 2, 0.),
+            ("intro paragraph", 15, 20.),
+            ("bullet", 100, 40.),
+            ("let x", 133, 60.),
+        ] {
+            let stops = (0..=text.len())
+                .map(|visible| VisualCaretStop {
+                    visible,
+                    source: source_start + visible,
+                    x: visible as f32 * 10.,
+                })
+                .collect();
+            ime.report_visual_lines(
+                leaf_layout(text, source_start),
+                vec![VisualLine {
+                    visible_start: 0,
+                    visible_end: text.len(),
+                    top,
+                    height: 20.,
+                    stops,
+                }],
+            );
+        }
+
+        let up = ime
+            .visual_vertical_target(133, -1, None)
+            .expect("raw block has a painted row above it");
+        assert_eq!(up.source, Some(100), "Up must reach the adjacent bullet");
+        let down = ime
+            .visual_vertical_target(100, 1, Some(up.preferred_x))
+            .expect("bullet has a painted raw row below it");
+        assert_eq!(down.source, Some(133), "Down must return to the raw block");
     }
 
     fn widget_frame(

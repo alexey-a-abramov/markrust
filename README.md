@@ -2,7 +2,7 @@
 
 Fast, native, local-first Markdown workspace for developers.
 
-MarkRust is a free, open-source editor that keeps documents as plain UTF-8 Markdown on disk while rendering a true WYSIWYG view (Typora-style: delimiters hidden unless the caret or a selection intersects the node). Source mode with delimiter masking and a side-by-side split are optional (`Cmd/Ctrl+Shift+M`).
+MarkRust is a free, open-source editor that keeps documents as plain UTF-8 Markdown on disk while rendering a true WYSIWYG view. Source mode keeps its in-place delimiter masking; Split shows literal Markdown beside an editable visual view. Cycle modes with `Cmd/Ctrl+Shift+M`, or turn off WYSIWYG markup hints in View.
 
 ## Status
 
@@ -86,6 +86,7 @@ bash scripts/release.sh
 | `Cmd/Ctrl+Shift+Z` | Redo |
 | `Cmd/Ctrl+P` | Command palette |
 | `Cmd/Ctrl+Shift+M` | Cycle WYSIWYG / Source / Split |
+| `Cmd/Ctrl+Option+4` | Toggle WYSIWYG markup hints |
 | `Cmd/Ctrl+Shift+T` | Toggle light/dark theme |
 | `Cmd/Ctrl+C` / `X` | Copy / cut as Markdown (empty caret copies/cuts the current block) |
 | `Cmd/Ctrl+B` / `I` / `K` | Bold / italic / link |

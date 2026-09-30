@@ -56,6 +56,21 @@ pub struct Snapshot {
     pub line_count: usize,
     /// Window viewport height in logical pixels.
     pub viewport_height: f32,
+    /// First rendered block in the rich viewport, when that pane is visible.
+    pub viewport_first_block: Option<usize>,
+    /// Pixel offset inside the first rendered block.
+    pub viewport_offset_px: Option<f32>,
+    /// Whether this frame painted the active caret inside the rich viewport.
+    pub caret_visible: Option<bool>,
+    /// Painted viewport and caret vertical bounds, for scroll diagnostics.
+    pub viewport_y: Option<(f32, f32)>,
+    pub caret_y: Option<(f32, f32)>,
+    /// Whether the focused source caret is inside its pane's viewport.
+    pub source_caret_visible: Option<bool>,
+    /// Source scroll offset and vertical bounds, for Source/Split traces.
+    pub source_viewport_offset_y: Option<f32>,
+    pub source_viewport_y: Option<(f32, f32)>,
+    pub source_caret_y: Option<(f32, f32)>,
     /// Monotonic timestamp in milliseconds since UNIX epoch.
     pub timestamp_ms: u64,
 }
@@ -84,6 +99,8 @@ pub enum Action {
     /// `JumpTo(offset)` to position the caret without producing undo
     /// history (used to set up the pre-state for follow-up actions).
     JumpTo(usize),
+    /// Focus the raw source pane in Split mode.
+    FocusSource,
 }
 
 impl Action {
@@ -92,6 +109,7 @@ impl Action {
             Action::Keystroke(s) => format!("keystroke: {s}"),
             Action::InsertText(s) => format!("insert-text: {s:?}"),
             Action::JumpTo(o) => format!("jump-to: {o}"),
+            Action::FocusSource => "focus-source".into(),
         }
     }
 }
@@ -100,6 +118,9 @@ impl Action {
 pub enum DocumentTemplate {
     Empty,
     Plain {
+        paragraphs: usize,
+    },
+    SeparatedParagraphs {
         paragraphs: usize,
     },
     Headings {
@@ -135,6 +156,9 @@ impl DocumentTemplate {
             DocumentTemplate::Empty => String::new(),
             DocumentTemplate::Plain { paragraphs } => (0..*paragraphs)
                 .map(|i| format!("Paragraph {}.\n", i + 1))
+                .collect(),
+            DocumentTemplate::SeparatedParagraphs { paragraphs } => (0..*paragraphs)
+                .map(|i| format!("Paragraph {}.\n\n", i + 1))
                 .collect(),
             DocumentTemplate::Headings { levels } => levels
                 .iter()
@@ -240,6 +264,18 @@ pub enum Invariant {
     Mode(Vec<EditorMode>),
     /// The final selection must equal this range.
     Selection(Range<usize>),
+    /// The caret must stay within a nearby source section after navigation.
+    CaretInRange(Range<usize>),
+    /// The active rich caret must be painted inside its viewport.
+    CaretVisible,
+    /// The active rich caret must be visible after every scenario action.
+    CaretVisibleAfterEveryAction,
+    /// The rich viewport must remain past the first block after every action.
+    ViewportFirstBlockAtLeastAfterEveryAction(usize),
+    /// The focused source caret must be visible from this 1-based action step.
+    SourceCaretVisibleFromStep(usize),
+    /// The source viewport must stay away from the document start from this step.
+    SourceViewportScrolledFromStep(usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +287,10 @@ pub enum Invariant {
 /// is the canonical example for a class of behaviour (e.g. empty list
 /// item + Enter exits the list).
 pub fn curated_scenarios() -> Vec<Scenario> {
+    let mixed_source = DocumentTemplate::Mixed.render();
+    let code_body = mixed_source
+        .find("let x = 1;")
+        .expect("mixed fixture contains a fenced code body");
     vec![
         // The example from the user request: pressing Enter on the
         // empty trailing item of an unchecked task list must close the
@@ -348,6 +388,71 @@ pub fn curated_scenarios() -> Vec<Scenario> {
                 Action::Keystroke("alt-cmd-1".into()),
             ],
             invariants: vec![Invariant::Mode(vec![EditorMode::Wysiwyg])],
+        },
+        Scenario {
+            name: "long_document_edit_keeps_caret_visible".into(),
+            template: DocumentTemplate::SeparatedParagraphs { paragraphs: 120 },
+            setup_caret: Some(0),
+            actions: vec![
+                Action::JumpTo(usize::MAX),
+                Action::InsertText("✓".into()),
+                Action::Keystroke("up".into()),
+                Action::Keystroke("down".into()),
+            ],
+            invariants: vec![
+                Invariant::SourceContains("✓".into()),
+                Invariant::BlockCount(120),
+                Invariant::CaretVisibleAfterEveryAction,
+                Invariant::ViewportFirstBlockAtLeastAfterEveryAction(1),
+            ],
+        },
+        Scenario {
+            name: "up_from_raw_block_reaches_adjacent_section".into(),
+            template: DocumentTemplate::Mixed,
+            setup_caret: Some(code_body),
+            actions: vec![Action::Keystroke("up".into())],
+            invariants: vec![
+                Invariant::SourceContains("let x = 1;".into()),
+                Invariant::CaretInRange(71..133),
+                Invariant::CaretVisible,
+            ],
+        },
+        Scenario {
+            name: "source_long_document_edit_keeps_caret_visible".into(),
+            template: DocumentTemplate::SeparatedParagraphs { paragraphs: 120 },
+            setup_caret: Some(0),
+            actions: vec![
+                Action::Keystroke("alt-cmd-2".into()),
+                Action::JumpTo(usize::MAX),
+                Action::InsertText("✓".into()),
+                Action::Keystroke("up".into()),
+                Action::Keystroke("down".into()),
+            ],
+            invariants: vec![
+                Invariant::SourceContains("✓".into()),
+                Invariant::Mode(vec![EditorMode::Source]),
+                Invariant::SourceCaretVisibleFromStep(1),
+                Invariant::SourceViewportScrolledFromStep(2),
+            ],
+        },
+        Scenario {
+            name: "split_source_long_document_edit_keeps_caret_visible".into(),
+            template: DocumentTemplate::SeparatedParagraphs { paragraphs: 120 },
+            setup_caret: Some(0),
+            actions: vec![
+                Action::Keystroke("alt-cmd-3".into()),
+                Action::FocusSource,
+                Action::JumpTo(usize::MAX),
+                Action::InsertText("✓".into()),
+                Action::Keystroke("up".into()),
+                Action::Keystroke("down".into()),
+            ],
+            invariants: vec![
+                Invariant::SourceContains("✓".into()),
+                Invariant::Mode(vec![EditorMode::Split]),
+                Invariant::SourceCaretVisibleFromStep(2),
+                Invariant::SourceViewportScrolledFromStep(3),
+            ],
         },
         // Typing into an empty document produces a single paragraph that
         // contains the typed text. This exercises the rich engine's
@@ -494,6 +599,7 @@ fn short_template_name(t: &DocumentTemplate) -> &'static str {
     match t {
         DocumentTemplate::Empty => "empty",
         DocumentTemplate::Plain { .. } => "plain",
+        DocumentTemplate::SeparatedParagraphs { .. } => "separated-paragraphs",
         DocumentTemplate::Headings { .. } => "headings",
         DocumentTemplate::BulletList { .. } => "ulist",
         DocumentTemplate::OrderedList { .. } => "olist",
@@ -606,10 +712,11 @@ pub fn run_scenario(
     let mut snapshots = Vec::with_capacity(scenario.actions.len() + 1);
     snapshots.push(capture_snapshot(
         cx,
+        window,
         workspace,
         0,
         &Action::JumpTo(setup_caret),
-    ));
+    )?);
 
     for (step, action) in scenario.actions.iter().enumerate() {
         apply_action(cx, window, workspace, action)?;
@@ -618,7 +725,7 @@ pub fn run_scenario(
         // `window.draw()` the input pipeline's on_action handlers may not
         // flush their document mutations into the snapshot reader.
         draw(cx, window)?;
-        snapshots.push(capture_snapshot(cx, workspace, step + 1, action));
+        snapshots.push(capture_snapshot(cx, window, workspace, step + 1, action)?);
     }
 
     // Write the trace.
@@ -627,6 +734,33 @@ pub fn run_scenario(
     for snap in &snapshots {
         let line = serde_json::to_string(snap)?;
         writeln!(file, "{}", line)?;
+    }
+
+    let step_invariants: Vec<_> = scenario
+        .invariants
+        .iter()
+        .filter(|inv| {
+            matches!(
+                inv,
+                Invariant::CaretVisibleAfterEveryAction
+                    | Invariant::ViewportFirstBlockAtLeastAfterEveryAction(_)
+                    | Invariant::SourceCaretVisibleFromStep(_)
+                    | Invariant::SourceViewportScrolledFromStep(_)
+            )
+        })
+        .cloned()
+        .collect();
+    for snapshot in snapshots.iter().skip(1) {
+        check_invariants(
+            &format!(
+                "{} step {} ({})",
+                scenario.name,
+                snapshot.step,
+                snapshot.action.describe()
+            ),
+            snapshot,
+            &step_invariants,
+        )?;
     }
 
     Ok(snapshots.last().cloned().unwrap())
@@ -638,35 +772,30 @@ fn move_caret(
     workspace: &Entity<Workspace>,
     target: usize,
 ) -> Result<()> {
-    // Read the active mode under a single app-cx borrow, then refocus the
-    // surface that owns keystrokes for that mode (richtext view for
-    // Wysiwyg/Split, source editor for Source) and route the offset to the
-    // matching engine.
+    // Keep the focused editing surface in Split mode; either pane can own
+    // keystrokes there. Source and WYSIWYG modes have one active surface.
     let mode = cx.read_entity(workspace, |ws, _| ws.active_tab().unwrap().mode);
-    cx.update_window(window.into(), |_, window, cx| {
+    let use_source = cx.update_window(window.into(), |_, window, cx| {
         let tab = workspace.read(cx).active_tab().unwrap();
-        match mode {
-            EditorMode::Source => {
-                let handle = tab.editor.read(cx).focus_handle.clone();
-                window.focus(&handle, cx);
-            }
-            EditorMode::Wysiwyg | EditorMode::Split => {
-                let handle = tab.rich_view.read(cx).focus_handle(cx);
-                window.focus(&handle, cx);
-            }
+        let use_source = mode == EditorMode::Source
+            || mode == EditorMode::Split && tab.editor.read(cx).focus_handle.is_focused(window);
+        if use_source {
+            let handle = tab.editor.read(cx).focus_handle.clone();
+            window.focus(&handle, cx);
+        } else {
+            let handle = tab.rich_view.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
         }
+        use_source
     })?;
     let (rich_entity, editor_entity) = cx.read_entity(workspace, |ws, _| {
         let tab = ws.active_tab().unwrap();
         (tab.rich_view.clone(), tab.editor.clone())
     });
-    match mode {
-        EditorMode::Source => {
-            editor_entity.update(cx, |ed, cx| ed.jump_to(target, cx));
-        }
-        EditorMode::Wysiwyg | EditorMode::Split => {
-            rich_entity.update(cx, |view, cx| view.jump_to(target, cx));
-        }
+    if use_source {
+        editor_entity.update(cx, |ed, cx| ed.jump_to(target, cx));
+    } else {
+        rich_entity.update(cx, |view, cx| view.jump_to(target, cx));
     }
     Ok(())
 }
@@ -716,6 +845,13 @@ fn apply_action(
             };
             move_caret(cx, window, workspace, target)?;
         }
+        Action::FocusSource => {
+            cx.update_window(window.into(), |_, window, cx| {
+                let tab = workspace.read(cx).active_tab().unwrap();
+                let handle = tab.editor.read(cx).focus_handle.clone();
+                window.focus(&handle, cx);
+            })?;
+        }
     }
     Ok(())
 }
@@ -739,12 +875,17 @@ fn draw(cx: &mut HeadlessAppContext, window: WindowHandle<MarkRustWindow>) -> Re
 }
 
 fn capture_snapshot(
-    cx: &HeadlessAppContext,
+    cx: &mut HeadlessAppContext,
+    window: WindowHandle<MarkRustWindow>,
     workspace: &Entity<Workspace>,
     step: usize,
     action: &Action,
-) -> Snapshot {
-    cx.read_entity(workspace, |ws, cx| {
+) -> Result<Snapshot> {
+    let source_focused = cx.update_window(window.into(), |_, window, cx| {
+        let tab = workspace.read(cx).active_tab().unwrap();
+        tab.editor.read(cx).focus_handle.is_focused(window)
+    })?;
+    Ok(cx.read_entity(workspace, |ws, cx| {
         let tab = ws.active_tab().unwrap();
         let rich = tab.rich_view.read(cx);
         let editor = tab.editor.read(cx);
@@ -764,6 +905,9 @@ fn capture_snapshot(
                 // delete, etc.). Source mode collapses to the editor.
                 (editor.cursor_offset(), editor.selected_range.clone())
             }
+            EditorMode::Split if source_focused => {
+                (editor.cursor_offset(), editor.selected_range.clone())
+            }
             EditorMode::Wysiwyg | EditorMode::Split => {
                 (rich.cursor_offset(), rich.selected_range.clone())
             }
@@ -774,6 +918,42 @@ fn capture_snapshot(
             .painted_viewport_bounds()
             .map(|b| f32::from(b.size.height))
             .unwrap_or(0.);
+        let (viewport_first_block, viewport_offset_px, caret_visible, viewport_y, caret_y) =
+            if mode == EditorMode::Wysiwyg || mode == EditorMode::Split && !source_focused {
+                let (anchor, viewport, caret_rect) = rich.test_viewport_state();
+                let visible = caret_rect.is_some_and(|caret_rect| {
+                    caret_rect.top() >= viewport.top() - gpui::px(2.)
+                        && caret_rect.bottom() <= viewport.bottom() + gpui::px(2.)
+                });
+                (
+                    Some(anchor.item_ix),
+                    Some(f32::from(anchor.offset_in_item)),
+                    Some(visible),
+                    Some((f32::from(viewport.top()), f32::from(viewport.bottom()))),
+                    caret_rect.map(|rect| (f32::from(rect.top()), f32::from(rect.bottom()))),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+        let (source_caret_visible, source_viewport_offset_y, source_viewport_y, source_caret_y) =
+            if mode == EditorMode::Source || mode == EditorMode::Split && source_focused {
+                let (viewport, _, offset) = tab.editor_view.read(cx).horizontal_scroll_state();
+                let caret_rect = editor.painted_caret_bounds();
+                let visible = caret_rect.is_some_and(|caret_rect| {
+                    caret_rect.left() >= viewport.left() - gpui::px(2.)
+                        && caret_rect.right() <= viewport.right() + gpui::px(2.)
+                        && caret_rect.top() >= viewport.top() - gpui::px(2.)
+                        && caret_rect.bottom() <= viewport.bottom() + gpui::px(2.)
+                });
+                (
+                    Some(visible),
+                    Some(f32::from(offset.y)),
+                    Some((f32::from(viewport.top()), f32::from(viewport.bottom()))),
+                    caret_rect.map(|rect| (f32::from(rect.top()), f32::from(rect.bottom()))),
+                )
+            } else {
+                (None, None, None, None)
+            };
         let line_count = source.lines().count();
         Snapshot {
             step,
@@ -785,12 +965,21 @@ fn capture_snapshot(
             blocks,
             line_count,
             viewport_height,
+            viewport_first_block,
+            viewport_offset_px,
+            caret_visible,
+            viewport_y,
+            caret_y,
+            source_caret_visible,
+            source_viewport_offset_y,
+            source_viewport_y,
+            source_caret_y,
             timestamp_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         }
-    })
+    }))
 }
 
 fn collect_blocks(engine: &markrust_core::rich::RichEngine, source: &str) -> Vec<BlockInfo> {
@@ -939,6 +1128,45 @@ pub fn check_invariants(
                     got = snapshot.selection,
                 );
             }
+            Invariant::CaretInRange(range) => ensure!(
+                range.contains(&snapshot.caret),
+                "[{scenario_name}] caret {} escaped expected neighboring range {range:?}",
+                snapshot.caret,
+            ),
+            Invariant::CaretVisible | Invariant::CaretVisibleAfterEveryAction => ensure!(
+                snapshot.caret_visible == Some(true),
+                "[{scenario_name}] rich caret is not visible at byte {} (viewport block {:?}, offset {:?})",
+                snapshot.caret,
+                snapshot.viewport_first_block,
+                snapshot.viewport_offset_px,
+            ),
+            Invariant::ViewportFirstBlockAtLeastAfterEveryAction(minimum) => ensure!(
+                snapshot.viewport_first_block.is_some_and(|block| block >= *minimum),
+                "[{scenario_name}] rich viewport jumped toward block 0 (first block {:?}, offset {:?})",
+                snapshot.viewport_first_block,
+                snapshot.viewport_offset_px,
+            ),
+            Invariant::SourceCaretVisibleFromStep(first_step) => {
+                if snapshot.step >= *first_step {
+                    ensure!(
+                        snapshot.source_caret_visible == Some(true),
+                        "[{scenario_name}] source caret is not visible at byte {} (viewport {:?}, caret {:?}, offset {:?})",
+                        snapshot.caret,
+                        snapshot.source_viewport_y,
+                        snapshot.source_caret_y,
+                        snapshot.source_viewport_offset_y,
+                    );
+                }
+            }
+            Invariant::SourceViewportScrolledFromStep(first_step) => {
+                if snapshot.step >= *first_step {
+                    ensure!(
+                        snapshot.source_viewport_offset_y.is_some_and(|offset| offset < -1.),
+                        "[{scenario_name}] source viewport jumped to top (offset {:?})",
+                        snapshot.source_viewport_offset_y,
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -964,8 +1192,19 @@ pub fn run_all(
     let mut passed = 0usize;
     for scenario in &scenarios {
         let snapshot = run_scenario(cx, window, workspace, scenario, output_dir)?;
-        check_invariants(&scenario.name, &snapshot, &scenario.invariants)
-            .with_context(|| format!("scenario `{}` failed invariants", scenario.name))?;
+        if let Err(error) = check_invariants(&scenario.name, &snapshot, &scenario.invariants) {
+            // The JSONL trace records every action and model response. When a
+            // renderer is available, keep the final painted frame beside it.
+            // Geometry-only CI intentionally has no screenshot renderer.
+            if let Ok(screenshot) = cx.capture_screenshot(window.into()) {
+                let path = output_dir
+                    .join("usecases")
+                    .join(format!("{}.failure.png", scenario.name));
+                let _ = screenshot.save(path);
+            }
+            return Err(error)
+                .with_context(|| format!("scenario `{}` failed invariants", scenario.name));
+        }
         passed += 1;
     }
     println!(
@@ -1062,6 +1301,15 @@ mod tests {
             blocks: vec![],
             line_count: 1,
             viewport_height: 100.,
+            viewport_first_block: Some(0),
+            viewport_offset_px: Some(0.),
+            caret_visible: Some(true),
+            viewport_y: Some((0., 100.)),
+            caret_y: Some((10., 30.)),
+            source_caret_visible: None,
+            source_viewport_offset_y: None,
+            source_viewport_y: None,
+            source_caret_y: None,
             timestamp_ms: 0,
         };
         let json = serde_json::to_string(&snap).unwrap();

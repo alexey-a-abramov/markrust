@@ -17,15 +17,18 @@ use super::hit_test::{click_byte_offset, invert_doc_to_display};
 use crate::editor::MarkdownEditor;
 use crate::highlight::HighlightKind;
 use crate::layout::{
-    build_display_layout, line_byte_ranges, source_line_font_size, DisplayLayout, SegmentStyle,
+    build_display_layout, build_raw_display_layout, line_byte_ranges, source_line_font_size,
+    DisplayLayout, SegmentStyle,
 };
 use crate::theme::EditorTheme;
 use markrust_core::TableRowKind;
 
 /// GPUI custom element that lays out and paints the Markdown editor surface.
+type SharedViewportSize = Rc<Cell<(Pixels, Pixels)>>;
+
 pub struct EditorElement {
     pub editor: Entity<MarkdownEditor>,
-    scroll_handle: Option<(ScrollHandle, Rc<Cell<Pixels>>)>,
+    scroll_handle: Option<(ScrollHandle, SharedViewportSize)>,
     reveal_caret: bool,
 }
 
@@ -70,10 +73,10 @@ impl EditorElement {
     fn with_scroll(
         mut self,
         handle: ScrollHandle,
-        viewport_width: Rc<Cell<Pixels>>,
+        viewport_size: SharedViewportSize,
         reveal_caret: bool,
     ) -> Self {
-        self.scroll_handle = Some((handle, viewport_width));
+        self.scroll_handle = Some((handle, viewport_size));
         self.reveal_caret = reveal_caret;
         self
     }
@@ -122,7 +125,11 @@ impl Element for EditorElement {
         };
         let carets = editor.carets();
         let selections = editor.selections();
-        let display_layout = build_display_layout(&content, &spans, &carets, &selections, theme);
+        let display_layout = if editor.raw_source() {
+            build_raw_display_layout(&content, &spans, &carets, &selections, theme)
+        } else {
+            build_display_layout(&content, &spans, &carets, &selections, theme)
+        };
         let lines = shape_lines(window, &display_layout, theme, &content);
         let intrinsic_width = lines
             .iter()
@@ -276,15 +283,22 @@ impl Element for EditorElement {
             editor.layout_cache.display_to_doc = prepaint.display_to_doc.clone();
         });
 
-        if let Some((scroll, last_viewport_width)) = &self.scroll_handle {
+        if let Some((scroll, last_viewport_size)) = &self.scroll_handle {
             let viewport = scroll.bounds();
-            let resized = last_viewport_width.replace(viewport.size.width) != viewport.size.width;
+            let size = (viewport.size.width, viewport.size.height);
+            let resized = last_viewport_size.replace(size) != size;
             if (self.reveal_caret || resized) && focus_handle.is_focused(window) {
                 let offset = horizontal_caret_scroll_offset(
                     scroll.offset(),
                     viewport,
                     prepaint.caret_bounds,
                     scroll.max_offset().x,
+                );
+                let offset = vertical_caret_scroll_offset(
+                    offset,
+                    viewport,
+                    prepaint.caret_bounds,
+                    scroll.max_offset().y,
                 );
                 if offset != scroll.offset() {
                     scroll.set_offset(offset);
@@ -310,6 +324,23 @@ fn horizontal_caret_scroll_offset(
         px(0.)
     };
     point((offset.x + adjustment).clamp(-max_offset, px(0.)), offset.y)
+}
+
+fn vertical_caret_scroll_offset(
+    offset: Point<Pixels>,
+    viewport: Bounds<Pixels>,
+    caret: Bounds<Pixels>,
+    max_offset: Pixels,
+) -> Point<Pixels> {
+    let margin = px(EDITOR_GUTTER).min(viewport.size.height / 2.);
+    let adjustment = if caret.top() < viewport.top() + margin {
+        viewport.top() + margin - caret.top()
+    } else if caret.bottom() > viewport.bottom() - margin {
+        viewport.bottom() - margin - caret.bottom()
+    } else {
+        px(0.)
+    };
+    point(offset.x, (offset.y + adjustment).clamp(-max_offset, px(0.)))
 }
 
 fn x_positions_for_shaped(shaped: &ShapedLine) -> Vec<f32> {
@@ -790,7 +821,7 @@ impl MarkdownEditor {
 pub struct MarkdownEditorView {
     pub editor: Entity<MarkdownEditor>,
     scroll_handle: ScrollHandle,
-    scroll_viewport_width: Rc<Cell<Pixels>>,
+    scroll_viewport_size: SharedViewportSize,
     last_revealed_caret: Option<(usize, u64, bool)>,
 }
 
@@ -799,7 +830,7 @@ impl MarkdownEditorView {
         Self {
             editor,
             scroll_handle: ScrollHandle::new(),
-            scroll_viewport_width: Rc::new(Cell::new(px(0.))),
+            scroll_viewport_size: Rc::new(Cell::new((px(0.), px(0.)))),
             last_revealed_caret: None,
         }
     }
@@ -1178,7 +1209,7 @@ impl Render for MarkdownEditorView {
             })
             .child(EditorElement::new(editor).with_scroll(
                 self.scroll_handle.clone(),
-                self.scroll_viewport_width.clone(),
+                self.scroll_viewport_size.clone(),
                 reveal_caret,
             ))
     }
@@ -1215,6 +1246,36 @@ mod scroll_tests {
         assert_eq!(
             horizontal_caret_scroll_offset(offset, viewport, far, px(600.)),
             point(px(-600.), px(-30.))
+        );
+    }
+
+    #[test]
+    fn vertical_caret_scrolls_into_view_without_resetting_horizontal_offset() {
+        let viewport = Bounds::new(point(px(100.), px(50.)), size(px(300.), px(200.)));
+        let bottom = Bounds::new(point(px(160.), px(500.)), size(px(2.), px(24.)));
+        let offset =
+            vertical_caret_scroll_offset(point(px(-40.), px(0.)), viewport, bottom, px(600.));
+        assert_eq!(offset, point(px(-40.), px(-290.)));
+        let top = Bounds::new(point(px(160.), px(66.) + offset.y), size(px(2.), px(24.)));
+        assert_eq!(
+            vertical_caret_scroll_offset(offset, viewport, top, px(600.)),
+            point(px(-40.), px(0.))
+        );
+    }
+
+    #[test]
+    fn vertical_scroll_preserves_visible_caret_and_clamps_to_content() {
+        let viewport = Bounds::new(point(px(0.), px(0.)), size(px(300.), px(200.)));
+        let visible = Bounds::new(point(px(100.), px(50.)), size(px(2.), px(24.)));
+        let offset = point(px(-30.), px(-100.));
+        assert_eq!(
+            vertical_caret_scroll_offset(offset, viewport, visible, px(600.)),
+            offset
+        );
+        let far = Bounds::new(point(px(100.), px(2000.)), size(px(2.), px(24.)));
+        assert_eq!(
+            vertical_caret_scroll_offset(offset, viewport, far, px(600.)),
+            point(px(-30.), px(-600.))
         );
     }
 }

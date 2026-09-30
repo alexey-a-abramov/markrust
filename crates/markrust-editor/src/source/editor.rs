@@ -105,6 +105,7 @@ pub struct MarkdownEditor {
     pub marked_range: Option<Range<usize>>,
     pub is_selecting: bool,
     pub cursor_visible: bool,
+    raw_source: bool,
     pub layout_cache: LineLayoutCache,
     pub last_bounds_line_height: f32,
     last_caret_bounds: Option<Bounds<Pixels>>,
@@ -138,6 +139,7 @@ impl MarkdownEditor {
             marked_range: None,
             is_selecting: false,
             cursor_visible: false,
+            raw_source: false,
             layout_cache: LineLayoutCache::default(),
             last_bounds_line_height: 0.0,
             last_caret_bounds: None,
@@ -149,6 +151,19 @@ impl MarkdownEditor {
 
     pub fn content(&self, cx: &App) -> String {
         self.document.read(cx).buffer.content()
+    }
+
+    pub fn raw_source(&self) -> bool {
+        self.raw_source
+    }
+
+    pub fn set_raw_source(&mut self, raw_source: bool, cx: &mut Context<Self>) {
+        if self.raw_source != raw_source {
+            self.raw_source = raw_source;
+            self.layout_cache = LineLayoutCache::default();
+            self.last_caret_bounds = None;
+            cx.notify();
+        }
     }
 
     fn editor_state(&self) -> EditorState {

@@ -95,10 +95,7 @@ else
   echo "    (no $ICON_SRC — installing without a custom icon)"
 fi
 
-# NOTE: no CFBundleDocumentTypes on purpose. The app takes a file path on the
-# command line but does not yet handle Finder open-document events, so claiming
-# .md would make double-clicked files open a blank window. Add the document
-# types together with the open-event handler, not before.
+# Finder open-document events are handled by the GPUI application shell.
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -120,6 +117,19 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<string>$VERSION</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Markdown document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>net.daringfireball.markdown</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>LSMinimumSystemVersion</key>
