@@ -100,6 +100,20 @@ This subset checks both themes and writes diagnostic screenshots and state
 traces. It cannot compare/update goldens or be combined with other subsets.
 The complete default run includes these checks too.
 
+For isolated update notices and the all-window restart/checkpoint barrier:
+
+```bash
+cargo run --locked -p markrust-app --features gui-tests --example gui_regression -- --update-only --output target/gui-updates
+```
+
+The 12 synthetic native states cover two-window checkpoint success/failure,
+active Source/Rich composition, the image inspector and translated light/dark
+notice geometry with actual Later clicks. They use no network, installed bundle
+or personal recovery data. The full run includes them; this diagnostic subset
+cannot be mixed with screenshot goldens or other subsets. Also run strict Clippy
+both with default features and `--all-features`: test-only observer indexes must
+not hide production-build warnings.
+
 Document Find is an input owner separate from both editing panes. Its observations
 record query selection, literal source ranges, active match, originating pane and
 native input registration. Contracts independently join actual highlight quads

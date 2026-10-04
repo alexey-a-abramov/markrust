@@ -5050,7 +5050,7 @@ fn table_toolbar(
         .flex_col()
         .gap(px(4.))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .children(items.chunks(columns).enumerate().map(|(_row_index, row)| {
+        .children(items.chunks(columns).enumerate().map(|(row_index, row)| {
             let line = div().w_full().flex().flex_row().gap(px(4.));
             #[cfg(feature = "gui-tests")]
             let line = {
@@ -5058,58 +5058,59 @@ fn table_toolbar(
                 line.on_children_prepainted(move |bounds, _window, cx| {
                     observer.update(cx, |view, _| {
                         for (column, bounds) in bounds.into_iter().enumerate() {
-                            view.table_button_bounds[_row_index * columns + column] = Some(bounds);
+                            view.table_button_bounds[row_index * columns + column] = Some(bounds);
                         }
                     });
                 })
             };
-            line.children(row.iter().map(|(label, id, command)| {
-                let editor = editor.clone();
-                let theme = theme.clone();
-                let command = command.clone();
-                let label: SharedString = theme.ui_text(label).into();
-                div()
-                    .id(*id)
-                    .accessibility_id(*id)
-                    .role(Role::Button)
-                    .aria_label(label.clone())
-                    .flex_1()
-                    .h(px(24.))
-                    .px(px(4.))
-                    .rounded_sm()
-                    .text_xs()
-                    .text_color(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor(CursorStyle::PointingHand)
-                    .hover(move |style| style.bg(theme.sidebar_hover))
-                    .child(label)
-                    .on_click(move |_, window, cx| {
-                        cx.stop_propagation();
-                        editor.update(cx, |view, cx| {
-                            // Revalidate the live target instead of applying a
-                            // stale overlay action to a different input owner.
-                            let source = view.document.read(cx).buffer.content();
-                            if !context_controls_eligible(
-                                view.focus_handle.is_focused(window),
-                                view.selected_range.is_empty(),
-                                matches!(view.widget_edit, WidgetEdit::Idle),
-                                view.is_selecting || view.widget_selecting,
-                            ) || view
-                                .engine
-                                .cell_edit_range(view.cursor_offset(), &source)
-                                .is_none()
-                            {
-                                return;
-                            }
-                            if view.apply_rich(command.clone(), cx) == RichOutcome::Noop {
-                                window.play_system_bell();
-                            }
-                            view.focus_handle.focus(window, cx);
-                        });
-                    })
-            }))
+            line.id(("wysiwyg-table-toolbar-row", row_index))
+                .children(row.iter().map(|(label, id, command)| {
+                    let editor = editor.clone();
+                    let theme = theme.clone();
+                    let command = command.clone();
+                    let label: SharedString = theme.ui_text(label).into();
+                    div()
+                        .id(*id)
+                        .accessibility_id(*id)
+                        .role(Role::Button)
+                        .aria_label(label.clone())
+                        .flex_1()
+                        .h(px(24.))
+                        .px(px(4.))
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(theme.text)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |style| style.bg(theme.sidebar_hover))
+                        .child(label)
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            editor.update(cx, |view, cx| {
+                                // Revalidate the live target instead of applying a
+                                // stale overlay action to a different input owner.
+                                let source = view.document.read(cx).buffer.content();
+                                if !context_controls_eligible(
+                                    view.focus_handle.is_focused(window),
+                                    view.selected_range.is_empty(),
+                                    matches!(view.widget_edit, WidgetEdit::Idle),
+                                    view.is_selecting || view.widget_selecting,
+                                ) || view
+                                    .engine
+                                    .cell_edit_range(view.cursor_offset(), &source)
+                                    .is_none()
+                                {
+                                    return;
+                                }
+                                if view.apply_rich(command.clone(), cx) == RichOutcome::Noop {
+                                    window.play_system_bell();
+                                }
+                                view.focus_handle.focus(window, cx);
+                            });
+                        })
+                }))
         }))
 }
 
