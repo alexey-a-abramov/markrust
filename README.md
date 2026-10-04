@@ -35,14 +35,16 @@ and preserve the other version as an unsaved draft. See
 
 ### GitHub Releases
 
-Prebuilt release archives are not published yet. Follow the
-[releases page](https://github.com/alexey-a-abramov/markrust/releases) for the
-first tagged alpha; until then, build from source below.
+Download [v0.8.1](https://github.com/alexey-a-abramov/markrust/releases/tag/v0.8.1)
+for macOS Apple Silicon/Intel, Linux x86_64 or experimental Windows x86_64.
+Each archive has a SHA-256 sidecar. macOS bundles are ad-hoc signed, not
+Developer-ID signed or notarized; Windows downloads are unsigned.
 
-Prepared GitHub Actions build macOS Apple Silicon/Intel, Linux x86_64 and
-experimental Windows x86_64 archives after verification on each push. Successful
-run artifacts expire after 14 days; permanent Releases require an explicitly
-chosen version tag. These workflows are not yet remotely verified or published.
+GitHub Actions build macOS Apple Silicon/Intel, Linux x86_64 and experimental
+Windows x86_64 archives after verification on each push. The four-native-platform
+matrix is remotely verified. Successful run artifacts expire after 14 days;
+permanent Releases require an explicitly chosen version tag and fresh release gates.
+The first tagged release passed all verification and native build jobs before publication.
 See [binary distribution](docs/deployment.md#binary-distribution) for signing,
 platform acceptance and download details.
 
@@ -57,7 +59,7 @@ release-archive SHA256 checksums before it can be installed.
 `markrust-core` is crates.io-ready. The desktop binary currently depends on GPUI from a pinned Zed git revision, so install from the repository until GPUI is available on crates.io:
 
 ```bash
-cargo install --git https://github.com/alexey-a-abramov/markrust markrust
+cargo install --git https://github.com/alexey-a-abramov/markrust --tag v0.8.1 markrust
 ```
 
 After the package is published:
@@ -73,6 +75,7 @@ Requires **Rust 1.96+**.
 ```bash
 git clone https://github.com/alexey-a-abramov/markrust.git
 cd markrust
+git checkout v0.8.1
 ```
 
 **Linux:** install GPUI system dependencies first:
@@ -192,7 +195,7 @@ cargo run -p markrust            # launches GUI
 CI runs `fmt`, `clippy`, Rust tests, website tests and native macOS GUI contracts
 before the four-platform binary matrix. A matching `v*` version tag runs the
 release gates and publishes checksum-backed assets only after all jobs succeed.
-Public release approval, signing and native cross-platform acceptance remain
+Publisher signing and native cross-platform desktop acceptance remain
 part of the [release gate](docs/deployment.md#repository-prerequisites-and-decisions).
 
 ## Website

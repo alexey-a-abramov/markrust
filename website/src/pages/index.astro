@@ -238,7 +238,7 @@ import CodeBlock from '../components/CodeBlock.astro';
           <p class="band__aside">v0.8.1 alpha · rustc 1.96+</p>
         </header>
         <h2>Download</h2>
-        <p>Public binary archives are not published yet. Native CI workflows are prepared for macOS, Linux, and experimental Windows; the first remote matrix run remains pending. Successful branch builds will provide Actions artifacts, and reviewed version tags will publish checksum-backed releases.</p>
+        <p>v0.8.1 binary archives are published after verified native builds for all four targets. Each download has a SHA-256 sidecar. macOS bundles are ad-hoc signed, not notarized; Linux and Windows desktop acceptance remains experimental.</p>
         <table class="release">
           <thead>
             <tr>
@@ -252,26 +252,26 @@ import CodeBlock from '../components/CodeBlock.astro';
             <tr>
               <td>macOS</td>
               <td><code>aarch64</code> · <code>x86_64</code></td>
-              <td>native CI prepared · source builds</td>
-              <td><a href="/docs/building">Build →</a></td>
+              <td>published · ad-hoc signed</td>
+              <td><a href="https://github.com/alexey-a-abramov/markrust/releases/download/v0.8.1/markrust-macos-aarch64.tar.gz">ARM</a> · <a href="https://github.com/alexey-a-abramov/markrust/releases/download/v0.8.1/markrust-macos-x86_64.tar.gz">Intel</a></td>
             </tr>
             <tr>
               <td>Linux</td>
               <td><code>x86_64</code></td>
-              <td>experimental CI prepared</td>
-              <td><a href="/docs/building">Build →</a></td>
+              <td>experimental · runtime libraries required</td>
+              <td><a href="https://github.com/alexey-a-abramov/markrust/releases/download/v0.8.1/markrust-linux-x86_64.tar.gz">Download →</a></td>
             </tr>
             <tr>
               <td>Windows</td>
               <td><code>x86_64</code></td>
               <td>experimental · GUI/privacy QA pending</td>
-              <td><a href="/docs/install">Status →</a></td>
+              <td><a href="https://github.com/alexey-a-abramov/markrust/releases/download/v0.8.1/markrust-windows-x86_64-experimental.zip">Download →</a></td>
             </tr>
           </tbody>
         </table>
         <div class="download__install">
           <p class="label">from source</p>
-          <CodeBlock code="cargo install --git https://github.com/alexey-a-abramov/markrust markrust" terminal />
+          <CodeBlock code="cargo install --git https://github.com/alexey-a-abramov/markrust --tag v0.8.1 markrust" terminal />
         </div>
         <p><a href="https://github.com/alexey-a-abramov/markrust/releases">Release status →</a> · <a href="/docs/install">Platform and signing limitations →</a></p>
       </div>

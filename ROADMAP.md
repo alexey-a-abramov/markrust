@@ -18,9 +18,9 @@ evidence; they are not a competing priority list.
   redirects, malformed responses, and accessible failure states. Fetches now
   default off, require public HTTPS endpoints, and validate `data:`, remote,
   and local SVGs through the same strict boundary.
-- [ ] **Distribution readiness:** verify the prepared four-native-runner Actions
-  matrix remotely, complete Windows recovery ACL/locking and desktop acceptance,
-  choose signing/notarization, smoke-test tagged archives, publish
+- [ ] **Distribution readiness:** the four-native-runner Actions matrix and
+  tagged `v0.8.1` archive publication passed. Complete Windows recovery
+  ACL/locking and desktop acceptance, choose signing/notarization, publish
   checksum-backed Homebrew formulae, and make an explicit crates.io decision
   for each publishable crate.
 - [ ] **Website delivery:** enable the GitHub Pages workflow, verify ownership
@@ -30,9 +30,10 @@ evidence; they are not a competing priority list.
   a release binary `--version` smoke test, and a short native GUI smoke pass.
   Native builds and screenshot capture require full Xcode and its Metal
   toolchain. See [GUI testing](docs/gui-testing.md).
-- [ ] **Real update acceptance:** install the `0.8.0` local seed, publish `v0.8.1`
-  only after native/remote gates, then observe the new process, build identity
-  and recovered unsaved draft. Checksums and helper receipts alone are not proof
+- [ ] **Real update acceptance:** the `0.8.0` local seed is installed and
+  `v0.8.1` is published after native/remote gates. Unlock the Mac and complete
+  the in-app update; observe the new process, build identity and recovered
+  unsaved draft. Checksums and helper receipts alone are not proof
   of successful startup. In-app installation currently supports macOS only;
   publisher signing/notarization remains a separate decision.
 

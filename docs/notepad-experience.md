@@ -59,13 +59,60 @@ acceptance results, not inferred from these fixtures. See
   The installer did not edit document/recovery data; ordinary startup resumed
   the user's recovered session. Evidence: `target/auto-update-seed-install.log`.
 
-Public `0.8.1` publication and an actual updater-driven restart remain distinct
-pending results until the remote gates, new process identity and recovery are observed.
-The version-only `0.8.1` candidate passed 1,504 all-feature Rust tests, strict
-all-target/all-feature Clippy, packaging contracts and the exact `v0.8.1` tag
-guard. The additional test protects the isolated updater probe from being
-misreported as a complete GUI gate. Logs: `target/auto-update-081-rust.log`,
-`target/auto-update-081-clippy.log` and `target/auto-update-081-packaging.log`.
+### Verified `0.8.1` source and publication gate
+
+The tagged source is `7da9ed99ea959d556fa75f43385374efde9ccbd9`.
+It passed 1,508 all-feature Rust tests, strict default and all-feature Clippy,
+formatting, 16 packaging contracts and the exact `v0.8.1` tag guard.
+The complete local Metal run passed 109 native states and 262 journeys,
+matching all 32 reviewed screenshots without updating references. Evidence:
+`target/auto-update-081-retirement-rust.log`,
+`target/auto-update-081-retirement-default-clippy.log`,
+`target/auto-update-081-retirement-all-clippy.log`, and
+`target/auto-update-081-retirement-metal.log`.
+
+[CI 37227957784](https://github.com/alexey-a-abramov/markrust/actions/runs/37227957784)
+succeeded on that exact source, including the minimum toolchain, website,
+native macOS GUI gate, and all four native test/build/smoke/package/upload jobs.
+The Windows recovery-retirement regression passed on Windows: retirement now
+closes the shared lease before cleanup, rejects retained-worker writes, and
+cannot recreate a retired session. Unix checkpoints retain their locked inode.
+All four development archives' checksums and source/version/target manifests
+were reviewed. The ARM archive also passed the production bounded extractor,
+plist/Mach-O and strict signature probe without execution or installation:
+`target/auto-update-ci081-final-arm-probe.json`.
+
+The immutable `v0.8.1` tag resolved to that same verified commit.
+[Release 37230381296](https://github.com/alexey-a-abramov/markrust/actions/runs/37230381296)
+passed all fresh verification gates and native builds, then published
+[v0.8.1](https://github.com/alexey-a-abramov/markrust/releases/tag/v0.8.1)
+at `2026-10-04T20:33:13Z`. GitHub's latest-release endpoint reports a stable,
+non-draft release with all eight archive/checksum assets uploaded.
+
+The actual published ARM archive was downloaded separately and passed the same
+production extraction, identity/architecture and strict signature probe without
+execution or installation. Its manifest identifies the tagged source and build
+`2026-10-04T20:20:45Z`; SHA-256
+`d795e51cf2b0c19cb97e665dfdfa1243e4bef1f606c91bcc60ef867c2bea9158`.
+Evidence: `target/auto-update-published081-arm-probe.json`,
+`target/auto-update-release081-latest.json` and
+`target/auto-update-release081-final-run.json`.
+
+The publication documentation/download links passed three website unit tests,
+16 Chromium E2E tests and an isolated 25-page build. A concurrent build collided
+with E2E's output regeneration; its sequential rerun passed. Run these commands
+sequentially because they share `website/dist`. Evidence:
+`target/auto-update-publication-website-test.log` and
+`target/auto-update-publication-website-build-final.log`. The website itself was
+not deployed, and no DNS or repository setting was changed.
+
+Actual updater-driven startup remains pending: the Mac was locked when native
+interaction was requested. The installed `0.8.0` seed remains running with
+three dirty tabs, including an unsaved control paragraph. Buffer/base hashes
+were captured privately without exporting user text. Continue through the app's
+Check for Updates, Download Update, and Restart and Update controls only after
+unlocking; verify the new process, About identity, retained backup/receipt and
+exact recovered buffers. Do not replace the live bundle or force-quit the app.
 
 ## Version 0.7.0 navigation, locations and live UI language
 

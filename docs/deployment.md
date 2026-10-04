@@ -58,8 +58,15 @@ workflow permissions set to read. The publisher's explicit `contents: write`
 uses the built-in `GITHUB_TOKEN`; unsigned builds/releases need no personal
 access token. Confirm the first remote run: runner labels and policies can change.
 
-The first remote matrix and tagged release are being validated. Local tests do
-not establish remote publication or Windows/Linux desktop acceptance. Signing
+The four-platform matrix succeeded on source
+`7da9ed99ea959d556fa75f43385374efde9ccbd9` in
+[CI 37227957784](https://github.com/alexey-a-abramov/markrust/actions/runs/37227957784).
+[Release 37230381296](https://github.com/alexey-a-abramov/markrust/actions/runs/37230381296)
+also succeeded on that source and published
+[v0.8.1](https://github.com/alexey-a-abramov/markrust/releases/tag/v0.8.1)
+at `2026-10-04T20:33:13Z`, with all four archives and SHA-256 sidecars uploaded.
+The public latest-release endpoint returns this stable release. Native builds
+and Rust tests do not establish Windows/Linux desktop acceptance. Signing
 credentials, repository settings and DNS remain unchanged.
 
 | Question | Recommendation | User decision | Notes (optional) |

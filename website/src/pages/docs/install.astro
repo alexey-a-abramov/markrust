@@ -13,25 +13,25 @@ const headings = [
 <DocsLayout title="Installation" headings={headings}>
   <h2 id="requirements">Requirements</h2>
   <ul>
-    <li><strong>macOS:</strong> Apple Silicon or Intel; native build jobs are prepared for both architectures.</li>
+    <li><strong>macOS:</strong> Apple Silicon or Intel; verified native builds are published for both architectures.</li>
     <li><strong>Linux:</strong> experimental x86_64 builds for an X11/Wayland desktop with Vulkan graphics and the required system libraries.</li>
-    <li><strong>Windows:</strong> experimental x86_64 build job; native editor, clipboard, IME, and recovery-directory privacy/locking acceptance remain pending.</li>
+    <li><strong>Windows:</strong> experimental x86_64 download; native editor, clipboard, IME, and recovery-directory privacy/locking acceptance remain pending.</li>
   </ul>
 
   <h2 id="releases">GitHub Releases</h2>
-  <p>Successful branch builds provide 14-day Actions artifacts; matching version tags publish checksum-backed GitHub Releases after all gates pass. The v0.8.1 release is the first macOS in-app update test target. Confirm available downloads on the releases page before installing.</p>
+  <p>v0.8.1 is published with macOS Apple Silicon/Intel, Linux x86_64 and experimental Windows x86_64 archives plus SHA-256 sidecars. All native build and release gates passed before publication. Successful branch builds also provide 14-day Actions artifacts. Confirm available downloads on the releases page before installing.</p>
   <p>On macOS, the application menu checks for new stable releases automatically or on demand. Download and restart require your confirmation; unsaved drafts in every window must be checkpointed first. In-app replacement is not supported on Windows or Linux yet. macOS bundles are ad-hoc signed, not Developer-ID signed or notarized.</p>
-  <p>Follow the <a href="https://github.com/alexey-a-abramov/markrust/releases">releases page</a> for public downloads. No current download link is implied by the prepared workflows.</p>
+  <p>Download the <a href="https://github.com/alexey-a-abramov/markrust/releases/tag/v0.8.1">v0.8.1 release</a> and its checksums, or follow the <a href="https://github.com/alexey-a-abramov/markrust/releases">releases page</a> for later versions.</p>
   <Callout type="note">
-    <p>The prepared macOS bundles are ad-hoc signed, not Developer-ID signed or notarized. Windows archives are explicitly experimental and unsigned. Gatekeeper or SmartScreen may warn or block these development builds.</p>
+    <p>macOS bundles are ad-hoc signed, not Developer-ID signed or notarized. Windows archives are explicitly experimental and unsigned. Gatekeeper or SmartScreen may warn or block these development builds.</p>
   </Callout>
 
   <h2 id="homebrew">Homebrew</h2>
   <p>The Homebrew tap is not published yet. It will be available after release archives and their checksums are published.</p>
 
   <h2 id="development">Development builds</h2>
-  <p>Until binary downloads are published, developers can use the <a href="/docs/building">source-build instructions</a>, including platform toolchains and Cargo installation. These are development workflows, not a one-click end-user installer.</p>
+  <p>Developers can also use the <a href="/docs/building">source-build instructions</a>, including platform toolchains and Cargo installation. These are development workflows, not a one-click end-user installer.</p>
 
   <h2>Related</h2>
-  <p><a href="/docs/building">Building from source</a> · <a href="/docs/roadmap">Release gates</a> · <a href="https://github.com/alexey-a-abramov/markrust/blob/main/docs/deployment.md">Distribution reference</a></p>
+  <p><a href="/docs/building">Building from source</a> · <a href="/docs/roadmap">Release gates</a> · <a href="https://github.com/alexey-a-abramov/markrust/blob/feat/markdown-toolbar/docs/deployment.md">Distribution reference</a></p>
 </DocsLayout>
