@@ -15,7 +15,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -414,6 +414,7 @@ pub enum RecoveryWarning {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryWriteResult {
     Written,
+    /// Superseded work or a retired window; no storage mutation occurred.
     SkippedStale,
 }
 
@@ -443,9 +444,12 @@ pub struct RecoveryStore {
     directory: PathBuf,
     write_lock: Arc<Mutex<()>>,
     latest_generation: Arc<AtomicU64>,
-    /// Production windows retain an exclusive process-lifetime file lease.
-    /// Cloning a store shares the lease rather than creating another owner.
-    _lease: Option<Arc<File>>,
+    /// Retirement is shared with delayed checkpoint workers and readers. Its
+    /// transition is serialized with writes before the shared lease is closed.
+    retired: Arc<AtomicBool>,
+    /// Live windows retain one stable owner-lease inode across checkpoints.
+    /// Retirement can close its handle even while worker clones remain alive.
+    lease: Arc<Mutex<Option<File>>>,
 }
 
 impl RecoveryStore {
@@ -573,11 +577,16 @@ impl RecoveryStore {
             directory,
             write_lock: Arc::new(Mutex::new(())),
             latest_generation: Arc::new(AtomicU64::new(0)),
-            _lease: None,
+            retired: Arc::new(AtomicBool::new(false)),
+            lease: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn claim(mut self) -> Result<Self, RecoveryError> {
+    fn claim(self) -> Result<Self, RecoveryError> {
+        let write_lock = self.write_lock.clone();
+        let _write_guard = write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_private_directory()?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -605,13 +614,16 @@ impl RecoveryStore {
                 ));
             }
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            // flock has no pointer or lifetime contract. The live Arc<File>
-            // below keeps the descriptor (and lease) open across worker clones.
+            // flock has no pointer or lifetime contract. The shared lease
+            // below keeps the descriptor open across live worker clones.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Err(io::Error::last_os_error().into());
             }
         }
-        self._lease = Some(Arc::new(file));
+        *self
+            .lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(file);
         Ok(self)
     }
 
@@ -636,6 +648,9 @@ impl RecoveryStore {
             .write_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.retired.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.ensure_private_directory()?;
         let snapshot = self.read_snapshot(&self.snapshot_path())?.ok_or_else(|| {
             RecoveryError::InvalidSnapshot(
@@ -658,36 +673,57 @@ impl RecoveryStore {
         sync_directory(&self.directory)?;
         fs::remove_file(self.snapshot_path())?;
         sync_directory(&self.directory)?;
+        // No retained worker may reopen this session after its checkpoints
+        // have been durably removed. Set the barrier before closing any handle.
+        self.retired.store(true, Ordering::Release);
+        #[cfg(not(unix))]
+        self.close_lease();
         // Only a durably retired clean window may remove its lease pathname.
         // Live checkpoints must keep the locked inode reachable, otherwise a
         // second process could create and lock a different owner-lease inode.
-        #[cfg(unix)]
-        {
+        // Windows also needs every shared handle closed before directory
+        // removal; share-delete alone does not complete file deletion.
+        let cleanup = (|| -> Result<(), RecoveryError> {
             match fs::remove_file(self.directory.join(LEASE_FILE)) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 result => result?,
             }
             sync_directory(&self.directory)?;
-        }
-        if self
-            .directory
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(WINDOW_DIRECTORY_PREFIX))
-        {
-            match fs::remove_dir(&self.directory) {
-                Ok(()) => {
-                    if let Some(parent) = self.directory.parent() {
-                        sync_directory(parent)?;
+            if self
+                .directory
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(WINDOW_DIRECTORY_PREFIX))
+            {
+                match fs::remove_dir(&self.directory) {
+                    Ok(()) => {
+                        if let Some(parent) = self.directory.parent() {
+                            sync_directory(parent)?;
+                        }
                     }
+                    Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-                Err(error) => return Err(error.into()),
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        // Unix keeps the original flock until its pathname and clean window
+        // directory have been removed, including when cleanup reports an error.
+        #[cfg(unix)]
+        self.close_lease();
+        cleanup
     }
 
     pub fn load(&self) -> RecoveryLoad {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.retired.load(Ordering::Acquire) {
+            return RecoveryLoad {
+                snapshot: None,
+                warning: None,
+            };
+        }
         if let Err(error) = self.ensure_private_directory() {
             return RecoveryLoad {
                 snapshot: None,
@@ -764,7 +800,9 @@ impl RecoveryStore {
             .write_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.latest_generation.load(Ordering::Acquire) != generation {
+        if self.retired.load(Ordering::Acquire)
+            || self.latest_generation.load(Ordering::Acquire) != generation
+        {
             return Ok(RecoveryWriteResult::SkippedStale);
         }
         self.write_locked(snapshot)?;
@@ -772,6 +810,7 @@ impl RecoveryStore {
     }
 
     fn write_locked(&self, snapshot: &RecoverySnapshot) -> Result<(), RecoveryError> {
+        self.ensure_not_retired()?;
         let encoded = encode_snapshot(snapshot)?;
         self.ensure_private_directory()?;
 
@@ -833,6 +872,7 @@ impl RecoveryStore {
     }
 
     fn ensure_private_directory(&self) -> Result<(), RecoveryError> {
+        self.ensure_not_retired()?;
         let mut created = false;
         match fs::symlink_metadata(&self.directory) {
             Ok(metadata) => {
@@ -874,6 +914,24 @@ impl RecoveryStore {
             }
         }
         Ok(())
+    }
+
+    fn ensure_not_retired(&self) -> Result<(), RecoveryError> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(RecoveryError::InvalidSnapshot(
+                "cannot reopen a retired recovery session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn close_lease(&self) {
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(lease);
     }
 
     fn temp_path(&self, label: &str) -> PathBuf {
@@ -1240,6 +1298,104 @@ mod tests {
         }
         assert!(RecoveryStore::sessions_in(temp.path()).unwrap().is_empty());
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retained_worker_and_reader_clones_cannot_resurrect_a_retired_window() {
+        let temp = TempDir::new("retire-retained-clones");
+        let store = RecoveryStore::fresh_in(temp.path()).unwrap();
+        let directory = store.directory.clone();
+        let dirty = one_tab_snapshot(tab(None, "older private draft", "", true));
+        store.write(&dirty).unwrap();
+        store
+            .write(&one_tab_snapshot(tab(None, "saved", "saved", false)))
+            .unwrap();
+        let worker = store.clone();
+        let reader = store.clone();
+        store.note_generation(3);
+        let (start, delayed) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            delayed.recv().unwrap();
+            assert_eq!(
+                worker.write_if_current(&dirty, 3).unwrap(),
+                RecoveryWriteResult::SkippedStale
+            );
+            assert!(matches!(
+                worker.write(&dirty),
+                Err(RecoveryError::InvalidSnapshot(_))
+            ));
+            let loaded = worker.load();
+            assert!(loaded.snapshot.is_none());
+            assert!(loaded.warning.is_none());
+        });
+
+        store.retire_clean_session().unwrap();
+        assert!(store
+            .lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+        // The clones remain alive while the lease handle is closed and the
+        // directory is deleted, which is essential for Windows cleanup.
+        assert!(!directory.exists());
+        start.send(()).unwrap();
+        task.join().unwrap();
+        reader.note_generation(4);
+        assert_eq!(
+            reader
+                .write_if_current(&one_tab_snapshot(tab(None, "late", "", true)), 4)
+                .unwrap(),
+            RecoveryWriteResult::SkippedStale
+        );
+        assert!(reader.load().snapshot.is_none());
+        reader.retire_clean_session().unwrap();
+        assert!(reader.claim().is_err());
+        assert!(!directory.exists());
+        assert!(RecoveryStore::sessions_in(temp.path()).unwrap().is_empty());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retired_legacy_store_keeps_its_root_empty_without_recreating_a_checkpoint() {
+        let temp = TempDir::new("retire-legacy");
+        let directory = temp.path().join("legacy-recovery");
+        let store = RecoveryStore::new(directory.clone()).claim().unwrap();
+        let retained = store.clone();
+        let clean = one_tab_snapshot(tab(None, "saved", "saved", false));
+        store.write(&clean).unwrap();
+        store.retire_clean_session().unwrap();
+        assert!(directory.is_dir());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        assert!(retained.write(&clean).is_err());
+        let loaded = retained.load();
+        assert!(loaded.snapshot.is_none());
+        assert!(loaded.warning.is_none());
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn rejected_dirty_retirement_keeps_the_shared_lease_and_checkpoint_admission() {
+        let temp = TempDir::new("retire-dirty-admission");
+        let store = RecoveryStore::fresh_in(temp.path()).unwrap();
+        let retained = store.clone();
+        store
+            .write(&one_tab_snapshot(tab(None, "unsaved", "", true)))
+            .unwrap();
+        assert!(store.retire_clean_session().is_err());
+        assert!(!store.retired.load(Ordering::Acquire));
+        assert!(store
+            .lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some());
+        let newer = one_tab_snapshot(tab(None, "new unsaved edits", "", true));
+        retained.note_generation(2);
+        assert_eq!(
+            retained.write_if_current(&newer, 2).unwrap(),
+            RecoveryWriteResult::Written
+        );
+        assert_eq!(store.load().snapshot.unwrap(), newer);
+        assert!(store.directory.join(LEASE_FILE).is_file());
     }
 
     #[test]
