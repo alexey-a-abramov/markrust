@@ -219,7 +219,7 @@ fn drop_classifier_folder_md_and_image_insert() {
 
     let mut workspace = HeadlessWorkspace::new();
     workspace
-        .apply(WorkspaceCommand::SaveAs(md.clone()))
+        .apply(WorkspaceCommand::OpenFile(md.clone()))
         .unwrap();
     workspace
         .apply(WorkspaceCommand::DropFiles {
@@ -228,6 +228,7 @@ fn drop_classifier_folder_md_and_image_insert() {
         })
         .unwrap();
     let content = workspace.active().unwrap().editor.content();
+    assert!(content.contains("# Note\n"));
     assert!(
         content.contains("![photo.png](assets/photo.png)"),
         "{content}"
@@ -238,7 +239,7 @@ fn drop_classifier_folder_md_and_image_insert() {
 }
 
 #[test]
-fn autosave_debounce_uses_fake_clock() {
+fn private_autosave_debounce_never_publishes_the_source_file() {
     let dir = unique_temp("autosave");
     let path = dir.join("note.md");
     std::fs::write(&path, "start\n").unwrap();
@@ -257,12 +258,32 @@ fn autosave_debounce_uses_fake_clock() {
         .apply(WorkspaceCommand::AdvanceTime { millis: 999 })
         .unwrap();
     assert!(workspace.active().unwrap().editor.document().dirty);
+    assert!(workspace.private_checkpoint().is_none());
     workspace
         .apply(WorkspaceCommand::AdvanceTime { millis: 1 })
         .unwrap();
+    assert!(workspace.active().unwrap().editor.document().dirty);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "start\n");
+    assert!(workspace
+        .active()
+        .unwrap()
+        .editor
+        .content()
+        .contains("edited"));
+    let checkpoint = workspace
+        .private_checkpoint()
+        .expect("private draft checkpoint");
+    assert_eq!(checkpoint.tabs[0].saved_content, "start\n");
+    assert_eq!(
+        checkpoint.tabs[0].content,
+        workspace.active().unwrap().editor.content()
+    );
+    assert!(checkpoint.tabs[0].dirty);
+    // Save is the explicit publication boundary; private persistence never
+    // marks a document clean or changes its original Markdown on disk.
+    workspace.apply(WorkspaceCommand::Save).unwrap();
     assert!(!workspace.active().unwrap().editor.document().dirty);
-    let saved = std::fs::read_to_string(&path).unwrap();
-    assert!(saved.contains("edited"));
+    assert!(std::fs::read_to_string(&path).unwrap().contains("edited"));
 }
 
 #[test]

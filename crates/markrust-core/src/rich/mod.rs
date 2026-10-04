@@ -37,13 +37,15 @@ pub use input_rules::{
 pub use save::{save_candidates, DiffHunk, SaveCandidates};
 pub use serialize::{serialize_block, serialize_tree, SerializeMode};
 pub use tree::{
-    alert_title_range, code_span_visible_range, emoji_visible_range, expand_around_html_phrasing,
-    expand_around_markdown_link, expand_link_and_html_chrome, expand_marks_and_link_chrome,
-    find_alert_chrome, grow_mark_delimiters, is_toc_marker, link_reference_def_chrome,
-    markdown_link_chrome, markdown_link_dest_parts, math_visible_range, toc_visible_range,
-    wiki_visible_range, AlertChrome, AlertKind, Block, BlockKind, BreakStyle, ColumnAlign,
-    FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs, LinkReferenceDefChrome,
-    MarkFidelity, MarkSet, MarkdownLinkChrome, NodeId, PrefixBlank, RichTree,
+    alert_title_range, blank_gap_whitespace_range, code_span_visible_range, emoji_visible_range,
+    expand_around_html_phrasing, expand_around_markdown_link, expand_link_and_html_chrome,
+    expand_marks_and_link_chrome, find_alert_chrome, grow_mark_delimiters, is_toc_marker,
+    leading_prose_whitespace_range, link_reference_def_chrome, markdown_link_chrome,
+    markdown_link_dest_parts, math_visible_range, toc_visible_range,
+    trailing_prose_whitespace_range, wiki_visible_range, AlertChrome, AlertKind, Block, BlockKind,
+    BreakStyle, ColumnAlign, FenceFidelity, Frontmatter, HeadingStyle, IdGen, Inline, LinkAttrs,
+    LinkReferenceDefChrome, MarkFidelity, MarkSet, MarkdownLinkChrome, NodeId, PrefixBlank,
+    RichTree,
 };
 
 #[cfg(test)]

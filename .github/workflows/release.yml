@@ -1,12 +1,8 @@
 name: Release
 
-# Windows builds are deferred to v0.2 (GPUI platform support + CI cost).
-# macOS ships separate aarch64 and x86_64 archives; combine locally with lipo if needed.
-
 on:
   push:
-    tags:
-      - "v*"
+    tags: ['v*']
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,184 +11,151 @@ env:
 permissions:
   contents: read
 
+# A rerun must not cancel a verified publication halfway through uploading.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  version:
+    name: tag matches workspace version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate release tag
+        run: python3 scripts/package-release.py --check-tag
+        env:
+          MARKRUST_RELEASE_TAG: ${{ github.ref_name }}
+
   verify:
     name: release verification
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          toolchain: 1.96
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, reviewed 2026-10-04
+        with:
+          toolchain: '1.96'
           components: rustfmt, clippy
-
       - name: Install Linux GUI dependencies
         run: bash scripts/install-linux-deps.sh
-
+      - name: Release packaging contracts
+        run: python3 -m unittest discover -s scripts/tests -v
       - name: Check formatting
         run: cargo fmt --all -- --check
-
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
       - name: Run Rust test suite
         run: cargo test --locked --workspace
 
   verify-macos:
     name: native macOS release verification
-    runs-on: macos-latest
-    timeout-minutes: 30
+    needs: version
+    runs-on: macos-15
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          toolchain: 1.96
-
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, reviewed 2026-10-04
+        with:
+          toolchain: '1.96'
+      - name: Verify macOS shader toolchain
+        run: |
+          xcrun --find metal
+          xcrun --find metallib
       - name: Run native Rust test suite
+        # Geometry-only still compiles GPUI's bundled Metal shaders.
         run: cargo test --locked --workspace
-
       - name: UI contract fault-injection tests
         run: cargo test --locked -p markrust-app --features gui-tests --lib
-
       - name: Verify native GUI layout and input
         run: >-
           cargo run --locked -p markrust-app --features gui-tests
           --example gui_regression -- --geometry-only
           --output target/gui-regression
-
       - name: Upload native GUI evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-gui-regression
           path: target/gui-regression/
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Build and smoke native release binary
-        run: |
-          cargo build --locked --release -p markrust
-          ./target/release/markrust --version
-
   verify-website:
     name: website release verification
-    runs-on: ubuntu-latest
+    needs: version
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          version: 9
-
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 9.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
-
       - name: Install website dependencies
         run: pnpm install --frozen-lockfile
-
       - name: Install Playwright Chromium
         run: pnpm --dir website exec playwright install --with-deps chromium
-
       - name: Run website unit + e2e tests
         run: pnpm --dir website test
 
   build:
     needs: [verify, verify-macos, verify-website]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: markrust-macos-aarch64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: markrust-macos-x86_64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: markrust-linux-x86_64
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96
-          targets: ${{ matrix.target }}
-
-      - name: Install Linux GUI dependencies
-        if: runner.os == 'Linux'
-        run: bash scripts/install-linux-deps.sh
-
-      # Build and execute a binary for the runner's own architecture first.
-      # A cross-compiled artifact can prove it links, but cannot prove it starts.
-      - name: Build and smoke native release binary
-        run: |
-          cargo build --locked --release -p markrust
-          ./target/release/markrust --version
-
-      - name: Build target release binary
-        run: cargo build --locked --release -p markrust --target ${{ matrix.target }}
-
-      - name: Package archive
-        shell: bash
-        run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/markrust" dist/
-          tar czf "${{ matrix.artifact }}.tar.gz" -C dist markrust
-          if command -v shasum >/dev/null; then
-            shasum -a 256 "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
-          else
-            sha256sum "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.tar.gz.sha256
+    uses: ./.github/workflows/build-binaries.yml
+    permissions:
+      contents: read
 
   release:
-    needs: [verify, verify-macos, verify-website, build]
-    runs-on: ubuntu-latest
+    name: publish verified version-tag assets
+    needs: [version, verify, verify-macos, verify-website, build]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      # Only archives from this run's native build jobs, never GUI evidence or
+      # another workflow's artifacts. No checkout/build code receives write access.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: markrust-*-${{ github.sha }}
           path: artifacts
           merge-multiple: true
-
-      - name: Verify archive checksums
+      - name: Verify complete native matrix and archive checksums
         shell: bash
         run: |
-          shopt -s nullglob
-          checksums=(artifacts/*.sha256)
-          test "${#checksums[@]}" -gt 0
-          for checksum in "${checksums[@]}"; do
-            (
-              cd "$(dirname "$checksum")"
-              sha256sum -c "$(basename "$checksum")"
-            )
+          cd artifacts
+          for archive in markrust-macos-aarch64.tar.gz markrust-macos-x86_64.tar.gz markrust-linux-x86_64.tar.gz markrust-windows-x86_64-experimental.zip; do
+            test -s "$archive"
+            test -s "$archive.sha256"
+            sha256sum -c "$archive.sha256"
           done
-
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.tar.gz.sha256
-          generate_release_notes: true
+        # `gh release create` fails if the tag already has a release: a rerun
+        # cannot silently replace previously published binaries/checksums.
+        shell: bash
+        run: |
+          options=(--repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --notes "$RELEASE_NOTES")
+          if [[ "$RELEASE_TAG" == *-* ]]; then options+=(--prerelease --latest=false); fi
+          gh release create "$RELEASE_TAG" "${options[@]}" artifacts/*.tar.gz artifacts/*.zip artifacts/*.sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_NOTES: |
+            Native macOS (Apple Silicon + Intel), Linux x86_64, and **experimental Windows x86_64** builds.
+            Each archive includes compiled version/build time, source commit, license notices, and a SHA-256 sidecar.
+            macOS is ad-hoc signed, not Developer-ID signed or notarized. Windows is not Authenticode signed.
+            Windows native editor, clipboard, IME, and recovery-directory ACL/locking acceptance remain pending.
+            Linux requires a compatible X11/Wayland desktop, Vulkan graphics, and shared system libraries; it is not an AppImage.

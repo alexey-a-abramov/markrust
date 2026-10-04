@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.8.0"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.96"
@@ -30,3 +30,10 @@ gpui-rev = "8166e3d7b8b42d8aaf4d4dee7fcd25ab4ec65105"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# Keep lossless GUI frame recording usable in normal debug/test builds.
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3

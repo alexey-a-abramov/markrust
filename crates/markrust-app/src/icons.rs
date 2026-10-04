@@ -2,12 +2,23 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Original, monochrome 20-point toolbar symbols. Embedded SVG keeps the UI
-//! crisp at every display scale and avoids a runtime asset-directory dependency.
+//! Compact monochrome toolbar symbols. Embedded SVG and native style labels
+//! stay crisp at every display scale without a runtime asset-directory dependency.
 
-use gpui::{prelude::*, px, svg, Hsla, Svg};
+use gpui::{div, prelude::*, px, svg, AnyElement, FontWeight, Hsla};
 
-#[derive(Clone, Copy)]
+// A single grid and stroke contract keeps small toolbar symbols coherent.
+macro_rules! symbol {
+    ($geometry:literal) => {
+        concat!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"black\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">",
+            $geometry,
+            "</svg>"
+        )
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     Sidebar,
     NewDocument,
@@ -40,103 +51,210 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub fn render(self, color: Hsla) -> Svg {
+    pub fn render(self, color: Hsla) -> AnyElement {
+        if let Some(label) = self.text_label() {
+            return div()
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color)
+                .child(label)
+                .into_any_element();
+        }
         svg()
             .data(self.svg().as_bytes())
             .size(px(18.))
             .text_color(color)
+            .into_any_element()
+    }
+
+    /// Style names use actual type so their numerals cannot be confused with
+    /// hand-drawn symbols or change meaning at small display scales.
+    pub(crate) fn text_label(self) -> Option<&'static str> {
+        match self {
+            Self::Heading1 => Some("H1"),
+            Self::Heading2 => Some("H2"),
+            Self::Heading3 => Some("H3"),
+            Self::Paragraph => Some("Body"),
+            _ => None,
+        }
     }
 
     fn svg(self) -> &'static str {
         match self {
             Self::Sidebar => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.25" y="3.25" width="15.5" height="13.5" rx="2"/><path d="M7 3.5v13M4.5 6h.01M4.5 9h.01M4.5 12h.01"/></svg>"#
+                symbol!(
+                    r#"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M6 8h.01M6 12h.01M6 16h.01"/>"#
+                )
             }
             Self::NewDocument => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 2.5h-6a1 1 0 0 0-1 1v13a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-8M11 2.5v5h5M6.5 12h7M10 8.5v7"/></svg>"#
+                symbol!(
+                    r#"<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6ZM14 3v6h6M8 15h8M12 11v8"/>"#
+                )
             }
             Self::Open => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5v-2a1 1 0 0 1 1-1h4l2 2h7a1 1 0 0 1 1 1v1M3.2 16.5l-1-8h15.6l-1 8z"/></svg>"#
+                symbol!(
+                    r#"<path d="M3 9V6a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2M3 9h18l-2 11H5L3 9Z"/>"#
+                )
             }
             Self::Wysiwyg => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-5M6 13h3M6 6h2M6 9h1M10 10l1-3 5-5 2 2-5 5zM14.5 3.5l2 2"/></svg>"#
+                symbol!(
+                    r#"<path d="M11 4H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-6M7 9h3M7 13h2M7 17h6M13 11l1-4 5-5 3 3-5 5-4 1ZM18 3l3 3"/>"#
+                )
             }
             Self::Source => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 5-4.5 5L6 15m8-10 4.5 5-4.5 5M12 3 8 17"/></svg>"#
+                symbol!(r#"<path d="m7 6-5 6 5 6m10-12 5 6-5 6M14 4l-4 16"/>"#)
             }
             Self::Split => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.25" y="3.25" width="15.5" height="13.5" rx="2"/><path d="M10 3.5v13M5 7h2M5 10h2M5 13h2M13 7h2M13 10h2"/></svg>"#
+                symbol!(
+                    r#"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16M6 8h3M6 12h3M6 16h3M15 8h3M15 12h3M15 16h3"/>"#
+                )
             }
             Self::Outline => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4h10M7 8h7M7 12h10M7 16h7M3 4h.01M3 8h.01M3 12h.01M3 16h.01"/></svg>"#
+                symbol!(r#"<path d="M8 5h13M8 12h10M8 19h13M3 5h.01M3 12h.01M3 19h.01"/>"#)
             }
             Self::Close => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><path d="m6 6 8 8m0-8-8 8"/></svg>"#
+                symbol!(r#"<path d="m6 6 12 12m0-12L6 18"/>"#)
             }
             Self::Bold => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 4.5h5.5a3.25 3.25 0 0 1 0 6.5H5.5zM5.5 11h6a3.25 3.25 0 0 1 0 6.5H5.5z"/></svg>"#
+                symbol!(r#"<path d="M7 4h6a4 4 0 0 1 0 8H7m0 0h7a4 4 0 0 1 0 8H7V4Z"/>"#)
             }
             Self::Italic => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 4.5h7M5 15.5h7M11 4.5l-2 11"/></svg>"#
+                symbol!(r#"<path d="M9 4h10M5 20h10M15 4 9 20"/>"#)
             }
             Self::Code => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4c-2 0-3 1.5-3 3s1 3 0 4.5-2 3-2 3M7 6.5l-3.5 2L7 11M13 6.5l3.5 2L13 11"/></svg>"#
+                symbol!(r#"<path d="m8 6-6 6 6 6m8-12 6 6-6 6"/>"#)
             }
             Self::Link => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12a3.5 3.5 0 0 0 5 0l3-3a3.5 3.5 0 0 0-5-5l-1 1M12 8a3.5 3.5 0 0 0-5 0l-3 3a3.5 3.5 0 0 0 5 5l1-1"/></svg>"#
+                symbol!(
+                    r#"<path d="M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-2 2M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l2-2"/>"#
+                )
             }
-            Self::Heading1 => {
-                // H with an underline that doubles as the 1's foot — gives
-                // H1 its own silhouette distinct from H2 / H3.
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5v11M9 4.5v11M3 10H9M11.5 7v8M11.5 7l3.5 2M11.5 15l3.5-2"/></svg>"#
-            }
-            Self::Heading2 => {
-                // H with a 2 that hangs off its right (top + belly).
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5v11M9 4.5v11M3 10H9M11.5 6.5h6l-3.5 4h0a3.5 3.5 0 0 1 3.5 3.5v1h-7"/></svg>"#
-            }
-            Self::Heading3 => {
-                // H with two stacked semicircles (the two bumps of 3).
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5v11M9 4.5v11M3 10H9M12 6.5h4.5a2.5 2.5 0 0 1 0 5h-3.5a2.5 2.5 0 0 0 0 5h4.5"/></svg>"#
-            }
-            Self::Paragraph => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4.5h8M7 10h8M7 15.5h5M5 4.5v11"/></svg>"#
+            Self::Heading1 | Self::Heading2 | Self::Heading3 | Self::Paragraph => {
+                unreachable!("block-style buttons use native text labels")
             }
             Self::Quote => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6.5a2.5 2.5 0 1 0-2 4l1 1a2.5 2.5 0 1 1-2 4M14 6.5a2.5 2.5 0 1 0-2 4l1 1a2.5 2.5 0 1 1-2 4"/></svg>"#
+                symbol!(r#"<path d="M4 10h6v7H4v-7c0-4 2-6 6-6M14 10h6v7h-6v-7c0-4 2-6 6-6"/>"#)
             }
             Self::UnorderedList => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5.5h10M7 10h10M7 14.5h10M3.5 5.5h.01M3.5 10h.01M3.5 14.5h.01"/></svg>"#
+                symbol!(
+                    r#"<path d="M9 6h12M9 12h12M9 18h12"/><circle cx="3" cy="6" r="1" fill="black" stroke="none"/><circle cx="3" cy="12" r="1" fill="black" stroke="none"/><circle cx="3" cy="18" r="1" fill="black" stroke="none"/>"#
+                )
             }
             Self::OrderedList => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5.5h10M7 10h10M7 14.5h10M3 5v-.5a1 1 0 0 1 1-1h.5M3 10.5h2a1 1 0 0 0-1-1v-1M4 14.5a1 1 0 0 0-1 1v.5h2.5"/></svg>"#
+                // Two legible numbers are preferable to three tiny scribbles.
+                symbol!(
+                    r#"<path d="M10 7h11M10 17h11"/><path stroke-width="1.5" d="m3 5 2-1v6M3 10h4M3 16a2 2 0 1 1 4 0c0 1-1 2-4 4h4"/>"#
+                )
             }
             Self::TaskList => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="4" height="4" rx="0.75"/><path d="M3.5 6l1 1 2-2M8.5 6h8.5M8.5 10h8.5M2.5 11.5h4v4h-4zM3.5 13.5l1 1 2-2M8.5 15h8.5"/></svg>"#
+                symbol!(
+                    r#"<rect x="3" y="3" width="6" height="6" rx="1"/><rect x="3" y="15" width="6" height="6" rx="1"/><path d="m4.5 6 1 1 2-2M13 6h8M13 12h8M13 18h8"/>"#
+                )
             }
             Self::HorizontalRule => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><path d="M2.5 10h15"/></svg>"#
+                symbol!(r#"<path d="M3 12h18"/>"#)
             }
             Self::CodeBlock => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="15" height="13" rx="1.5"/><path d="M7 8l-2 2 2 2M13 8l2 2-2 2"/></svg>"#
+                symbol!(
+                    r#"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m9 9-3 3 3 3m6-6 3 3-3 3"/>"#
+                )
             }
             Self::Strikethrough => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6.5a3 3 0 0 1 3-2.5h0a3 3 0 0 1 3 2.5M5 13.5a3 3 0 0 0 3 2.5h0a3 3 0 0 0 3-2.5M3 10h14"/></svg>"#
+                symbol!(
+                    r#"<path d="M17 6a5 5 0 0 0-5-3C5 3 5 10 12 10m0 4c7 0 7 7 0 7a5 5 0 0 1-5-3M3 12h18"/>"#
+                )
             }
             Self::Image => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="15" height="13" rx="1.5"/><path d="m3.5 14 4-4 3 3 3-3 3 3M13 7.5a1 1 0 1 0 0-.01"/></svg>"#
+                symbol!(
+                    r#"<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8" cy="9" r="1.5"/><path d="m3 17 5-5 4 4 4-6 5 7"/>"#
+                )
             }
             Self::Table => {
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="15" height="13" rx="1.5"/><path d="M2.5 9h15M2.5 14h15M8 3.5v13"/></svg>"#
+                symbol!(
+                    r#"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M3 15h18M9 4v16M15 4v16"/>"#
+                )
             }
             Self::Indent => {
-                // Right-pointing chevron with two text lines: content
-                // moves one tab stop inward.
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h5M3 15h5M11 6l4 4-4 4"/></svg>"#
+                symbol!(r#"<path d="M3 4h18M3 20h18M12 9h9M12 15h9m-17-6 3 3-3 3"/>"#)
             }
             Self::Outdent => {
-                // Left-pointing chevron: content moves one tab stop out.
-                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5h5M12 15h5M9 6l-4 4 4 4"/></svg>"#
+                symbol!(r#"<path d="M3 4h18M3 20h18M12 9h9M12 15h9M7 9l-3 3 3 3"/>"#)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_styles_keep_literal_native_labels_in_heading_order() {
+        assert_eq!(Icon::Heading1.text_label(), Some("H1"));
+        assert_eq!(Icon::Heading2.text_label(), Some("H2"));
+        assert_eq!(Icon::Heading3.text_label(), Some("H3"));
+        assert_eq!(Icon::Paragraph.text_label(), Some("Body"));
+    }
+
+    #[test]
+    fn vector_symbols_share_a_crisp_grid_without_external_assets() {
+        for icon in [
+            Icon::Sidebar,
+            Icon::NewDocument,
+            Icon::Open,
+            Icon::Wysiwyg,
+            Icon::Source,
+            Icon::Split,
+            Icon::Outline,
+            Icon::Close,
+            Icon::Bold,
+            Icon::Italic,
+            Icon::Code,
+            Icon::Link,
+            Icon::Quote,
+            Icon::UnorderedList,
+            Icon::OrderedList,
+            Icon::TaskList,
+            Icon::HorizontalRule,
+            Icon::CodeBlock,
+            Icon::Strikethrough,
+            Icon::Image,
+            Icon::Table,
+            Icon::Indent,
+            Icon::Outdent,
+        ] {
+            let source = icon.svg();
+            assert!(source.contains("viewBox=\"0 0 24 24\""), "{icon:?}");
+            assert!(source.contains("stroke-width=\"2\""), "{icon:?}");
+            assert!(source.contains("stroke-linecap=\"round\""), "{icon:?}");
+            assert!(source.contains("stroke-linejoin=\"round\""), "{icon:?}");
+            assert!(source.ends_with("</svg>"), "{icon:?}");
+            assert!(
+                !source.contains("<image") && !source.contains("href="),
+                "{icon:?}"
+            );
+            assert!(
+                !source.contains("<script") && !source.contains("<text"),
+                "{icon:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_modes_and_list_styles_have_distinct_conventional_shapes() {
+        assert_ne!(Icon::Code.svg(), Icon::Source.svg());
+        assert_ne!(Icon::Code.svg(), Icon::CodeBlock.svg());
+        assert!(Icon::CodeBlock.svg().contains("<rect"));
+        assert!(Icon::Quote.svg().contains("M4 10h6v7H4"));
+        assert!(Icon::Quote.svg().contains("M14 10h6v7h-6"));
+        assert!(Icon::UnorderedList.svg().contains("<circle"));
+        assert!(Icon::OrderedList.svg().contains("m3 5 2-1v6"));
+        assert!(Icon::OrderedList.svg().contains("M3 16a2 2"));
+        assert!(Icon::TaskList.svg().contains("<rect"));
     }
 }

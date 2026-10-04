@@ -3,20 +3,381 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::{channel::mpsc, StreamExt};
-use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
+use gpui::{
+    px, size, App, AppContext, BorrowAppContext, Bounds, Global, KeyBinding, Subscription,
+    WeakEntity, WindowBounds, WindowHandle, WindowId, WindowOptions,
+};
 use gpui_platform::application;
 
 use crate::config::AppConfig;
 use crate::crash::{self, OpenOrigin};
+use crate::recovery::{RecoveryStore, RecoveryWarning};
 use crate::window::MarkRustWindow;
 use crate::workspace::Workspace;
 
 /// GPUI revision pinned in `Cargo.toml` for reproducible builds.
 pub const GPUI_GIT_REV: &str = "8166e3d7b8b42d8aaf4d4dee7fcd25ab4ec65105";
+
+#[derive(Default)]
+struct ActivationOrder<T> {
+    recent: Vec<T>,
+}
+
+impl<T: Copy + PartialEq> ActivationOrder<T> {
+    fn activate(&mut self, id: T) {
+        self.recent.retain(|previous| *previous != id);
+        self.recent.push(id);
+    }
+
+    fn remove(&mut self, id: T) {
+        self.recent.retain(|previous| *previous != id);
+    }
+
+    fn latest_live(&self, live: &[T]) -> Option<T> {
+        self.recent
+            .iter()
+            .rev()
+            .copied()
+            .find(|id| live.contains(id))
+    }
+}
+
+#[derive(Clone)]
+struct RegisteredWindow {
+    handle: WindowHandle<MarkRustWindow>,
+    workspace: WeakEntity<Workspace>,
+}
+
+struct DesktopWindows {
+    config: AppConfig,
+    windows: HashMap<WindowId, RegisteredWindow>,
+    activation: ActivationOrder<WindowId>,
+    _closed_subscription: Subscription,
+    #[cfg(feature = "gui-tests")]
+    test_recovery_root: Option<PathBuf>,
+    #[cfg(feature = "gui-tests")]
+    test_window_sequence: usize,
+}
+
+impl Global for DesktopWindows {}
+
+fn initialize_window_registry(config: AppConfig, cx: &mut App) {
+    let closed_subscription = cx.on_window_closed(|cx, id| {
+        if cx.try_global::<DesktopWindows>().is_some() {
+            cx.update_global::<DesktopWindows, _>(|registry, _| {
+                registry.windows.remove(&id);
+                registry.activation.remove(id);
+            });
+        }
+    });
+    cx.set_global(DesktopWindows {
+        config,
+        windows: HashMap::new(),
+        activation: ActivationOrder { recent: Vec::new() },
+        _closed_subscription: closed_subscription,
+        #[cfg(feature = "gui-tests")]
+        test_recovery_root: None,
+        #[cfg(feature = "gui-tests")]
+        test_window_sequence: 0,
+    });
+}
+
+pub(crate) fn note_window_activated(handle: gpui::AnyWindowHandle, cx: &mut App) {
+    if cx.try_global::<DesktopWindows>().is_some() {
+        cx.update_global::<DesktopWindows, _>(|registry, _| {
+            if registry.windows.contains_key(&handle.window_id()) {
+                registry.activation.activate(handle.window_id());
+            }
+        });
+    }
+}
+
+fn register_window(handle: WindowHandle<MarkRustWindow>, cx: &mut App) -> anyhow::Result<()> {
+    let workspace = handle.read_with(cx, |root, _| root.workspace.downgrade())?;
+    cx.update_global::<DesktopWindows, _>(|registry, _| {
+        registry
+            .windows
+            .insert(handle.window_id(), RegisteredWindow { handle, workspace });
+        registry.activation.activate(handle.window_id());
+    });
+    Ok(())
+}
+
+fn last_active_window(cx: &App) -> Option<WindowHandle<MarkRustWindow>> {
+    let registry = cx.try_global::<DesktopWindows>()?;
+    let live: Vec<_> = cx
+        .windows()
+        .iter()
+        .map(|handle| handle.window_id())
+        .collect();
+    let current = cx
+        .active_window()
+        .filter(|handle| registry.windows.contains_key(&handle.window_id()));
+    // Activation callbacks are authoritative; the platform's current-window
+    // lookup can lag a just-created or programmatically activated window.
+    let id = registry
+        .activation
+        .latest_live(&live)
+        .or_else(|| current.map(|handle| handle.window_id()))?;
+    registry.windows.get(&id).map(|entry| entry.handle)
+}
+
+/// UI language is a desktop preference, not a per-document property. Refresh
+/// every registered workspace, preserving buffers, input owners and history.
+pub(crate) fn set_ui_language(language: crate::i18n::Language, cx: &mut App) {
+    let Some(registry) = cx.try_global::<DesktopWindows>() else {
+        return;
+    };
+    let workspaces: Vec<_> = registry
+        .windows
+        .values()
+        .map(|entry| entry.workspace.clone())
+        .collect();
+    cx.update_global::<DesktopWindows, _>(|registry, _| registry.config.language = language);
+    for workspace in workspaces {
+        if let Some(workspace) = workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| workspace.set_ui_language(language, cx));
+        }
+    }
+    let mut menu = cx
+        .try_global::<crate::menus::MenuState>()
+        .copied()
+        .unwrap_or_default();
+    menu.language = language;
+    crate::menus::sync(menu, cx);
+    cx.refresh_windows();
+}
+
+fn create_application_window(
+    config: AppConfig,
+    store: Option<RecoveryStore>,
+    dimensions: gpui::Size<gpui::Pixels>,
+    isolated_test: bool,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<MarkRustWindow>> {
+    let bounds = Bounds::centered(None, dimensions, cx);
+    let handle = cx.open_window(
+        WindowOptions {
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("MarkRust".into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(680.), px(420.))),
+            icon: load_window_icon(),
+            show: !isolated_test,
+            focus: !isolated_test,
+            ..Default::default()
+        },
+        move |window, cx| {
+            let workspace = cx.new(|cx| {
+                #[cfg(feature = "gui-tests")]
+                if isolated_test {
+                    return match store {
+                        Some(store) => Workspace::new_for_recovery_tests(config, store, window, cx),
+                        None => Workspace::new_for_gui_tests(config, window, cx),
+                    };
+                }
+                Workspace::new_with_recovery_store(config, store, window, cx)
+            });
+            cx.new(|cx| {
+                let mut view = MarkRustWindow::new(workspace, cx);
+                view.attach_application_window(window, cx);
+                crash::record_window_ready();
+                view
+            })
+        },
+    )?;
+    register_window(handle, cx)?;
+    Ok(handle)
+}
+
+pub(crate) fn new_application_window(cx: &mut App) -> anyhow::Result<WindowHandle<MarkRustWindow>> {
+    let registry = cx
+        .try_global::<DesktopWindows>()
+        .ok_or_else(|| anyhow::anyhow!("the application window registry is unavailable"))?;
+    let config = last_active_window(cx)
+        .and_then(|handle| registry.windows.get(&handle.window_id()))
+        .and_then(|entry| entry.workspace.upgrade())
+        .map(|workspace| workspace.read(cx).config.clone())
+        .unwrap_or_else(|| registry.config.clone());
+    #[cfg(feature = "gui-tests")]
+    if let Some(directory) = cx.global::<DesktopWindows>().test_recovery_root.clone() {
+        let sequence = cx.update_global::<DesktopWindows, _>(|registry, _| {
+            registry.test_window_sequence += 1;
+            registry.test_window_sequence
+        });
+        let directory = directory.join(format!("new-window-{sequence}"));
+        std::fs::create_dir(&directory)?;
+        return create_application_window(
+            config,
+            Some(RecoveryStore::new(directory)),
+            size(px(1200.), px(800.)),
+            true,
+            cx,
+        );
+    }
+    create_application_window(
+        config,
+        Some(RecoveryStore::production_fresh()?),
+        size(px(1200.), px(800.)),
+        false,
+        cx,
+    )
+}
+
+pub(crate) fn route_external_open(
+    path: PathBuf,
+    origin: OpenOrigin,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !crate::update_ui::is_installing(cx),
+        "MarkRust is restarting for an update; reopen this path after restart"
+    );
+    let handle = match last_active_window(cx) {
+        Some(handle) => handle,
+        None => new_application_window(cx)?,
+    };
+    handle.update(cx, |view, window, cx| {
+        window.activate_window();
+        view.open_external_path(path, origin, window, cx)
+    })??;
+    Ok(())
+}
+
+pub(crate) fn reopen_application(cx: &mut App) -> anyhow::Result<()> {
+    let handle = match last_active_window(cx) {
+        Some(handle) => handle,
+        None => new_application_window(cx)?,
+    };
+    handle.update(cx, |view, window, cx| {
+        window.activate_window();
+        view.focus_visible_surface(window, cx);
+    })?;
+    Ok(())
+}
+
+pub(crate) fn quit_application_checked(cx: &mut App) {
+    if checkpoint_application(cx) {
+        cx.quit();
+    }
+}
+
+/// Checkpoint every window in the same event turn before allowing an update
+/// helper's start gate to open. Failure retains all live editors.
+pub(crate) fn checkpoint_application(cx: &mut App) -> bool {
+    let windows: Vec<_> = cx
+        .try_global::<DesktopWindows>()
+        .map(|registry| registry.windows.values().cloned().collect())
+        .unwrap_or_default();
+    let mut safe = true;
+    let mut failed_window = None;
+    for entry in windows {
+        if let Some(workspace) = entry.workspace.upgrade() {
+            let written = workspace
+                .update(cx, |workspace, cx| {
+                    workspace.checkpoint_before_close_or_quit(cx)
+                })
+                .is_ok();
+            safe &= written;
+            if !written {
+                failed_window = Some(entry.handle);
+            }
+        }
+    }
+    if !safe {
+        if let Some(handle) = failed_window {
+            let _ = handle.update(cx, |_, window, cx| {
+                window.activate_window();
+                cx.notify();
+            });
+        }
+    }
+    safe
+}
+
+pub(crate) fn can_restart_for_update(cx: &mut App) -> bool {
+    let windows: Vec<_> = cx
+        .try_global::<DesktopWindows>()
+        .map(|registry| {
+            registry
+                .windows
+                .values()
+                .map(|entry| entry.handle)
+                .collect()
+        })
+        .unwrap_or_default();
+    windows.into_iter().all(|handle| {
+        handle
+            .update(cx, |view, _, cx| view.can_restart_for_update(cx))
+            .unwrap_or(false)
+    })
+}
+
+pub(crate) fn set_automatic_updates(enabled: bool, cx: &mut App) {
+    let Some(registry) = cx.try_global::<DesktopWindows>() else {
+        return;
+    };
+    let workspaces: Vec<_> = registry
+        .windows
+        .values()
+        .map(|entry| entry.workspace.clone())
+        .collect();
+    let config = cx.update_global::<DesktopWindows, _>(|registry, _| {
+        registry.config.automatic_updates = enabled;
+        registry.config.clone()
+    });
+    if let Err(error) = config.save() {
+        eprintln!("MarkRust update preference could not be saved: {error}");
+    }
+    for workspace in workspaces {
+        if let Some(workspace) = workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.config.automatic_updates = enabled;
+                cx.notify();
+            });
+        }
+    }
+    let mut menu = cx
+        .try_global::<crate::menus::MenuState>()
+        .copied()
+        .unwrap_or_default();
+    menu.automatic_updates = enabled;
+    crate::menus::sync(menu, cx);
+}
+
+#[cfg(feature = "gui-tests")]
+pub(crate) fn test_initialize_window_registry(
+    config: AppConfig,
+    recovery_root: PathBuf,
+    cx: &mut App,
+) {
+    initialize_window_registry(config, cx);
+    cx.update_global::<DesktopWindows, _>(|registry, _| {
+        registry.test_recovery_root = Some(recovery_root)
+    });
+}
+
+#[cfg(feature = "gui-tests")]
+pub(crate) fn test_create_application_window(
+    config: AppConfig,
+    store: RecoveryStore,
+    dimensions: gpui::Size<gpui::Pixels>,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<MarkRustWindow>> {
+    create_application_window(config, Some(store), dimensions, true, cx)
+}
+
+#[cfg(feature = "gui-tests")]
+pub(crate) fn test_last_active_window(cx: &App) -> Option<WindowHandle<MarkRustWindow>> {
+    last_active_window(cx)
+}
 
 fn load_window_icon() -> Option<Arc<image::RgbaImage>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/icon/markrust.png");
@@ -57,75 +418,67 @@ pub fn run_gui_with_open(open_path: Option<PathBuf>) {
             }
         }
     });
+    app.on_reopen(|cx| {
+        if cx.try_global::<DesktopWindows>().is_some() {
+            if let Err(error) = reopen_application(cx) {
+                eprintln!("MarkRust could not reopen a window: {error}");
+            }
+        }
+    });
     app.run(move |cx: &mut App| {
         load_bundled_fonts(cx);
         let config = AppConfig::load();
         cx.bind_keys(desktop_key_bindings());
         crate::menus::init(cx);
-
-        let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("MarkRust".into()),
-                    ..Default::default()
-                }),
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(680.), px(420.))),
-                icon: load_window_icon(),
-                ..Default::default()
-            },
-            move |window, cx| {
-                let config = config.clone();
-                let open_path = open_path.clone();
-                let workspace = cx.new(|cx| {
-                    let mut workspace = Workspace::new(config, window, cx);
-                    if let Some(path) = open_path {
-                        let target = crash::open_target(&path);
-                        crash::record_open_started(OpenOrigin::Launch, target);
-                        match workspace.open_launch_path(path, window, cx) {
-                            Ok(()) => crash::record_open_succeeded(OpenOrigin::Launch, target),
-                            Err(error) => {
-                                crash::record_open_failed(OpenOrigin::Launch, target, &error);
-                                eprintln!("Failed to open document; see MarkRust diagnostics");
-                            }
-                        }
-                    }
-                    workspace
+        initialize_window_registry(config.clone(), cx);
+        crate::update_ui::initialize(config.automatic_updates, cx);
+        let (sessions, mut discovery_warning) = match RecoveryStore::production_sessions() {
+            Ok(sessions) => (sessions, None),
+            Err(error) => (Vec::new(), Some(format!("Private recovery could not be discovered: {error}. Previously retained drafts have not been removed. Save current work explicitly and retry recovery before assuming the session is empty."))),
+        };
+        for store in sessions {
+            if let Err(error) = create_application_window(
+                config.clone(),
+                Some(store),
+                size(px(1200.), px(800.)),
+                false,
+                cx,
+            ) {
+                eprintln!("MarkRust could not restore a window: {error}");
+                discovery_warning = Some(format!("A private recovery window could not be restored: {error}. Its retained drafts have not been removed. Save current work explicitly and retry recovery."));
+            }
+        }
+        if last_active_window(cx).is_none() {
+            if let Err(error) = new_application_window(cx) {
+                eprintln!("MarkRust recovery is unavailable: {error}");
+                create_application_window(config, None, size(px(1200.), px(800.)), false, cx)
+                    .expect("failed to open MarkRust window");
+            }
+        }
+        if let Some(message) = discovery_warning {
+            if let Some(handle) = last_active_window(cx) {
+                let _ = handle.update(cx, |view, _, cx| {
+                    view.workspace.update(cx, |workspace, cx| workspace.set_recovery_warning(RecoveryWarning::ReadFailed(message), cx));
                 });
-                cx.new(|cx| {
-                    let open_workspace = workspace.clone();
-                    cx.spawn_in(window, async move |_, cx| {
-                        while let Some(path) = open_rx.next().await {
-                            let _ = open_workspace.update_in(cx, |workspace, window, cx| {
-                                let target = crash::open_target(&path);
-                                crash::record_open_started(OpenOrigin::Finder, target);
-                                match workspace.open_launch_path(path, window, cx) {
-                                    Ok(()) => {
-                                        crash::record_open_succeeded(OpenOrigin::Finder, target)
-                                    }
-                                    Err(error) => {
-                                        crash::record_open_failed(
-                                            OpenOrigin::Finder,
-                                            target,
-                                            &error,
-                                        );
-                                        eprintln!(
-                                            "Failed to open document; see MarkRust diagnostics"
-                                        );
-                                    }
-                                }
-                            });
-                        }
-                    })
-                    .detach();
-                    let window = MarkRustWindow::new(workspace, cx);
-                    crash::record_window_ready();
-                    window
-                })
-            },
-        )
-        .expect("failed to open MarkRust window");
+            }
+        }
+        if let Some(path) = open_path {
+            if let Err(error) = route_external_open(path, OpenOrigin::Launch, cx) {
+                eprintln!("Failed to open launch document: {error}");
+            }
+        }
+        // This receiver belongs to the application, not to its first window.
+        // Finder events keep working after that window closes.
+        cx.spawn(async move |cx| {
+            while let Some(path) = open_rx.next().await {
+                cx.update(|cx| {
+                    if let Err(error) = route_external_open(path, OpenOrigin::Finder, cx) {
+                        eprintln!("Failed to open external document: {error}");
+                    }
+                });
+            }
+        })
+        .detach();
         cx.activate(true);
     });
     crash::record_application_stopped();
@@ -139,25 +492,60 @@ pub(crate) fn desktop_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-m", crate::window::Minimize, None),
         KeyBinding::new("ctrl-cmd-f", crate::window::ToggleFullScreen, None),
         KeyBinding::new("cmd-s", crate::window::Save, None),
+        KeyBinding::new("ctrl-s", crate::window::Save, None),
         KeyBinding::new("cmd-shift-s", crate::window::SaveAs, None),
+        KeyBinding::new("ctrl-shift-s", crate::window::SaveAs, None),
         KeyBinding::new("cmd-shift-m", crate::window::ToggleEditorMode, None),
+        KeyBinding::new("ctrl-shift-m", crate::window::ToggleEditorMode, None),
         // Mode picker shortcuts moved off Cmd-1/2/3 to free Cmd-1..6 for
         // ATX heading toggles (the standard set in iA Writer, Typora,
         // Obsidian).
         KeyBinding::new("alt-cmd-1", crate::window::ShowWysiwyg, None),
+        KeyBinding::new("alt-ctrl-1", crate::window::ShowWysiwyg, None),
         KeyBinding::new("alt-cmd-2", crate::window::ShowSource, None),
+        KeyBinding::new("alt-ctrl-2", crate::window::ShowSource, None),
         KeyBinding::new("alt-cmd-3", crate::window::ShowSplit, None),
+        KeyBinding::new("alt-ctrl-3", crate::window::ShowSplit, None),
         KeyBinding::new("alt-cmd-4", crate::window::ToggleMarkupHints, None),
+        KeyBinding::new("alt-ctrl-4", crate::window::ToggleMarkupHints, None),
         KeyBinding::new("ctrl-cmd-s", crate::window::ToggleSidebar, None),
         KeyBinding::new("ctrl-cmd-o", crate::window::ToggleOutline, None),
         KeyBinding::new("cmd-o", crate::window::OpenFile, None),
+        KeyBinding::new("ctrl-o", crate::window::OpenFile, None),
         KeyBinding::new("cmd-shift-o", crate::window::OpenFolder, None),
+        KeyBinding::new("ctrl-shift-o", crate::window::OpenFolder, None),
+        KeyBinding::new("shift-cmd-l", crate::window::OpenPath, None),
+        KeyBinding::new("shift-ctrl-l", crate::window::OpenPath, None),
         KeyBinding::new("cmd-n", crate::window::NewDocument, None),
+        KeyBinding::new("cmd-shift-n", crate::menus::NewWindow, None),
+        KeyBinding::new("ctrl-shift-n", crate::menus::NewWindow, None),
+        KeyBinding::new("ctrl-n", crate::window::NewDocument, None),
+        KeyBinding::new("cmd-t", crate::window::NewTab, None),
+        KeyBinding::new("ctrl-t", crate::window::NewTab, None),
+        KeyBinding::new("ctrl-tab", crate::window::NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", crate::window::PreviousTab, None),
+        KeyBinding::new("cmd-shift-]", crate::window::NextTab, None),
+        KeyBinding::new("cmd-shift-[", crate::window::PreviousTab, None),
         KeyBinding::new("cmd-w", crate::window::CloseTab, None),
+        KeyBinding::new("ctrl-w", crate::window::CloseTab, None),
         KeyBinding::new("cmd-p", crate::window::CommandPalette, None),
+        KeyBinding::new("ctrl-p", crate::window::CommandPalette, None),
         KeyBinding::new("cmd-z", crate::window::Undo, None),
+        KeyBinding::new("ctrl-z", crate::window::Undo, None),
         KeyBinding::new("cmd-shift-z", crate::window::Redo, None),
-        KeyBinding::new("shift-cmd-t", crate::window::ToggleTheme, None),
+        KeyBinding::new("ctrl-shift-z", crate::window::Redo, None),
+        KeyBinding::new("ctrl-y", crate::window::Redo, None),
+        KeyBinding::new("cmd-f", crate::window::Find, None),
+        KeyBinding::new("ctrl-f", crate::window::Find, None),
+        KeyBinding::new("cmd-g", crate::window::FindNext, None),
+        KeyBinding::new("ctrl-g", crate::window::FindNext, None),
+        KeyBinding::new("shift-cmd-g", crate::window::FindPrevious, None),
+        KeyBinding::new("shift-ctrl-g", crate::window::FindPrevious, None),
+        KeyBinding::new("f3", crate::window::FindNext, None),
+        KeyBinding::new("shift-f3", crate::window::FindPrevious, None),
+        // Keep the conventional Reopen Closed Tab chord free for that action.
+        KeyBinding::new("alt-shift-cmd-t", crate::window::ToggleTheme, None),
+        KeyBinding::new("alt-shift-ctrl-t", crate::window::ToggleTheme, None),
         KeyBinding::new("backspace", markrust_editor::Backspace, None),
         KeyBinding::new("delete", markrust_editor::Delete, None),
         // Option-Backspace/Delete (macOS) and Ctrl-Backspace/Delete (Windows/Linux).
@@ -208,6 +596,7 @@ pub(crate) fn desktop_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-pageup", markrust_editor::SelectPageUp, None),
         KeyBinding::new("shift-pagedown", markrust_editor::SelectPageDown, None),
         KeyBinding::new("cmd-a", markrust_editor::SelectAll, None),
+        KeyBinding::new("ctrl-a", markrust_editor::SelectAll, None),
         KeyBinding::new("cmd-c", markrust_editor::Copy, None),
         KeyBinding::new("ctrl-c", markrust_editor::Copy, None),
         KeyBinding::new("cmd-x", markrust_editor::Cut, None),
@@ -286,6 +675,38 @@ mod tests {
     }
 
     #[test]
+    fn activation_order_tracks_reactivation_and_closed_windows() {
+        let mut order = ActivationOrder::<u32>::default();
+        order.activate(1);
+        order.activate(2);
+        order.activate(1);
+        assert_eq!(order.recent, [2, 1]);
+        assert_eq!(order.latest_live(&[1, 2]), Some(1));
+        assert_eq!(order.latest_live(&[2]), Some(2));
+        order.remove(1);
+        assert_eq!(order.latest_live(&[1, 2]), Some(2));
+        order.remove(2);
+        assert_eq!(order.latest_live(&[1, 2]), None);
+    }
+
+    #[test]
+    fn new_window_shortcut_is_distinct_from_document_and_tab() {
+        assert_eq!(
+            action_for("cmd-shift-n"),
+            crate::menus::NewWindow::name_for_type()
+        );
+        assert_eq!(
+            action_for("ctrl-shift-n"),
+            crate::menus::NewWindow::name_for_type()
+        );
+        assert_eq!(
+            action_for("cmd-n"),
+            crate::window::NewDocument::name_for_type()
+        );
+        assert_eq!(action_for("cmd-t"), crate::window::NewTab::name_for_type());
+    }
+
+    #[test]
     fn shift_enter_binds_insert_line_break() {
         let bindings = desktop_key_bindings();
         let typed = Keystroke::parse("shift-enter").expect("shift-enter parses");
@@ -344,6 +765,87 @@ mod tests {
             .action()
             .name()
             .to_string()
+    }
+
+    #[test]
+    fn standard_file_and_edit_shortcuts_have_cmd_ctrl_parity() {
+        for (cmd, ctrl, expected) in [
+            ("cmd-s", "ctrl-s", crate::window::Save::name_for_type()),
+            (
+                "cmd-shift-s",
+                "ctrl-shift-s",
+                crate::window::SaveAs::name_for_type(),
+            ),
+            ("cmd-o", "ctrl-o", crate::window::OpenFile::name_for_type()),
+            (
+                "cmd-shift-o",
+                "ctrl-shift-o",
+                crate::window::OpenFolder::name_for_type(),
+            ),
+            (
+                "cmd-shift-l",
+                "ctrl-shift-l",
+                crate::window::OpenPath::name_for_type(),
+            ),
+            ("cmd-w", "ctrl-w", crate::window::CloseTab::name_for_type()),
+            ("cmd-z", "ctrl-z", crate::window::Undo::name_for_type()),
+            (
+                "cmd-shift-z",
+                "ctrl-shift-z",
+                crate::window::Redo::name_for_type(),
+            ),
+            (
+                "cmd-a",
+                "ctrl-a",
+                markrust_editor::SelectAll::name_for_type(),
+            ),
+            ("cmd-c", "ctrl-c", markrust_editor::Copy::name_for_type()),
+            ("cmd-x", "ctrl-x", markrust_editor::Cut::name_for_type()),
+            ("cmd-v", "ctrl-v", crate::window::Paste::name_for_type()),
+            (
+                "cmd-p",
+                "ctrl-p",
+                crate::window::CommandPalette::name_for_type(),
+            ),
+            (
+                "cmd-shift-m",
+                "ctrl-shift-m",
+                crate::window::ToggleEditorMode::name_for_type(),
+            ),
+        ] {
+            assert_eq!(action_for(cmd), expected, "{cmd}");
+            assert_eq!(action_for(ctrl), expected, "{ctrl}");
+        }
+        assert_eq!(action_for("ctrl-y"), crate::window::Redo::name_for_type());
+    }
+
+    #[test]
+    fn document_find_shortcuts_are_conventional() {
+        for key in ["cmd-f", "ctrl-f"] {
+            assert_eq!(action_for(key), crate::window::Find::name_for_type());
+        }
+        for key in ["cmd-g", "ctrl-g", "f3"] {
+            assert_eq!(action_for(key), crate::window::FindNext::name_for_type());
+        }
+        for key in ["shift-cmd-g", "shift-ctrl-g", "shift-f3"] {
+            assert_eq!(
+                action_for(key),
+                crate::window::FindPrevious::name_for_type()
+            );
+        }
+        assert_eq!(
+            action_for("alt-shift-cmd-t"),
+            crate::window::ToggleTheme::name_for_type()
+        );
+        assert_eq!(
+            action_for("alt-shift-ctrl-t"),
+            crate::window::ToggleTheme::name_for_type()
+        );
+        let reopen = Keystroke::parse("shift-cmd-t").unwrap();
+        assert!(!desktop_key_bindings().iter().any(|binding| binding
+            .match_keystrokes(std::slice::from_ref(&reopen))
+            == Some(false)
+            && binding.action().name() == crate::window::ToggleTheme::name_for_type()));
     }
 
     #[test]
@@ -629,5 +1131,21 @@ mod tests {
             action_for("alt-cmd-3"),
             crate::window::ShowSplit::name_for_type()
         );
+    }
+
+    #[test]
+    fn document_tabs_have_conventional_creation_and_wrapping_navigation_shortcuts() {
+        for key in ["cmd-n", "ctrl-n"] {
+            assert_eq!(action_for(key), crate::window::NewDocument::name_for_type());
+        }
+        for key in ["cmd-t", "ctrl-t"] {
+            assert_eq!(action_for(key), crate::window::NewTab::name_for_type());
+        }
+        for key in ["ctrl-tab", "cmd-shift-]"] {
+            assert_eq!(action_for(key), crate::window::NextTab::name_for_type());
+        }
+        for key in ["ctrl-shift-tab", "cmd-shift-["] {
+            assert_eq!(action_for(key), crate::window::PreviousTab::name_for_type());
+        }
     }
 }

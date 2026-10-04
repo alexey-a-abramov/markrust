@@ -411,11 +411,9 @@ fn lockstep_segments(src: &str, text: &str, exact_src: bool) -> Option<Vec<Seg>>
             if !text[t..].starts_with(literal) {
                 let ch = text[t..].chars().next()?;
                 let t_end = t + ch.len_utf8();
-                if let Some(last) = out.last_mut() {
-                    if last.entity {
-                        return None;
-                    }
-                }
+                // Adjacent references are distinct glyphs too (`&#32;&#32;`).
+                // Keep each source span; exact consumption below still
+                // rejects a decoded run which cannot be aligned fully.
                 out.push(Seg {
                     src: s..end,
                     text: t..t_end,
@@ -496,6 +494,22 @@ mod tests {
         assert!(segs[0].is_plain() && segs[0].src == (0..1));
         assert!(segs[1].entity && segs[1].src == (1..6));
         assert!(segs[2].is_plain() && segs[2].src == (6..7));
+    }
+
+    #[test]
+    fn adjacent_references_keep_individual_glyph_source_spans() {
+        let segs = lockstep_segments("🌍&#32;&#32;", "🌍  ", true).expect("align spaces");
+        assert_eq!(segs.len(), 3);
+        assert!(segs[0].is_plain() && segs[0].src == (0..4));
+        assert!(segs[1].entity && segs[1].src == (4..9) && segs[1].text == (4..5));
+        assert!(segs[2].entity && segs[2].src == (9..14) && segs[2].text == (5..6));
+        let segs = lockstep_segments("&amp;&#32;&lt;", "& <", true).expect("mixed references");
+        assert_eq!(segs.len(), 3);
+        assert!(segs.iter().all(|segment| segment.entity));
+        assert!(
+            lockstep_segments("&NotEqualTilde;&amp;", "≂\u{338}&", true).is_none(),
+            "ambiguous multi-codepoint references remain conservative"
+        );
     }
 
     #[test]

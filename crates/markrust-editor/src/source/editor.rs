@@ -105,9 +105,13 @@ pub struct MarkdownEditor {
     pub focus_handle: FocusHandle,
     pub selected_range: Range<usize>,
     pub selection_reversed: bool,
+    shadow_selection: Option<crate::shadow::ShadowSelection>,
+    search_highlights: Option<crate::search::SearchHighlights>,
+    pub(super) pending_search_reveal: Option<usize>,
     selection_revision: u64,
     pub marked_range: Option<Range<usize>>,
     pub is_selecting: bool,
+    pub(super) mouse_selection_anchor: Option<(Range<usize>, usize)>,
     pub cursor_visible: bool,
     raw_source: bool,
     pub layout_cache: LineLayoutCache,
@@ -130,6 +134,8 @@ impl MarkdownEditor {
             this.start_blink(cx);
         });
         let blur_sub = cx.on_blur(&focus_handle, window, |this, _window, cx| {
+            this.is_selecting = false;
+            this.mouse_selection_anchor = None;
             this.stop_blink(cx);
         });
         let selection_revision = document.read(cx).revision();
@@ -160,11 +166,15 @@ impl MarkdownEditor {
             focus_handle,
             selected_range: 0..0,
             selection_reversed: false,
+            shadow_selection: None,
+            search_highlights: None,
+            pending_search_reveal: None,
             selection_revision,
             marked_range: None,
             is_selecting: false,
+            mouse_selection_anchor: None,
             cursor_visible: false,
-            raw_source: false,
+            raw_source: true,
             layout_cache: LineLayoutCache::default(),
             last_bounds_line_height: 0.0,
             last_caret_bounds: None,
@@ -176,6 +186,49 @@ impl MarkdownEditor {
 
     pub fn content(&self, cx: &App) -> String {
         self.document.read(cx).buffer.content()
+    }
+
+    pub fn shadow_selection(&self) -> Option<&crate::shadow::ShadowSelection> {
+        self.shadow_selection.as_ref()
+    }
+
+    pub fn search_highlights(&self, cx: &App) -> Option<&crate::search::SearchHighlights> {
+        self.search_highlights
+            .as_ref()
+            .filter(|search| search.revision == self.document.read(cx).revision())
+    }
+
+    pub fn set_search_highlights(
+        &mut self,
+        search: Option<crate::search::SearchHighlights>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_highlights != search {
+            if search
+                .as_ref()
+                .is_none_or(|search| search.ranges.is_empty())
+            {
+                self.pending_search_reveal = None;
+            }
+            self.search_highlights = search;
+            cx.notify();
+        }
+    }
+
+    pub fn reveal_search_match(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.pending_search_reveal = Some(offset);
+        cx.notify();
+    }
+
+    pub fn set_shadow_selection(
+        &mut self,
+        shadow: Option<crate::shadow::ShadowSelection>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shadow_selection != shadow {
+            self.shadow_selection = shadow;
+            cx.notify();
+        }
     }
 
     pub fn raw_source(&self) -> bool {
@@ -222,9 +275,7 @@ impl MarkdownEditor {
         // marked-text input may select inside an in-progress grapheme: the
         // external-edit repair must not override the IME's active selection.
         self.selection_revision = self.document.read(cx).revision();
-        if outcome != EditorOutcome::Noop {
-            self.reset_blink(cx);
-        }
+        self.reset_blink(cx);
         cx.notify();
         outcome
     }
@@ -255,8 +306,7 @@ impl MarkdownEditor {
     }
 
     fn start_blink(&mut self, cx: &mut Context<Self>) {
-        self.cursor_visible = true;
-        self._blink_task = Self::spawn_blink_task(cx);
+        self.reset_blink(cx);
     }
 
     fn stop_blink(&mut self, cx: &mut Context<Self>) {
@@ -285,6 +335,7 @@ impl MarkdownEditor {
     pub fn reset_blink(&mut self, cx: &mut Context<Self>) {
         self.cursor_visible = true;
         self._blink_task = Self::spawn_blink_task(cx);
+        cx.notify();
     }
 
     pub fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {

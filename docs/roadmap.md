@@ -1,10 +1,14 @@
 # MarkRust WYSIWYG engineering notes — status & handoff
 
-_Last updated: 2026-09-14. This is the detailed design and verification handoff for the "real WYSIWYG editor" effort. The concise, canonical product plan is [the root roadmap](../ROADMAP.md)._
+_Last updated: 2026-10-02. This is the detailed design and verification handoff for the "real WYSIWYG editor" effort. The concise, canonical product plan is [the root roadmap](../ROADMAP.md)._
 
 ## Vision (locked decisions)
 
-MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered rich document (Typora-style: delimiters hidden unless the caret or a selection intersects the node); Markdown is the on-disk serialization format. Additionally: a **pure source** mode (the existing Typora-style delimiter-masking editor) and a **side-by-side** mode. All native Rust on **GPUI**, fast.
+MarkRust is a **true WYSIWYG Markdown editor**: the user edits a stable rendered document; Markdown is the on-disk serialization format. Caret/selection do not reveal delimiters inside shaped WYSIWYG lines. Optional hints use paint-only tint, a passive syntax badge and status text. Source is literal monospace Markdown; Split presents that source beside the rich view. Tables have a context-only floating row/column panel. All native Rust on **GPUI**.
+
+Earlier entries below are implementation history, including the previous
+in-place reveal policy. Current projection and recovery behavior is defined
+in [architecture](architecture.md) and [delimiter masking](delimiter-masking.md).
 
 - v1 scope: core rich text + tables (cell editing, row/col ops) + inline images + frontmatter panel. Mermaid WYSIWYG is future (renders as inert code block; extension point kept).
 - Save flow: **block-preserving by default** (untouched blocks keep exact original bytes). A diff dialog (Keep original / Normalize / Cancel) appears only when formatting beyond the user's edits would change — with the source-primary architecture that means only on an explicit Normalize action.
@@ -57,7 +61,7 @@ MarkRust becomes a **true WYSIWYG markdown editor**: the user edits a rendered r
 - `crates/markrust-core/src/document.rs` — `saved_content`, `apply_external_edit`, `apply_merged_edit`, `peel_typing_range`.
 - `crates/markrust-core/src/html_visual.rs` — safe HTML / footnote-ref / definition-list paint projection (no script; inline `style=` and same-block `.class` rules; safe `<svg>` as an image).
 - `crates/markrust-editor/src/wysiwyg/` — `view` (RichEditorView over virtualized `list()`), `blocks` (per-kind renderers), `block_text` (caret/hit-testing/IME host), `ime` (IME origin from the focused widget/leaf).
-- `crates/markrust-editor/src/source/` — the masking source editor (fallback and source/split panes).
+- `crates/markrust-editor/src/source/` — literal monospace source editor; internal masking API remains for projection tests.
 - `crates/markrust-core/src/perf_fixture.rs` — 256 KiB mixed GFM used by parse/layout budget tests and criterion benches.
 - `crates/markrust-app/src/crash.rs` — panic logger (see Crash handling).
 
@@ -179,8 +183,12 @@ Shipped this pass (keep previous bullets; this pass added):
 - **GitHub alerts:** `> [!NOTE]` / TIP / IMPORTANT / WARNING / CAUTION parse via comrak `alerts`. WYSIWYG paints a labeled callout (left rule + title); `[!NOTE]` chrome is hidden unless the caret or a selection intersects that first-line span. Home/click skip `[!NOTE]` onto the title/body like quote `>`. Untouched source bytes stay in the file. Source mode masks the same `[!NOTE]` token. Ordinary `>` quotes are unchanged.
 - **Dollar math:** `$…$` / `$$…$$` parse via comrak `math_dollars` (pandoc heuristics so `$5` and `$` in code stay text). WYSIWYG hides the dollars unless the caret or a selection intersects the span, and paints the TeX in italic monospace (no TeX-to-glyphs; no browser). Source mode masks the same delimiters. Untouched `$` bytes stay in the file. Enter / Shift-Enter inside the span stay in the TeX (quoted keep `>`; a `\n\n` split no longer breaks the dollars). Enter after the closer still splits the paragraph.
 - **P9:** tree-sitter-md removed from `markrust-core`. `extract_syntax_spans` walks the comrak AST (shared `parse_options` / `LineStarts` with `rich::import`). Background parser still off the UI thread. Source mode remains masking, now grammar-aligned with WYSIWYG. Split mode in the window (source | rich). Criterion benches plus CI timeout tests gate load+parse (`extract_syntax_spans` / `import_markdown`) and source-mode `build_display_layout` on a 256 KiB fixture.
-- P8: dirty tabs 3-way merge (`three_way_merge` + `Document::apply_merged_edit`); own-save watcher events ignored (`ours == theirs`); conflict still prompts. Autosave no longer spuriously prompts reload after it writes.
-- P7: Normalize save prompt includes a hunk preview (`SaveCandidates::hunk_preview`). Frontmatter panel edits title, description, tags, and the inner YAML body.
+- P8 (historical): initial line merge and watcher reconciliation. The current
+  [concurrent-editing policy](concurrent-editing.md) adds source/grapheme
+  preservation, checked publication and recoverable conflict review.
+- P7 (historical): Normalize save prompt included a hunk preview. Normalization
+  is now an explicit scrollable, undoable review, separate from Save.
+  Frontmatter edits title, description, tags, and the inner YAML body.
 - Chip/caption/frontmatter IME: `WidgetOverlay` hit-tests clicks/drags onto the inner draft (body-quality glyph x) and paints the inner caret. Left/Right (Shift extends) and Home/End move that same inner offset; YAML Up/Down steps `\n` lines; Delete edits the draft. Typing / Backspace / Delete replace or delete a non-empty inner selection. Cmd+A selects the draft, not the body. Overlay-focused Undo/Redo rewinds a per-overlay draft stack; commit still uses document undo. Origin is that caret/`|` rect via `report_widget_caret`, not the overlay’s trailing edge and not the last painted text leaf. `handle_input` still belongs to the focused overlay so body leaves cannot steal composition. Frontmatter commits accept only a valid YAML mapping; scalar values and tag sequences are serialized safely, while an invalid raw draft stays open with an inline error instead of changing the document.
 - **Visual vertical movement:** WYSIWYG paint records GPUI's actual soft-wrap row boundaries and glyph x positions. Up/Down and Shift+Up/Down use those rows plus a preserved preferred x-position, including across short rows; source-line movement is only the safe fallback when the target is outside the virtualized painted viewport.
 - IME origin (`wysiwyg/ime.rs`): `bounds_for_range` uses `ImeOriginState` — focused widget, else the leaf whose source range contains the document caret (wrapped-line caret rect, table cell, body). After that origin is painted, `Window::invalidate_character_coordinates` schedules GPUI's next-frame `selected_bounds` → `PlatformWindow::update_ime_position` (equivalent of `set_ime_cursor_position`). On macOS `update_ime_position` still **ignores the Bounds** and calls `NSTextInputContext invalidateCharacterCoordinates`; the OS then pulls `firstRectForCharacterRange:` → `bounds_for_range`. The last painted caret (including overlay inner `|`) is sticky across `begin_frame` so that pull is not the leaf top-left or overlay trailing edge. Blink-off frames keep the last painted caret. Composition start/update/commit bumps the origin generation so the platform is invalidated even when the caret rect is unchanged. Unit tests drive `EntityInputHandler` composition, a `PlatformImeSpy` for the `update_ime_position` payload (`compute_ime_candidate_bounds`), and a `firstRect` pull after `begin_frame`; GPUI's test window does not record the native call. **(a) In-repo origin/composition/platform-push/sticky-pull is proven. (b) A real OS CJK candidate window is not.**

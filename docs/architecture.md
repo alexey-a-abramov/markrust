@@ -1,6 +1,6 @@
 # MarkRust architecture
 
-MarkRust is a **true WYSIWYG** Markdown editor: the user edits a rendered rich document; Markdown is the on-disk serialization. Optional Source mode masks delimiters in place. Split shows literal Markdown source beside an editable WYSIWYG view of the same document. All native Rust on GPUI.
+MarkRust is a **true WYSIWYG** Markdown editor: the user edits a rendered rich document; Markdown is the on-disk serialization. Source displays literal Markdown with uniform monospace metrics. Split puts that Source editor beside an editable WYSIWYG view of the same document. All native Rust on GPUI.
 
 The rope buffer is the single source of truth. A derived `RichTree` (comrak) is authoritative for interpretation and command targeting. Source-mode masking is a projection of that same grammar, not a second Markdown parser.
 
@@ -13,16 +13,36 @@ The rope buffer is the single source of truth. A derived `RichTree` (comrak) is 
 | `markrust-app` | `HeadlessWorkspace` session + GPUI window chrome | GPUI (Zed git pin) |
 | `markrust` | CLI (`parse_args` / `run`) and desktop binary | GUI only for `--gui` |
 
-**Rule:** `HeadlessEditor` (`markrust-editor::headless`) and `HeadlessWorkspace` (`markrust-app::session`) must not use GPUI types. The GPUI window maps keys/clicks to `WorkspaceCommand` / `EditorCommand`.
+**Rule:** `HeadlessEditor` (`markrust-editor::headless`) and `HeadlessWorkspace` (`markrust-app::session`) must not use GPUI types. Native and headless workspace policies currently have separate adapters; native journeys must test the real adapter, not assume a headless result proves it.
+
+## UI language and auxiliary input boundary
+
+`markrust-app::i18n` owns 20 embedded catalogs and stable ISO language choices;
+`AppConfig` persists the choice and migrates older/unknown choices to English
+without resetting other preferences. The desktop window registry propagates
+changes to existing windows and the configuration used by future windows.
+`EditorTheme` carries an immutable shared catalog, keeping editor crates
+independent of the application's language enum. Locale changes update chrome
+strings only, including open inspector fields: never call the content theme's
+remeasure/caret-reveal path. Document bytes, Markdown, filenames, history and
+real selections are not translated. Unknown diagnostic labels retain English
+fallback. Catalog tests reject duplicate/empty/missing keys and altered
+placeholders. Native locale journeys check focus, deep viewport and document
+invariants; OS menus, full RTL layout and native-speaker review remain separate.
+
+Find is window-owned auxiliary plain-text input over source-addressed ranges,
+not a second document model. Both native editors paint passive highlights from
+the same revision; only the originating pane may reveal the active result.
+Open Location follows the existing owned file/folder route after canonical path
+validation, keeping dirty tabs and modal input ownership intact.
 
 ## Headless command layer
 
 ```
-GPUI window / CLI
-        ↓  WorkspaceCommand / EditorCommand
-HeadlessWorkspace (tabs, drop routing, autosave clock, export)
-        ↓  EditorCommand / RichCommand
-HeadlessEditor / RichEngine (Document + caret/selection)
+Native: GPUI window → Workspace → MarkdownEditor / RichEditorView
+Tests: WorkspaceCommand → HeadlessWorkspace → HeadlessEditor
+        ↓  shared Document / RichEngine + editor commands
+Document + caret/selection → RichTree
         ↓
 Source: compute_visibility / build_display_layout
 Split source: identity byte projection / syntax styling
@@ -34,28 +54,33 @@ export HTML (comrak, same extension set as import)
 - `RichCommand`: WYSIWYG typing, marks, lists, tables, frontmatter fields — compiled to byte splices on the rope.
 - `WorkspaceCommand`: save/open/export, drop files, theme, tabs, heading jump, `AdvanceTime` (fake clock), external-change reload, `SaveWithReview`.
 - Drop classification stays pure in `drop.rs`.
-- File-watcher policy is `classify_external_change` (ignore own saves; 3-way merge dirty tabs; prompt on conflict or clean-tab disk change).
+- File-watcher policy is `classify_external_change` (ignore own saves; three-way merge dirty tabs; review conflicts). The native workspace accepts clean-tab disk changes while retaining Undo.
 
 Unit tests live next to the modules. Headless e2e lives in `crates/markrust-app/tests/e2e.rs` (no window). CLI e2e lives in `crates/markrust/tests/e2e.rs` (`assert_cmd`, never empty args / `--gui`).
 
 ## Data flow
 
 ```
-Keyboard/Mouse/IME/FileWatcher
+Keyboard / Mouse / IME / FileWatcher
         ↓
 DocumentBuffer (ropey) + UndoStack
         ↓
-BackgroundMarkdownParser (comrak on a worker thread)
+Revision-stamped background comrak parse
         ↓
-SyntaxNodeSpan map (revision-stamped)  — Source masking and Split syntax styling
-RichEngine::sync → RichTree              — WYSIWYG + commands
+Source syntax spans + RichEngine::sync → RichTree
         ↓
-Source: compute_visibility + masked layout + paint
-Split source: literal byte layout + paint
-WYSIWYG: virtualized block list + BlockTextElement; mixed text+image paragraphs are a wrapping flex line-box (`img(PathBuf)`, 1.5em height cap); standalone image paragraphs stay block-sized (max 720×480); every local, remote, or `data:` image reaches the background decoder only through a validated content-addressed cache file (bounded bytes, allowlisted raster format, and pixel budget; SVG also uses the strict shared validator); remote URLs are never fetched on open: an explicit per-tab Load images action starts only public HTTPS/443 fetches, resolves and pins each redirect hop, and writes only validated image bytes into versioned `cache/markrust/images` (everything else remains an alt placeholder); safe inline/block HTML is painted (phrasing tags hidden unless the caret intersects, phrasing marks applied; inline `style=` / HTML `color` and same-block CSS classes paint; safe `<svg>` is an image; script/iframe/`javascript:` dropped); HTML-block comments (`<!-- … -->`) and PI/CDATA (`<?…?>` / `<![CDATA[…]]>`, including an inner `>`) hide unless the caret intersects (then source; Comrak’s empty sourcepos is recovered from the literal); CommonMark Type-1 `<style>` / `<textarea>` hide unless the caret intersects (then source; tags skip as dest chrome); Type-1 `<script>` stays hidden and skips as a widget; GFM tagfilter `<iframe>` / `<noembed>` / `<noframes>` stay hidden widgets the same way; `<title>` / `<xmp>` / `<plaintext>` hide unless the caret intersects (then source, like Type-1 `<textarea>`) and skip/delete as one widget; Type-6 `<details>` skips/deletes as one widget and reveals source on intersect (not a disclosure UI); `<video>` / `<dialog>` / `<form>` / `<canvas>` / `<math>` skip the same way (source on intersect, not a player or form UI); `<button>` / `<select>` / `<input>` / `<label>` / `<option>` / `<fieldset>` / `<legend>` / `<output>` / `<progress>` / `<meter>` skip as dest-chrome widgets the same way (source on intersect, not a live form UI); `<noscript>` / `<template>` skip the same way (source on intersect, not a nested document); `<datalist>` is not a dest-chrome widget (inner `<option>` is); `<picture>` / `<summary>` / `<search>` / `<slot>` stay flow; `<object>` / `<embed>` stay hidden widgets like `<iframe>`; GFM `<pre>` inner text stays literal (not a nested Markdown parse); other HTML-block inner Markdown (`**bold**`, links, code) is a nested parse, not raw chrome (wrapper `<div>` / `</div>` hide unless the caret intersects); thematic `---` / `<hr>` paint as a rule unless the caret intersects (then source); `==highlight==` / `<mark>` paint a background; `<sub>`/`<sup>` and `~sub~`/`^sup^` map to Unicode (GPUI has no per-run baseline); footnote refs paint as superscripts unless the caret intersects (then `[^1]`); footnote definition `[^1]:` and definition-list `: ` hide unless the caret intersects; footnote definition and definition-list bodies are nested rich trees (`**bold**`, links, code); GFM `[ref]: url` / image-ref definitions are recovered as editable WYSIWYG blocks (comrak detaches them); GFM wrap marks (`*` / `**` / `_` / `~~` / ticks / `==`), ATX `#`, setext underlines, markdown link `[` `]`, list/task markers, quote `>`, fence ticks, table `|`, HTML phrasing tags, HTML-block `<div>` / `</div>`, thematic `---` / `<hr>` source, and reference-definition `[` `]` hide unless the caret or a selection intersects the node (link dest `(url)` stays hidden while the caret is only in the label; click on painted `bold` / `label` / item still maps into the word); images paint `![]()` when the image node is intersected; `$…$` / `$$…$$` hide the dollars unless the caret intersects, and paint the TeX in italic monospace (no TeX-to-glyphs); `[[wikilink]]` / `[[target|label]]` paint as in-place links (`[[ ]]` hidden unless the caret intersects); `[TOC]` / `[[toc]]` paint a generated heading list from the outline (marker shown when the caret intersects); GitHub `> [!NOTE]` / TIP / IMPORTANT / WARNING / CAUTION alerts paint as labeled callouts (left rule + label; `[!NOTE]` chrome hidden unless the caret intersects); IME origin from the focused widget or caret leaf (`wysiwyg/ime.rs`), pushed with `invalidate_character_coordinates` after caret/widget/composition changes (OS CJK candidate window still unverified)
+Source / Split source: literal byte layout + color-only syntax styling
+WYSIWYG: virtualized blocks + native shaped text + widget overlays
 ```
 
-Parse, the folder watcher `recv`, an explicitly approved remote-image fetch, and GPUI image decode stay off the GPUI UI thread. `Document::new` / `from_file` only *schedule* a parse; they do not fetch network images. The frame drains parse with `apply_pending_parse`. CI timeout tests (`crates/markrust-core/tests/perf_gates.rs`, `crates/markrust-editor/tests/perf_gates.rs`) fail if load+parse or source layout of a 256 KiB fixture exceeds a budget. Local numbers: `cargo bench -p markrust-core --bench parse` and `cargo bench -p markrust-editor --bench layout`.
+Parse, watcher waits, explicitly approved remote-image fetches and image
+decode stay off the UI thread. Images pass bounded raster/SVG validation
+before reaching GPUI; opening a document never fetches remote content.
+Caret and widget changes invalidate native IME coordinates; operating-system
+CJK candidate placement remains a manual acceptance gate.
+
+CI performance gates cover load/parse and source layout of 256 KiB fixtures.
+Local measurements use the core `parse` and editor `layout` benches.
 
 ## Document model
 
@@ -76,26 +101,182 @@ tree-sitter-md is not used. Source-mode `SyntaxNodeSpan`s are extracted from the
 
 ## Editing surfaces
 
-The WYSIWYG behavior below describes the default **Show Markup Hints** setting.
-
-| Mode | Default | How |
+| Mode | Projection | Input ownership |
 |---|---|---|
-| **Wysiwyg** | yes | `RichEditorView` — Typora in-place: wrap marks, ATX `#`, setext underlines, link `[` `]`, list/task markers, quote `>`, fence ticks, indented-code indent, table `|`, HTML phrasing tags, HTML-block `<div>` / `</div>` / comments / Type-1 `<style>` / `<textarea>`, thematic `---` / `<hr>`, definition-list `: `, footnote-definition `[^1]:`, and footnote-ref `[^1]` hidden unless the caret or a selection intersects the node (dest `(url)` hidden while the caret is only in the label; a thematic break is a rule when the caret is outside; footnote refs are a superscript when the caret is outside; `<pre>` inner text is literal; `<script>` / `<iframe>` / `<object>` stay hidden as widgets; `<title>` / `<xmp>` / Type-6 `<details>` / `<fieldset>` / `<video>` / `<dialog>` / `<button>` / `<select>` / `<output>` / `<noscript>` reveal source on intersect and skip as widgets); Markdown is serialization |
-| **Source** | `cmd-shift-m` | Existing delimiter-masking editor; spans from comrak |
-| **Split** | cycle `cmd-shift-m` again | Literal Markdown source left, editable WYSIWYG view right; both use the same `Document` |
+| WYSIWYG | Stable rich text; Markdown delimiters stay outside shaped text | Rich body or a focused widget draft |
+| Source | Literal Markdown, uniform monospace rows, color-only syntax styling | Source editor |
+| Split | Literal source on the left, editable rich text on the right | Last focused pane, remembered per tab |
 
-Split's source projection keeps every Markdown byte and a one-to-one byte-offset map. Source mode retains delimiter masking. [Delimiter masking](delimiter-masking.md) describes the WYSIWYG markup-hint preference and visibility rule.
+**Show Markup Hints** controls a paint-only active-context tint, a non-interactive
+floating syntax badge and a compact status-bar label such as `Bold · **…**`.
+The badge is suppressed during selection, dragging and widget/table editing.
+It never changes glyph advances,
+line count, selection, document bytes or viewport anchoring. Native, Ocean
+and Forest highlight palettes change colors only. Full syntax is available
+in Source and Split. The older masking API remains internal, not a user mode;
+see [projection policy](delimiter-masking.md).
 
-Caret/selection are source byte offsets. `RichEngine` provides delimiter-skipping snap/step for WYSIWYG, including a clickable blank on a standard `\n\n` between top-level blocks and on a trailing blank after the last block (`hello\n\n`). Quote and list-indent prefixes on nested fences, HTML, quoted paragraphs, and list items are skipped the same way (click, IME, and Left/Right stay on the painted body, not on `>` / `- ` / `1. `; CommonMark tab / 1–4 space padding after the list marker skips the same way). CommonMark code-span stripped padding spaces (`` ` foo ` ``) skip like ticks. CommonMark indented-code opening 4 spaces / tab skip like fence ticks (comrak sourcepos that drops the indent is recovered). CommonMark 0–3 spaces before ATX `#` / a setext title / a fence / a thematic break skip the same way (quoted `>  # Title` keeps `>`; four spaces stay indented code). Fenced content lines strip `fence_offset`. GFM table `|` and the alignment `|---|` row skip onto the painted cell the same way (Home/click do not sit on a hidden pipe), including compact spec tables that omit wrapping pipes (`foo|bar`). An escaped `\|` in a cell is a literal pipe, not dest chrome (typing next to it does not split the row). GitHub alert `[!NOTE]` skips onto the title/body; `[TOC]` / `[[toc]]` skip brackets; GFM `[ref]: url` skips `[` onto the label and `: ` onto dest. Inline chrome (`[` / `](url)` / `[ref]`, dest wrapping `(url "title")` / `'title'` / `(title)` so click/Home land on the URL or title inner not `(` `"` `)`, `**` / ticks, wrapping `**` around a whole `[hello](url)`, URL and email autolink `<>`, `$math$` / multiline `$$\n…\n$$` wrapping newlines / `[[wiki]]` / `:emoji:`, wrapping dest around a linked image, HTML phrasing tags `<b>` / `<a href>` / comments) is skipped the same way (Left at a link label does not sit on `[` or wrapping `*`; Backspace there does not nibble dest, `$` / `[[` / `:`, wrapping marks, or HTML `>`). End on a last-in-line HTML `<a href>label</a>` / `<b>` / comment stays on the inner insert home (before `</a>` / `</b>` / `<!--`), not dest `href`. Two-space / backslash hard breaks (`a  \nb`) skip like `<br>`. Empty-caret wrap wraps dest-chrome widgets (`**<br>**`, wrap around a hard break, `**[^1]**`, `**<https://…>**`) instead of splicing `****` / `[]()` in front; leftover below a last-block widget still opens `[]()`. Empty wrap on ATX `#`, setext underlines, table `|`, and 0–3 space heading indent uses the same Home/click skip so the pair sits in the body (`# **x**Title`, `| **x**a |`), not splice `**x**#` / `**x**|`. Empty wrap / InsertText on markdown-link `[`, HTML phrasing `<b>` / `<a href>`, and GFM alignment dashes skip onto inner text the same way (`[**x**hello](url)`, `<b>**x**hello</b>`, not `|x---|`). InsertText on revealed list/quote/task/`[ref]:` prefixes skips onto the body (`> xhello`, `- [x] xdone`, `[xref]: url`), not splice `x> hello` / `x[ref]:`. InsertText on setext underline / closed ATX trailing hashes / leading table `|` / GitHub `[!NOTE]` matches that skip (`Titlex\n===`, `# Titlex #`, `| xa |`, `> [!NOTE]\n> xbody`), not glue `Title\n===x` / `# Title #x` / `x| a |` / `x[!NOTE]` (cell-end `|` and open ATX `# Titlex` stay; document EOF on underline / trailing hashes still opens a body line). InsertText on a thematic `---` / `***` / `<hr>` widget opens a paragraph above (`x\n\n---`, not `x---` / a setext heading; quoted keep `>`; leftover/EOF after; HTML `<hr>` / `<br>` keep a blank line). InsertText on two-space / `\` hard-break chrome lands on the next line's first visible char (`a  \nxb`); the break start still extends the previous word. GFM extended autolinks (`www.`, `https://`, bare email) recover the URL literal when comrak reports `0..1` / marker sourcepos. CommonMark character references (`A&amp;B`) paint the decoded glyph and skip `amp;` dest chrome (click/Home on `&`; Left/Right/Backspace/Delete one step; InsertText on dest chrome skips after the glyph (`A&amp;xB`), not `A&xamp;B`; End on last-in-line `A&amp;` after the glyph, not inside `amp;`; End on last-in-line `[^1]` after the widget, not the label start; linked `[![alt](img)](url)` End stays on wrapping `]`, not dest; code spans stay literal). CommonMark backslash escapes (`A\*B`) paint the decoded glyph and skip the escaped char the same way (click/Home on `\`; InsertText on `*` is `A\*xB`, not `A\x*B`; End on last-in-line `A\*` after the glyph, not on `*`; code spans walk `\` and `*` as literals). Autolink `<>` stay hidden unless the caret or a selection intersects the span. Wrap marks (`*` / `**` / `_` / `~~` / ticks / `==`), ATX heading hashes, setext underlines, markdown link `[` `]`, list/task markers (`- ` / `1. ` / `[ ] `, including tab / 1–4 space padding), quote `>`, fence ticks (and the info string), table `|`, HTML phrasing tags (`<b>` / `<a href>` / comments), HTML-block `<div>` / `</div>` / `<!-- … -->`, thematic `---` / `<hr>` source, definition-list `: `, footnote-definition `[^1]:`, and footnote-ref `[^1]` use that same intersect rule (hidden outside; painted when the caret or a selection hits the node — list markers per item, quote `>` for the whole quote, fence ticks for that block, table pipes for the whole table, `: ` per details block, `[^1]:` per definition; a thematic break is a rule widget when the caret is outside; a footnote ref is a superscript when the caret is outside). Link dest `(url)` stays hidden while the caret is only in the label and paints when the caret is in dest or a selection overlaps the node. Images paint `![]()` when the image node is intersected. Left/Right/Delete still treat a thematic break / `<hr>` as one unit. Backspace/Delete that empties a marked run unwraps surrounding `**` / `==` / `~~` / ticks (no leftover `====`). Empty `> ` / `- ` lines sit after the prefix so typing is `> x` / `- x`. InsertText / wrap / block commands at EOF on a closing fence, last-line fence opener / info-string, setext underline, closed ATX trailing `#`, HTML-block `</div>` / single-line `<pre>…</pre>`, last-block `<svg>…</svg>` / `<img>` / `<br>`, or `[TOC]` (no following newline) insert a newline first (`===\nx`, `# Title #\nx`, `</div>\nx`, `<pre>…</pre>\nx`, `<svg></svg>\nx`, ` ```rust\nx`, `[TOC]\nx`). Enter inside `[hello](url)` / `[hello][ref]` / `![alt](url)` / GFM autolink stays one node (label/title wrap with `\n`; dest/autolink split after the node; ATX headings split after the heading line). Enter inside wrap marks / inline code / HTML phrasing stays one node (`**bo\nld**`, `` `co\nde` ``, `<b>he\nllo</b>`; ATX `# **hello**` splits after the heading). Clicking leftover viewport below the last painted line places the caret on that trailing blank, or opens one when the file has none (`hello` then type `x` is two paragraphs). Click on the last line of the last block still sits in that paragraph. A document that is only newlines still hosts a caret. A lone terminator `\n` is not an empty paragraph.
+Caret and selection use source byte offsets. Each rich leaf has a visible
+glyph-to-source map and a separate logical caret ownership range. The latter
+includes hidden delimiters and editable empty-list/paragraph endpoints.
+This distinction prevents a valid EOF caret from disappearing merely because
+its position has no visible glyph. Enter continues a nonempty list item;
+Enter on an empty item exits to an editable paragraph.
+
+Trailing spaces and tabs omitted by the Markdown AST are projected from exact
+source bytes into paragraph/heading text leaves; plain paragraph leading spaces
+and whitespace-only editable rows retain their glyph-to-source map. Typing
+whitespace therefore moves the caret immediately. Structural table padding,
+hard-break syntax and line endings remain hidden. First Enter creates an editable
+paragraph; Enter in an already
+empty plain paragraph is a no-op without an undo entry. List exit and literal
+code/Source newlines retain their own behavior. Input, including a boundary
+no-op, restarts the visible caret phase; idle blinking keeps IME geometry stable.
+The EOF draft reserves the same separator spacing as its future paragraph,
+preventing a vertical jump when its first non-whitespace character is entered.
+
+Hidden delimiters are skipped by rich navigation and command targeting.
+Tables show editable cell text without a persistent structural toolbar or raw
+delimiter row. A floating row/column panel appears only for a focused, collapsed
+caret inside a cell, never during selection or dragging. It uses freshly painted
+caret geometry, stays inside the viewport and does not cover the active row or
+participate in document layout. Format → Table remains available. Table
+edits clamp to cells. Newly typed spaces at a trimmed cell boundary use `&#32;`
+(ordinary U+0020, not a nonbreaking space), distinguishing authored content from
+GFM alignment padding across parse, save/reopen and Undo/Redo. Existing padding
+is not rewritten; internal spaces and literal Source input remain unchanged.
+Widget drafts own their selection, IME origin
+and undo while focused. Both panes repair stale UTF-8/grapheme endpoints
+after shared-document edits. Unsupported active HTML is never executed.
+Detailed syntax edge cases remain in [engineering notes](roadmap.md).
+
+Split's passive `ShadowSelection` is separate from both input selections. The
+workspace copies only the actually focused owner's source range, direction and
+revision; the peer paints it through its native grapheme stops. Ghost updates
+never enter Document, IME, undo/recovery or scroll-reveal state. Focus on a
+palette, widget or image inspector suppresses the ghost; hidden/offscreen
+syntax cannot force either pane to reveal markup or scroll.
+
+Link destinations use an out-of-flow editor opened with Cmd-K, including when
+markup hints are disabled. Enter or Tab commits the URL; Escape cancels the
+draft. The rich label and document geometry stay unchanged during URL editing.
+Save and Save As commit valid widget drafts before publishing document bytes.
+Tab close commits valid drafts or archives an invalid draft separately. Window
+close/Quit checkpoint raw uncommitted fields without requiring a save decision;
+recovery reattaches them only to validated matching source targets.
+
+Image properties use a separate bounded inspector with real plain-text input
+entities. Local paths resolve from Document.path and preview crosses the same
+approved image-cache boundary as body rendering. Apply is revision/source
+pinned and atomic; Cancel discards the inspector only by explicit gesture.
+Field focus/history/Paste are routed independently, and private recovery
+stores a length-delimited URL/alt draft without publishing it to Markdown.
+
+## Workspace chrome and recovery
+
+Document tabs belong to the editor column, not the sidebar. A horizontally
+scrollable strip reveals the active tab; dirty markers and full-path tooltips
+distinguish drafts and same-named files. Welcome is limited to the initial
+empty workspace. Recent files use basenames with full-path hover labels.
+At compact widths, formatting tools scroll with explicit previous/next controls.
+
+`recovery.rs` stores versioned private per-window snapshots; `Workspace`
+observes buffer changes and checkpoints content, saved base, modes, selections
+and active pane. Restoring compares current disk bytes against both the
+saved base and the recovered buffer. A changed or missing target requires
+an explicit save decision before publication. Recovery writes do not write the
+original document.
+
+Recovery files are owner-only on Unix, reject symlinks/hard links at their private
+boundary, use lifetime window-owner leases and atomic replacement, and retain a
+prior valid snapshot. Limits are 16 MiB serialized per window, 4 MiB per buffer/base,
+256 total live/closed tab entries, and 64 recoverable windows. Dirty closed drafts
+are retained, not
+silently trimmed; archived named drafts reopen as separate Save As buffers.
+Normal typing schedules checkpoints after a configured 25–150 ms without
+postponing the first deadline during continuous input. Worker and fsync time
+are additional; this is not a durability deadline. Normal Quit completes a
+bounded synchronous final write; a slow disk may delay quitting. Our Quit and
+titlebar-close commands keep unsaved state open on failure; a fully saved window
+can close despite recovery metadata failure. GPUI's separate system
+shutdown hook cannot veto an OS-requested exit. Errors and size limits are
+visible, not silent. Clean closed windows retire their session; dirty closed
+drafts remain recoverable. Recovery
+does not restore undo history and cannot guarantee the last uncheckpointed
+keystroke after abrupt termination or power loss. Native persistence tests
+use isolated temporary stores, never the user's real session.
+Uncommitted and invalid widget fields retain raw text and source identity.
+Recovery never silently attaches a stale field to changed Markdown: it opens
+the raw text as a pathless Source draft if exact reattachment is unsafe.
+Finder/open events route to the last active live window. The receiver belongs
+to the application, so closing the oldest window cannot orphan later events.
 
 ## Save and external edits
 
-- Default save writes the buffer verbatim (untouched blocks are untouched bytes).
-- When house-style Normalize would change the file, Save offers Keep original / Normalize / Cancel with a hunk preview.
-- Autosave writes the buffer as-is (no Normalize).
-- External disk changes: if the buffer still matches the last snapshot, prompt to reload; if the tab is dirty, 3-way line-merge disjoint edits (carets mapped with `map_offset_across_change`); overlapping edits prompt before discarding.
+- Default save writes the buffer verbatim (untouched blocks are untouched bytes),
+  fsyncs a unique sibling temporary file before rename, preserves existing
+  permissions and syncs the parent directory on Unix.
+- Save never offers normalization. Normalization is absent from the user-facing
+  File menu; its internal, explicitly dispatched review remains available to
+  engineering regression probes and is never part of ordinary Save.
+- Background autosave writes private snapshots only, never the source file or
+  its clean marker. Explicit Save is the publication boundary.
+- Explicit save failures show a native error prompt and retain the dirty buffer.
+  Document writes currently complete on the foreground executor; slow network
+  or cloud-mounted volumes may delay editing. Moving that I/O off-thread needs
+  revision-aware completion before it can safely mark a newer buffer clean.
+- External edits use the last reconciled disk bytes, live buffer and fresh disk
+  bytes for source-preserving three-way merge. Independent lines and bounded
+  same-line grapheme edits merge; ambiguous/structural overlaps require review.
+  Similar's structured regions avoid conflict-marker parsing and AST rewriting.
+- Manual Save checks disk even without a watcher event. Atomic writes compare
+  expected bytes before staging and again before rename; a final check/rename
+  race with an uncooperative writer remains, not a portable compare-and-swap.
+- Conflicts block source publication, not private checkpoints, including across
+  recovery. Review tokens pin tab
+  identity, revision and all three versions, then recheck disk before applying.
+  Keep Mine, Use Disk and Keep Both retain the other version as a pathless draft
+  with a durable checkpoint before buffer replacement. Cancel/stale tokens
+  leave both versions intact. Clean tabs accept fresh disk bytes without reload.
+
+## Build identity
+
+The workspace manifest owns the product version. User-facing feature updates
+advance the minor version rather than reuse the previous version; the current
+release-update feature advances to `0.8.0`; the following `0.8.1` patch is the
+first intended GitHub update-test release.
+
+`markrust-app/build.rs` embeds a seconds-resolution UTC timestamp at compilation.
+About MarkRust, the non-GUI `--build-info` JSON command and the macOS installer's
+`MarkRustBuildDate` plist field all use that compiled identity. Packaging or
+launching the app never invents a newer date. A no-op cached build retains its
+timestamp; changes to product sources or manifests trigger a new stamp.
+
+For reproducible builds, `SOURCE_DATE_EPOCH` supplies the timestamp instead of
+the wall clock. About labels this provenance and JSON reports
+`timestamp_source: "source-date-epoch"`. Invalid epochs fail the build. This
+timestamp identifies a build, not its installation time or a unique content hash.
+
+## Release-update boundary
+
+`updater.rs` owns fixed-repository metadata, bounded HTTPS downloads, checksums
+and safe archive/bundle validation. It never installs or executes the candidate.
+`update_install.rs` prepares a private same-volume handoff and uses the current
+trusted executable as a helper; pinned hashes and filesystem identities guard
+replacement, rollback and the receipt. `update_ui.rs` owns the asynchronous
+single-job state machine and explicit user actions. Application-level restart
+checks all windows' dialog/composition guards and private checkpoints before
+freezing input and quitting. None of these modules publish document files.
+
+Keep this within the application crate for now: the repository, platform and
+desktop lifecycle are product-specific. A separately published updater crate
+would add a compatibility/security contract without helping this simple notepad.
+See [in-app updates](deployment.md#in-app-macos-updates) for trust and acceptance.
 
 ## Related
 
 - [WYSIWYG roadmap](roadmap.md) — phase status and handoff
+- [Concurrent editing](concurrent-editing.md) — merge/save policy and verification gates
+- [Everyday notepad](notepad-experience.md) — lifecycle, persistence boundaries and private session-crate proposal
 - [Delimiter masking](delimiter-masking.md) — source-mode visibility algorithm
+- [Apple macOS design guidance](https://developer.apple.com/design/human-interface-guidelines/designing-for-macos/) — familiar keyboard commands and configurable colors

@@ -725,9 +725,6 @@ fn scan_inline_dest_url(source: &str, start: usize, limit: usize) -> Option<(Ran
             match bytes[i] {
                 b'>' => {
                     let inner = start + 1..i;
-                    if inner.start >= inner.end {
-                        return None;
-                    }
                     return Some((inner, i + 1));
                 }
                 b'\n' | b'<' => return None,
@@ -763,7 +760,7 @@ fn scan_inline_dest_url(source: &str, start: usize, limit: usize) -> Option<(Ran
         }
         i += 1;
     }
-    if i == start || parens != 0 {
+    if parens != 0 || (i == start && bytes.get(i) != Some(&b')')) {
         return None;
     }
     Some((start..i, i))
@@ -1088,16 +1085,158 @@ impl RichTree {
     }
 }
 
-/// Trailing empty line(s) at EOF. A lone terminator `\n` after the last
-/// content line is not a blank; `hello\n\n` / extra `\n`s are.
-pub(crate) fn trailing_blank_gap(source: &str) -> Option<Range<usize>> {
-    let bytes = source.as_bytes();
-    if bytes.last().is_none_or(|b| *b != b'\n') {
+/// Proven prose bytes which Comrak omits from the final inline, but which
+/// remain visible editing positions. Shared by caret navigation and paint.
+/// Hidden wrappers, table padding and literal newlines are not prose suffixes.
+pub fn trailing_prose_whitespace_range(block: &Block, source: &str) -> Option<Range<usize>> {
+    if !matches!(block.kind, BlockKind::Paragraph | BlockKind::Heading { .. }) {
         return None;
     }
-    let last_nl = source.len() - 1;
-    let last_line_start = source[..last_nl].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    if !source[last_line_start..last_nl].trim().is_empty() {
+    // A final image is a separate element, not a text segment. Do not expose
+    // extra logical stops which its current renderer cannot yet paint.
+    if block.inlines.last().is_some_and(|inline| match inline {
+        Inline::Image { .. } => true,
+        Inline::OpaqueInline { raw, .. } => crate::html_visual::html_inline_image(raw).is_some(),
+        _ => false,
+    }) {
+        return None;
+    }
+    let mut html = crate::html_visual::HtmlStack::default();
+    let mut has_visible_text = false;
+    for inline in &block.inlines {
+        match inline {
+            Inline::OpaqueInline { raw, .. } => {
+                let action = crate::html_visual::classify_opaque_inline(raw, &mut html);
+                has_visible_text |= !html.hidden()
+                    && matches!(
+                        action,
+                        crate::html_visual::InlineHtmlAction::Raw
+                            | crate::html_visual::InlineHtmlAction::FootnoteRef { .. }
+                    );
+            }
+            Inline::Run { text, .. } => has_visible_text |= !html.hidden() && !text.is_empty(),
+            Inline::Math { literal, .. } => {
+                has_visible_text |= !html.hidden() && !literal.is_empty()
+            }
+            Inline::WikiLink { label, .. } => {
+                has_visible_text |= !html.hidden() && !label.is_empty()
+            }
+            Inline::Emoji { glyph, .. } => has_visible_text |= !html.hidden() && !glyph.is_empty(),
+            _ => {}
+        }
+    }
+    if !has_visible_text || html.hidden() {
+        return None;
+    }
+    let lo = block.source_range.start.min(source.len());
+    let hi = block.source_range.end.min(source.len());
+    let start = block
+        .inlines
+        .iter()
+        .map(|inline| {
+            let link = match inline {
+                Inline::Run { link, .. } => link.as_ref(),
+                _ => None,
+            };
+            expand_marks_and_link_chrome(source, inline.source_range(), link, lo, hi).end
+        })
+        .max()?;
+    // A setext underline is a separate hidden line, not the title's suffix.
+    let end = if matches!(
+        block.kind,
+        BlockKind::Heading {
+            style: HeadingStyle::Setext,
+            ..
+        }
+    ) {
+        source
+            .get(start..hi)?
+            .find(['\r', '\n'])
+            .map_or(hi, |newline| start + newline)
+    } else {
+        hi
+    };
+    let suffix = source.get(start..end)?;
+    (!suffix.is_empty() && suffix.bytes().all(|byte| matches!(byte, b' ' | b'\t')))
+        .then_some(start..end)
+}
+
+/// CommonMark's 0–3 leading spaces on a plain paragraph are live editing
+/// bytes, not quote/list/code/table prefixes. Import keeps them in the block
+/// span so typing the first letter cannot replace a whitespace-only row.
+pub fn leading_prose_whitespace_range(block: &Block, source: &str) -> Option<Range<usize>> {
+    if !matches!(block.kind, BlockKind::Paragraph)
+        || matches!(block.inlines.first(), Some(Inline::Image { .. }))
+    {
+        return None;
+    }
+    let start = block.source_range.start.min(source.len());
+    if source
+        .get(..start)?
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1)
+        != start
+    {
+        return None;
+    }
+    let end = block
+        .inlines
+        .iter()
+        .map(|inline| {
+            let link = match inline {
+                Inline::Run { link, .. } => link.as_ref(),
+                _ => None,
+            };
+            expand_marks_and_link_chrome(
+                source,
+                inline.source_range(),
+                link,
+                start,
+                block.source_range.end.min(source.len()),
+            )
+            .start
+        })
+        .min()?;
+    let text = source.get(start..end)?;
+    ((1..=3).contains(&text.len()) && text.bytes().all(|byte| byte == b' ')).then_some(start..end)
+}
+
+/// Horizontal whitespace on the single visible line of an empty paragraph.
+/// Extra separator newlines retain their bytes but are not extra painted rows.
+pub fn blank_gap_whitespace_range(source: &str, gap: Range<usize>) -> Option<Range<usize>> {
+    let mut end = gap.end.min(source.len());
+    if source.as_bytes().get(end.checked_sub(1)?) == Some(&b'\n') {
+        end -= 1;
+        if source.as_bytes().get(end.checked_sub(1)?) == Some(&b'\r') {
+            end -= 1;
+        }
+    }
+    let start = source
+        .get(..end)?
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1)
+        .max(gap.start);
+    let text = source.get(start..end)?;
+    (!text.is_empty() && text.bytes().all(|byte| matches!(byte, b' ' | b'\t')))
+        .then_some(start..end)
+}
+
+/// Trailing empty line(s) at EOF, including a space/tab typed into that
+/// paragraph before its terminating newline exists. A lone terminator `\n`
+/// after the last content line is not a blank; `hello\n\n` / extra `\n`s are.
+pub(crate) fn trailing_blank_gap(source: &str) -> Option<Range<usize>> {
+    let bytes = source.as_bytes();
+    let terminated = bytes.last() == Some(&b'\n');
+    let line_end = source.len().saturating_sub(usize::from(terminated));
+    let last_line_start = source[..line_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let last_line = &source[last_line_start..line_end];
+    if if terminated {
+        !last_line.trim().is_empty()
+    } else {
+        last_line_start == 0
+            || last_line.is_empty()
+            || !last_line.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+    } {
         return None;
     }
     let mut start = last_line_start;

@@ -8,7 +8,7 @@ import DocsLayout from '../../layouts/DocsLayout.astro';
   <h2>Open a folder</h2>
   <ul>
     <li><kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd> — open folder dialog</li>
-    <li>Drag a folder onto the MarkRust window</li>
+    <li><strong>File → Open Location</strong> (<kbd>⌘⇧L</kbd> / <kbd>Ctrl+Shift+L</kbd>) — paste a file or folder path</li>
   </ul>
 
   <h2>File tree</h2>
@@ -18,5 +18,7 @@ import DocsLayout from '../../layouts/DocsLayout.astro';
   <p>When no folder is open, the sidebar lists recent workspaces stored in MarkRust’s platform configuration directory.</p>
 
   <h2>External changes</h2>
-  <p>If a file changes on disk while open, MarkRust detects it and offers to reload. Your in-editor changes are not overwritten without confirmation.</p>
+  <p>If a file changes on disk while open, MarkRust detects it and offers change review and merging. Independent edits can be combined; conflicting changes need an explicit choice. Your in-editor draft is not silently replaced by the disk version.</p>
+  <h2>Related</h2>
+  <p><a href="/docs/first-document">First document</a> · <a href="/docs/shortcuts">Keyboard shortcuts</a></p>
 </DocsLayout>

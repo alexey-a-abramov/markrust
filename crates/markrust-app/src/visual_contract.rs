@@ -145,8 +145,12 @@ pub(crate) fn validate_selection_layering(
                 .and_then(|background| selected.intersection(background))
                 .is_some()
             {
-                ensure!(selection.order > background.order,
-                    "{label}: an opaque code background paints over the selection: selection order {:?}, background order {:?}", selection.order, background.order);
+                ensure!(
+                    selection.order > background.order,
+                    "{label}: an opaque code background paints over the selection: selection order {:?}, background order {:?}",
+                    selection.order,
+                    background.order
+                );
             }
         }
     }
@@ -181,20 +185,31 @@ pub(crate) fn validate_text_geometry(leaves: &[PaintedLeafGeometry], label: &str
                 rect.valid(true),
                 "{label}: invalid glyph row {leaf_index}:{row_index}: {rect:?}"
             );
-            ensure!(rect.top >= allocated.top - TOLERANCE && rect.bottom <= allocated.bottom + TOLERANCE,
-                "{label}: glyph rows overflow allocated leaf height: leaf={:?}, allocated={allocated:?}, row={rect:?}", leaf.text);
-            ensure!(rect.left >= allocated.left - TOLERANCE && rect.right <= allocated.right + TOLERANCE,
-                "{label}: text escapes horizontal leaf bounds: leaf={:?}, allocated={allocated:?}, row={rect:?}", leaf.text);
+            ensure!(
+                rect.top >= allocated.top - TOLERANCE
+                    && rect.bottom <= allocated.bottom + TOLERANCE,
+                "{label}: glyph rows overflow allocated leaf height: leaf={:?}, allocated={allocated:?}, row={rect:?}",
+                leaf.text
+            );
+            ensure!(
+                rect.left >= allocated.left - TOLERANCE
+                    && rect.right <= allocated.right + TOLERANCE,
+                "{label}: text escapes horizontal leaf bounds: leaf={:?}, allocated={allocated:?}, row={rect:?}",
+                leaf.text
+            );
             rectangles.push((leaf_index, row_index, rect));
         }
     }
     for (position, &(a_leaf, a_row, a)) in rectangles.iter().enumerate() {
         for &(b_leaf, b_row, b) in &rectangles[position + 1..] {
             // Wrapped rows in the same leaf must not overprint either.
-            ensure!(a.right.min(b.right) - a.left.max(b.left) <= TOLERANCE
-                || a.bottom.min(b.bottom) - a.top.max(b.top) <= TOLERANCE,
+            ensure!(
+                a.right.min(b.right) - a.left.max(b.left) <= TOLERANCE
+                    || a.bottom.min(b.bottom) - a.top.max(b.top) <= TOLERANCE,
                 "{label}: glyph rows overlap: {a_leaf}:{a_row} {a:?} ({:?}) and {b_leaf}:{b_row} {b:?} ({:?})",
-                leaves[a_leaf].text, leaves[b_leaf].text);
+                leaves[a_leaf].text,
+                leaves[b_leaf].text
+            );
         }
     }
     Ok(())
@@ -356,8 +371,10 @@ fn match_selection_rectangles(expected: &[Rect], painted: &[Rect], label: &str) 
         })?;
         matched[index] = true;
     }
-    ensure!(matched.iter().all(|matched| *matched),
-        "{label}: selected glyphs are missing highlights; expected {expected:?}, painted {painted:?}");
+    ensure!(
+        matched.iter().all(|matched| *matched),
+        "{label}: selected glyphs are missing highlights; expected {expected:?}, painted {painted:?}"
+    );
     Ok(())
 }
 

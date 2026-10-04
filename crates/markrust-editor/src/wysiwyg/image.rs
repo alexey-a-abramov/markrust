@@ -465,6 +465,24 @@ fn parse_safe_remote_url(input: &str) -> Result<Url, RemoteImageError> {
     Ok(url)
 }
 
+pub(crate) fn validate_remote_image_url(input: &str) -> Result<(), RemoteImageError> {
+    let url = parse_safe_remote_url(input)?;
+    if let Some(host) = url.host_str() {
+        if let Ok(ip) = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+        {
+            if !is_public_ip(ip) {
+                return Err(RemoteImageError::UnsafeAddress(
+                    "private or reserved IP addresses are not allowed".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn resolve_safe_remote_target(url: &Url) -> Result<SafeRemoteTarget, RemoteImageError> {
     let host = url
         .host_str()

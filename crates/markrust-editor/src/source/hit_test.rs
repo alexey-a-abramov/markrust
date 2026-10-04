@@ -11,8 +11,8 @@ use super::layout::DisplayLayout;
 pub struct ClickMap {
     pub line_heights: Vec<f32>,
     pub display_line_starts: Vec<usize>,
-    /// Per-line x positions (pixels from the line origin) at each UTF-8 index
-    /// in that display line, length `display_line_len + 1`.
+    /// Per-line x positions at grapheme caret stops, indexed by display byte.
+    /// Non-caret bytes are NaN; length is `display_line_len + 1`.
     pub line_x_at: Vec<Vec<f32>>,
     /// Document byte for each display-text byte (length `display_text.len() + 1`).
     pub display_to_doc: Vec<usize>,
@@ -74,6 +74,11 @@ pub fn click_byte_offset(
     if line_heights.is_empty() {
         return display_to_doc.first().copied().unwrap_or(0);
     }
+    if relative_y >= line_heights.iter().sum::<f32>() {
+        // Empty space below the document belongs to EOF, not to whichever
+        // column happens to share the pointer's x coordinate on the last row.
+        return display_to_doc.last().copied().unwrap_or(0);
+    }
     let mut y = 0.0f32;
     let mut line_idx = 0usize;
     for (i, height) in line_heights.iter().enumerate() {
@@ -120,6 +125,13 @@ mod tests {
     use crate::theme::EditorTheme;
 
     #[test]
+    fn nearest_hit_skips_internal_bytes_of_a_shaped_grapheme() {
+        let xs = [0., f32::NAN, f32::NAN, f32::NAN, 21.];
+        assert_eq!(closest_index_in_xs(&xs, 20.), 4);
+        assert_eq!(closest_index_in_xs(&xs, 1.), 0);
+    }
+
+    #[test]
     fn click_x_maps_to_byte_not_line_start() {
         // One line, four cells at x = 0, 8, 16, 24, 32 → click near 20 → index 2 or 3.
         let offset = click_byte_offset(
@@ -144,6 +156,36 @@ mod tests {
             &[0, 1, 2, 3, 4, 5, 6],
         );
         assert_eq!(offset, 4);
+    }
+
+    #[test]
+    fn click_below_last_row_owns_eof_regardless_of_horizontal_position() {
+        for y in [32.0, 100.0, 1000.0] {
+            for x in [-50.0, 0.0, 8.0, 1000.0] {
+                assert_eq!(
+                    click_byte_offset(
+                        x,
+                        y,
+                        &[16.0, 16.0],
+                        &[0, 4],
+                        &[vec![0.0, 8.0], vec![0.0, 8.0, 16.0]],
+                        &[0, 1, 2, 3, 4, 5, 6],
+                    ),
+                    6
+                );
+            }
+        }
+        assert_eq!(
+            click_byte_offset(
+                0.0,
+                31.9,
+                &[16.0, 16.0],
+                &[0, 4],
+                &[vec![0.0, 8.0], vec![0.0, 8.0, 16.0]],
+                &[0, 1, 2, 3, 4, 5, 6],
+            ),
+            4
+        );
     }
 
     #[test]

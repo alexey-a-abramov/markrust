@@ -13,6 +13,10 @@ use crate::config::{is_markdown, ThemeChoice};
 use crate::drop::{
     classify_editor_drop, classify_window_drop, markdown_image_reference, DropIntent,
 };
+use crate::recovery::{
+    RecoveryEditingPane, RecoveryEditorMode, RecoveryError, RecoverySelection, RecoverySnapshot,
+    RecoveryStore, RecoveryTab, RECOVERY_VERSION,
+};
 
 /// Where a file drop landed in the chrome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,8 +75,14 @@ pub enum SessionError {
     InvalidRange,
     #[error("tab not found")]
     TabNotFound,
+    #[error("document changed on disk; local edits were preserved for review")]
+    ExternalChange,
+    #[error("cannot reload a tab with unsaved edits; resolve or save a copy first")]
+    DirtyReloadBlocked,
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Recovery(#[from] RecoveryError),
 }
 
 /// How to react to an on-disk change for an open tab.
@@ -151,7 +161,7 @@ pub fn normalize_review_decision(
     }
 }
 
-/// Debounced autosave using an injected millisecond clock.
+/// Bounded-latency private checkpoint using an injected millisecond clock.
 #[derive(Debug, Clone, Default)]
 pub struct AutosaveScheduler {
     pub delay_ms: u64,
@@ -167,7 +177,13 @@ impl AutosaveScheduler {
     }
 
     pub fn note_edit(&mut self, tab_id: usize, now_ms: u64) {
-        self.pending = Some((tab_id, now_ms.saturating_add(self.delay_ms)));
+        let deadline = now_ms.saturating_add(self.delay_ms);
+        self.pending = Some((
+            tab_id,
+            self.pending
+                .map(|(_, due)| due.min(deadline))
+                .unwrap_or(deadline),
+        ));
     }
 
     pub fn due(&self, now_ms: u64) -> Option<usize> {
@@ -184,6 +200,9 @@ pub struct HeadlessTab {
     pub id: usize,
     pub editor: HeadlessEditor,
     pub title: String,
+    /// A merge or unresolved disk change must never become an implicit write
+    /// through the deterministic autosave test path.
+    autosave_blocked: bool,
 }
 
 /// Headless workspace: tabs, file tree, drop routing, export. No GPUI types.
@@ -194,9 +213,13 @@ pub struct HeadlessWorkspace {
     next_tab_id: usize,
     pub theme: ThemeChoice,
     pub pending_external_change: Option<(usize, PathBuf)>,
+    pending_external_change_tab_id: Option<usize>,
     pub last_export: Option<PathBuf>,
     autosave: AutosaveScheduler,
     now_ms: u64,
+    recovery_store: Option<RecoveryStore>,
+    recovery_archives: Vec<RecoveryTab>,
+    private_checkpoint: Option<RecoverySnapshot>,
 }
 
 impl Default for HeadlessWorkspace {
@@ -218,9 +241,13 @@ impl HeadlessWorkspace {
             next_tab_id: 1,
             theme: ThemeChoice::Dark,
             pending_external_change: None,
+            pending_external_change_tab_id: None,
             last_export: None,
             autosave: AutosaveScheduler::new(delay_ms),
             now_ms: 0,
+            recovery_store: None,
+            recovery_archives: Vec::new(),
+            private_checkpoint: None,
         };
         let _ = workspace.apply(WorkspaceCommand::NewDocument);
         workspace
@@ -230,12 +257,75 @@ impl HeadlessWorkspace {
         &self.tabs
     }
 
+    /// Explicit isolated storage for deterministic recovery tests. Default
+    /// headless sessions never access the user's production data directory.
+    pub fn with_private_recovery(delay_ms: u64, store: RecoveryStore) -> Self {
+        let mut workspace = Self::with_autosave_ms(delay_ms);
+        workspace.recovery_store = Some(store);
+        workspace
+    }
+
+    pub fn private_checkpoint(&self) -> Option<&RecoverySnapshot> {
+        self.private_checkpoint.as_ref()
+    }
+
     pub fn active(&self) -> Option<&HeadlessTab> {
         self.tabs.get(self.active_tab)
     }
 
     pub fn active_mut(&mut self) -> Option<&mut HeadlessTab> {
         self.tabs.get_mut(self.active_tab)
+    }
+
+    fn set_pending_external_change(&mut self, index: usize, path: PathBuf) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.editor.document().path.as_deref() != Some(path.as_path()) {
+            return;
+        }
+        self.pending_external_change = Some((index, path));
+        self.pending_external_change_tab_id = Some(tab.id);
+    }
+
+    fn clear_pending_external_change_for_tab(&mut self, tab_id: usize) {
+        if self.pending_external_change_tab_id == Some(tab_id) {
+            self.pending_external_change = None;
+            self.pending_external_change_tab_id = None;
+        }
+    }
+
+    fn reconcile_pending_external_change(&mut self) {
+        let Some((_, path)) = self.pending_external_change.clone() else {
+            self.pending_external_change_tab_id = None;
+            return;
+        };
+        let Some(tab_id) = self.pending_external_change_tab_id else {
+            self.pending_external_change = None;
+            return;
+        };
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            tab.id == tab_id && tab.editor.document().path.as_deref() == Some(path.as_path())
+        }) {
+            self.pending_external_change = Some((index, path));
+        } else {
+            self.pending_external_change = None;
+            self.pending_external_change_tab_id = None;
+        }
+    }
+
+    fn pending_external_change_matches_tab(&self, index: usize) -> bool {
+        let Some((pending_index, pending_path)) = self.pending_external_change.as_ref() else {
+            return true;
+        };
+        let Some(pending_tab_id) = self.pending_external_change_tab_id else {
+            return false;
+        };
+        *pending_index == index
+            && self.tabs.get(index).is_some_and(|tab| {
+                tab.id == pending_tab_id
+                    && tab.editor.document().path.as_deref() == Some(pending_path.as_path())
+            })
     }
 
     pub fn list_files(&self) -> Vec<PathBuf> {
@@ -287,7 +377,7 @@ impl HeadlessWorkspace {
             WorkspaceCommand::SaveWithReview(choice) => self.save_with_review(choice),
             WorkspaceCommand::AdvanceTime { millis } => {
                 self.now_ms = self.now_ms.saturating_add(millis);
-                self.flush_autosave();
+                self.flush_autosave()?;
                 Ok(EditorOutcome::Noop)
             }
             WorkspaceCommand::ExternalFileChange(path) => {
@@ -337,26 +427,51 @@ impl HeadlessWorkspace {
         &mut self,
         choice: NormalizeReviewChoice,
     ) -> Result<EditorOutcome, SessionError> {
-        let tab = self.active_mut().ok_or(SessionError::NoActiveDocument)?;
-        if tab.editor.document().path.is_none() {
-            return Err(SessionError::UntitledHasNoPath);
-        }
-        let mut engine = markrust_core::rich::RichEngine::new();
-        let candidates = markrust_core::rich::save_candidates(tab.editor.document(), &mut engine);
-        if should_offer_normalize_review(&candidates) {
-            let Some(text) = normalize_review_decision(&candidates, choice) else {
+        let active_tab = self.active_tab;
+        let (tab_id, path, result) = {
+            let tab = self.active_mut().ok_or(SessionError::NoActiveDocument)?;
+            let path = tab
+                .editor
+                .document()
+                .path
+                .clone()
+                .ok_or(SessionError::UntitledHasNoPath)?;
+            let mut engine = markrust_core::rich::RichEngine::new();
+            let candidates =
+                markrust_core::rich::save_candidates(tab.editor.document(), &mut engine);
+            if should_offer_normalize_review(&candidates) {
+                let Some(text) = normalize_review_decision(&candidates, choice) else {
+                    return Ok(EditorOutcome::Noop);
+                };
+                if text != tab.editor.document().buffer.content() {
+                    let len = tab.editor.document().buffer.len_bytes();
+                    tab.editor.document_mut().replace_range(0, len, &text);
+                }
+            } else if choice == NormalizeReviewChoice::Cancel {
                 return Ok(EditorOutcome::Noop);
-            };
-            if text != tab.editor.document().buffer.content() {
-                let len = tab.editor.document().buffer.len_bytes();
-                tab.editor.document_mut().replace_range(0, len, &text);
             }
-        } else if choice == NormalizeReviewChoice::Cancel {
-            return Ok(EditorOutcome::Noop);
+            let expected_disk = tab.editor.document().saved_content().to_string();
+            let result = tab
+                .editor
+                .document_mut()
+                .save_checked_and_mark_clean(Some(&expected_disk));
+            (tab.id, path, result)
+        };
+        match result {
+            Ok(()) => {
+                if let Some(tab) = self.tabs.get_mut(active_tab) {
+                    tab.autosave_blocked = false;
+                }
+                self.clear_pending_external_change_for_tab(tab_id);
+                self.autosave.clear();
+                Ok(EditorOutcome::Changed)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                self.note_external_change(&path);
+                Err(SessionError::ExternalChange)
+            }
+            Err(error) => Err(error.into()),
         }
-        tab.editor.document_mut().save_and_mark_clean()?;
-        self.autosave.clear();
-        Ok(EditorOutcome::Changed)
     }
 
     fn set_frontmatter_field(
@@ -382,14 +497,35 @@ impl HeadlessWorkspace {
     }
 
     fn save_active_as(&mut self, path: PathBuf) -> Result<EditorOutcome, SessionError> {
-        let tab = self.active_mut().ok_or(SessionError::NoActiveDocument)?;
-        tab.editor.document_mut().save_as(path.clone())?;
-        tab.title = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Untitled".into());
-        self.autosave.clear();
-        Ok(EditorOutcome::Changed)
+        let active_tab = self.active_tab;
+        let (tab_id, result) = {
+            let tab = self.active_mut().ok_or(SessionError::NoActiveDocument)?;
+            let expected_disk = (tab.editor.document().path.as_deref() == Some(path.as_path()))
+                .then(|| tab.editor.document().saved_content().to_string());
+            let result = tab
+                .editor
+                .document_mut()
+                .save_as_checked(path.clone(), expected_disk.as_deref());
+            (tab.id, result)
+        };
+        match result {
+            Ok(()) => {
+                if let Some(tab) = self.tabs.get_mut(active_tab) {
+                    tab.title = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Untitled".into());
+                    tab.autosave_blocked = false;
+                }
+                self.clear_pending_external_change_for_tab(tab_id);
+                self.autosave.clear();
+                Ok(EditorOutcome::Changed)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(SessionError::ExternalChange)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn open_file(&mut self, path: PathBuf) -> Result<EditorOutcome, SessionError> {
@@ -507,84 +643,206 @@ impl HeadlessWorkspace {
 
     fn close_active_tab(&mut self) -> Result<EditorOutcome, SessionError> {
         if self.tabs.len() <= 1 {
+            self.checkpoint_private_session()?;
             return Ok(EditorOutcome::Noop);
         }
-        self.tabs.remove(self.active_tab);
+        let mut projected = self.capture_private_session();
+        let closed = projected.tabs.remove(self.active_tab);
+        if closed.dirty {
+            projected.archived_tabs.push(closed.clone());
+        }
+        projected.active_tab = self.active_tab.min(projected.tabs.len() - 1);
+        self.persist_private_session(&projected)?;
+        if closed.dirty {
+            self.recovery_archives.push(closed);
+        }
+        let removed = self.tabs.remove(self.active_tab);
+        self.clear_pending_external_change_for_tab(removed.id);
+        self.reconcile_pending_external_change();
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         Ok(EditorOutcome::Changed)
     }
 
-    fn flush_autosave(&mut self) {
-        let Some(tab_id) = self.autosave.due(self.now_ms) else {
-            return;
-        };
-        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-            let doc = tab.editor.document();
-            if doc.dirty && doc.path.is_some() {
-                let _ = tab.editor.document_mut().save_and_mark_clean();
-            }
+    fn flush_autosave(&mut self) -> Result<(), SessionError> {
+        if self.autosave.due(self.now_ms).is_none() {
+            return Ok(());
         }
+        self.checkpoint_private_session()?;
         self.autosave.clear();
+        Ok(())
+    }
+
+    fn capture_private_session(&self) -> RecoverySnapshot {
+        RecoverySnapshot {
+            version: RECOVERY_VERSION,
+            root: self.root.clone(),
+            active_tab: self.active_tab,
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| {
+                    let document = tab.editor.document();
+                    let state = tab.editor.state();
+                    let selection = RecoverySelection {
+                        start: state.selected_range.start,
+                        end: state.selected_range.end,
+                        reversed: state.selection_reversed,
+                    };
+                    RecoveryTab {
+                        path: document.path.clone(),
+                        title: tab.title.clone(),
+                        mode: RecoveryEditorMode::Source,
+                        editing_pane: RecoveryEditingPane::Source,
+                        source_selection: selection.clone(),
+                        rich_selection: selection,
+                        content: document.buffer.content(),
+                        saved_content: document.saved_content().to_string(),
+                        dirty: document.dirty,
+                        autosave_blocked: tab.autosave_blocked,
+                        widget_draft: None,
+                    }
+                })
+                .collect(),
+            archived_tabs: self.recovery_archives.clone(),
+        }
+    }
+
+    fn persist_private_session(&mut self, snapshot: &RecoverySnapshot) -> Result<(), SessionError> {
+        snapshot.validate_for_write()?;
+        if let Some(store) = &self.recovery_store {
+            store.write(snapshot)?;
+        }
+        self.private_checkpoint = Some(snapshot.clone());
+        Ok(())
+    }
+
+    pub fn checkpoint_private_session(&mut self) -> Result<(), SessionError> {
+        let snapshot = self.capture_private_session();
+        match self.persist_private_session(&snapshot) {
+            Err(_)
+                if self.recovery_archives.is_empty()
+                    && self.tabs.iter().all(|tab| {
+                        !crate::workspace::tab_requires_private_recovery(
+                            tab.editor.document(),
+                            false,
+                        )
+                    }) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     fn note_external_change(&mut self, path: &Path) {
         let Ok(theirs) = std::fs::read_to_string(path) else {
+            self.block_autosave_for_unreadable_path(path);
             return;
         };
-        let mut pending = None;
-        let mut merges = Vec::new();
-        for (index, tab) in self.tabs.iter().enumerate() {
-            let doc = tab.editor.document();
-            match classify_external_change(
-                doc.path.as_deref(),
-                path,
-                doc.saved_content(),
-                &doc.buffer.content(),
-                &theirs,
-            ) {
-                ExternalChangeAction::PromptReload | ExternalChangeAction::PromptConflict => {
-                    pending = Some((index, path.to_path_buf()));
-                }
-                ExternalChangeAction::Apply(merged) => merges.push((index, merged)),
+        let actions = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let doc = tab.editor.document();
+                (
+                    index,
+                    classify_external_change(
+                        doc.path.as_deref(),
+                        path,
+                        doc.saved_content(),
+                        &doc.buffer.content(),
+                        &theirs,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, action) in actions {
+            match action {
                 ExternalChangeAction::Ignore => {}
+                ExternalChangeAction::PromptReload | ExternalChangeAction::PromptConflict => {
+                    if let Some(tab) = self.tabs.get_mut(index) {
+                        tab.autosave_blocked = tab.editor.document().dirty;
+                    }
+                    self.set_pending_external_change(index, path.to_path_buf());
+                }
+                ExternalChangeAction::Apply(merged) => {
+                    let Some((tab_id, clear_pending)) = self.tabs.get_mut(index).map(|tab| {
+                        let caret = tab.editor.cursor_offset();
+                        let mapped =
+                            tab.editor
+                                .document_mut()
+                                .apply_merged_edit(&merged, &theirs, &[caret]);
+                        if let Some(offset) = mapped.first() {
+                            let _ = tab.editor.apply(EditorCommand::JumpTo(*offset));
+                        }
+                        tab.autosave_blocked = merged != theirs;
+                        (tab.id, !tab.autosave_blocked)
+                    }) else {
+                        continue;
+                    };
+                    if clear_pending {
+                        self.clear_pending_external_change_for_tab(tab_id);
+                    }
+                }
             }
         }
-        for (index, merged) in merges {
-            let Some(tab) = self.tabs.get_mut(index) else {
-                continue;
-            };
-            let caret = tab.editor.cursor_offset();
-            let mapped = tab
-                .editor
-                .document_mut()
-                .apply_merged_edit(&merged, &theirs, &[caret]);
-            if let Some(offset) = mapped.first() {
-                let _ = tab.editor.apply(EditorCommand::JumpTo(*offset));
+    }
+
+    fn block_autosave_for_unreadable_path(&mut self, path: &Path) {
+        for index in 0..self.tabs.len() {
+            let matching_dirty_tab = self.tabs.get(index).is_some_and(|tab| {
+                tab.editor.document().path.as_deref() == Some(path) && tab.editor.document().dirty
+            });
+            if matching_dirty_tab {
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.autosave_blocked = true;
+                }
+                self.set_pending_external_change(index, path.to_path_buf());
             }
-        }
-        if let Some(pending) = pending {
-            self.pending_external_change = Some(pending);
         }
     }
 
     fn reload_tab(&mut self, index: usize) -> Result<EditorOutcome, SessionError> {
-        let tab = self.tabs.get_mut(index).ok_or(SessionError::TabNotFound)?;
-        let path = tab
-            .editor
-            .document()
-            .path
-            .clone()
-            .ok_or(SessionError::UntitledHasNoPath)?;
-        let content = std::fs::read_to_string(&path)?;
-        let caret = tab.editor.cursor_offset();
-        let mapped = tab
-            .editor
-            .document_mut()
-            .apply_external_edit(&content, &[caret]);
-        if let Some(offset) = mapped.first() {
-            let _ = tab.editor.apply(EditorCommand::JumpTo(*offset));
+        if self.pending_external_change.is_some()
+            && !self.pending_external_change_matches_tab(index)
+        {
+            self.reconcile_pending_external_change();
+            return Ok(EditorOutcome::Noop);
         }
-        self.pending_external_change = None;
+        let (tab_id, path, dirty) = {
+            let tab = self.tabs.get(index).ok_or(SessionError::TabNotFound)?;
+            (
+                tab.id,
+                tab.editor
+                    .document()
+                    .path
+                    .clone()
+                    .ok_or(SessionError::UntitledHasNoPath)?,
+                tab.editor.document().dirty,
+            )
+        };
+        if dirty {
+            if let Some(tab) = self.tabs.get_mut(index) {
+                tab.autosave_blocked = true;
+            }
+            self.set_pending_external_change(index, path);
+            return Err(SessionError::DirtyReloadBlocked);
+        }
+        let content = std::fs::read_to_string(&path)?;
+        {
+            let tab = self.tabs.get_mut(index).ok_or(SessionError::TabNotFound)?;
+            let caret = tab.editor.cursor_offset();
+            let mapped = tab
+                .editor
+                .document_mut()
+                .apply_external_edit(&content, &[caret]);
+            if let Some(offset) = mapped.first() {
+                let _ = tab.editor.apply(EditorCommand::JumpTo(*offset));
+            }
+            tab.autosave_blocked = false;
+        }
+        self.clear_pending_external_change_for_tab(tab_id);
         Ok(EditorOutcome::Changed)
     }
 
@@ -604,7 +862,12 @@ impl HeadlessWorkspace {
             .unwrap_or_else(|| "Untitled".into());
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        self.tabs.push(HeadlessTab { id, editor, title });
+        self.tabs.push(HeadlessTab {
+            id,
+            editor,
+            title,
+            autosave_blocked: false,
+        });
         self.active_tab = self.tabs.len() - 1;
     }
 }
@@ -732,6 +995,273 @@ mod tests {
             ExternalChangeAction::Apply(merged) => assert_eq!(merged, "aaa\nBBB\nCCC\n"),
             other => panic!("expected apply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ordinary_save_merges_a_stale_disk_version_without_overwriting_it() {
+        let dir = TestDir::new("checked-save-merge");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut workspace = HeadlessWorkspace::new();
+        workspace
+            .apply(WorkspaceCommand::OpenFile(path.clone()))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::JumpTo(0)))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "ours\n".into(),
+            )))
+            .unwrap();
+
+        std::fs::write(&path, "one\ntwo\ntheirs\n").unwrap();
+        let error = workspace.apply(WorkspaceCommand::Save).unwrap_err();
+
+        assert!(matches!(error, SessionError::ExternalChange));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "one\ntwo\ntheirs\n"
+        );
+        let tab = workspace.active().unwrap();
+        assert_eq!(tab.editor.content(), "ours\none\ntwo\ntheirs\n");
+        assert!(tab.editor.document().dirty);
+        assert!(tab.autosave_blocked);
+    }
+
+    #[test]
+    fn private_autosave_preserves_the_buffer_and_base_without_touching_changed_disk() {
+        let dir = TestDir::new("checked-autosave");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "base\n").unwrap();
+        let mut workspace = HeadlessWorkspace::with_autosave_ms(1);
+        workspace
+            .apply(WorkspaceCommand::OpenFile(path.clone()))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::JumpTo(0)))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "ours ".into(),
+            )))
+            .unwrap();
+
+        std::fs::write(&path, "theirs\n").unwrap();
+        workspace
+            .apply(WorkspaceCommand::AdvanceTime { millis: 1 })
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        let tab = workspace.active().unwrap();
+        assert_eq!(tab.editor.content(), "ours base\n");
+        assert!(tab.editor.document().dirty);
+        assert!(!tab.autosave_blocked);
+        assert_eq!(workspace.pending_external_change, None);
+        let checkpoint = workspace.private_checkpoint().unwrap();
+        assert_eq!(checkpoint.tabs[0].content, "ours base\n");
+        assert_eq!(checkpoint.tabs[0].saved_content, "base\n");
+        assert!(checkpoint.tabs[0].dirty);
+        workspace
+            .apply(WorkspaceCommand::ExternalFileChange(path.clone()))
+            .unwrap();
+        assert!(workspace.active().unwrap().autosave_blocked);
+        assert_eq!(workspace.pending_external_change, Some((0, path)));
+    }
+
+    #[test]
+    fn private_autosave_is_durable_but_only_explicit_save_publishes() {
+        let dir = TestDir::new("private-only-autosave");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "base\n").unwrap();
+        let store = RecoveryStore::new(dir.join("private"));
+        let mut workspace = HeadlessWorkspace::with_private_recovery(150, store.clone());
+        workspace
+            .apply(WorkspaceCommand::OpenFile(path.clone()))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::JumpTo(0)))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "draft ".into(),
+            )))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::AdvanceTime { millis: 150 })
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "base\n");
+        assert!(workspace.active().unwrap().editor.document().dirty);
+        assert_eq!(
+            store.load().snapshot.unwrap().tabs[0].content,
+            "draft base\n"
+        );
+        workspace.apply(WorkspaceCommand::Save).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "draft base\n");
+        assert!(!workspace.active().unwrap().editor.document().dirty);
+    }
+
+    #[test]
+    fn sustained_typing_does_not_postpone_the_first_private_checkpoint() {
+        let mut workspace = HeadlessWorkspace::with_autosave_ms(150);
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "a".into(),
+            )))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::AdvanceTime { millis: 100 })
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "b".into(),
+            )))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::AdvanceTime { millis: 50 })
+            .unwrap();
+        assert_eq!(
+            workspace.private_checkpoint().unwrap().tabs[0].content,
+            "ab"
+        );
+    }
+
+    #[test]
+    fn dirty_tab_close_checkpoints_the_archive_before_removing_the_owner() {
+        let dir = TestDir::new("durable-close");
+        let store = RecoveryStore::new(dir.join("private"));
+        let mut workspace = HeadlessWorkspace::with_private_recovery(150, store.clone());
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "never saved 👩‍🚀".into(),
+            )))
+            .unwrap();
+        workspace.apply(WorkspaceCommand::NewDocument).unwrap();
+        workspace.apply(WorkspaceCommand::SwitchTab(0)).unwrap();
+        workspace.apply(WorkspaceCommand::CloseTab).unwrap();
+        assert_eq!(workspace.tabs().len(), 1);
+        let snapshot = store.load().snapshot.unwrap();
+        assert_eq!(snapshot.archived_tabs[0].content, "never saved 👩‍🚀");
+        assert!(snapshot.archived_tabs[0].dirty);
+    }
+
+    #[test]
+    fn failed_private_checkpoint_keeps_the_dirty_tab_open() {
+        let dir = TestDir::new("failed-private-close");
+        let invalid_directory = dir.join("not-a-directory");
+        std::fs::write(&invalid_directory, "sentinel").unwrap();
+        let mut workspace = HeadlessWorkspace::with_private_recovery(
+            150,
+            RecoveryStore::new(invalid_directory.clone()),
+        );
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "live bytes".into(),
+            )))
+            .unwrap();
+        workspace.apply(WorkspaceCommand::NewDocument).unwrap();
+        workspace.apply(WorkspaceCommand::SwitchTab(0)).unwrap();
+        assert!(matches!(
+            workspace.apply(WorkspaceCommand::CloseTab),
+            Err(SessionError::Recovery(_))
+        ));
+        assert_eq!(workspace.tabs().len(), 2);
+        assert_eq!(workspace.active().unwrap().editor.content(), "live bytes");
+        assert_eq!(
+            std::fs::read_to_string(&invalid_directory).unwrap(),
+            "sentinel"
+        );
+    }
+
+    #[test]
+    fn unavailable_private_storage_does_not_trap_a_clean_saved_session() {
+        let dir = TestDir::new("clean-unavailable-recovery");
+        let invalid_directory = dir.join("not-a-directory");
+        std::fs::write(&invalid_directory, "sentinel").unwrap();
+        let mut workspace = HeadlessWorkspace::with_private_recovery(
+            150,
+            RecoveryStore::new(invalid_directory.clone()),
+        );
+        assert!(workspace.checkpoint_private_session().is_ok());
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "unsaved".into(),
+            )))
+            .unwrap();
+        assert!(matches!(
+            workspace.checkpoint_private_session(),
+            Err(SessionError::Recovery(_))
+        ));
+        assert_eq!(workspace.active().unwrap().editor.content(), "unsaved");
+        assert_eq!(
+            std::fs::read_to_string(invalid_directory).unwrap(),
+            "sentinel"
+        );
+    }
+
+    #[test]
+    fn reload_never_discards_a_dirty_headless_buffer() {
+        let dir = TestDir::new("dirty-reload");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "base\n").unwrap();
+        let mut workspace = HeadlessWorkspace::new();
+        workspace
+            .apply(WorkspaceCommand::OpenFile(path.clone()))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::JumpTo(0)))
+            .unwrap();
+        workspace
+            .apply(WorkspaceCommand::Editor(EditorCommand::InsertText(
+                "ours ".into(),
+            )))
+            .unwrap();
+        std::fs::write(&path, "theirs\n").unwrap();
+        workspace
+            .apply(WorkspaceCommand::ExternalFileChange(path.clone()))
+            .unwrap();
+
+        let error = workspace.apply(WorkspaceCommand::ReloadTab(0)).unwrap_err();
+
+        assert!(matches!(error, SessionError::DirtyReloadBlocked));
+        assert_eq!(workspace.active().unwrap().editor.content(), "ours base\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+    }
+
+    #[test]
+    fn stale_pending_reload_index_cannot_target_the_tab_that_replaced_it() {
+        let dir = TestDir::new("stale-reload-index");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "base\n").unwrap();
+        let mut workspace = HeadlessWorkspace::new();
+        workspace.apply(WorkspaceCommand::NewDocument).unwrap();
+        workspace
+            .apply(WorkspaceCommand::OpenFile(path.clone()))
+            .unwrap();
+        std::fs::write(&path, "theirs\n").unwrap();
+        workspace
+            .apply(WorkspaceCommand::ExternalFileChange(path))
+            .unwrap();
+        assert_eq!(
+            workspace
+                .pending_external_change
+                .as_ref()
+                .map(|(index, _)| *index),
+            Some(1)
+        );
+        workspace.apply(WorkspaceCommand::SwitchTab(0)).unwrap();
+        workspace.apply(WorkspaceCommand::CloseTab).unwrap();
+
+        let outcome = workspace.apply(WorkspaceCommand::ReloadTab(1)).unwrap();
+        assert_eq!(outcome, EditorOutcome::Noop);
+        assert_eq!(
+            workspace
+                .pending_external_change
+                .as_ref()
+                .map(|(index, _)| *index),
+            Some(0)
+        );
+        assert_eq!(workspace.active().unwrap().editor.content(), "base\n");
     }
 
     #[test]

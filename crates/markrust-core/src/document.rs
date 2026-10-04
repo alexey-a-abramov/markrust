@@ -3,8 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::buffer::DocumentBuffer;
@@ -109,6 +110,29 @@ impl Document {
         self.coalescing_blocked = true;
     }
 
+    /// Keep the first typed character and the splices that open its draft
+    /// paragraph together, while allowing the rest of this typing burst to
+    /// join it. A command or an action without edits remains a history barrier.
+    pub(crate) fn finish_typing_undo_group(
+        &mut self,
+        checkpoint: UndoGroupCheckpoint,
+        selection_after: SelectionSnapshot,
+    ) {
+        let continues_typing = self.undo.undo_depth() > checkpoint.depth
+            && self
+                .undo
+                .last()
+                .is_some_and(|transaction| transaction.kind == TransactionKind::Typing);
+        self.finish_undo_group(checkpoint, selection_after);
+        if continues_typing {
+            self.undo
+                .last_mut()
+                .expect("the typing group contains at least one edit")
+                .kind = TransactionKind::Typing;
+            self.coalescing_blocked = false;
+        }
+    }
+
     /// Last reconciled on-disk snapshot (load, save, or last merged disk bytes).
     pub fn saved_content(&self) -> &str {
         &self.saved_content
@@ -194,17 +218,106 @@ impl Document {
     /// Apply a 3-way merge of dirty in-memory edits with on-disk bytes.
     /// Keeps the tab dirty when `merged` still differs from `disk`.
     /// `disk` becomes the last-known disk snapshot so the same change is not
-    /// merged twice. Undo is cleared (ops would not invert against the merge).
+    /// merged twice. The merge is one undoable command, so undo first restores
+    /// the local pre-merge buffer and then retains its prior local history.
     pub fn apply_merged_edit(&mut self, merged: &str, disk: &str, offsets: &[usize]) -> Vec<usize> {
+        self.apply_merged_edit_with_selection(
+            merged,
+            disk,
+            offsets,
+            SelectionSnapshot::collapsed(offsets.first().copied().unwrap_or(0)),
+        )
+    }
+
+    /// Preserve the active pane's full selection in the merge undo boundary.
+    pub fn apply_merged_edit_with_selection(
+        &mut self,
+        merged: &str,
+        disk: &str,
+        offsets: &[usize],
+        before: SelectionSnapshot,
+    ) -> Vec<usize> {
+        fn snap_offsets(content: &str, offsets: &mut [usize]) {
+            use unicode_segmentation::UnicodeSegmentation;
+
+            let mut pending = offsets
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(ix, offset)| {
+                    if *offset >= content.len() {
+                        *offset = content.len();
+                        None
+                    } else {
+                        Some((*offset, ix))
+                    }
+                })
+                .collect::<Vec<_>>();
+            if pending.is_empty() {
+                return;
+            }
+            pending.sort_unstable();
+            let mut next = 0;
+            let mut previous_boundary = 0;
+            for boundary in content
+                .grapheme_indices(true)
+                .map(|(boundary, _)| boundary)
+                .chain(std::iter::once(content.len()))
+            {
+                while next < pending.len() && pending[next].0 < boundary {
+                    offsets[pending[next].1] = previous_boundary;
+                    next += 1;
+                }
+                if next == pending.len() {
+                    break;
+                }
+                previous_boundary = boundary;
+            }
+        }
+
+        fn repair_selection(content: &str, snapshot: SelectionSnapshot) -> SelectionSnapshot {
+            let mut endpoints = [snapshot.start, snapshot.end];
+            snap_offsets(content, &mut endpoints);
+            let mut reversed = snapshot.reversed;
+            if endpoints[0] > endpoints[1] {
+                endpoints.swap(0, 1);
+                reversed = !reversed;
+            }
+            SelectionSnapshot {
+                start: endpoints[0],
+                end: endpoints[1],
+                reversed: reversed && endpoints[0] != endpoints[1],
+            }
+        }
+
         let old = self.buffer.content();
-        let mapped = offsets
+        let mut valid_offsets = offsets.to_vec();
+        snap_offsets(&old, &mut valid_offsets);
+        let mut mapped = valid_offsets
             .iter()
             .map(|offset| map_offset_across_change(&old, merged, *offset))
-            .collect();
+            .collect::<Vec<_>>();
+        // Byte-relative mapping inside a replacement can land within UTF-8,
+        // a combining sequence, or a ZWJ emoji. Persist only legal caret edges
+        // so Redo cannot reintroduce an endpoint that the live view repaired.
+        snap_offsets(merged, &mut mapped);
         if old != merged {
-            self.buffer = DocumentBuffer::with_text(merged);
-            self.undo = UndoStack::new();
-            self.schedule_parse();
+            let before = repair_selection(&old, before);
+            let after = repair_selection(
+                merged,
+                SelectionSnapshot {
+                    start: map_offset_across_change(&old, merged, before.start),
+                    end: map_offset_across_change(&old, merged, before.end),
+                    reversed: before.reversed,
+                },
+            );
+            self.replace_range_tx(
+                0,
+                old.len(),
+                merged,
+                TransactionKind::Command,
+                before,
+                after,
+            );
         }
         self.dirty = merged != disk;
         self.saved_content = disk.to_string();
@@ -472,10 +585,49 @@ impl Document {
         Ok(())
     }
 
+    /// Save only when the target still has the exact bytes this document last
+    /// reconciled. `None` means the target must not exist. The guard is checked
+    /// before staging and immediately before publish; a mismatch returns
+    /// [`io::ErrorKind::WouldBlock`] without changing this document's path,
+    /// dirty flag, or saved base.
+    ///
+    /// This is a content precondition, not a portable cross-process compare-
+    /// and-swap. A non-cooperating writer can still race after the final check
+    /// and before `rename`; callers must retain a conflict/recovery path rather
+    /// than treating a successful write as a merge protocol.
+    pub fn save_checked_and_mark_clean(&mut self, expected_disk: Option<&str>) -> io::Result<()> {
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "document has no path"))?;
+        let content = self.buffer.content();
+        atomic_write_checked(&path, &content, expected_disk)?;
+        self.saved_content = content;
+        self.mark_clean();
+        Ok(())
+    }
+
     pub fn save_as(&mut self, path: PathBuf) -> io::Result<()> {
         atomic_write(&path, &self.buffer.content())?;
         self.path = Some(path);
         self.saved_content = self.buffer.content();
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Save to a new path only when its current bytes match `expected_disk`.
+    /// `None` requires that the destination does not already exist. On a
+    /// rejected or failed write this document keeps its original path, dirty
+    /// state, and saved base.
+    pub fn save_as_checked(
+        &mut self,
+        path: PathBuf,
+        expected_disk: Option<&str>,
+    ) -> io::Result<()> {
+        let content = self.buffer.content();
+        atomic_write_checked(&path, &content, expected_disk)?;
+        self.path = Some(path);
+        self.saved_content = content;
         self.dirty = false;
         Ok(())
     }
@@ -505,12 +657,200 @@ impl Document {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DiskExpectation<'a> {
+    Unchecked,
+    Exact(Option<&'a str>),
+}
+
 fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    atomic_write_with_expectation(path, content, DiskExpectation::Unchecked, || Ok(()))
+}
+
+fn atomic_write_checked(path: &Path, content: &str, expected_disk: Option<&str>) -> io::Result<()> {
+    atomic_write_with_expectation(path, content, DiskExpectation::Exact(expected_disk), || {
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn atomic_write_checked_with_before_publish<F>(
+    path: &Path,
+    content: &str,
+    expected_disk: Option<&str>,
+    before_publish: F,
+) -> io::Result<()>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    atomic_write_with_expectation(
+        path,
+        content,
+        DiskExpectation::Exact(expected_disk),
+        before_publish,
+    )
+}
+
+/// Stage a complete replacement and publish it atomically. Checked writes use
+/// a content precondition before staging and immediately before publishing.
+/// The latter cannot be an unconditional cross-process CAS on every supported
+/// platform; it narrows the race and rejects stale callers before replacement.
+fn atomic_write_with_expectation<F>(
+    path: &Path,
+    content: &str,
+    expectation: DiskExpectation<'_>,
+    before_publish: F,
+) -> io::Result<()>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    ensure_disk_expectation(path, expectation)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     fs::create_dir_all(parent)?;
-    let temp_path = path.with_extension("markrust-tmp");
-    fs::write(&temp_path, content)?;
-    fs::rename(temp_path, path)
+    let (mut file, mut temporary) = create_save_temp(path, parent)?;
+    // Make the replacement durable before publishing it. The original file
+    // remains untouched if writing, setting permissions, or syncing fails.
+    let write_result = (|| {
+        file.write_all(content.as_bytes())?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.sync_all()
+    })();
+    drop(file);
+    write_result?;
+    // Test hooks and future instrumentation belong between staging and this
+    // second guard, the narrowest useful place to detect a stale replacement.
+    before_publish()?;
+    ensure_disk_expectation(path, expectation)?;
+    fs::rename(&temporary.path, path)?;
+    temporary.remove_on_drop = false;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn ensure_disk_expectation(path: &Path, expectation: DiskExpectation<'_>) -> io::Result<()> {
+    let DiskExpectation::Exact(expected) = expectation else {
+        return Ok(());
+    };
+    match expected {
+        Some(expected) => match file_matches_expected_bytes(path, expected.as_bytes()) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(stale_disk_error(path)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(stale_disk_error(path)),
+            Err(error) => Err(error),
+        },
+        None => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(stale_disk_error(path)),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+/// Compare an untrusted current file with the caller's already-owned saved
+/// base without allocating a second copy of it. Metadata rejects obvious large
+/// replacements before opening them; the chunked comparison catches changes
+/// made between metadata and the read. A non-cooperating writer can still
+/// replace the file after this final comparison and before rename, which is
+/// the unavoidable small race documented on `atomic_write_with_expectation`.
+fn file_matches_expected_bytes(path: &Path, expected: &[u8]) -> io::Result<bool> {
+    let expected_len = u64::try_from(expected.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "document content is too large to compare",
+        )
+    })?;
+    if fs::metadata(path)?.len() != expected_len {
+        return Ok(false);
+    }
+
+    let mut file = fs::File::open(path)?;
+    let mut offset = 0;
+    let mut buffer = [0_u8; 64 * 1024];
+    while offset < expected.len() {
+        let read_len = buffer.len().min(expected.len() - offset);
+        let count = file.read(&mut buffer[..read_len])?;
+        if count == 0 || buffer[..count] != expected[offset..offset + count] {
+            return Ok(false);
+        }
+        offset += count;
+    }
+
+    // Metadata can become stale while we stream. A final byte detects growth;
+    // an early EOF above detects truncation without allocating arbitrary data.
+    Ok(file.read(&mut buffer[..1])? == 0)
+}
+
+fn stale_disk_error(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("document changed on disk before save: {}", path.display()),
+    )
+}
+
+static SAVE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct SaveTemp {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl Drop for SaveTemp {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn create_save_temp(path: &Path, parent: &Path) -> io::Result<(fs::File, SaveTemp)> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "document path has no file name",
+        )
+    })?;
+    for _ in 0..64 {
+        let sequence = SAVE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = std::ffi::OsString::from(".");
+        temporary_name.push(name);
+        temporary_name.push(format!(".markrust-{}-{sequence}.tmp", std::process::id()));
+        let temporary_path = parent.join(temporary_name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary_path) {
+            Ok(file) => {
+                return Ok((
+                    file,
+                    SaveTemp {
+                        path: temporary_path,
+                        remove_on_drop: true,
+                    },
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a unique document save temporary file",
+    ))
 }
 
 #[cfg(test)]
@@ -767,6 +1107,227 @@ mod tests {
     }
 
     #[test]
+    fn checked_save_rejects_stale_disk_and_retains_document_state() {
+        let dir = TempDir::new("doc-checked-stale");
+        let path = dir.join("note.md");
+        fs::write(&path, "base").unwrap();
+        let mut doc = Document::from_file(path.clone()).unwrap();
+        doc.insert(4, " ours");
+
+        fs::write(&path, "theirs").unwrap();
+        let error = doc.save_checked_and_mark_clean(Some("base")).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+        assert_eq!(doc.path.as_deref(), Some(path.as_path()));
+        assert_eq!(doc.buffer.content(), "base ours");
+        assert_eq!(doc.saved_content(), "base");
+        assert!(doc.dirty);
+        assert_eq!(fs::read_dir(dir.join("")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn checked_save_rejects_an_oversized_current_file_without_replacing_it() {
+        let dir = TempDir::new("doc-checked-oversized");
+        let path = dir.join("note.md");
+        fs::write(&path, "base").unwrap();
+        let mut doc = Document::from_file(path.clone()).unwrap();
+        doc.insert(4, " ours");
+
+        // The precondition comparator must reject on metadata length before it
+        // can allocate an unbounded replacement merely to compare bytes.
+        let external = vec![b'x'; 8 * 1024 * 1024];
+        fs::write(&path, &external).unwrap();
+        let error = doc.save_checked_and_mark_clean(Some("base")).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::metadata(&path).unwrap().len(), external.len() as u64);
+        assert_eq!(doc.buffer.content(), "base ours");
+        assert_eq!(doc.saved_content(), "base");
+        assert!(doc.dirty);
+    }
+
+    #[test]
+    fn checked_save_rejects_same_length_but_different_disk_bytes() {
+        let dir = TempDir::new("doc-checked-same-length");
+        let path = dir.join("note.md");
+        fs::write(&path, "base").unwrap();
+        let mut doc = Document::from_file(path.clone()).unwrap();
+        doc.insert(4, " ours");
+
+        // This reaches the chunked byte comparison rather than the metadata
+        // length fast path.
+        fs::write(&path, "disk").unwrap();
+        let error = doc.save_checked_and_mark_clean(Some("base")).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "disk");
+        assert_eq!(doc.buffer.content(), "base ours");
+        assert_eq!(doc.saved_content(), "base");
+        assert!(doc.dirty);
+    }
+
+    #[test]
+    fn checked_save_rechecks_before_publish_after_delete_and_recreate() {
+        let dir = TempDir::new("doc-checked-recreate");
+        let path = dir.join("note.md");
+        fs::write(&path, "base").unwrap();
+
+        let error = atomic_write_checked_with_before_publish(&path, "ours", Some("base"), || {
+            fs::remove_file(&path)?;
+            fs::write(&path, "theirs")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+        assert_eq!(fs::read_dir(dir.join("")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn checked_save_as_requires_an_absent_destination_before_publish() {
+        let dir = TempDir::new("doc-checked-save-as");
+        let path = dir.join("note.md");
+
+        let error = atomic_write_checked_with_before_publish(&path, "ours", None, || {
+            fs::write(&path, "theirs")
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+        assert_eq!(fs::read_dir(dir.join("")).unwrap().count(), 1);
+
+        let mut doc = Document::new("draft");
+        doc.insert(5, " ours");
+        let error = doc.save_as_checked(path.clone(), None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(doc.path, None);
+        assert_eq!(doc.buffer.content(), "draft ours");
+        assert_eq!(doc.saved_content(), "draft");
+        assert!(doc.dirty);
+    }
+
+    #[test]
+    fn atomic_save_does_not_touch_unrelated_temporary_files() {
+        let dir = TempDir::new("doc-foreign-temp");
+        let path = dir.join("note.md");
+        let legacy_temp = path.with_extension("markrust-tmp");
+        fs::write(&path, "original").unwrap();
+        fs::write(&legacy_temp, "unrelated data").unwrap();
+
+        atomic_write(&path, "replacement").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(fs::read_to_string(&legacy_temp).unwrap(), "unrelated data");
+        assert_eq!(fs::read_dir(dir.join("")).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_atomic_save_cleans_its_temp_and_keeps_document_dirty() {
+        let dir = TempDir::new("doc-failed-save");
+        let target_directory = dir.join("note.md");
+        fs::create_dir(&target_directory).unwrap();
+        let original = target_directory.join("original.md");
+        fs::write(&original, "original data").unwrap();
+        let mut doc = Document::new("new data");
+        doc.insert(8, "!");
+        doc.set_path(Some(target_directory.clone()));
+
+        assert!(doc.save_and_mark_clean().is_err());
+
+        assert!(doc.dirty);
+        assert_eq!(doc.saved_content(), "new data");
+        assert_eq!(fs::read_to_string(original).unwrap(), "original data");
+        assert_eq!(fs::read_dir(dir.join("")).unwrap().count(), 1);
+        assert_eq!(doc.path.as_deref(), Some(target_directory.as_path()));
+    }
+
+    #[test]
+    fn concurrent_atomic_saves_publish_only_complete_replacements() {
+        let dir = TempDir::new("doc-concurrent-save");
+        let path = dir.join("note.md");
+        let contents = std::sync::Arc::new([
+            "original".repeat(2048),
+            "alpha".repeat(2048),
+            "beta".repeat(2048),
+        ]);
+        atomic_write(&path, &contents[0]).unwrap();
+        let writers: Vec<_> = (1..=2)
+            .map(|index| {
+                let path = path.clone();
+                let contents = contents.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..4 {
+                        atomic_write(&path, &contents[index]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        while writers.iter().any(|writer| !writer.is_finished()) {
+            let published = fs::read_to_string(&path).unwrap();
+            assert!(contents.iter().any(|content| content == &published));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let published = fs::read_to_string(&path).unwrap();
+        assert!(contents.iter().any(|content| content == &published));
+        assert_eq!(fs::read_dir(dir.join("")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_save_temps_are_unique_and_removed_when_abandoned() {
+        let dir = TempDir::new("doc-unique-temp");
+        let parent = dir.join("");
+        let path = dir.join("note.md");
+        let (first_file, first_temp) = create_save_temp(&path, &parent).unwrap();
+        let (second_file, second_temp) = create_save_temp(&path, &parent).unwrap();
+        assert_ne!(first_temp.path, second_temp.path);
+        assert!(first_temp.path.exists());
+        assert!(second_temp.path.exists());
+        drop(first_file);
+        drop(second_file);
+        drop(first_temp);
+        drop(second_temp);
+        assert_eq!(fs::read_dir(parent).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_preserves_existing_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("doc-save-permissions");
+        let path = dir.join("note.md");
+        fs::write(&path, "private original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        atomic_write(&path, "private replacement").unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "private replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_creates_new_files_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("doc-save-new-permissions");
+        let path = dir.join("new.md");
+        atomic_write(&path, "private new document").unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
     fn word_count_edge_cases() {
         let cases: &[(&str, usize)] = &[
             ("hello, world!", 2),
@@ -886,6 +1447,77 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_draft_typing_group_keeps_separator_and_character_burst_together() {
+        let source = "- First\n\n- Following";
+        let before = SelectionSnapshot::collapsed(8);
+        let mut doc = Document::new(source);
+        let group = doc.begin_undo_group(before);
+        doc.replace_range_tx(
+            9,
+            9,
+            "\n\n",
+            TransactionKind::Command,
+            before,
+            SelectionSnapshot::collapsed(9),
+        );
+        doc.replace_range_tx(
+            9,
+            9,
+            "N",
+            TransactionKind::Typing,
+            SelectionSnapshot::collapsed(9),
+            SelectionSnapshot::collapsed(10),
+        );
+        doc.finish_typing_undo_group(group, SelectionSnapshot::collapsed(10));
+        for (at, ch) in [(10, "e"), (11, "w")] {
+            doc.replace_range_tx(
+                at,
+                at,
+                ch,
+                TransactionKind::Typing,
+                SelectionSnapshot::collapsed(at),
+                SelectionSnapshot::collapsed(at + 1),
+            );
+        }
+        assert_eq!(doc.buffer.content(), "- First\n\nNew\n\n- Following");
+        assert_eq!(doc.undo_stack().undo_depth(), 1);
+        let undo = doc.undo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), source);
+        assert_eq!(undo.selection_after, before);
+        let redo = doc.redo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), "- First\n\nNew\n\n- Following");
+        assert_eq!(redo.selection_after, SelectionSnapshot::collapsed(12));
+    }
+
+    #[test]
+    fn empty_typing_group_does_not_change_the_previous_command_kind() {
+        let mut doc = Document::new("old");
+        doc.replace_range_tx(
+            3,
+            3,
+            "!",
+            TransactionKind::Command,
+            SelectionSnapshot::collapsed(3),
+            SelectionSnapshot::collapsed(4),
+        );
+        let empty = doc.begin_undo_group(SelectionSnapshot::collapsed(4));
+        doc.finish_typing_undo_group(empty, SelectionSnapshot::collapsed(4));
+        assert_eq!(
+            doc.undo_stack().last().unwrap().kind,
+            TransactionKind::Command
+        );
+        doc.replace_range_tx(
+            4,
+            4,
+            "x",
+            TransactionKind::Typing,
+            SelectionSnapshot::collapsed(4),
+            SelectionSnapshot::collapsed(5),
+        );
+        assert_eq!(doc.undo_stack().undo_depth(), 2);
+    }
+
+    #[test]
     fn undo_group_without_document_edits_preserves_redo() {
         let mut doc = Document::new("old");
         doc.insert(3, "!");
@@ -996,6 +1628,147 @@ mod tests {
         assert!(doc.dirty);
         assert_eq!(doc.saved_content(), "aaa\nbbb\nCCC\n");
         assert_eq!(mapped.len(), 1);
-        assert!(!doc.undo_stack().can_undo());
+        assert!(doc.undo_stack().can_undo());
+    }
+
+    #[test]
+    fn merge_undo_redo_preserves_active_reversed_unicode_selection_not_inactive_source_caret() {
+        let base = "# Notes\n\nПривет e\u{301} 👩‍👩‍👧‍👦 tail\n";
+        let mut doc = Document::new(base);
+        doc.insert(base.len(), "local\n");
+        let ours = doc.buffer.content();
+        let selected = "e\u{301} 👩‍👩‍👧‍👦";
+        let start = ours.find(selected).unwrap();
+        let before = SelectionSnapshot {
+            start,
+            end: start + selected.len(),
+            reversed: true,
+        };
+        let prefix = "external heading\n";
+        let merged = format!("{prefix}{ours}");
+        let disk = format!("{prefix}{base}");
+        let after = SelectionSnapshot {
+            start: before.start + prefix.len(),
+            end: before.end + prefix.len(),
+            reversed: true,
+        };
+
+        // Source remains at zero while the rich pane owns this reversed range.
+        // The explicit snapshot must win over offsets.first() for undo state.
+        let mapped = doc.apply_merged_edit_with_selection(
+            &merged,
+            &disk,
+            &[0, before.start, before.end],
+            before,
+        );
+        assert_eq!(&mapped[1..], &[after.start, after.end]);
+        assert_eq!(doc.buffer.content(), merged);
+        assert_eq!(doc.saved_content(), disk);
+        assert!(doc.dirty);
+        assert_eq!(&merged[after.start..after.end], selected);
+
+        let undo = doc.undo_tx().expect("merge must be independently undoable");
+        assert_eq!(undo.selection_after, before);
+        assert_eq!(doc.buffer.content(), ours);
+        assert_eq!(&ours[before.start..before.end], selected);
+
+        let redo = doc
+            .redo_tx()
+            .expect("merge must restore its mapped rich range");
+        assert_eq!(redo.selection_after, after);
+        assert_eq!(doc.buffer.content(), merged);
+        assert_eq!(doc.saved_content(), disk);
+
+        assert!(doc.undo());
+        assert!(doc.undo(), "pre-merge local history must remain available");
+        assert_eq!(doc.buffer.content(), base);
+    }
+
+    #[test]
+    fn merge_redo_selection_repairs_ascii_to_greek_combining_and_zwj_replacements() {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        for merged in ["αβγ", "q\u{301}yz", "👩‍👩‍👧‍👦x"] {
+            let mut doc = Document::new("abcdef");
+            let before = SelectionSnapshot {
+                start: 2,
+                end: 3,
+                reversed: true,
+            };
+            let mapped =
+                doc.apply_merged_edit_with_selection(merged, merged, &[2, 3, usize::MAX], before);
+            let boundaries = merged
+                .grapheme_indices(true)
+                .map(|(boundary, _)| boundary)
+                .chain(std::iter::once(merged.len()))
+                .collect::<Vec<_>>();
+            assert!(mapped.iter().all(|offset| boundaries.contains(offset)));
+            assert_eq!(mapped[2], merged.len());
+
+            let undo = doc.undo_tx().unwrap();
+            assert_eq!(undo.selection_after, before);
+            assert_eq!(doc.buffer.content(), "abcdef");
+            let redo = doc.redo_tx().unwrap();
+            assert_eq!(doc.buffer.content(), merged);
+            let after = redo.selection_after;
+            assert_eq!((after.start, after.end), (mapped[0], mapped[1]));
+            assert!(boundaries.contains(&after.start));
+            assert!(boundaries.contains(&after.end));
+            assert!(merged.is_char_boundary(after.start));
+            assert!(merged.is_char_boundary(after.end));
+            assert_eq!(
+                after.reversed,
+                after.start != after.end,
+                "preserve reversed direction only while the repaired range is nonempty"
+            );
+            assert!(merged.get(after.range()).is_some());
+        }
+    }
+
+    #[test]
+    fn merge_undo_repairs_stale_pre_merge_grapheme_edges_and_preserves_direction() {
+        let before_text = "e\u{301} 👩‍👩‍👧‍👦 end";
+        let mut doc = Document::new(before_text);
+        let emoji_start = before_text.find('👩').unwrap();
+        let before = SelectionSnapshot {
+            start: emoji_start + 4,
+            end: 1,
+            reversed: false,
+        };
+        let merged = format!("prefix {before_text}");
+        doc.apply_merged_edit_with_selection(&merged, &merged, &[1, emoji_start + 4], before);
+        let undo = doc.undo_tx().unwrap();
+        assert_eq!(
+            undo.selection_after,
+            SelectionSnapshot {
+                start: 0,
+                end: emoji_start,
+                reversed: true,
+            }
+        );
+        assert_eq!(doc.buffer.content(), before_text);
+    }
+
+    #[test]
+    fn undoing_a_merge_restores_our_buffer_then_prior_local_history() {
+        let mut doc = Document::new("base\n");
+        doc.insert(4, " local");
+        let ours_before_merge = doc.buffer.content();
+
+        doc.apply_merged_edit(
+            "base local\nremote\n",
+            "base\nremote\n",
+            &[ours_before_merge.len()],
+        );
+        assert_eq!(doc.buffer.content(), "base local\nremote\n");
+        assert_eq!(doc.saved_content(), "base\nremote\n");
+
+        assert!(doc.undo(), "merge should be the newest undo command");
+        assert_eq!(doc.buffer.content(), ours_before_merge);
+        assert!(
+            doc.undo(),
+            "the local edit before the merge must remain undoable"
+        );
+        assert_eq!(doc.buffer.content(), "base\n");
     }
 }

@@ -4,14 +4,26 @@
 
 use gpui::{rgb, Hsla};
 use markrust_core::rich::AlertKind;
+use std::{collections::BTreeMap, sync::Arc};
 
 fn hex(color: u32) -> Hsla {
     Hsla::from(rgb(color))
 }
 
+/// Color-only profiles: changing highlights never changes text metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HighlightPalette {
+    #[default]
+    Native,
+    Ocean,
+    Forest,
+}
+
 /// Editor color and typography settings.
 #[derive(Debug, Clone)]
 pub struct EditorTheme {
+    /// Immutable application-supplied UI labels; document text is unaffected.
+    pub ui_strings: Arc<BTreeMap<String, String>>,
     pub background: Hsla,
     pub text: Hsla,
     pub delimiter: Hsla,
@@ -63,18 +75,22 @@ pub struct EditorTheme {
     pub code_bg: Hsla,
     /// Fenced code block line background.
     pub code_block_bg: Hsla,
+    /// Subtle, geometry-neutral tint for the active rich editing context.
+    pub editing_context: Hsla,
 }
 
 impl EditorTheme {
     pub fn dark() -> Self {
         // Warm iA Writer / Typora dark, rust accent (MarkRust).
         Self {
+            ui_strings: Arc::new(BTreeMap::new()),
             background: hex(0x1c1917),
             editor_bg: hex(0x1c1917),
             chrome_bg: hex(0x292524),
             text: hex(0xf5f0e8),
             delimiter: hex(0xa8a29e),
-            selection: hex(0x9a3412).opacity(0.35),
+            selection: hex(0x0a84ff).opacity(0.32),
+            editing_context: hex(0x0a84ff).opacity(0.055),
             caret: hex(0xfafaf9),
             sidebar_bg: hex(0x241f1c),
             sidebar_text: hex(0xe7e5e4),
@@ -115,12 +131,14 @@ impl EditorTheme {
     pub fn light() -> Self {
         // iA Writer / Typora warm paper.
         Self {
+            ui_strings: Arc::new(BTreeMap::new()),
             background: hex(0xfaf7f2),
             editor_bg: hex(0xfffcf7),
             chrome_bg: hex(0xf3eee7),
             text: hex(0x1c1917),
             delimiter: hex(0x78716c),
-            selection: hex(0xea580c).opacity(0.18),
+            selection: hex(0x007aff).opacity(0.20),
+            editing_context: hex(0x007aff).opacity(0.035),
             caret: hex(0x1c1917),
             sidebar_bg: hex(0xeee8e0),
             sidebar_text: hex(0x44403c),
@@ -156,6 +174,48 @@ impl EditorTheme {
             code_font_family: "Menlo".into(),
             line_height_multiplier: 1.55,
         }
+    }
+
+    pub fn ui_text(&self, key: &str) -> String {
+        self.ui_strings
+            .get(key)
+            .map_or(key, String::as_str)
+            .to_owned()
+    }
+
+    pub fn apply_highlight_palette(&mut self, palette: HighlightPalette) {
+        let dark = self.background.l < 0.5;
+        let (accent, keyword, string, number, comment, function, ty) = match (palette, dark) {
+            (HighlightPalette::Native, true) => (
+                0x0a84ff, 0xf0abfc, 0x86efac, 0xfdba74, 0xa8a29e, 0x7dd3fc, 0xfcd34d,
+            ),
+            (HighlightPalette::Native, false) => (
+                0x007aff, 0x7e22ce, 0x15803d, 0xc2410c, 0x78716c, 0x1d4ed8, 0xb45309,
+            ),
+            (HighlightPalette::Ocean, true) => (
+                0x64d2ff, 0x9cc9ff, 0x92e5d4, 0xf5c887, 0x9aaec5, 0x7de1ff, 0xd0b3ff,
+            ),
+            (HighlightPalette::Ocean, false) => (
+                0x0077b6, 0x205ba6, 0x087f70, 0xa15a12, 0x64748b, 0x036e9b, 0x7041a0,
+            ),
+            (HighlightPalette::Forest, true) => (
+                0x6fd69b, 0xc9b1f5, 0xa8d995, 0xf0c58a, 0x9baea4, 0x8cd8c2, 0xe6d29a,
+            ),
+            (HighlightPalette::Forest, false) => (
+                0x217a4b, 0x724399, 0x327328, 0x9a5c14, 0x627369, 0x157561, 0x896818,
+            ),
+        };
+        self.selection = hex(accent).opacity(if dark { 0.32 } else { 0.20 });
+        self.editing_context = hex(accent).opacity(if dark { 0.055 } else { 0.035 });
+        self.syntax_keyword = hex(keyword);
+        self.syntax_string = hex(string);
+        self.syntax_number = hex(number);
+        self.syntax_comment = hex(comment);
+        self.syntax_function = hex(function);
+        self.syntax_type = hex(ty);
+        self.link = hex(function);
+        self.delimiter = hex(comment);
+        self.frontmatter_text = hex(number);
     }
 
     pub fn heading_font_size(&self, level: u8) -> f32 {
@@ -210,6 +270,40 @@ mod tests {
     fn stable_line_height_uses_heading_max() {
         let theme = EditorTheme::dark();
         assert!(theme.stable_line_height(theme.font_size) >= theme.font_size * 2.0);
+    }
+
+    #[test]
+    fn highlight_profiles_change_colors_not_layout_or_caret_contrast() {
+        for mut theme in [EditorTheme::light(), EditorTheme::dark()] {
+            let metrics = (
+                theme.font_size,
+                theme.line_height_multiplier,
+                theme.font_family.clone(),
+            );
+            let caret = theme.caret;
+            let mut colors = Vec::new();
+            for palette in [
+                HighlightPalette::Native,
+                HighlightPalette::Ocean,
+                HighlightPalette::Forest,
+            ] {
+                theme.apply_highlight_palette(palette);
+                assert_eq!(
+                    metrics,
+                    (
+                        theme.font_size,
+                        theme.line_height_multiplier,
+                        theme.font_family.clone()
+                    )
+                );
+                assert_eq!(caret, theme.caret);
+                assert!((theme.caret.l - theme.editor_bg.l).abs() > 0.5);
+                assert!(theme.editing_context.a < 0.08);
+                colors.push((theme.selection, theme.syntax_keyword));
+            }
+            assert_ne!(colors[0], colors[1]);
+            assert_ne!(colors[1], colors[2]);
+        }
     }
 
     #[test]

@@ -11,12 +11,12 @@ use std::rc::Rc;
 use gpui::{
     div, fill, point, prelude::*, px, relative, size, App, Bounds, Context, CursorStyle, Element,
     ElementInputHandler, Entity, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollHandle,
-    ShapedLine, SharedString, Style, TextAlign, TextRun, Window,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
+    ScrollHandle, ShapedLine, SharedString, Style, TextAlign, TextRun, Window,
 };
 
 use super::hit_test::{click_byte_offset, invert_doc_to_display};
-use crate::editor::MarkdownEditor;
+use crate::editor::{LineLayoutCache, MarkdownEditor};
 use crate::highlight::HighlightKind;
 use crate::layout::{
     build_display_layout, build_raw_display_layout, line_byte_ranges, source_line_font_size,
@@ -24,6 +24,7 @@ use crate::layout::{
 };
 use crate::theme::EditorTheme;
 use markrust_core::TableRowKind;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// GPUI custom element that lays out and paints the Markdown editor surface.
 type SharedViewportSize = Rc<Cell<(Pixels, Pixels)>>;
@@ -53,6 +54,10 @@ pub struct EditorPrepaint {
     lines: Vec<LinePaintData>,
     selection: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
+    shadow_cursor: Vec<PaintQuad>,
+    shadow_selection: Vec<PaintQuad>,
+    search_matches: Vec<PaintQuad>,
+    search_reveal: Option<Bounds<Pixels>>,
     caret_bounds: Bounds<Pixels>,
     blockquote_borders: Vec<PaintQuad>,
     code_block_backgrounds: Vec<PaintQuad>,
@@ -165,7 +170,13 @@ impl Element for EditorElement {
         } else {
             build_display_layout(&content, &spans, &carets, &selections, theme)
         };
-        let lines = shape_lines(window, &display_layout, theme, &content);
+        let lines = shape_lines(
+            window,
+            &display_layout,
+            theme,
+            &content,
+            editor.raw_source(),
+        );
         let intrinsic_width = lines
             .iter()
             .map(|line| line.shaped.width)
@@ -206,13 +217,16 @@ impl Element for EditorElement {
         let selected_range = editor.selected_range.clone();
         let cursor_visible = editor.cursor_visible;
         let is_focused = editor.focus_handle.is_focused(window);
+        let shadow = editor
+            .shadow_selection()
+            .filter(|shadow| !is_focused && shadow.revision == editor.document.read(cx).revision());
 
         let display_layout = &request_layout.display_layout;
         let lines = request_layout.lines.clone();
 
         let cursor_display = display_layout.display_offset_for_doc(cursor_doc);
         let caret_bounds = caret_bounds_for_display(&lines, cursor_display, bounds);
-        let selection = if selected_range.is_empty() {
+        let selection = if selected_range.is_empty() || shadow.is_some() {
             Vec::new()
         } else {
             selection_quads(
@@ -224,11 +238,52 @@ impl Element for EditorElement {
             )
         };
 
-        let cursor = if is_focused && cursor_visible {
+        let cursor = if is_focused && cursor_visible && selected_range.is_empty() {
             Some(cursor_quad(&lines, cursor_display, bounds, theme.caret))
         } else {
             None
         };
+        let shadow_cursor = shadow.map_or_else(Vec::new, |shadow| {
+            crate::shadow::cursor_quads(caret_bounds_for_display(
+                &lines,
+                display_layout.display_offset_for_doc(shadow.caret()),
+                bounds,
+            ))
+        });
+        let shadow_selection = shadow.map_or_else(Vec::new, |shadow| {
+            selection_quads(
+                &lines,
+                display_layout,
+                &shadow.range,
+                bounds,
+                crate::shadow::selection_color(),
+            )
+        });
+        let search_matches = editor
+            .search_highlights(cx)
+            .map_or_else(Vec::new, |search| {
+                search
+                    .ranges
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, range)| {
+                        selection_quads(
+                            &lines,
+                            display_layout,
+                            range,
+                            bounds,
+                            crate::search::match_color(search.active == Some(index)),
+                        )
+                    })
+                    .collect()
+            });
+        let search_reveal = editor.pending_search_reveal.map(|offset| {
+            caret_bounds_for_display(
+                &lines,
+                display_layout.display_offset_for_doc(offset),
+                bounds,
+            )
+        });
 
         let blockquote_borders = blockquote_border_quads(&lines, bounds, theme.blockquote_border);
         let code_block_backgrounds =
@@ -238,6 +293,10 @@ impl Element for EditorElement {
             lines,
             selection,
             cursor,
+            shadow_cursor,
+            shadow_selection,
+            search_matches,
+            search_reveal,
             caret_bounds,
             blockquote_borders,
             code_block_backgrounds,
@@ -286,7 +345,7 @@ impl Element for EditorElement {
                     let caret_stops = line
                         .shaped
                         .text
-                        .char_indices()
+                        .grapheme_indices(true)
                         .map(|(offset, _)| offset)
                         .chain([line.shaped.text.len()])
                         .map(|offset| {
@@ -323,7 +382,13 @@ impl Element for EditorElement {
             window.paint_quad(border);
         }
 
+        for selection in prepaint.search_matches.drain(..) {
+            window.paint_quad(selection);
+        }
         for selection in prepaint.selection.drain(..) {
+            window.paint_quad(selection);
+        }
+        for selection in prepaint.shadow_selection.drain(..) {
             window.paint_quad(selection);
         }
 
@@ -336,6 +401,9 @@ impl Element for EditorElement {
         }
 
         if let Some(cursor) = prepaint.cursor.take() {
+            window.paint_quad(cursor);
+        }
+        for cursor in prepaint.shadow_cursor.drain(..) {
             window.paint_quad(cursor);
         }
 
@@ -368,26 +436,90 @@ impl Element for EditorElement {
             editor.layout_cache.display_to_doc = prepaint.display_to_doc.clone();
         });
 
+        // Mouse offsets must use the same content origin that painted the
+        // glyphs, not the stationary scroll wrapper. The viewport admits
+        // clicks below the last row while keeping other Split panes out.
+        let mouse_bounds = self
+            .scroll_handle
+            .as_ref()
+            .map(|(scroll, _)| scroll.bounds())
+            .unwrap_or(bounds)
+            .intersect(&window.content_mask().bounds);
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |event: &MouseDownEvent, phase, window, cx| {
+                if !phase.bubble()
+                    || event.button != MouseButton::Left
+                    || !mouse_bounds.contains(&event.position)
+                {
+                    return;
+                }
+                editor.update(cx, |editor, cx| {
+                    editor.focus_handle.focus(window, cx);
+                    editor.on_mouse_down(event, bounds, cx);
+                });
+                window.prevent_default();
+                cx.stop_propagation();
+            }
+        });
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                if !phase.bubble()
+                    || event.pressed_button != Some(MouseButton::Left)
+                    || !editor.read(cx).is_selecting
+                    || !editor.read(cx).focus_handle.is_focused(window)
+                {
+                    return;
+                }
+                editor.update(cx, |editor, cx| editor.on_mouse_move(event, bounds, cx));
+                window.prevent_default();
+                cx.stop_propagation();
+            }
+        });
+        window.on_mouse_event({
+            let editor = self.editor.clone();
+            move |event: &MouseUpEvent, phase, window, cx| {
+                if phase.bubble()
+                    && event.button == MouseButton::Left
+                    && editor.read(cx).is_selecting
+                    && editor.read(cx).focus_handle.is_focused(window)
+                {
+                    editor.update(cx, |editor, cx| editor.on_mouse_up(event, bounds, cx));
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }
+        });
+
         if let Some((scroll, last_viewport_size)) = &self.scroll_handle {
             let viewport = scroll.bounds();
             let size = (viewport.size.width, viewport.size.height);
             let resized = last_viewport_size.replace(size) != size;
-            if (self.reveal_caret || resized) && focus_handle.is_focused(window) {
+            let reveal_bounds = prepaint.search_reveal.or_else(|| {
+                ((self.reveal_caret || resized) && focus_handle.is_focused(window))
+                    .then_some(prepaint.caret_bounds)
+            });
+            if let Some(reveal_bounds) = reveal_bounds {
                 let offset = horizontal_caret_scroll_offset(
                     scroll.offset(),
                     viewport,
-                    prepaint.caret_bounds,
+                    reveal_bounds,
                     scroll.max_offset().x,
                 );
                 let offset = vertical_caret_scroll_offset(
                     offset,
                     viewport,
-                    prepaint.caret_bounds,
+                    reveal_bounds,
                     scroll.max_offset().y,
                 );
                 if offset != scroll.offset() {
                     scroll.set_offset(offset);
                     self.editor.update(cx, |_editor, cx| cx.notify());
+                }
+                if prepaint.search_reveal.is_some() {
+                    self.editor
+                        .update(cx, |editor, _| editor.pending_search_reveal = None);
                 }
             }
         }
@@ -401,7 +533,10 @@ fn horizontal_caret_scroll_offset(
     max_offset: Pixels,
 ) -> Point<Pixels> {
     let margin = px(EDITOR_GUTTER).min(viewport.size.width / 2.);
-    let adjustment = if caret.left() < viewport.left() + margin {
+    let adjustment = if caret.left() >= viewport.left() && caret.right() <= viewport.right() {
+        // A visible caret is not a request to move the user's viewport.
+        px(0.)
+    } else if caret.left() < viewport.left() + margin {
         viewport.left() + margin - caret.left()
     } else if caret.right() > viewport.right() - margin {
         viewport.right() - margin - caret.right()
@@ -418,7 +553,9 @@ fn vertical_caret_scroll_offset(
     max_offset: Pixels,
 ) -> Point<Pixels> {
     let margin = px(EDITOR_GUTTER).min(viewport.size.height / 2.);
-    let adjustment = if caret.top() < viewport.top() + margin {
+    let adjustment = if caret.top() >= viewport.top() && caret.bottom() <= viewport.bottom() {
+        px(0.)
+    } else if caret.top() < viewport.top() + margin {
         viewport.top() + margin - caret.top()
     } else if caret.bottom() > viewport.bottom() - margin {
         viewport.bottom() - margin - caret.bottom()
@@ -430,13 +567,16 @@ fn vertical_caret_scroll_offset(
 
 fn x_positions_for_shaped(shaped: &ShapedLine) -> Vec<f32> {
     let n = shaped.text.len();
-    let mut xs = vec![0.0f32; n + 1];
-    for i in 0..=n {
-        if i == n || shaped.text.is_char_boundary(i) {
-            xs[i] = f32::from(shaped.x_for_index(i));
-        } else if i > 0 {
-            xs[i] = xs[i - 1];
-        }
+    // Non-caret bytes must not win a nearest-position tie inside a combining
+    // sequence or ZWJ emoji. Hit testing skips nonfinite entries.
+    let mut xs = vec![f32::NAN; n + 1];
+    for i in shaped
+        .text
+        .grapheme_indices(true)
+        .map(|(i, _)| i)
+        .chain([n])
+    {
+        xs[i] = f32::from(shaped.x_for_index(i));
     }
     xs
 }
@@ -457,6 +597,7 @@ fn shape_lines(
     layout: &DisplayLayout,
     theme: &EditorTheme,
     content: &str,
+    raw_source: bool,
 ) -> Vec<LinePaintData> {
     let line_ranges = line_byte_ranges(&layout.display_text);
     let doc_line_ranges = line_byte_ranges(content);
@@ -471,28 +612,38 @@ fn shape_lines(
             .get(line_idx)
             .copied()
             .unwrap_or((0, content.len()));
-        let font_size = source_line_font_size(layout, theme, content, doc_start, doc_end);
+        let font_size =
+            source_row_font_size(layout, theme, content, doc_start, doc_end, raw_source);
         let height = px(theme.line_height_for_font_size(font_size));
-        let runs = build_runs_for_line(layout, theme, *display_start, *display_end, &line_text);
+        let runs = build_runs_for_line(
+            layout,
+            theme,
+            *display_start,
+            *display_end,
+            &line_text,
+            raw_source,
+        );
 
         let shaped = window
             .text_system()
             .shape_line(line_text.clone(), px(font_size), &runs, None);
-        let is_code_block = line_is_style(layout, doc_start, doc_end, |style| {
-            matches!(
-                style,
-                SegmentStyle::CodeBlock | SegmentStyle::SyntaxHighlight(_)
-            )
-        }) || layout
-            .code_block_lines
-            .iter()
-            .any(|&start| start >= doc_start && start < doc_end.max(doc_start + 1));
-        let is_blockquote = line_is_style(layout, doc_start, doc_end, |style| {
-            matches!(style, SegmentStyle::BlockQuote)
-        }) || layout
-            .blockquote_lines
-            .iter()
-            .any(|&start| start >= doc_start && start < doc_end.max(doc_start + 1));
+        let is_code_block = !raw_source
+            && (line_is_style(layout, doc_start, doc_end, |style| {
+                matches!(
+                    style,
+                    SegmentStyle::CodeBlock | SegmentStyle::SyntaxHighlight(_)
+                )
+            }) || layout
+                .code_block_lines
+                .iter()
+                .any(|&start| start >= doc_start && start < doc_end.max(doc_start + 1)));
+        let is_blockquote = !raw_source
+            && (line_is_style(layout, doc_start, doc_end, |style| {
+                matches!(style, SegmentStyle::BlockQuote)
+            }) || layout
+                .blockquote_lines
+                .iter()
+                .any(|&start| start >= doc_start && start < doc_end.max(doc_start + 1)));
         lines.push(LinePaintData {
             shaped,
             doc_line_start: doc_start,
@@ -508,7 +659,7 @@ fn shape_lines(
     if lines.is_empty() {
         let runs = vec![TextRun {
             len: 0,
-            font: body_font(theme),
+            font: source_font(theme, SegmentStyle::Plain, raw_source),
             color: theme.text,
             background_color: None,
             underline: None,
@@ -531,12 +682,28 @@ fn shape_lines(
     lines
 }
 
+fn source_row_font_size(
+    layout: &DisplayLayout,
+    theme: &EditorTheme,
+    content: &str,
+    doc_start: usize,
+    doc_end: usize,
+    raw_source: bool,
+) -> f32 {
+    if raw_source {
+        theme.font_size
+    } else {
+        source_line_font_size(layout, theme, content, doc_start, doc_end)
+    }
+}
+
 fn build_runs_for_line(
     layout: &DisplayLayout,
     theme: &EditorTheme,
     display_start: usize,
     display_end: usize,
     line_text: &str,
+    raw_source: bool,
 ) -> Vec<TextRun> {
     let mut runs = Vec::new();
     let mut pos = display_start;
@@ -568,11 +735,23 @@ fn build_runs_for_line(
         }
         runs.push(TextRun {
             len,
-            font: styled_font(theme, style),
+            font: source_font(theme, style, raw_source),
             color: styled_color(theme, style),
-            background_color: styled_background(theme, style),
-            underline: styled_underline(style),
-            strikethrough: styled_strikethrough(style),
+            background_color: if raw_source {
+                None
+            } else {
+                styled_background(theme, style)
+            },
+            underline: if raw_source {
+                None
+            } else {
+                styled_underline(style)
+            },
+            strikethrough: if raw_source {
+                None
+            } else {
+                styled_strikethrough(style)
+            },
         });
         pos += len;
     }
@@ -581,7 +760,7 @@ fn build_runs_for_line(
     if covered < line_text.len() {
         runs.push(TextRun {
             len: line_text.len() - covered,
-            font: body_font(theme),
+            font: source_font(theme, SegmentStyle::Plain, raw_source),
             color: theme.text,
             background_color: None,
             underline: None,
@@ -592,7 +771,7 @@ fn build_runs_for_line(
     if runs.is_empty() {
         runs.push(TextRun {
             len: line_text.len(),
-            font: body_font(theme),
+            font: source_font(theme, SegmentStyle::Plain, raw_source),
             color: theme.text,
             background_color: None,
             underline: None,
@@ -636,9 +815,12 @@ fn styled_font(theme: &EditorTheme, style: SegmentStyle) -> gpui::Font {
     }
 }
 
-fn body_font(theme: &EditorTheme) -> gpui::Font {
+fn source_font(theme: &EditorTheme, style: SegmentStyle, raw_source: bool) -> gpui::Font {
+    if !raw_source {
+        return styled_font(theme, style);
+    }
     gpui::Font {
-        family: theme.font_family.clone().into(),
+        family: theme.code_font_family.clone().into(),
         features: gpui::FontFeatures::default(),
         fallbacks: Some(EditorTheme::system_font_fallbacks()),
         weight: gpui::FontWeight::NORMAL,
@@ -863,40 +1045,12 @@ impl MarkdownEditor {
         position: Point<Pixels>,
         bounds: Bounds<Pixels>,
     ) -> usize {
-        let relative_x = f32::from(position.x - bounds.left()) - EDITOR_GUTTER;
-        let relative_y = f32::from(position.y - bounds.top());
-        if !self.layout_cache.line_x_at.is_empty() {
-            return click_byte_offset(
-                relative_x,
-                relative_y,
-                &self.layout_cache.line_heights,
-                &self.layout_cache.display_line_starts,
-                &self.layout_cache.line_x_at,
-                &self.layout_cache.display_to_doc,
-            );
-        }
-        if !self.layout_cache.line_heights.is_empty() {
-            let mut y = 0.0;
-            for (line_idx, height) in self.layout_cache.line_heights.iter().enumerate() {
-                if relative_y < y + height || line_idx + 1 == self.layout_cache.line_heights.len() {
-                    return self
-                        .layout_cache
-                        .line_starts
-                        .get(line_idx)
-                        .copied()
-                        .unwrap_or(0);
-                }
-                y += height;
-            }
-        }
-        let line_height = self.last_bounds_line_height.max(1.0);
-        let line_idx = ((relative_y / line_height).floor() as usize)
-            .min(self.layout_cache.line_starts.len().saturating_sub(1));
-        self.layout_cache
-            .line_starts
-            .get(line_idx)
-            .copied()
-            .unwrap_or(0)
+        source_offset_for_mouse_position(
+            &self.layout_cache,
+            self.last_bounds_line_height,
+            position,
+            bounds,
+        )
     }
 
     pub fn on_mouse_down(
@@ -906,8 +1060,20 @@ impl MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         self.is_selecting = true;
+        self.mouse_selection_anchor = None;
         let offset = self.index_for_mouse_position(event.position, bounds);
-        if event.modifiers.shift {
+        if event.click_count >= 2 && !event.modifiers.shift {
+            let content = self.content(cx);
+            let range = source_range_for_mouse_click(&content, offset, event.click_count);
+            self.mouse_selection_anchor = Some((range.clone(), event.click_count));
+            self.apply_command(
+                crate::EditorCommand::SetSelection {
+                    start: range.start,
+                    end: range.end,
+                },
+                cx,
+            );
+        } else if event.modifiers.shift {
             self.select_to(offset, cx);
         } else {
             self.move_to(offset, cx);
@@ -915,8 +1081,20 @@ impl MarkdownEditor {
         self.reset_blink(cx);
     }
 
-    pub fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Context<Self>) {
+    pub fn on_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_selecting {
+            // MouseMove delivery can be coalesced. The release coordinate,
+            // not the last intermediate event, defines the final extent.
+            let offset = self.index_for_mouse_position(event.position, bounds);
+            self.extend_mouse_selection_to(offset, cx);
+        }
         self.is_selecting = false;
+        self.mouse_selection_anchor = None;
     }
 
     pub fn on_mouse_move(
@@ -927,9 +1105,86 @@ impl MarkdownEditor {
     ) {
         if self.is_selecting {
             let offset = self.index_for_mouse_position(event.position, bounds);
+            self.extend_mouse_selection_to(offset, cx);
+        }
+    }
+
+    fn extend_mouse_selection_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if let Some((anchor, count)) = self.mouse_selection_anchor.clone() {
+            let extent = source_range_for_mouse_click(&self.content(cx), offset, count);
+            let (start, end) = multiclick_drag_selection(&anchor, &extent);
+            self.apply_command(crate::EditorCommand::SetSelection { start, end }, cx);
+        } else {
             self.select_to(offset, cx);
         }
     }
+}
+
+/// Keep the initially selected word/line intact despite pointer jitter, and
+/// extend by the same unit while preserving the original drag direction.
+fn multiclick_drag_selection(anchor: &Range<usize>, extent: &Range<usize>) -> (usize, usize) {
+    if extent.start < anchor.start {
+        (anchor.end, extent.start)
+    } else {
+        (anchor.start, anchor.end.max(extent.end))
+    }
+}
+
+fn source_offset_for_mouse_position(
+    cache: &LineLayoutCache,
+    fallback_line_height: f32,
+    position: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+) -> usize {
+    let relative_x = f32::from(position.x - bounds.left()) - EDITOR_GUTTER;
+    let relative_y = f32::from(position.y - bounds.top());
+    if !cache.line_x_at.is_empty() {
+        return click_byte_offset(
+            relative_x,
+            relative_y,
+            &cache.line_heights,
+            &cache.display_line_starts,
+            &cache.line_x_at,
+            &cache.display_to_doc,
+        );
+    }
+    if !cache.line_heights.is_empty() {
+        let mut y = 0.0;
+        for (line_idx, height) in cache.line_heights.iter().enumerate() {
+            if relative_y < y + height || line_idx + 1 == cache.line_heights.len() {
+                return cache.line_starts.get(line_idx).copied().unwrap_or(0);
+            }
+            y += height;
+        }
+    }
+    let line_height = fallback_line_height.max(1.0);
+    let line_idx = ((relative_y / line_height).floor() as usize)
+        .min(cache.line_starts.len().saturating_sub(1));
+    cache.line_starts.get(line_idx).copied().unwrap_or(0)
+}
+
+fn source_range_for_mouse_click(content: &str, offset: usize, click_count: usize) -> Range<usize> {
+    let mut offset = offset.min(content.len());
+    while !content.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    if click_count >= 3 {
+        let start = content[..offset]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let end = content[offset..]
+            .find('\n')
+            .map_or(content.len(), |newline| offset + newline + 1);
+        return start..end;
+    }
+    content
+        .split_word_bound_indices()
+        .find_map(|(start, word)| {
+            let end = start + word.len();
+            (start <= offset && (offset < end || offset == end && end == content.len()))
+                .then_some(start..end)
+        })
+        .unwrap_or(offset..offset)
 }
 
 /// Render wrapper that attaches keyboard/mouse handlers to the editor element.
@@ -938,6 +1193,7 @@ pub struct MarkdownEditorView {
     scroll_handle: ScrollHandle,
     scroll_viewport_size: SharedViewportSize,
     last_revealed_caret: Option<(usize, u64, bool)>,
+    preserve_next_focus_scroll: bool,
     #[cfg(feature = "gui-tests")]
     paint_observation: Rc<RefCell<SourcePaintGeometry>>,
 }
@@ -949,9 +1205,25 @@ impl MarkdownEditorView {
             scroll_handle: ScrollHandle::new(),
             scroll_viewport_size: Rc::new(Cell::new((px(0.), px(0.)))),
             last_revealed_caret: None,
+            preserve_next_focus_scroll: false,
             #[cfg(feature = "gui-tests")]
             paint_observation: Rc::new(RefCell::new(SourcePaintGeometry::default())),
         }
+    }
+
+    /// Returning from an auxiliary input is not document navigation.
+    pub fn preserve_scroll_on_next_focus(&mut self) {
+        self.preserve_next_focus_scroll = true;
+    }
+
+    pub fn scroll_offset(&self) -> Point<Pixels> {
+        self.scroll_handle.offset()
+    }
+
+    pub fn restore_scroll_offset(&mut self, offset: Point<Pixels>, cx: &mut Context<Self>) {
+        self.scroll_handle.set_offset(offset);
+        self.preserve_next_focus_scroll = true;
+        cx.notify();
     }
 
     #[cfg(feature = "gui-tests")]
@@ -979,7 +1251,8 @@ impl Render for MarkdownEditorView {
             state.document.read(cx).revision(),
             state.focus_handle.is_focused(window),
         );
-        let reveal_caret = self.last_revealed_caret != Some(caret_state);
+        let reveal_caret = self.last_revealed_caret != Some(caret_state)
+            && !std::mem::take(&mut self.preserve_next_focus_scroll);
         self.last_revealed_caret = Some(caret_state);
         div()
             .id("source-editor-scroll")
@@ -1349,6 +1622,149 @@ mod scroll_tests {
     use super::*;
 
     #[test]
+    fn raw_source_has_uniform_monospace_metrics_and_only_color_styling() {
+        use crate::layout::LayoutSegment;
+
+        let theme = EditorTheme::dark();
+        let content = "# Heading\n**bold** [link](url)";
+        let layout = DisplayLayout {
+            display_text: content.into(),
+            doc_to_display: (0..=content.len()).map(Some).collect(),
+            segments: vec![
+                LayoutSegment {
+                    doc_start: 0,
+                    doc_end: 9,
+                    style: SegmentStyle::Heading { level: 1 },
+                },
+                LayoutSegment {
+                    doc_start: 10,
+                    doc_end: 18,
+                    style: SegmentStyle::Bold,
+                },
+                LayoutSegment {
+                    doc_start: 18,
+                    doc_end: content.len(),
+                    style: SegmentStyle::Link,
+                },
+            ],
+            highlight_spans: vec![],
+            blockquote_lines: vec![],
+            code_block_lines: vec![],
+        };
+        for (start, end) in line_byte_ranges(content) {
+            assert_eq!(
+                source_row_font_size(&layout, &theme, content, start, end, true),
+                theme.font_size
+            );
+            let text = content[start..end].trim_end_matches('\n');
+            let runs = build_runs_for_line(&layout, &theme, start, end, text, true);
+            assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
+            for run in runs {
+                assert_eq!(run.font.family.as_ref(), theme.code_font_family);
+                assert_eq!(run.font.weight, gpui::FontWeight::NORMAL);
+                assert_eq!(run.font.style, gpui::FontStyle::Normal);
+                assert!(run.background_color.is_none());
+                assert!(run.underline.is_none());
+                assert!(run.strikethrough.is_none());
+            }
+        }
+        assert!(source_row_font_size(&layout, &theme, content, 0, 9, false) > theme.font_size);
+        assert_eq!(styled_color(&theme, SegmentStyle::Link), theme.link);
+    }
+
+    #[test]
+    fn mouse_hit_uses_painted_origin_after_scroll_and_cyrillic_byte_stops() {
+        let text = "# H\nЭто прекрасно аффы";
+        let start = text.find("Это").unwrap();
+        let word = text.find("аффы").unwrap();
+        let mut xs = vec![0.; text.len() - start + 1];
+        for (column, (byte, ch)) in text[start..].char_indices().enumerate() {
+            for x in &mut xs[byte..byte + ch.len_utf8()] {
+                *x = column as f32 * 8.;
+            }
+        }
+        *xs.last_mut().unwrap() = text[start..].chars().count() as f32 * 8.;
+        let word_x = text[start..word].chars().count() as f32 * 8.;
+        let cache = LineLayoutCache {
+            line_starts: vec![0, start],
+            display_line_starts: vec![0, start],
+            line_heights: vec![24., 24.],
+            line_x_at: vec![vec![0., 8., 16., 24.], xs],
+            display_to_doc: (0..=text.len()).collect(),
+        };
+        let origin = Bounds::new(point(px(-180.), px(-48.)), size(px(600.), px(48.)));
+        for (offset, x) in [(word, word_x), (word + "аффы".len(), word_x + 32.)] {
+            let position = point(
+                origin.left() + px(EDITOR_GUTTER + x),
+                origin.top() + px(30.),
+            );
+            assert_eq!(
+                source_offset_for_mouse_position(&cache, 24., position, origin),
+                offset
+            );
+        }
+        let after = point(origin.left() + px(800.), origin.top() + px(500.));
+        assert_eq!(
+            source_offset_for_mouse_position(&cache, 24., after, origin),
+            text.len()
+        );
+    }
+
+    #[test]
+    fn double_click_selects_cyrillic_word_and_triple_click_literal_source_line() {
+        let text = "# Heading\nЭто прекрасно аффы\nlast";
+        let word = text.find("аффы").unwrap();
+        assert_eq!(
+            source_range_for_mouse_click(text, word + 3, 2),
+            word..word + "аффы".len()
+        );
+        let row = text.find("Это").unwrap();
+        let row_end = text.find("\nlast").unwrap() + 1;
+        assert_eq!(source_range_for_mouse_click(text, word, 3), row..row_end);
+        assert_eq!(
+            source_range_for_mouse_click(text, text.len(), 2),
+            text.len() - 4..text.len()
+        );
+        assert_eq!(source_range_for_mouse_click("", 1, 2), 0..0);
+    }
+
+    #[test]
+    fn double_click_jitter_keeps_whole_word_and_drag_extends_wordwise_both_directions() {
+        let text = "Это аффы прекрасно";
+        let word = text.find("аффы").unwrap();
+        let anchor = source_range_for_mouse_click(text, word + 2, 2);
+        for offset in word..word + "аффы".len() {
+            let extent = source_range_for_mouse_click(text, offset, 2);
+            assert_eq!(
+                multiclick_drag_selection(&anchor, &extent),
+                (anchor.start, anchor.end)
+            );
+        }
+        let next = source_range_for_mouse_click(text, text.find("прекрасно").unwrap() + 2, 2);
+        assert_eq!(
+            multiclick_drag_selection(&anchor, &next),
+            (anchor.start, text.len())
+        );
+        let previous = source_range_for_mouse_click(text, 2, 2);
+        assert_eq!(
+            multiclick_drag_selection(&anchor, &previous),
+            (anchor.end, 0)
+        );
+    }
+
+    #[test]
+    fn triple_click_drag_preserves_complete_lines_in_both_directions() {
+        let text = "first\nsecond\nthird";
+        let anchor = source_range_for_mouse_click(text, 8, 3);
+        let same = source_range_for_mouse_click(text, 10, 3);
+        assert_eq!(multiclick_drag_selection(&anchor, &same), (6, 13));
+        let previous = source_range_for_mouse_click(text, 2, 3);
+        assert_eq!(multiclick_drag_selection(&anchor, &previous), (13, 0));
+        let next = source_range_for_mouse_click(text, 15, 3);
+        assert_eq!(multiclick_drag_selection(&anchor, &next), (6, text.len()));
+    }
+
+    #[test]
     fn multiline_selection_keeps_partial_edges_and_complete_middle_line() {
         assert_eq!(
             selected_source_rows(&(3..25), [(0, 10, 11), (11, 21, 22), (22, 32, 32)]),
@@ -1456,5 +1872,27 @@ mod scroll_tests {
             vertical_caret_scroll_offset(offset, viewport, far, px(600.)),
             point(px(-30.), px(-600.))
         );
+    }
+
+    #[test]
+    fn fully_visible_caret_near_pane_edges_does_not_trigger_comfort_scroll() {
+        let viewport = Bounds::new(point(px(20.), px(50.)), size(px(300.), px(200.)));
+        let offset = point(px(-100.), px(-200.));
+        for position in [
+            point(px(21.), px(51.)),
+            point(px(317.), px(225.)),
+            point(px(20.), px(50.)),
+            point(px(318.), px(226.)),
+        ] {
+            let caret = Bounds::new(position, size(px(2.), px(24.)));
+            assert_eq!(
+                horizontal_caret_scroll_offset(offset, viewport, caret, px(600.)),
+                offset
+            );
+            assert_eq!(
+                vertical_caret_scroll_offset(offset, viewport, caret, px(600.)),
+                offset
+            );
+        }
     }
 }

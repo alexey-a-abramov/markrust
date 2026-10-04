@@ -5,21 +5,33 @@
 //! GPUI application shell for MarkRust.
 
 mod app;
+pub mod build_info;
 mod config;
 pub mod crash;
 mod drop;
+pub mod i18n;
 mod icons;
 mod menus;
 mod panels;
+mod recovery;
 mod session;
 mod ui;
+pub mod update_install;
+mod update_ui;
+pub mod updater;
 mod window;
 mod workspace;
 
 #[cfg(feature = "gui-tests")]
+mod concurrent_visual_tests;
+#[cfg(feature = "gui-tests")]
 mod evidence;
 #[cfg(feature = "gui-tests")]
+mod notepad_visual_tests;
+#[cfg(feature = "gui-tests")]
 pub mod observation;
+#[cfg(feature = "gui-tests")]
+mod update_visual_tests;
 #[cfg(feature = "gui-tests")]
 pub mod usecases;
 #[cfg(feature = "gui-tests")]
@@ -32,6 +44,7 @@ pub use config::{AppConfig, RecentWorkspaces, ThemeChoice};
 pub use drop::{
     classify_editor_drop, classify_window_drop, is_image, markdown_image_reference, DropIntent,
 };
+pub use recovery::{RecoveryWarning, RestoreKind};
 pub use session::{
     classify_external_change, list_markdown_files, normalize_review_decision, reload_decision,
     should_offer_normalize_review, AutosaveScheduler, DropTarget, ExternalChangeAction,

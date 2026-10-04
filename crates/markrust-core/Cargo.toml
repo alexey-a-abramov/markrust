@@ -18,7 +18,7 @@ ropey = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 comrak = "0.36"
-similar = "2.6"
+similar = "3.2"
 unicode-segmentation = "1.12"
 yaml-rust = "0.4.5"
 

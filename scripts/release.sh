@@ -15,6 +15,9 @@ fi
 echo "==> cargo fmt --check"
 cargo fmt --all -- --check
 
+echo "==> release packaging contracts (Python 3.11+)"
+python3 -m unittest discover -s scripts/tests -v
+
 echo "==> cargo clippy"
 cargo clippy --locked --workspace --all-targets -- -D warnings
 
@@ -38,3 +41,5 @@ echo "==> binary smoke test"
 echo ""
 echo "Release checks passed for v${VERSION}."
 echo "To publish: tag v${VERSION}, push tag, then update Homebrew SHA256 placeholders."
+echo "Every branch push builds downloadable Actions artifacts; only matching version tags publish Releases."
+echo "See docs/deployment.md for unsigned/experimental platform status and signing decisions."

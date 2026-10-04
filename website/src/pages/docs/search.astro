@@ -3,14 +3,18 @@ import DocsLayout from '../../layouts/DocsLayout.astro';
 ---
 
 <DocsLayout title="Search">
-  <p>A dedicated find interface and workspace-wide search are not available yet. The current navigation tools make it quick to move between files and headings.</p>
+  <p>In-document find is implemented in v0.7.0. Open it with <kbd>⌘F</kbd> on macOS or <kbd>Ctrl+F</kbd> on Windows/Linux. It searches the current document in WYSIWYG, Source, and Split modes.</p>
 
-  <h2>Planned search</h2>
-  <p>In-document find and workspace-wide search are prioritised from alpha feedback.</p>
+  <h2>Find in document</h2>
+  <p>Type your query to highlight matches and show the match count. A selected single line can seed the query. Use <kbd>⌘G</kbd> / <kbd>⌘⇧G</kbd> for the next / previous match, or <kbd>Ctrl+G</kbd> / <kbd>Ctrl+Shift+G</kbd> on Windows/Linux. <kbd>F3</kbd> / <kbd>Shift+F3</kbd> also navigate matches.</p>
+  <p>While the find field owns input, <kbd>Enter</kbd> and <kbd>Shift+Enter</kbd> navigate without inserting text into the document. <kbd>Escape</kbd> closes find and returns focus to the active editor. Finish an active image/table field or text composition before opening find.</p>
+  <p>Find uses literal text. Workspace-wide search and replace are not implemented yet.</p>
 
   <h2>File navigation</h2>
   <p>Use <kbd>⌘P</kbd> to open the command palette and switch between open files by name.</p>
 
   <h2>Outline</h2>
   <p>The outline panel lists document headings parsed from the syntax tree. Click a heading to jump to that position.</p>
+  <h2>Related</h2>
+  <p><a href="/docs/shortcuts">Keyboard shortcuts</a> · <a href="/docs/command-palette">Command palette</a></p>
 </DocsLayout>

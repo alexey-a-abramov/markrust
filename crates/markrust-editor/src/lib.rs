@@ -8,6 +8,8 @@
 
 pub mod headless;
 pub mod highlight;
+pub mod search;
+pub mod shadow;
 pub mod source;
 pub mod table;
 pub mod theme;

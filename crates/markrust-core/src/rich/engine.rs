@@ -19,10 +19,11 @@ use super::entities::{
 };
 use super::import::import_markdown;
 use super::tree::{
-    alert_title_range, code_span_visible_range, emoji_visible_range, expand_link_and_html_chrome,
-    expand_marks_and_link_chrome, link_reference_def_chrome, markdown_link_chrome,
-    markdown_link_dests, math_visible_range, quoted_title_inner, toc_visible_range,
-    wiki_visible_range, Block, BlockKind, IdGen, Inline, MarkSet, NodeId, PrefixBlank, RichTree,
+    alert_title_range, blank_gap_whitespace_range, code_span_visible_range, emoji_visible_range,
+    expand_link_and_html_chrome, expand_marks_and_link_chrome, leading_prose_whitespace_range,
+    link_reference_def_chrome, markdown_link_chrome, markdown_link_dests, math_visible_range,
+    quoted_title_inner, toc_visible_range, trailing_prose_whitespace_range, wiki_visible_range,
+    Block, BlockKind, IdGen, Inline, MarkSet, NodeId, PrefixBlank, RichTree,
 };
 
 /// Caret snapping direction when a byte falls on delimiter bytes.
@@ -68,6 +69,17 @@ pub struct RichEngine {
     ids: IdGen,
     synced_revision: Option<u64>,
     last_splice: Option<BlockSplice>,
+    /// One just-completed input rule can be cancelled by the next Backspace.
+    /// The source revision and caret home prevent reuse after external edits,
+    /// history navigation, or editing a different position.
+    auto_list_prefix: Option<AutoListPrefix>,
+}
+
+#[derive(Debug)]
+struct AutoListPrefix {
+    revision: u64,
+    range: Range<usize>,
+    literal: String,
 }
 
 impl RichEngine {
@@ -95,10 +107,36 @@ impl RichEngine {
     /// Force the next [`RichEngine::sync`] to reparse.
     pub fn invalidate(&mut self) {
         self.synced_revision = None;
+        self.auto_list_prefix = None;
     }
 
     pub fn tree(&self) -> &RichTree {
         &self.tree
+    }
+
+    pub(crate) fn remember_auto_list_prefix(
+        &mut self,
+        revision: u64,
+        range: Range<usize>,
+        literal: String,
+    ) {
+        self.auto_list_prefix = Some(AutoListPrefix {
+            revision,
+            range,
+            literal,
+        });
+    }
+
+    /// Consume on every rich command, not just edits. Only an immediate
+    /// Backspace at this exact source revision/home may use the returned rule.
+    pub(crate) fn take_auto_list_prefix(
+        &mut self,
+        revision: u64,
+        cursor: usize,
+    ) -> Option<(Range<usize>, String)> {
+        let rule = self.auto_list_prefix.take()?;
+        (rule.revision == revision && rule.range.end == cursor)
+            .then_some((rule.range, rule.literal))
     }
 
     /// The splice produced by the most recent re-sync (None when the last
@@ -310,6 +348,9 @@ impl RichEngine {
             return self.snap_caret(fm_end, bias);
         }
         if let Some(gap) = blank_caret_gap_at(&self.tree, byte) {
+            if let Some(whitespace) = blank_gap_whitespace_range(&self.source, gap.clone()) {
+                return byte.clamp(whitespace.start, whitespace.end);
+            }
             // One painted line: extra trailing `\n`s share the gap start
             // (EOF must not snap into the last paragraph).
             if gap.end == self.tree.source_len {
@@ -398,6 +439,11 @@ impl RichEngine {
     pub fn prev_caret(&self, source: &str, byte: usize) -> usize {
         let byte = self.snap_caret(byte, Bias::Left);
         if let Some(gap) = blank_caret_gap_at(&self.tree, byte) {
+            if let Some(whitespace) = blank_gap_whitespace_range(source, gap.clone()) {
+                if byte > whitespace.start {
+                    return step_left_in_slice(source, whitespace.start, byte);
+                }
+            }
             return self.snap_caret(gap.start.saturating_sub(1), Bias::Left);
         }
         if let Some(blank) = self.prefix_blank_at(byte) {
@@ -461,6 +507,14 @@ impl RichEngine {
     pub fn next_caret(&self, source: &str, byte: usize) -> usize {
         let byte = self.snap_caret(byte, Bias::Right);
         if let Some(gap) = blank_caret_gap_at(&self.tree, byte) {
+            if let Some(whitespace) = blank_gap_whitespace_range(source, gap.clone()) {
+                if byte < whitespace.end {
+                    return step_right_in_slice(source, byte, whitespace.end);
+                }
+                if gap.end == source.len() {
+                    return whitespace.end;
+                }
+            }
             return self.snap_caret(gap.end.min(source.len()), Bias::Right);
         }
         if let Some(blank) = self.prefix_blank_at(byte) {
@@ -729,7 +783,11 @@ impl RichEngine {
         if html_block_atomic_range(block).is_none()
             && !matches!(block.kind, BlockKind::ThematicBreak)
         {
-            let prefix = raw_container_prefix(source, block);
+            let prefix = if leading_prose_whitespace_range(block, source).is_some() {
+                String::new()
+            } else {
+                raw_container_prefix(source, block)
+            };
             let fence_offset = match &block.kind {
                 BlockKind::CodeBlock { fence: Some(f), .. } => f.fence_offset,
                 _ => 0,
@@ -1198,7 +1256,7 @@ pub fn blank_caret_gaps(tree: &RichTree) -> Vec<Range<usize>> {
         let lo = if i == 0 {
             fm_end
         } else {
-            tree.blocks[i - 1].source_range.end
+            list_content_end(&tree.blocks[i - 1])
         };
         let hi = block.source_range.start;
         if let Some(gap) = blank_between(lo, hi, i == 0 && fm_end == 0) {
@@ -1208,7 +1266,49 @@ pub fn blank_caret_gaps(tree: &RichTree) -> Vec<Range<usize>> {
     if let Some(gap) = blank_caret_gap_after_last(tree) {
         out.push(gap);
     }
+    collect_list_item_gaps(&tree.blocks, &mut out);
+    out.sort_by_key(|gap| gap.start);
+    out.dedup();
     out
+}
+
+/// CommonMark list/item ranges absorb trailing blank line terminators. They
+/// are source fidelity, not visible item text or a reason to swallow the
+/// editable paragraph between a list and its next sibling.
+fn list_content_end(block: &Block) -> usize {
+    if matches!(
+        block.kind,
+        BlockKind::BulletList { .. } | BlockKind::OrderedList { .. } | BlockKind::ListItem { .. }
+    ) {
+        block
+            .children
+            .last()
+            .map_or(block.source_range.end, list_content_end)
+    } else {
+        block.source_range.end
+    }
+}
+
+fn collect_list_item_gaps(blocks: &[Block], out: &mut Vec<Range<usize>>) {
+    for block in blocks {
+        if matches!(
+            block.kind,
+            BlockKind::BulletList { .. } | BlockKind::OrderedList { .. }
+        ) {
+            for siblings in block.children.windows(2) {
+                if let Some(gap) = blank_between(
+                    list_content_end(&siblings[0]),
+                    siblings[1].source_range.start,
+                    false,
+                ) {
+                    out.push(gap);
+                }
+            }
+        }
+        // Top-level list siblings have plain newline separators. Nested and
+        // quoted lists also contain indentation/quote chrome in those bytes;
+        // their existing prefix-blank homes retain ownership of that surface.
+    }
 }
 
 /// Empty-paragraph slot painted/clicked immediately before top-level `index`.
@@ -3552,6 +3652,12 @@ fn leaf_inline_ranges(block: &Block, source: &str) -> Vec<Range<usize>> {
             }
         }
     }
+    if let Some(suffix) = trailing_prose_whitespace_range(block, source) {
+        out.push(suffix);
+    }
+    if let Some(prefix) = leading_prose_whitespace_range(block, source) {
+        out.push(prefix);
+    }
     out.sort_by_key(|r| (r.start, r.end));
     if out.is_empty() {
         out.push(block.source_range.clone());
@@ -3680,6 +3786,76 @@ mod tests {
         let mut engine = RichEngine::new();
         engine.sync(&doc);
         (doc, engine)
+    }
+
+    #[test]
+    fn trailing_prose_spaces_remain_directional_caret_stops() {
+        for source in [
+            "café 🌍  ",
+            "**hello**  ",
+            "[hello](https://example.com)  ",
+            "# hello  ",
+        ] {
+            let (_doc, engine) = engine_for(source);
+            let end = source.len();
+            assert_eq!(engine.snap_caret(end, Bias::Left), end, "{source:?}");
+            assert_eq!(engine.snap_caret(end, Bias::Right), end, "{source:?}");
+            assert_eq!(
+                engine.next_caret(source, end),
+                end,
+                "Right at end cannot move left"
+            );
+            assert_eq!(engine.prev_caret(source, end), end - 1, "{source:?}");
+            assert_eq!(engine.next_caret(source, end - 1), end, "{source:?}");
+            assert_eq!(engine.line_end_caret(source, 0), end, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn typed_leading_spaces_are_part_of_the_same_plain_paragraph() {
+        let source = "first\n\n  i";
+        let (_doc, engine) = engine_for(source);
+        let block = engine.tree().blocks.last().expect("second paragraph");
+        assert_eq!(block.source_range.start, "first\n\n".len(), "{block:?}");
+        assert_eq!(
+            engine.line_start_caret(source, source.len()),
+            "first\n\n".len()
+        );
+        assert_eq!(engine.prev_caret(source, source.len()), source.len() - 1);
+        assert_eq!(
+            engine.prev_caret(source, source.len() - 1),
+            source.len() - 2
+        );
+    }
+
+    #[test]
+    fn whitespace_only_trailing_paragraph_has_real_space_stops() {
+        for source in [
+            "first\n\n ",
+            "first\n\n  ",
+            "first\n\n \t",
+            "first\n \n",
+            "first\r\n \r\n",
+        ] {
+            let (_doc, engine) = engine_for(source);
+            let gap = blank_caret_gap_after_last(engine.tree()).expect("visible empty paragraph");
+            let whitespace = blank_gap_whitespace_range(source, gap).expect("typed whitespace");
+            let end = whitespace.end;
+            assert_eq!(engine.snap_caret(end, Bias::Left), end, "{source:?}");
+            assert_eq!(engine.prev_caret(source, end), end - 1, "{source:?}");
+            assert_eq!(engine.next_caret(source, end - 1), end, "{source:?}");
+            assert_eq!(engine.next_caret(source, source.len()), end, "{source:?}");
+            assert_eq!(
+                engine.line_start_caret(source, end),
+                whitespace.start,
+                "{source:?}"
+            );
+            assert_eq!(
+                engine.line_end_caret(source, whitespace.start),
+                end,
+                "{source:?}"
+            );
+        }
     }
 
     #[test]

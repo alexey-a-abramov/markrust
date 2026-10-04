@@ -12,12 +12,15 @@ user documentation lives in the [website](../website/).
   their edge cases.
 - [GUI testing](gui-testing.md) — native layout and interaction regressions,
   screenshot comparison, and visual review.
+- [Concurrent editing](concurrent-editing.md) — byte-preserving merge and save review.
+- [Everyday notepad](notepad-experience.md) — private drafts, window lifecycle,
+  persistence limits and lean next features.
 - [Desktop diagnostics](logging.md) — bounded local logs and crash-report
   retrieval.
 - [WYSIWYG engineering notes](roadmap.md) — detailed design decisions,
   verification evidence, known limitations, and handoff context.
-- [Website deployment](deployment.md) — GitHub Pages workflow, custom-domain
-  setup, DNS records, and verification.
+- [Binary distribution and website deployment](deployment.md) — native GitHub
+  Actions builds/releases, signing gates, Pages, DNS and verification.
 
 ## Related
 

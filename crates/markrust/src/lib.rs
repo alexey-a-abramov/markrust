@@ -16,6 +16,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum CliAction {
     Gui { open: Option<PathBuf> },
     Version,
+    BuildInfo,
+    ApplyUpdate { plan: Option<PathBuf> },
     Help,
     Export { args: Vec<String> },
     Unknown(String),
@@ -33,6 +35,10 @@ pub fn parse_args(args: &[String]) -> CliAction {
         }
         Some("-h") | Some("--help") => CliAction::Help,
         Some("-V") | Some("--version") => CliAction::Version,
+        Some("--build-info") => CliAction::BuildInfo,
+        Some("--apply-update") => CliAction::ApplyUpdate {
+            plan: (args.len() == 2).then(|| PathBuf::from(&args[1])),
+        },
         Some("export") => CliAction::Export {
             args: args[1..].to_vec(),
         },
@@ -71,6 +77,7 @@ pub fn print_help() {
     println!("  --gui            Launch the desktop editor (default when no args)");
     println!("  -h, --help       Print help");
     println!("  -V, --version    Print version");
+    println!("  --build-info     Print compiled version and UTC build timestamp as JSON");
     println!("  -o, --output     HTML output path (export subcommand)");
     println!("  --unsafe-html    Allow trusted raw HTML and dangerous URLs; GFM tag filtering remains enabled");
 }
@@ -139,6 +146,22 @@ pub fn run(args: &[String]) -> i32 {
             print_version();
             0
         }
+        CliAction::BuildInfo => {
+            println!("{}", markrust_app::build_info::metadata_json());
+            0
+        }
+        CliAction::ApplyUpdate { plan } => {
+            let Some(path) = plan else {
+                eprintln!("update helper requires exactly one private plan path");
+                return 1;
+            };
+            let result = markrust_app::update_install::helper_cli(&path);
+            if let Err(error) = result {
+                eprintln!("MarkRust update was not applied: {error}");
+                return 1;
+            }
+            0
+        }
         CliAction::Help => {
             print_help();
             0
@@ -160,6 +183,7 @@ mod tests {
     #[test]
     fn version_is_set() {
         assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(VERSION, markrust_app::build_info::VERSION);
     }
 
     #[test]
@@ -181,6 +205,25 @@ mod tests {
     fn parse_args_never_implies_gui_for_version_help_export() {
         assert_eq!(parse_args(&["--version".into()]), CliAction::Version);
         assert_eq!(parse_args(&["-V".into()]), CliAction::Version);
+        assert_eq!(parse_args(&["--build-info".into()]), CliAction::BuildInfo);
+        assert_eq!(
+            parse_args(&["--apply-update".into()]),
+            CliAction::ApplyUpdate { plan: None }
+        );
+        assert_eq!(
+            parse_args(&["--apply-update".into(), "/private/plan.json".into()]),
+            CliAction::ApplyUpdate {
+                plan: Some(PathBuf::from("/private/plan.json"))
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "--apply-update".into(),
+                "/private/plan.json".into(),
+                "extra".into()
+            ]),
+            CliAction::ApplyUpdate { plan: None }
+        );
         assert_eq!(parse_args(&["--help".into()]), CliAction::Help);
         assert_eq!(parse_args(&["-h".into()]), CliAction::Help);
         assert!(matches!(

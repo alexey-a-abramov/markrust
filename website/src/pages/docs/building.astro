@@ -10,17 +10,30 @@ import Callout from '../../components/Callout.astro';
     <li>Rust 1.96+ (<code>rustup update</code>)</li>
     <li>macOS: Xcode with Metal toolchain</li>
     <li>Linux: GPUI system dependencies (<code>scripts/install-linux-deps.sh</code>)</li>
+    <li>Windows x86_64 (experimental): MSVC C++ build tools and a Windows SDK with <code>fxc.exe</code> for GPUI release shaders.</li>
   </ul>
 
-  <CodeBlock code={`git clone https://github.com/alexey-a-abramov/markrust.git\ncd markrust\ncargo build --release -p markrust`} terminal />
+  <CodeBlock code={`git clone https://github.com/alexey-a-abramov/markrust.git\ncd markrust\ncargo build --locked --release -p markrust`} terminal />
+  <p>On Linux, install the system dependencies before building: <code>bash scripts/install-linux-deps.sh</code>. Run <code>./target/release/markrust</code> on macOS/Linux or <code>.\target\release\markrust.exe</code> on Windows.</p>
 
   <Callout type="note">
     <p>On macOS, if Metal compilation fails, run: <code>sudo xcode-select -s /Applications/Xcode.app/Contents/Developer</code></p>
   </Callout>
 
+  <h2>Cargo installation</h2>
+  <p>With the platform prerequisites installed, Cargo can build the pinned-GPUI desktop executable directly from GitHub:</p>
+  <CodeBlock code="cargo install --locked --git https://github.com/alexey-a-abramov/markrust markrust" terminal />
+  <p>No crates.io desktop package, Homebrew tap, or signed installer is published yet.</p>
+
+  <h2>Prepared CI distribution</h2>
+  <p>The v0.7.0 native matrix covers macOS Apple Silicon/Intel, Linux x86_64, and experimental Windows x86_64. Branch builds produce Actions artifacts; matching version tags publish archives and checksums only after verification. The first remote matrix run and Windows/Linux GUI acceptance remain pending. See the <a href="https://github.com/alexey-a-abramov/markrust/blob/main/docs/deployment.md">distribution reference</a> for signing and release gates.</p>
+
   <h2>Development</h2>
-  <CodeBlock code={`cargo test -p markrust-core -p markrust-editor\ncargo clippy --workspace -- -D warnings\ncargo run -p markrust`} terminal />
+  <CodeBlock code={`cargo test --locked --workspace\ncargo clippy --locked --workspace --all-targets -- -D warnings\ncargo run --locked -p markrust`} terminal />
 
   <h2>Website</h2>
   <CodeBlock code={`pnpm install\npnpm dev      # http://localhost:4321\npnpm build`} terminal />
+
+  <h2>Related</h2>
+  <p><a href="/docs/install">Installation status</a> · <a href="/docs/roadmap">Release gates</a></p>
 </DocsLayout>

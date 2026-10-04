@@ -6,8 +6,9 @@
 #   scripts/install-macos.sh --launch   # open the app when done
 #   MARKRUST_INSTALL_DIR=~/Applications scripts/install-macos.sh
 #
-# Re-running updates the installed bundle in place, so the Dock icon, bundle id
-# and any granted permissions stay attached to the same app.
+# Re-running replaces the installed bundle at the same path and retains the
+# previous bundle for rollback. Changed ad-hoc signatures can require permission
+# reapproval.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -53,30 +54,28 @@ fi
 
 echo "==> building markrust ($PROFILE)"
 if [[ "$PROFILE" == "release" ]]; then
-  cargo build --release -p markrust
+  cargo build --locked --release -p markrust
 else
-  cargo build -p markrust
+  cargo build --locked -p markrust
 fi
 
 BIN="target/$PROFILE/markrust"
 [[ -x "$BIN" ]] || { echo "error: $BIN not found after build" >&2; exit 1; }
-
-VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c '
-import json, sys
-for pkg in json.load(sys.stdin)["packages"]:
-    if pkg["name"] == "markrust":
-        print(pkg["version"])
-        break
-')"
-[[ -n "$VERSION" ]] || { echo "error: could not read markrust version" >&2; exit 1; }
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 APP="$STAGE/$APP_NAME.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-echo "==> assembling $APP_NAME.app (v$VERSION)"
 cp "$BIN" "$APP/Contents/MacOS/markrust"
+# Query the staged executable, not a build target that another Cargo process
+# could replace while this bundle is being assembled.
+BUILD_INFO="$("$APP/Contents/MacOS/markrust" --build-info)"
+VERSION="$(printf '%s' "$BUILD_INFO" | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')"
+[[ -n "$VERSION" ]] || { echo "error: could not read markrust version" >&2; exit 1; }
+BUILD_DATE="$(printf '%s' "$BUILD_INFO" | python3 -c 'import json, sys; print(json.load(sys.stdin)["built_at_utc"])')"
+[[ -n "$BUILD_DATE" ]] || { echo "error: could not read compiled build timestamp" >&2; exit 1; }
+echo "==> assembling $APP_NAME.app (v$VERSION)"
 
 # Icon: build a full .icns so Finder, Dock and cmd-tab all look right.
 ICON_SRC="assets/icon/icon.png"
@@ -115,6 +114,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<string>$VERSION</string>
 	<key>CFBundleVersion</key>
 	<string>$VERSION</string>
+	<key>MarkRustBuildDate</key>
+	<string>$BUILD_DATE</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleDocumentTypes</key>
@@ -149,12 +150,12 @@ PLIST
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # Ad-hoc signature: unsigned binaries copied into /Applications get killed by
-# Gatekeeper on some setups, and a stable signature keeps granted permissions
-# (screen recording, accessibility) attached across updates.
+# Gatekeeper on some setups. This is not a Developer-ID/notarized release;
+# TCC permissions may require reapproval when the executable changes.
 echo "==> signing (ad-hoc)"
-codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1 || {
-  echo "    warning: ad-hoc signing failed; the app may need a Gatekeeper override" >&2
-}
+codesign --force --sign - --timestamp=none "$APP"
+codesign --verify --deep --strict "$APP"
+plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
 TARGET="$DEST_DIR/$APP_NAME.app"
 mkdir -p "$DEST_DIR"
@@ -164,6 +165,10 @@ if pgrep -f "$TARGET/Contents/MacOS/markrust" >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ -L "$TARGET" ]]; then
+  echo "error: $TARGET is a symbolic link; refusing to replace it." >&2
+  exit 1
+fi
 if [[ -e "$TARGET" ]]; then
   # Only ever replace a bundle that is actually ours.
   EXISTING_ID="$(defaults read "$TARGET/Contents/Info" CFBundleIdentifier 2>/dev/null || echo "")"
@@ -172,16 +177,39 @@ if [[ -e "$TARGET" ]]; then
     echo "       Refusing to replace an app this script did not create." >&2
     exit 1
   fi
-  echo "==> updating existing install at $TARGET"
-  rm -rf "$TARGET"
-else
-  echo "==> installing to $TARGET"
+  codesign --verify --deep --strict "$TARGET"
 fi
 
-if ! cp -R "$APP" "$TARGET" 2>/dev/null; then
+# Stage on the destination volume before moving the old install. A failed
+# copy or signature check must leave the current application untouched.
+INSTALL_STAGE="$(mktemp -d "$DEST_DIR/.MarkRust-install.XXXXXX")"
+if ! cp -R "$APP" "$INSTALL_STAGE/$APP_NAME.app"; then
   echo "error: could not write to $DEST_DIR." >&2
-  echo "       Try: sudo scripts/install-macos.sh, or MARKRUST_INSTALL_DIR=\"\$HOME/Applications\" scripts/install-macos.sh" >&2
+  echo "       The existing installation has not been changed."
   exit 1
+fi
+codesign --verify --deep --strict "$INSTALL_STAGE/$APP_NAME.app"
+if pgrep -f "$TARGET/Contents/MacOS/markrust" >/dev/null 2>&1; then
+  echo "error: $APP_NAME started during installation; quit it and re-run." >&2
+  exit 1
+fi
+
+PREVIOUS=""
+if [[ -e "$TARGET" ]]; then
+  PREVIOUS="$INSTALL_STAGE/Previous-$APP_NAME.app"
+  mv "$TARGET" "$PREVIOUS"
+fi
+if ! mv "$INSTALL_STAGE/$APP_NAME.app" "$TARGET"; then
+  if [[ -n "$PREVIOUS" ]]; then
+    mv "$PREVIOUS" "$TARGET"
+  fi
+  echo "error: installation failed; the previous bundle was restored." >&2
+  exit 1
+fi
+if [[ -n "$PREVIOUS" ]]; then
+  echo "==> previous bundle retained at $PREVIOUS"
+else
+  rmdir "$INSTALL_STAGE"
 fi
 
 # Nudge LaunchServices so Finder picks up the new version and icon immediately.
@@ -190,8 +218,8 @@ touch "$TARGET"
   -f "$TARGET" >/dev/null 2>&1 || true
 
 echo ""
-echo "$APP_NAME $VERSION installed at $TARGET"
-echo "Launch it from Spotlight/Launchpad, or: open -a $APP_NAME"
+echo "$APP_NAME $VERSION ($BUILD_DATE) installed at $TARGET"
+echo "Launch it from Spotlight/Launchpad, or: open '$TARGET'"
 
 if [[ "$LAUNCH" == "1" ]]; then
   open -a "$TARGET"

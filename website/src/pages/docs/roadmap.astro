@@ -5,28 +5,30 @@ import DocsLayout from '../../layouts/DocsLayout.astro';
 <DocsLayout title="Roadmap">
   <p>The <a href="https://github.com/alexey-a-abramov/markrust/blob/main/ROADMAP.md">repository roadmap</a> is the current source of truth. This page summarizes the public plan.</p>
 
-  <h2>Current v0.1 alpha release gate</h2>
+  <h2>Current v0.7.0 release gates</h2>
   <ul>
     <li>Manual macOS CJK IME validation for body text, wrapped lines, tables, code-language chips, image captions, and frontmatter fields</li>
-    <li>Release archive smoke tests and checksum-backed package distribution</li>
+    <li>First remote native CI matrix and checksum-backed release archives; workflows are prepared locally, not yet proven on GitHub</li>
     <li>Native GUI smoke testing alongside the automated Rust and website suites</li>
-    <li>Remote-image privacy and safety hardening</li>
+    <li>Windows/Linux native GUI, clipboard, and IME acceptance; Windows recovery-directory ACL/privacy/locking verification</li>
+    <li>Public signing/notarization and reviewed package distribution</li>
   </ul>
 
-  <h2>Shipped in v0.1 alpha</h2>
+  <h2>Implemented in the editor</h2>
   <ul>
     <li>Typora-style WYSIWYG editing, plus Source and Split modes</li>
     <li>Folder workspace with file tree</li>
     <li>Document outline and command palette</li>
     <li>GFM tables, task lists, images, frontmatter, and code highlighting</li>
     <li>HTML export CLI</li>
-    <li>Autosave, atomic writes, and external-edit reconciliation</li>
+    <li>Separate draft recovery, explicit file saves, atomic writes, and external-edit reconciliation</li>
+    <li>In-document find with standard shortcuts, plus Open Location for pasted file/folder paths</li>
+    <li>Shadow cursors in Split, contextual table/image editing, and clearer formatting controls</li>
   </ul>
 
   <h2>Next, guided by alpha feedback</h2>
   <ul>
-    <li>Windows support</li>
-    <li>Save As dialog</li>
+    <li>Promote experimental Windows/Linux distribution only after native acceptance</li>
     <li>Workspace-wide search</li>
     <li>Custom keybindings</li>
     <li>Accessibility improvements</li>
@@ -39,4 +41,6 @@ import DocsLayout from '../../layouts/DocsLayout.astro';
     <li>Plugin marketplace and MCP/agent server</li>
     <li>Full TeX/LaTeX and Mermaid rendering</li>
   </ul>
+  <h2>Related</h2>
+  <p><a href="/docs/install">Installation status</a> · <a href="/docs/building">Building and CI</a></p>
 </DocsLayout>

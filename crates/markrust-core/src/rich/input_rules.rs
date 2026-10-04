@@ -263,7 +263,11 @@ fn match_pending_opener(
         // cannot rewrite the GFM row. `*` / `_` / `` ` `` / `~` at a physical
         // line start would start a list / fence / break (italic still
         // InsertRaw when not at `content_start`).
-        b'#' | b'>' | b'+' | b'-' if at_start && !in_table => {
+        // A bare hyphen is already an empty CommonMark list item. Keep the
+        // first keystroke literal; the following space deliberately promotes
+        // `\-` through match_block_space instead of flickering list -> prose.
+        b'-' if at_start && !in_table => Some(InputRule::InsertRaw("\\-".into())),
+        b'#' | b'>' | b'+' if at_start && !in_table => {
             Some(InputRule::InsertRaw(typed.to_string()))
         }
         b'*' | b'_' | b'`' | b'~' if in_table && at_start => None,
@@ -529,6 +533,14 @@ mod tests {
         assert_eq!(apply(">", 1, " ").0, "> ");
         assert_eq!(apply("1.", 2, " ").0, "1. ");
         assert_eq!(apply("1)", 2, " ").0, "1) ");
+    }
+
+    #[test]
+    fn pending_hyphen_is_literal_until_space_and_still_supports_a_thematic_break() {
+        assert_eq!(apply("", 0, "-"), ("\\-".into(), 2));
+        assert_eq!(apply("\\-", 2, " "), ("- ".into(), 2));
+        assert_eq!(apply("\\--", 3, "-"), ("---\n\n".into(), 5));
+        assert!(match_input_rule("\\-", 2, "a", false).is_none());
     }
 
     #[test]

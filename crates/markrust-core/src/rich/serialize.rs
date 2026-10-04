@@ -857,7 +857,7 @@ fn close_down_to(ser: &mut Ser, stack: &mut Vec<(MarkKey, String)>, keep: usize)
 /// An empty destination stays bare so Cmd-K serializes `[hello]()` (Typora),
 /// not `[hello](<>)`. A following title still needs `<>` so `"title"` is not
 /// parsed as the destination.
-fn printable_url(url: &str, has_title: bool) -> String {
+pub(crate) fn printable_url(url: &str, has_title: bool) -> String {
     let needs_brackets = (url.is_empty() && has_title)
         || url.chars().any(|c| c == ' ' || c.is_control())
         || url.matches('(').count() != url.matches(')').count();

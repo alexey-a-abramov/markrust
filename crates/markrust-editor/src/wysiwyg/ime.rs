@@ -149,8 +149,8 @@ pub struct ImeOriginState {
     /// frame-local: a virtualized, unpainted target falls back to the rich
     /// engine's source-level vertical move.
     visual_lines: Vec<ImeVisualLine>,
-    /// Non-text painted surfaces (standalone images, thematic rules) so a
-    /// leftover click is below them rather than on them.
+    /// Non-text painted surfaces, including every chip/caption widget, so
+    /// body gap clicks cannot claim their input or mistake them for EOF.
     painted_bounds: Vec<Bounds<Pixels>>,
     /// Preedit string this frame (`None` = not composing). A change bumps
     /// [`Self::caret_generation`] so composition start/update/commit still
@@ -253,6 +253,7 @@ impl ImeOriginState {
 
     pub fn report_widget(&mut self, bounds: Bounds<Pixels>) {
         self.widget_bounds = Some(bounds);
+        self.painted_bounds.push(bounds);
     }
 
     pub fn report_widget_caret(&mut self, caret: Bounds<Pixels>) {
@@ -435,7 +436,7 @@ impl ImeOriginState {
     /// Inner overlay `|` or the focused leaf's painted caret this frame.
     ///
     /// Does not include sticky, trailing-edge, or leaf-top fallbacks.
-    fn painted_caret_rect(&self) -> Option<Bounds<Pixels>> {
+    pub(super) fn painted_caret_rect(&self) -> Option<Bounds<Pixels>> {
         if self.widget_focused {
             return self
                 .widget_caret
@@ -494,17 +495,56 @@ impl ImeOriginState {
         self.leaves.iter().find(|leaf| leaf.bounds.contains(&point))
     }
 
+    /// Nearest caret stop in this frame's painted text rows. The body drag
+    /// fallback uses this only between leaves, where no exact leaf hitbox owns
+    /// the pointer. Picking a visual row before its horizontal stop keeps a
+    /// short heading elsewhere in the viewport from hijacking the selection.
+    pub fn source_near_point(&self, point: Point<Pixels>) -> Option<usize> {
+        let x = f32::from(point.x);
+        let y = f32::from(point.y);
+        self.visual_lines
+            .iter()
+            .filter_map(|entry| {
+                let stop = entry.line.stops.iter().min_by(|left, right| {
+                    (left.x - x)
+                        .abs()
+                        .total_cmp(&(right.x - x).abs())
+                        .then_with(|| left.x.total_cmp(&right.x))
+                })?;
+                let distance_y = if y < entry.line.top {
+                    entry.line.top - y
+                } else {
+                    (y - entry.line.top - entry.line.height).max(0.)
+                };
+                Some((distance_y, (stop.x - x).abs(), stop.source))
+            })
+            .min_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.1.total_cmp(&right.1))
+                    .then_with(|| left.2.cmp(&right.2))
+            })
+            .map(|(_, _, source)| source)
+    }
+
+    /// All actual non-text surfaces, not just the last reported widget.
+    pub fn point_is_reserved_surface(&self, point: Point<Pixels>) -> bool {
+        self.painted_bounds
+            .iter()
+            .any(|bounds| bounds.contains(&point))
+            || self
+                .widget_bounds
+                .is_some_and(|bounds| bounds.contains(&point))
+    }
+
     /// True when `point` is in leftover viewport below the last painted leaf
     /// or non-text widget (standalone image, thematic rule). Clicks on a
     /// leaf, those widgets, or a focused overlay are not leftover.
     pub fn point_is_below_painted_content(&self, point: Point<Pixels>) -> bool {
-        if self.widget_bounds.is_some_and(|b| b.contains(&point)) {
+        if self.point_is_reserved_surface(point) {
             return false;
         }
         if self.leaves.iter().any(|leaf| leaf.bounds.contains(&point)) {
-            return false;
-        }
-        if self.painted_bounds.iter().any(|b| b.contains(&point)) {
             return false;
         }
         let leaf_bottom = self.leaves.iter().map(|leaf| leaf.bounds.bottom()).max();
@@ -786,6 +826,7 @@ mod tests {
             runs: Vec::new(),
             source_at,
             block_start: start,
+            caret_range: None,
         })
     }
 
@@ -829,6 +870,79 @@ mod tests {
             ime.report_leaf(leaf);
         }
         ime
+    }
+
+    #[test]
+    fn nearest_painted_stop_keeps_gap_drags_on_the_closest_row() {
+        let mut ime = ImeOriginState::default();
+        ime.begin_frame(false, 0, None);
+        ime.report_visual_lines(leaf_layout("abcdefghij", 0), vec![visual_line(0..10, 20.)]);
+        ime.report_visual_lines(
+            leaf_layout("абв", 100),
+            vec![VisualLine {
+                visible_start: 0,
+                visible_end: 6,
+                top: 80.,
+                height: 20.,
+                stops: vec![
+                    VisualCaretStop {
+                        visible: 0,
+                        source: 100,
+                        x: 0.,
+                    },
+                    VisualCaretStop {
+                        visible: 2,
+                        source: 102,
+                        x: 10.,
+                    },
+                    VisualCaretStop {
+                        visible: 4,
+                        source: 104,
+                        x: 20.,
+                    },
+                    VisualCaretStop {
+                        visible: 6,
+                        source: 106,
+                        x: 30.,
+                    },
+                ],
+            }],
+        );
+        assert_eq!(ime.source_near_point(point(px(80.), px(45.))), Some(8));
+        assert_eq!(ime.source_near_point(point(px(80.), px(75.))), Some(106));
+        assert_eq!(ime.source_near_point(point(px(19.), px(80.))), Some(104));
+        ime.begin_frame(false, 0, None);
+        assert_eq!(ime.source_near_point(point(px(19.), px(80.))), None);
+    }
+
+    #[cfg(feature = "gui-tests")]
+    #[test]
+    fn gap_drag_uses_the_paragraph_row_not_its_heading_or_empty_end_neighbor() {
+        let mut ime = ImeOriginState::default();
+        ime.begin_frame(false, 104, None);
+        let row = |source_start: usize, text: &str, top: f32, height: f32| {
+            let mut line = visual_line(0..text.len(), top);
+            line.height = height;
+            for stop in &mut line.stops {
+                stop.source += source_start;
+            }
+            (leaf_layout(text, source_start), vec![line])
+        };
+        for (layout, lines) in [
+            row(2, "Notepad smoke C", 20., 42.),
+            row(100, "paragraph", 120., 24.),
+            row(200, "", 220., 24.),
+        ] {
+            ime.report_visual_lines(layout, lines);
+        }
+        // The pointer is outside the paragraph leaf but nearest to its lower
+        // row edge. An unrelated heading's wider text must not win the drag.
+        assert_eq!(ime.source_near_point(point(px(55.), px(151.))), Some(105));
+        assert_eq!(ime.source_near_point(point(px(200.), px(151.))), Some(109));
+        // Above the paragraph and below its empty end neighbor, the closest
+        // row is still selected by its vertical band, not by source order.
+        assert_eq!(ime.source_near_point(point(px(20.), px(111.))), Some(102));
+        assert_eq!(ime.source_near_point(point(px(20.), px(211.))), Some(200));
     }
 
     #[test]
@@ -1243,6 +1357,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn body_gap_hits_exclude_all_widgets_and_non_text_surfaces_until_next_frame() {
+        let mut ime = ImeOriginState::default();
+        ime.begin_frame(false, 0, None);
+        let chip = rect(8., 10., 80., 22.);
+        let caption = rect(8., 90., 200., 22.);
+        let image = rect(8., 40., 200., 40.);
+        ime.report_widget(chip);
+        ime.report_widget(caption);
+        ime.report_painted_bounds(image);
+        for bounds in [chip, caption, image] {
+            assert!(ime.point_is_reserved_surface(bounds.center()));
+            assert!(!ime.point_is_below_painted_content(bounds.center()));
+        }
+        assert!(!ime.point_is_reserved_surface(point(px(20.), px(35.))));
+        assert!(ime.point_is_below_painted_content(point(px(20.), px(130.))));
+        ime.begin_frame(false, 0, None);
+        for bounds in [chip, caption, image] {
+            assert!(!ime.point_is_reserved_surface(bounds.center()));
+        }
+    }
+
     fn first_code(blocks: &[markrust_core::rich::Block]) -> Option<&markrust_core::rich::Block> {
         for b in blocks {
             if matches!(b.kind, BlockKind::CodeBlock { .. }) {
@@ -1274,6 +1410,7 @@ mod tests {
                 runs: Vec::new(),
                 source_at,
                 block_start: start,
+                caret_range: None,
             }),
             bounds,
             font_size: 16.0,

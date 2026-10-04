@@ -8,11 +8,14 @@
 mod block_text;
 mod blocks;
 mod image;
+mod image_editor;
 mod ime;
 mod inline_layout;
 mod view;
 
-pub use view::RichEditorView;
+pub use view::{
+    FrontmatterField, RichEditorView, WidgetDraftKind, WidgetDraftRestoreError, WidgetDraftSnapshot,
+};
 
 #[cfg(feature = "gui-tests")]
 pub use ime::{PaintedLeafGeometry, PaintedLineGeometry, VisualCaretStop};

@@ -25,6 +25,19 @@ fn cli_version_via_assert_cmd() {
 }
 
 #[test]
+fn cli_build_info_is_non_gui_and_matches_about_identity() {
+    let mut cmd = Command::cargo_bin("markrust").unwrap();
+    let output = cmd.arg("--build-info").output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        markrust_app::build_info::metadata_json()
+    );
+    assert_eq!(parse_args(&["--build-info".into()]), CliAction::BuildInfo);
+}
+
+#[test]
 fn cli_export_via_assert_cmd_and_library() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

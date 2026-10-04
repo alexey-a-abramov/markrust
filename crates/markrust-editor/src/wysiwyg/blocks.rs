@@ -10,24 +10,25 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, img, prelude::*, px, AnyElement, CursorStyle, Entity, FontWeight, MouseButton,
-    ObjectFit, SharedString, StyledText, TextStyle,
+    canvas, div, img, prelude::*, px, AnyElement, App, Bounds, CursorStyle, Element, ElementId,
+    Entity, FontWeight, GlobalElementId, InspectorElementId, LayoutId, MouseButton, ObjectFit,
+    Pixels, SharedString, StyledText, TextStyle, Window,
 };
 use markrust_core::html_visual::{
     definition_list_items, footnote_definition, project_html_block, to_superscript, HtmlBlockVisual,
 };
 use markrust_core::rich::{
-    alert_title_range, blank_caret_gap_after_last, blank_caret_gap_before,
+    alert_title_range, blank_caret_gap_after_last, blank_caret_gap_before, blank_caret_gaps,
     link_reference_def_chrome, toc_visible_range, Block, BlockKind, ColumnAlign, Inline, NodeId,
     PrefixBlank, RichTree,
 };
 
 use super::block_text::{
-    apply_code_fence_reveal, apply_structural_chrome, build_blank_gap_layout,
+    apply_code_fence_reveal, apply_structural_chrome, build_blank_gap_layout_with_source,
     build_code_block_layout, build_code_layout, build_html_block_layout, build_leaf_layout_inlines,
     build_leaf_layout_revealed, build_prefix_blank_layout, chrome_hosts_for, layout_html_block,
-    table_alignment_line, BlockTextElement, ChromeHosts, OverlayTarget, RevealState, WidgetOverlay,
-    WysiwygHost,
+    project_leading_horizontal_whitespace, project_trailing_horizontal_whitespace,
+    BlockTextElement, ChromeHosts, OverlayTarget, RevealState, WidgetOverlay, WysiwygHost,
 };
 use super::image::{resolve_image_source, ResolvedImage};
 use super::inline_layout::{
@@ -36,6 +37,9 @@ use super::inline_layout::{
 };
 use crate::highlight::highlight_code_block;
 use crate::theme::EditorTheme;
+
+const TOP_BLOCK_VERTICAL_PADDING: f32 = 4.;
+const LIST_ROW_GAP: f32 = 2.;
 
 /// Immutable per-frame snapshot the virtualized list renders from.
 #[derive(Clone)]
@@ -60,19 +64,13 @@ pub struct RenderSnapshot {
     pub editing_image: Option<(Range<usize>, String)>,
     pub caret: usize,
     pub selected_range: Range<usize>,
-    pub markup_hints_enabled: bool,
 }
 
 impl RenderSnapshot {
     fn reveal_state(&self) -> RevealState {
-        if self.markup_hints_enabled {
-            RevealState {
-                caret: self.caret,
-                selection: self.selected_range.clone(),
-            }
-        } else {
-            RevealState::HIDDEN
-        }
+        // Live WYSIWYG keeps one glyph projection. Context hints belong in
+        // paint-only tint and app chrome, never in the document's text flow.
+        RevealState::HIDDEN
     }
 }
 
@@ -83,18 +81,24 @@ pub fn render_top_block<H: WysiwygHost>(
 ) -> AnyElement {
     if snap.tree.blocks.is_empty() {
         let gap = blank_caret_gap_after_last(&snap.tree).unwrap_or(0..snap.tree.source_len);
+        let mut leaf = source_blank_gap_layout(snap, gap.clone());
+        leaf.caret_range = Some(gap);
         return div()
             .w_full()
             .min_w_0()
             .px(px(24.))
-            .py(px(4.))
-            .child(blank_gap_element(snap, gap, editor))
+            .py(px(TOP_BLOCK_VERTICAL_PADDING))
+            .child(blank_layout_element(snap, leaf, editor))
             .into_any_element();
     }
     let Some(block) = snap.tree.blocks.get(index) else {
         return div().into_any_element();
     };
-    let mut root = div().w_full().min_w_0().px(px(24.)).py(px(4.));
+    let mut root = div()
+        .w_full()
+        .min_w_0()
+        .px(px(24.))
+        .py(px(TOP_BLOCK_VERTICAL_PADDING));
     if let Some(gap) = blank_caret_gap_before(&snap.tree, index) {
         root = root.child(blank_gap_element(snap, gap, editor.clone()));
     }
@@ -103,7 +107,19 @@ pub fn render_top_block<H: WysiwygHost>(
         .flatten();
     if let Some(gap) = trailing {
         root = root.child(render_block(snap, block, editor.clone()));
-        root = root.child(blank_gap_element(snap, gap, editor));
+        let mut leaf = source_blank_gap_layout(snap, gap.clone());
+        leaf.caret_range = Some(gap);
+        // Reserve the same separator row and two 4px root paddings as the
+        // paragraph this EOF draft becomes. Its first letter must not jump
+        // downward when comrak finally creates a nonempty paragraph node.
+        let sibling_spacing = paragraph_draft_spacing(&snap.theme);
+        root = root.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .mt(px(sibling_spacing))
+                .child(blank_layout_element(snap, leaf, editor)),
+        );
     } else {
         root = root.child(render_block(snap, block, editor));
     }
@@ -115,12 +131,28 @@ fn blank_gap_element<H: WysiwygHost>(
     gap: Range<usize>,
     editor: Entity<H>,
 ) -> AnyElement {
+    blank_layout_element(snap, source_blank_gap_layout(snap, gap), editor)
+}
+
+fn source_blank_gap_layout(
+    snap: &RenderSnapshot,
+    gap: Range<usize>,
+) -> super::block_text::LeafLayout {
+    let style = base_text_style(&snap.theme, snap.theme.font_size, FontWeight::NORMAL);
+    build_blank_gap_layout_with_source(gap, &snap.source, &style)
+}
+
+fn blank_layout_element<H: WysiwygHost>(
+    snap: &Arc<RenderSnapshot>,
+    layout: super::block_text::LeafLayout,
+    editor: Entity<H>,
+) -> AnyElement {
     let theme = &snap.theme;
     let font_size = theme.font_size;
     let line_height = theme.line_height_for_font_size(font_size);
     BlockTextElement {
         editor,
-        layout: Arc::new(build_blank_gap_layout(gap)),
+        layout: Arc::new(layout),
         font_size,
         line_height,
         theme: theme.clone(),
@@ -289,6 +321,7 @@ fn render_block<H: WysiwygHost>(
                     italic: false,
                     monospace: true,
                     hug_width: true,
+                    single_line: false,
                     target: OverlayTarget::CodeInfo(block.id),
                 });
             div()
@@ -415,6 +448,7 @@ fn render_alert<H: WysiwygHost>(
             .text_color(accent)
             .cursor(CursorStyle::PointingHand)
             .child(SharedString::from(label))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, window, cx| {
                 editor_click.update(cx, |host, cx| {
                     host.click_source(caret_at, false, window, cx);
@@ -454,6 +488,7 @@ fn render_toc<H: WysiwygHost>(
             .text_color(theme.secondary_text)
             .cursor(CursorStyle::PointingHand)
             .child(SharedString::from("No headings"))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, window, cx| {
                 editor_click.update(cx, |host, cx| {
                     host.click_source(caret_at, false, window, cx);
@@ -480,6 +515,7 @@ fn render_toc<H: WysiwygHost>(
                 .text_color(theme.link)
                 .cursor(CursorStyle::PointingHand)
                 .child(label)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |_, window, cx| {
                     editor_click.update(cx, |host, cx| {
                         host.click_source(jump, false, window, cx);
@@ -543,6 +579,7 @@ fn thematic_rule<H: WysiwygHost>(
         .cursor(CursorStyle::PointingHand)
         .child(painted_bounds_hit(editor))
         .child(div().w_full().h(px(1.)).bg(theme.table_delimiter))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(move |_, window, cx| {
             editor_click.update(cx, |host, cx| {
                 host.select_source_range(click_range.clone(), window, cx);
@@ -816,7 +853,7 @@ fn render_list<H: WysiwygHost>(
         BlockKind::OrderedList { start, .. } => (true, *start),
         _ => (false, 1),
     };
-    let rows: Vec<AnyElement> = list
+    let mut rows: Vec<(usize, AnyElement)> = list
         .children
         .iter()
         .enumerate()
@@ -882,6 +919,7 @@ fn render_list<H: WysiwygHost>(
                     let editor = editor.clone();
                     marker = marker
                         .cursor(CursorStyle::PointingHand)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(move |_, _, cx| {
                             editor.update(cx, |host, cx| host.toggle_task(item_id, cx));
                         });
@@ -890,16 +928,53 @@ fn render_list<H: WysiwygHost>(
                     .child(marker)
                     .child(div().flex_1().min_w_0().children(children));
             }
-            row.into_any_element()
+            (item.source_range.start, row.into_any_element())
         })
         .collect();
+    // A same-marker list is one CommonMark container even after an empty
+    // item is exited. Preserve its ordinary blank paragraph as an unbulleted
+    // source-backed leaf, rather than snapping the caret into the next item.
+    for gap in list_blank_gaps(list, &snap.tree) {
+        // This draft will become a separate top-level paragraph as soon as
+        // it receives text. Reserve both neighboring separator rows and root
+        // paddings now; the first character must not move its baseline or the
+        // following list. The surrounding list already supplies its row gap.
+        let spacing = paragraph_draft_spacing(&theme) - LIST_ROW_GAP;
+        rows.push((
+            gap.start,
+            div()
+                .w_full()
+                .min_w_0()
+                .mt(px(spacing))
+                .mb(px(spacing))
+                .child(blank_gap_element(snap, gap, editor.clone()))
+                .into_any_element(),
+        ));
+    }
+    rows.sort_by_key(|(source, _)| *source);
     div()
         .w_full()
         .min_w_0()
         .flex()
         .flex_col()
-        .gap(px(2.))
-        .children(rows)
+        .gap(px(LIST_ROW_GAP))
+        .children(rows.into_iter().map(|(_, row)| row))
+}
+
+fn paragraph_draft_spacing(theme: &EditorTheme) -> f32 {
+    theme.line_height_for_font_size(theme.font_size) + 2. * TOP_BLOCK_VERTICAL_PADDING
+}
+
+fn list_blank_gaps(list: &Block, tree: &RichTree) -> Vec<Range<usize>> {
+    blank_caret_gaps(tree)
+        .into_iter()
+        .filter(|gap| {
+            list.children
+                .iter()
+                .skip(1)
+                .any(|item| item.source_range.start == gap.end)
+        })
+        .collect()
 }
 
 fn render_table<H: WysiwygHost>(
@@ -909,11 +984,6 @@ fn render_table<H: WysiwygHost>(
     editor: Entity<H>,
 ) -> AnyElement {
     let theme = snap.theme.clone();
-    let reveal = snap.reveal_state();
-    let show_align = reveal.intersects(&table.source_range);
-    let align_line = show_align
-        .then(|| table_alignment_line(&snap.source, table))
-        .flatten();
     let mut rows: Vec<AnyElement> = Vec::new();
     for row in &table.children {
         let header = matches!(row.kind, BlockKind::TableRow { header: true });
@@ -962,36 +1032,6 @@ fn render_table<H: WysiwygHost>(
             row_el = row_el.bg(theme.table_header_bg);
         }
         rows.push(row_el.children(cells).into_any_element());
-        if header {
-            if let Some(range) = &align_line {
-                if let Some(slice) = snap.source.get(range.clone()) {
-                    let mut delim_style =
-                        base_text_style(&theme, theme.font_size * 0.85, FontWeight::NORMAL);
-                    delim_style.color = theme.secondary_text;
-                    let layout = std::sync::Arc::new(build_code_layout(
-                        slice,
-                        range.start,
-                        &delim_style,
-                        &theme,
-                    ));
-                    let line_height = theme.line_height_for_font_size(theme.font_size * 0.85);
-                    rows.push(
-                        div()
-                            .px(px(10.))
-                            .py(px(2.))
-                            .child(BlockTextElement {
-                                editor: editor.clone(),
-                                layout,
-                                font_size: theme.font_size * 0.85,
-                                line_height,
-                                theme: theme.clone(),
-                                hug_width: false,
-                            })
-                            .into_any_element(),
-                    );
-                }
-            }
-        }
     }
     div()
         .w_full()
@@ -1022,7 +1062,7 @@ fn paragraph_element<H: WysiwygHost>(
     let theme = &snap.theme;
     let text_style = base_text_style(theme, font_size, base_weight);
     let line_height = theme.line_height_for_font_size(font_size);
-    let reveal = snap.reveal_state();
+    let reveal = paragraph_reveal_state(snap, block);
     let hosts = chrome_hosts_for(&snap.tree, block.id);
     let flow = classify_paragraph(&block.inlines);
     let role = image_role(flow).unwrap_or(ImageRole::Inline);
@@ -1165,6 +1205,16 @@ fn paragraph_element<H: WysiwygHost>(
     }
 }
 
+fn paragraph_reveal_state(snap: &RenderSnapshot, block: &Block) -> RevealState {
+    // Table delimiters remain source structure, never editable glyphs. Even
+    // an explicit markup-hint policy must not insert pipes into rich cells.
+    if matches!(block.kind, BlockKind::TableCell) {
+        RevealState::HIDDEN
+    } else {
+        snap.reveal_state()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_text_child<H: WysiwygHost>(
     children: &mut Vec<AnyElement>,
@@ -1201,7 +1251,11 @@ fn push_text_child<H: WysiwygHost>(
         hosts,
         def_chrome.as_ref(),
     );
+    if paint_end == inlines.len() {
+        project_trailing_horizontal_whitespace(&mut layout, block, source, text_style);
+    }
     if paint_start == 0 {
+        project_leading_horizontal_whitespace(&mut layout, block, source, text_style);
         apply_structural_chrome(&mut layout, block, source, reveal, hosts, text_style, theme);
     }
     if layout.text.is_empty() {
@@ -1247,10 +1301,10 @@ fn render_image<H: WysiwygHost>(
     let editor_away = editor.clone();
     let editor_click = editor.clone();
     let alt_for_edit = alt.to_string();
+    let url_for_edit = url.to_string();
     let secondary = snap.theme.secondary_text;
     let code_bg = snap.theme.code_bg;
     let inline_h = px(inline_image_height(font_size));
-    let edit_on_click = role == ImageRole::Inline;
     let click_range = image_range.clone();
     // GPUI: `img(String)` is an unvalidated URI path. Markdown images must be
     // `PathBuf`s: a preflight-approved local/data cache copy or a populated
@@ -1288,6 +1342,7 @@ fn render_image<H: WysiwygHost>(
             .map(img),
         ResolvedImage::File(_) | ResolvedImage::Blocked => None,
     };
+    let pixels_available = ready_source.is_some();
     let pixels = if let Some(source) = ready_source {
         let source = source
             .id(("md-img", image_range.start as u64))
@@ -1312,7 +1367,8 @@ fn render_image<H: WysiwygHost>(
                     .with_fallback(move || missing_image_fallback(secondary, &fallback_label))
             }
             ImageRole::Block => source
-                .max_w(px(BLOCK_IMAGE_MAX_WIDTH))
+                .max_w_full()
+                .min_w_0()
                 .max_h(px(BLOCK_IMAGE_MAX_HEIGHT))
                 .with_loading(move || {
                     div()
@@ -1325,12 +1381,16 @@ fn render_image<H: WysiwygHost>(
                 .with_fallback(move || missing_image_fallback(secondary, &fallback_label)),
         };
         source
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, window, cx| {
                 editor_click.update(cx, |host, cx| {
-                    host.select_source_range(click_range.clone(), window, cx);
-                    if edit_on_click {
-                        host.edit_image_alt(click_range.clone(), &alt_for_edit, cx);
-                    }
+                    host.open_image_editor(
+                        click_range.clone(),
+                        &alt_for_edit,
+                        &url_for_edit,
+                        window,
+                        cx,
+                    );
                 });
             })
             .into_any_element()
@@ -1345,17 +1405,26 @@ fn render_image<H: WysiwygHost>(
         placeholder
             .id(("md-img", image_range.start as u64))
             .cursor(CursorStyle::PointingHand)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, window, cx| {
                 editor_click.update(cx, |host, cx| {
-                    host.select_source_range(click_range.clone(), window, cx);
-                    if edit_on_click {
-                        host.edit_image_alt(click_range.clone(), &alt_for_edit, cx);
-                    }
+                    host.open_image_editor(
+                        click_range.clone(),
+                        &alt_for_edit,
+                        &url_for_edit,
+                        window,
+                        cx,
+                    );
                 });
             })
             .into_any_element()
     };
-    let show_caption = role == ImageRole::Block || editing;
+    let pixels = ImageBoundsElement {
+        element: pixels,
+        editor: editor.clone(),
+        range: image_range.clone(),
+    };
+    let show_caption = (pixels_available && role == ImageRole::Block && !alt.is_empty()) || editing;
     let cap_font = 12.0;
     let cap_lh = snap.theme.line_height_for_font_size(cap_font);
     let caption_el = div()
@@ -1381,6 +1450,7 @@ fn render_image<H: WysiwygHost>(
             italic: true,
             monospace: false,
             hug_width: false,
+            single_line: false,
             target: OverlayTarget::ImageAlt {
                 range: image_range.clone(),
                 stored: alt.to_string(),
@@ -1402,6 +1472,9 @@ fn render_image<H: WysiwygHost>(
             el.into_any_element()
         }
         ImageRole::Block => div()
+            .w_full()
+            .min_w_0()
+            .max_w(px(BLOCK_IMAGE_MAX_WIDTH))
             .my(px(4.))
             .flex()
             .flex_col()
@@ -1409,8 +1482,69 @@ fn render_image<H: WysiwygHost>(
             .relative()
             .child(painted_bounds_hit(editor))
             .child(pixels)
-            .child(caption_row)
+            .when(show_caption, |el| el.child(caption_row))
             .into_any_element(),
+    }
+}
+
+/// Observe the clickable image's own layout without adding a sizing wrapper.
+/// The caption/container can fit while an intrinsic-size child still overflows.
+struct ImageBoundsElement<H: WysiwygHost> {
+    element: AnyElement,
+    editor: Entity<H>,
+    range: Range<usize>,
+}
+
+impl<H: WysiwygHost> IntoElement for ImageBoundsElement<H> {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl<H: WysiwygHost> Element for ImageBoundsElement<H> {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.element.request_layout(window, cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.element.prepaint(window, cx);
+    }
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.editor.update(cx, |host, _| {
+            host.report_image_bounds(self.range.clone(), bounds)
+        });
+        self.element.paint(window, cx);
     }
 }
 
@@ -1500,8 +1634,169 @@ fn text_runs_from_highlights(
 mod tests {
     use super::*;
 
+    fn table_snapshot(source: &str) -> RenderSnapshot {
+        use markrust_core::rich::{import_markdown, IdGen};
+        RenderSnapshot {
+            tree: import_markdown(source, &mut IdGen::default()),
+            source: source.into(),
+            theme: EditorTheme::dark(),
+            base_dir: None,
+            local_image_paths: HashMap::new(),
+            local_image_pending: HashSet::new(),
+            data_image_paths: HashMap::new(),
+            data_image_pending: HashSet::new(),
+            editing_code: None,
+            editing_image: None,
+            caret: 0,
+            selected_range: 0..0,
+        }
+    }
+
+    fn table_cell_layout(
+        snapshot: &RenderSnapshot,
+        cell: &Block,
+    ) -> super::super::block_text::LeafLayout {
+        let theme = &snapshot.theme;
+        let style = base_text_style(theme, theme.font_size * 0.95, FontWeight::NORMAL);
+        build_leaf_layout_revealed(
+            cell,
+            &snapshot.source,
+            &style,
+            theme,
+            FontWeight::NORMAL,
+            &paragraph_reveal_state(snapshot, cell),
+            &chrome_hosts_for(&snapshot.tree, cell.id),
+        )
+    }
+
     #[test]
-    fn markup_hint_toggle_only_changes_reveal_state() {
+    fn rich_table_paints_only_cells_at_every_caret_and_selection() {
+        for (source, expected) in [
+            (
+                "| Name | Description |\n| :--- | ---: |\n| **First** | [Label](https://example.test) |\n| Second | `code` |\n",
+                vec!["Name", "Description", "First", "Label", "Second", "code"],
+            ),
+            ("Name|Value\n---|---\none|two\n", vec!["Name", "Value", "one", "two"]),
+            ("> | A | B |\n> | --- | --- |\n> | C | D |\n", vec!["A", "B", "C", "D"]),
+        ] {
+            let mut snapshot = table_snapshot(source);
+            let mut table = &snapshot.tree.blocks[0];
+            while !matches!(table.kind, BlockKind::Table { .. }) {
+                table = table.children.first().expect("nested table");
+            }
+            let table = table.clone();
+            assert_eq!(table.children.len(), expected.len() / 2);
+            for caret in 0..=source.len() {
+                snapshot.caret = caret;
+                snapshot.selected_range = caret..source.len();
+                let layouts: Vec<_> = table
+                    .children
+                    .iter()
+                    .flat_map(|row| {
+                        row.children
+                            .iter()
+                            .map(|cell| table_cell_layout(&snapshot, cell))
+                    })
+                    .collect();
+                assert_eq!(
+                    layouts
+                        .iter()
+                        .map(|layout| layout.text.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert!(layouts.iter().all(|layout| !layout.text.contains('|')));
+                assert_eq!(
+                    snapshot.source, source,
+                    "rendering must not normalize the Markdown"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rich_table_preserves_literal_pipes_and_maps_text_to_its_source_cell() {
+        let source = "| a\\|b | **bold** |\n| --- | --- |\n| A&amp;B |  |\n";
+        let snapshot = table_snapshot(source);
+        let table = &snapshot.tree.blocks[0];
+        let cells: Vec<_> = table
+            .children
+            .iter()
+            .flat_map(|row| &row.children)
+            .collect();
+        let layouts: Vec<_> = cells
+            .iter()
+            .map(|cell| table_cell_layout(&snapshot, cell))
+            .collect();
+        assert_eq!(
+            layouts
+                .iter()
+                .map(|layout| layout.text.as_str())
+                .collect::<Vec<_>>(),
+            ["a|b", "bold", "A&B", ""]
+        );
+        assert_eq!(
+            layouts[0].source_for_visible(0),
+            source.find("a\\|b").unwrap()
+        );
+        assert_eq!(
+            layouts[1].source_for_visible(0),
+            source.find("bold").unwrap()
+        );
+        assert_eq!(
+            layouts[2].source_for_visible(1),
+            source.find("&amp;").unwrap()
+        );
+        for (cell, layout) in cells.iter().zip(&layouts) {
+            for (_, mapped) in layout
+                .source_at
+                .iter()
+                .enumerate()
+                .filter(|(offset, _)| layout.text.is_char_boundary(*offset))
+            {
+                assert!(*mapped >= cell.source_range.start && *mapped <= cell.source_range.end);
+                assert!(layout.contains_source(*mapped));
+            }
+        }
+    }
+
+    #[test]
+    fn rich_table_visible_cell_click_can_edit_text_and_undo_without_losing_structure() {
+        use markrust_core::rich::{apply_rich_command, CaretState, RichCommand, RichEngine};
+        use markrust_core::Document;
+        let source = "| Name | Value |\n| --- | --- |\n| first |  |\n";
+        let snapshot = table_snapshot(source);
+        let row = &snapshot.tree.blocks[0].children[1];
+        for (column, cell) in row.children.iter().enumerate() {
+            let layout = table_cell_layout(&snapshot, cell);
+            let mut document = Document::new(source);
+            let mut engine = RichEngine::new();
+            let mut caret = CaretState::collapsed(layout.source_for_visible(0));
+            apply_rich_command(
+                &mut document,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("X".into()),
+            )
+            .unwrap();
+            let edited = table_snapshot(&document.buffer.content());
+            let table = &edited.tree.blocks[0];
+            assert!(matches!(table.kind, BlockKind::Table { .. }));
+            assert_eq!(table.children.len(), 2);
+            assert!(table.children.iter().all(|row| row.children.len() == 2));
+            assert!(document.buffer.content().contains("| --- | --- |"));
+            assert!(
+                table_cell_layout(&edited, &table.children[1].children[column])
+                    .text
+                    .contains('X')
+            );
+            assert!(document.undo());
+            assert_eq!(document.buffer.content(), source);
+        }
+    }
+
+    #[test]
+    fn markup_hints_and_caret_never_change_live_text_projection() {
         let mut snapshot = RenderSnapshot {
             tree: RichTree::default(),
             source: "**bold**".into(),
@@ -1515,12 +1810,154 @@ mod tests {
             editing_image: None,
             caret: 3,
             selected_range: 3..3,
-            markup_hints_enabled: true,
         };
-        assert!(snapshot.reveal_state().intersects(&(0..8)));
-
-        snapshot.markup_hints_enabled = false;
         assert!(!snapshot.reveal_state().intersects(&(0..8)));
-        assert_eq!(snapshot.caret, 3, "the editable source caret is unchanged");
+
+        snapshot.caret = 7;
+        snapshot.selected_range = 2..7;
+        assert!(!snapshot.reveal_state().intersects(&(0..8)));
+        assert_eq!(snapshot.caret, 7, "the editable source caret is unchanged");
+    }
+
+    #[test]
+    fn live_context_does_not_insert_heading_link_list_or_code_chrome() {
+        use markrust_core::rich::{import_markdown, IdGen};
+        for source in [
+            "# Heading with **bold**\n",
+            "A [label](https://example.test/very/long/destination) and **bold**.\n",
+            "- **First item**\n- Second item\n",
+            "```rust\nlet x = 1;\n```\n",
+        ] {
+            let tree = import_markdown(source, &mut IdGen::default());
+            let mut snapshot = RenderSnapshot {
+                tree,
+                source: source.into(),
+                theme: EditorTheme::dark(),
+                base_dir: None,
+                local_image_paths: HashMap::new(),
+                local_image_pending: HashSet::new(),
+                data_image_paths: HashMap::new(),
+                data_image_pending: HashSet::new(),
+                editing_code: None,
+                editing_image: None,
+                caret: 0,
+                selected_range: 0..0,
+            };
+            let projection = |snapshot: &RenderSnapshot| {
+                let mut block = &snapshot.tree.blocks[0];
+                while let Some(child) = block.children.first() {
+                    block = child;
+                }
+                let style = base_text_style(
+                    &snapshot.theme,
+                    snapshot.theme.font_size,
+                    FontWeight::NORMAL,
+                );
+                let hosts = chrome_hosts_for(&snapshot.tree, block.id);
+                let layout = build_leaf_layout_revealed(
+                    block,
+                    &snapshot.source,
+                    &style,
+                    &snapshot.theme,
+                    FontWeight::NORMAL,
+                    &snapshot.reveal_state(),
+                    &hosts,
+                );
+                (
+                    layout.text,
+                    layout.source_at,
+                    layout
+                        .runs
+                        .iter()
+                        .map(|run| (run.len, run.font.weight))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let expected = projection(&snapshot);
+            for caret in 0..=source.len() {
+                snapshot.caret = caret;
+                snapshot.selected_range = caret..caret;
+                assert_eq!(
+                    projection(&snapshot),
+                    expected,
+                    "caret {caret} changed live projection for {source:?}"
+                );
+            }
+            snapshot.selected_range = 0..source.len();
+            assert_eq!(
+                projection(&snapshot),
+                expected,
+                "selection changed live projection"
+            );
+        }
+    }
+
+    #[test]
+    fn newly_continued_empty_list_item_has_a_rendered_caret_home() {
+        use markrust_core::rich::{import_markdown, IdGen};
+        for source in ["- First\n- ", "1. First\n2. ", "- [x] First\n- [ ] "] {
+            let tree = import_markdown(source, &mut IdGen::default());
+            let list = &tree.blocks[0];
+            let item = list.children.last().expect("continued list item");
+            let blanks = prefix_blanks_for(item, &tree);
+            let theme = EditorTheme::dark();
+            let style = base_text_style(&theme, theme.font_size, FontWeight::NORMAL);
+            let layout = if let Some(blank) = blanks.iter().find(|blank| blank.home == source.len())
+            {
+                build_prefix_blank_layout(source, blank, &RevealState::HIDDEN, &style, &theme)
+            } else {
+                // Empty task items retain a zero-text paragraph in Comrak;
+                // ordinary empty items instead use the prefix-blank leaf.
+                let child = item.children.first().expect("empty item text leaf");
+                let hosts = chrome_hosts_for(&tree, child.id);
+                build_leaf_layout_revealed(
+                    child,
+                    source,
+                    &style,
+                    &theme,
+                    FontWeight::NORMAL,
+                    &RevealState::HIDDEN,
+                    &hosts,
+                )
+            };
+            assert!(layout.text.is_empty());
+            assert!(layout.contains_source(source.len()));
+        }
+    }
+
+    #[test]
+    fn exited_middle_list_gap_is_an_unbulleted_source_backed_caret_leaf() {
+        use markrust_core::rich::{import_markdown, IdGen};
+        for (source, home) in [
+            ("- First\n\n- Following", 8),
+            ("1. First\n\n1. Following", 9),
+        ] {
+            let tree = import_markdown(source, &mut IdGen::default());
+            assert_eq!(tree.blocks.len(), 1, "CommonMark keeps one loose list");
+            let gaps = list_blank_gaps(&tree.blocks[0], &tree);
+            assert_eq!(gaps, vec![home..home + 1]);
+            let layout = super::super::block_text::build_blank_gap_layout(gaps[0].clone());
+            assert!(layout.text.is_empty());
+            assert!(layout.contains_source(home));
+            assert_eq!(layout.source_for_visible(0), home);
+        }
+    }
+
+    #[test]
+    fn list_draft_reserves_the_future_paragraph_separator_spacing() {
+        for theme in [EditorTheme::light(), EditorTheme::dark()] {
+            let reserve = paragraph_draft_spacing(&theme) - LIST_ROW_GAP;
+            let row_height = theme.line_height_for_font_size(theme.font_size);
+            assert_eq!(
+                LIST_ROW_GAP + reserve,
+                row_height + 2. * TOP_BLOCK_VERTICAL_PADDING,
+                "draft baseline must already include the paragraph's separator and padding"
+            );
+            assert_eq!(
+                LIST_ROW_GAP + reserve,
+                paragraph_draft_spacing(&theme),
+                "the following list must retain its baseline when the draft becomes text"
+            );
+        }
     }
 }

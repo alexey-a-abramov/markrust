@@ -1,40 +1,37 @@
 ---
 import DocsLayout from '../../layouts/DocsLayout.astro';
-import CodeBlock from '../../components/CodeBlock.astro';
 import Callout from '../../components/Callout.astro';
 
 const headings = [
   { id: 'requirements', text: 'Requirements', level: 2 },
   { id: 'releases', text: 'GitHub Releases', level: 2 },
   { id: 'homebrew', text: 'Homebrew', level: 2 },
-  { id: 'cargo', text: 'Cargo', level: 2 },
-  { id: 'build', text: 'Build from source', level: 2 },
+  { id: 'development', text: 'Development builds', level: 2 },
 ];
 ---
 
 <DocsLayout title="Installation" headings={headings}>
   <h2 id="requirements">Requirements</h2>
   <ul>
-    <li><strong>macOS</strong> 12+ (Apple Silicon or Intel)</li>
-    <li><strong>Linux</strong> x86_64 with GPUI system libraries</li>
-    <li><strong>Windows</strong> — planned for v0.2</li>
-    <li><strong>Rust 1.96+</strong> when building from source</li>
+    <li><strong>macOS:</strong> Apple Silicon or Intel; native build jobs are prepared for both architectures.</li>
+    <li><strong>Linux:</strong> experimental x86_64 builds for an X11/Wayland desktop with Vulkan graphics and the required system libraries.</li>
+    <li><strong>Windows:</strong> experimental x86_64 build job; native editor, clipboard, IME, and recovery-directory privacy/locking acceptance remain pending.</li>
   </ul>
 
   <h2 id="releases">GitHub Releases</h2>
-  <p>Prebuilt release archives are not published yet. Follow the <a href="https://github.com/alexey-a-abramov/markrust/releases">releases page</a> for the first tagged alpha. Until then, <a href="/docs/building">build from source</a>.</p>
+  <p>Successful branch builds provide 14-day Actions artifacts; matching version tags publish checksum-backed GitHub Releases after all gates pass. The v0.8.1 release is the first macOS in-app update test target. Confirm available downloads on the releases page before installing.</p>
+  <p>On macOS, the application menu checks for new stable releases automatically or on demand. Download and restart require your confirmation; unsaved drafts in every window must be checkpointed first. In-app replacement is not supported on Windows or Linux yet. macOS bundles are ad-hoc signed, not Developer-ID signed or notarized.</p>
+  <p>Follow the <a href="https://github.com/alexey-a-abramov/markrust/releases">releases page</a> for public downloads. No current download link is implied by the prepared workflows.</p>
+  <Callout type="note">
+    <p>The prepared macOS bundles are ad-hoc signed, not Developer-ID signed or notarized. Windows archives are explicitly experimental and unsigned. Gatekeeper or SmartScreen may warn or block these development builds.</p>
+  </Callout>
 
   <h2 id="homebrew">Homebrew</h2>
   <p>The Homebrew tap is not published yet. It will be available after release archives and their checksums are published.</p>
 
-  <h2 id="cargo">Cargo</h2>
-  <p>The desktop binary depends on GPUI from a pinned git revision:</p>
-  <CodeBlock code="cargo install --git https://github.com/alexey-a-abramov/markrust markrust" terminal />
-  <Callout type="note">
-    <p>After the package is published and GPUI is available on crates.io, <code>cargo install markrust</code> will work without the git URL.</p>
-  </Callout>
+  <h2 id="development">Development builds</h2>
+  <p>Until binary downloads are published, developers can use the <a href="/docs/building">source-build instructions</a>, including platform toolchains and Cargo installation. These are development workflows, not a one-click end-user installer.</p>
 
-  <h2 id="build">Build from source</h2>
-  <CodeBlock code={`git clone https://github.com/alexey-a-abramov/markrust.git\ncd markrust\ncargo build --release -p markrust\n./target/release/markrust`} terminal />
-  <p>On Linux, install GPUI dependencies first: <code>bash scripts/install-linux-deps.sh</code></p>
+  <h2>Related</h2>
+  <p><a href="/docs/building">Building from source</a> · <a href="/docs/roadmap">Release gates</a> · <a href="https://github.com/alexey-a-abramov/markrust/blob/main/docs/deployment.md">Distribution reference</a></p>
 </DocsLayout>

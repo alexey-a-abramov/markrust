@@ -136,6 +136,17 @@ pub enum RichCommand {
         source_range: Range<usize>,
         alt: String,
     },
+    /// Update an image atomically without normalizing the surrounding prose.
+    SetImage {
+        source_range: Range<usize>,
+        alt: String,
+        url: String,
+    },
+    /// Commit one inline Markdown destination without rewriting its label/title.
+    SetLinkDestination {
+        destination: Range<usize>,
+        url: String,
+    },
     SetFrontmatter {
         raw: String,
     },
@@ -179,6 +190,12 @@ pub fn apply_rich_command(
 ) -> Result<RichOutcome, RichError> {
     engine.sync(doc);
     caret.clamp(doc.buffer.len_bytes());
+    let auto_list_prefix = engine.take_auto_list_prefix(doc.revision(), caret.cursor());
+    if matches!(command, RichCommand::Backspace) && caret.range.is_empty() {
+        if let Some((range, literal)) = auto_list_prefix {
+            return rewrite_range(doc, engine, caret, range, &literal);
+        }
+    }
     // YAML is the frontmatter panel. Body commands must not splice into it
     // (a caret at 0 on a file with `---` would otherwise type `x---`).
     if !matches!(
@@ -212,6 +229,14 @@ pub fn apply_rich_command(
         RichCommand::SetCodeInfo { id, info } => set_code_info(doc, engine, caret, id, &info),
         RichCommand::SetImageAlt { source_range, alt } => {
             set_image_alt(doc, engine, caret, source_range, &alt)
+        }
+        RichCommand::SetImage {
+            source_range,
+            alt,
+            url,
+        } => set_image(doc, engine, caret, source_range, &alt, &url),
+        RichCommand::SetLinkDestination { destination, url } => {
+            set_link_destination(doc, engine, caret, destination, &url)
         }
         RichCommand::SetFrontmatter { raw } => set_frontmatter(doc, engine, caret, &raw),
         RichCommand::SetFrontmatterField { key, value } => {
@@ -279,16 +304,24 @@ fn insert_text(
     caret: &mut CaretState,
     text: &str,
 ) -> Result<RichOutcome, RichError> {
-    if caret.range.is_empty() || text.is_empty() {
+    let opens_blank_paragraph =
+        blank_text_insertion_plan(engine, &doc.buffer.content(), caret.cursor())
+            .is_some_and(|(home, padding)| padding > 0 || home != caret.cursor());
+    if (caret.range.is_empty() && !opens_blank_paragraph) || text.is_empty() {
         return insert_text_inner(doc, engine, caret, text);
     }
     // Deletion must run through Markdown-aware selection expansion before
     // insertion can resolve its new context (table cells, links, lists).
     // Keep those splices, but expose the replacement as one user undo step.
     // Prevent coalescing even when selection clamping makes deletion empty.
+    let starts_typing_in_blank = caret.range.is_empty() && opens_blank_paragraph;
     let undo_group = doc.begin_undo_group(caret.snapshot());
     let result = insert_text_inner(doc, engine, caret, text);
-    doc.finish_undo_group(undo_group, caret.snapshot());
+    if starts_typing_in_blank {
+        doc.finish_typing_undo_group(undo_group, caret.snapshot());
+    } else {
+        doc.finish_undo_group(undo_group, caret.snapshot());
+    }
     result
 }
 
@@ -308,11 +341,16 @@ fn insert_text_inner(
         delete_range(doc, engine, caret, TransactionKind::Command)?;
         engine.sync(doc);
     }
+    prepare_blank_text_insertion(doc, engine, caret);
     if text.contains('\n') || text.contains('\r') {
         return insert_multiline_text(doc, engine, caret, text);
     }
     let source = doc.buffer.content();
-    let mut offset = insert_offset_escaping_table_pipe(engine, &source, caret.cursor());
+    let mut offset = insertion_home_after_trailing_blank(
+        engine,
+        &source,
+        insert_offset_escaping_table_pipe(engine, &source, caret.cursor()),
+    );
     // 0–3 space CommonMark indent before ATX `#`: type into the title, not
     // the orphan indent (`x # Title` would become a paragraph).
     if let Some(heading) = heading_at(engine, offset) {
@@ -425,6 +463,9 @@ fn insert_text_inner(
         };
         escape_text(text, ctx)
     };
+    if in_table && !raw && !needs_newline_after_frontmatter_fence(&source, engine, caret.cursor()) {
+        inserted = encode_table_boundary_spaces(doc, engine, &source, offset, inserted);
+    }
     // Typora empty quotes/lists are `> ` / `- `, not `>`. InsertText at
     // that home fills in the missing marker space so typing is `> x`.
     if empty_prefix_home_needs_marker_space(engine.tree(), &source, offset, &inserted) {
@@ -481,7 +522,11 @@ fn insert_multiline_text(
 ) -> Result<RichOutcome, RichError> {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let source = doc.buffer.content();
-    let offset = insert_offset_escaping_table_pipe(engine, &source, caret.cursor());
+    let offset = insertion_home_after_trailing_blank(
+        engine,
+        &source,
+        insert_offset_escaping_table_pipe(engine, &source, caret.cursor()),
+    );
     if caret.range.is_empty() {
         caret.collapse_to(offset);
     }
@@ -531,6 +576,80 @@ fn insert_multiline_text(
         inserted.push_str(line);
     }
     commit_inserted_text(doc, engine, caret, offset, inserted, true)
+}
+
+/// One painted trailing blank can map to any of its source newlines. Typing
+/// before its first terminator consumes the separator (`- item\ntext\n`) and
+/// silently rejoins a list as lazy continuation. Open text after the first
+/// existing separator line; extra newlines and already typed spaces keep their
+/// source positions instead of being normalized away.
+fn blank_text_insertion_plan(
+    engine: &RichEngine,
+    source: &str,
+    offset: usize,
+) -> Option<(usize, usize)> {
+    if engine.tree().blocks.is_empty() {
+        return None;
+    }
+    let gap = blank_caret_gap_at(engine.tree(), offset)?;
+    if !source
+        .get(gap.clone())?
+        .bytes()
+        .all(|byte| matches!(byte, b'\r' | b'\n'))
+    {
+        return None;
+    }
+    let home = if gap.start == frontmatter_body_start(engine.tree()) {
+        offset
+    } else {
+        source[gap.start..gap.end]
+            .find('\n')
+            .map_or(offset, |terminator| offset.max(gap.start + terminator + 1))
+    };
+    let padding = if gap.end < source.len() {
+        2usize.saturating_sub(
+            source[home..gap.end]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count(),
+        )
+    } else {
+        0
+    };
+    Some((home, padding))
+}
+
+fn insertion_home_after_trailing_blank(engine: &RichEngine, source: &str, offset: usize) -> usize {
+    blank_text_insertion_plan(engine, source, offset).map_or(offset, |(home, _)| home)
+}
+
+/// Materialize only the separator needed when the user starts typing in an
+/// interior blank. An empty draft stays source-only until this first edit;
+/// then the new paragraph is separated from both neighboring blocks. The
+/// caller groups this splice with typing as one undo step.
+fn prepare_blank_text_insertion(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+) {
+    let source = doc.buffer.content();
+    let Some((home, padding)) = blank_text_insertion_plan(engine, &source, caret.cursor()) else {
+        return;
+    };
+    if padding > 0 {
+        let before = caret.snapshot();
+        let after = CaretState::collapsed(home);
+        doc.replace_range_tx(
+            home,
+            home,
+            &"\n".repeat(padding),
+            TransactionKind::Command,
+            before,
+            after.snapshot(),
+        );
+        *caret = after;
+        engine.sync(doc);
+    }
 }
 
 fn format_table_paste(text: &str, source: &str, offset: usize) -> String {
@@ -900,6 +1019,22 @@ fn apply_input_rule(
             *caret = after;
             engine.sync(doc);
             caret.clamp(doc.buffer.len_bytes());
+            // Backspace immediately after `- ` (or another list prefix)
+            // cancels autoformatting while keeping the user's literal marker
+            // and separator. Existing lists retain normal structural delete.
+            if list_marker_prefix(&insert).as_deref() == Some(insert.as_str()) {
+                engine.remember_auto_list_prefix(
+                    doc.revision(),
+                    start..start + insert.len(),
+                    escape_text(
+                        &insert,
+                        EscapeContext {
+                            in_table: false,
+                            at_line_start: true,
+                        },
+                    ),
+                );
+            }
             Ok(RichOutcome::Changed)
         }
     }
@@ -907,6 +1042,71 @@ fn apply_input_rule(
 
 fn is_coalescable_insert(text: &str) -> bool {
     crate::undo::is_typing_burst(text)
+}
+
+/// Literal boundary spaces are indistinguishable from GFM alignment padding
+/// and disappear during import. Encode only newly entered spaces which would
+/// be trimmed, using ordinary U+0020 (not NBSP). Existing padding/source stays
+/// untouched, internal spaces stay literal, and Source-mode edits bypass this.
+fn encode_table_boundary_spaces(
+    doc: &Document,
+    engine: &RichEngine,
+    source: &str,
+    offset: usize,
+    inserted: String,
+) -> String {
+    // A first keystroke after an EOF closing pipe opens a body line. GFM can
+    // temporarily interpret its unfinished marker as another table row;
+    // preserve the literal separator which lets `# ` / `- ` finish that rule.
+    if doc.undo_stack().last().is_some_and(|transaction| {
+        transaction.ops.iter().any(|operation| match operation {
+            crate::undo::EditOperation::Insert { byte_offset, text } => {
+                text.starts_with('\n')
+                    && *byte_offset + text.len() == offset
+                    && source
+                        .get(..*byte_offset)
+                        .is_some_and(|prefix| prefix.trim_end_matches([' ', '\t']).ends_with('|'))
+            }
+            _ => false,
+        })
+    }) {
+        return inserted;
+    }
+    let Some(cell) = engine.cell_edit_range(offset, source) else {
+        return inserted;
+    };
+    let Some(raw) = source.get(cell.clone()) else {
+        return inserted;
+    };
+    let body_start = cell.start + raw.len() - raw.trim_start_matches([' ', '\t']).len();
+    let body_end = cell.start + raw.trim_end_matches([' ', '\t']).len();
+    let prefix = if offset <= body_start {
+        inserted.bytes().take_while(|byte| *byte == b' ').count()
+    } else {
+        0
+    };
+    let suffix = if offset >= body_end {
+        inserted
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b' ')
+            .count()
+    } else {
+        0
+    };
+    if prefix == 0 && suffix == 0 {
+        return inserted;
+    }
+    let suffix_start = inserted.len().saturating_sub(suffix);
+    let mut encoded = String::with_capacity(inserted.len());
+    for (index, ch) in inserted.char_indices() {
+        if ch == ' ' && (index < prefix || index >= suffix_start) {
+            encoded.push_str("&#32;");
+        } else {
+            encoded.push(ch);
+        }
+    }
+    encoded
 }
 
 /// Empty `>` / `-` / `1.` (no trailing space) still host a caret after the
@@ -2018,6 +2218,7 @@ fn split_block(
     engine: &mut RichEngine,
     caret: &mut CaretState,
 ) -> Result<RichOutcome, RichError> {
+    let deleted_selection = !caret.range.is_empty();
     if !caret.range.is_empty() {
         delete_range(doc, engine, caret, TransactionKind::Command)?;
         engine.sync(doc);
@@ -2108,6 +2309,17 @@ fn split_block(
     // one node. A paragraph `\n\n` split orphans the closer as prose.
     if let Some((hit, _)) = wrap_span_split_at(&source, engine, offset) {
         return apply_markdown_link_split(doc, engine, caret, &source, offset, hit, false);
+    }
+    // A Comrak-less plain blank already represents one editable paragraph.
+    // Enter there keeps that paragraph rather than growing an invisible run
+    // of Markdown separators. Structural exits and literal code newlines
+    // above retain their own behavior; existing whitespace stays byte-exact.
+    if blank_caret_gap_at(engine.tree(), offset).is_some() {
+        return Ok(if deleted_selection {
+            RichOutcome::Changed
+        } else {
+            RichOutcome::Noop
+        });
     }
     let Some(leaf_id) = engine.block_at(offset) else {
         splice(doc, caret, offset, offset, "\n\n", TransactionKind::Command);
@@ -4556,7 +4768,7 @@ fn toggle_link(
     Ok(RichOutcome::Changed)
 }
 
-fn toggle_link_inlines(inlines: &mut [Inline], sel: &Range<usize>, wrap: bool) {
+fn toggle_link_inlines(inlines: &mut Vec<Inline>, sel: &Range<usize>, wrap: bool) {
     let link = if wrap {
         Some(LinkAttrs {
             url: String::new(),
@@ -4568,27 +4780,56 @@ fn toggle_link_inlines(inlines: &mut [Inline], sel: &Range<usize>, wrap: bool) {
     } else {
         None
     };
-    for inline in inlines.iter_mut() {
+    let mut out = Vec::with_capacity(inlines.len() + 2);
+    for inline in inlines.drain(..) {
         match inline {
             Inline::Run {
+                text,
                 source_range,
-                link: slot,
-                raw,
+                link: original_link,
+                marks,
+                fidelity,
                 ..
-            } if ranges_overlap(source_range, sel) => {
-                *slot = link.clone();
-                *raw = None;
+            } if ranges_overlap(&source_range, sel) => {
+                // Match mark toggling: an exact source/text run can be split
+                // at selection edges. Decoded escapes keep the conservative
+                // whole-run policy in split_run_text rather than guessing.
+                for (text, source_range, covered) in split_run_text(&text, &source_range, sel) {
+                    out.push(Inline::Run {
+                        text,
+                        raw: None,
+                        source_range,
+                        marks,
+                        link: if covered {
+                            link.clone()
+                        } else {
+                            original_link.clone()
+                        },
+                        fidelity,
+                    });
+                }
             }
             Inline::Image {
+                alt,
+                url,
+                title,
                 source_range,
-                link: slot,
+                marks,
                 ..
-            } if ranges_overlap(source_range, sel) => {
-                *slot = link.clone();
+            } if ranges_overlap(&source_range, sel) => {
+                out.push(Inline::Image {
+                    alt,
+                    url,
+                    title,
+                    source_range,
+                    marks,
+                    link: link.clone(),
+                });
             }
-            _ => {}
+            other => out.push(other),
         }
     }
+    *inlines = out;
 }
 
 /// Dest-chrome widget containing `offset` (not wrapping dest after `)` — that
@@ -5938,8 +6179,23 @@ fn outdent_current_list_line(
     let rest = after.get(prefix.len()..).unwrap_or("");
     if rest.trim().is_empty() {
         if !quote.is_empty() {
-            // Typora: empty quoted list item becomes an empty quoted paragraph.
-            return rewrite_range(doc, engine, caret, start..start + line.len(), &quote);
+            // Retain the quote, but leave a quoted blank separator before the
+            // new paragraph so its text cannot lazily continue the prior item.
+            let replacement = if start == 0 {
+                quote
+            } else {
+                format!("{quote}\n{quote}")
+            };
+            splice(
+                doc,
+                caret,
+                start,
+                start + line.len(),
+                &replacement,
+                TransactionKind::Command,
+            );
+            engine.sync(doc);
+            return Ok(RichOutcome::Changed);
         }
         let mut from = start;
         let mut to = start + line.len();
@@ -5951,7 +6207,32 @@ fn outdent_current_list_line(
             from -= 1;
             replacement = "\n\n".to_string();
         }
-        return rewrite_range(doc, engine, caret, from..to, &replacement);
+        // This is a newly opened paragraph, not a length-preserving rewrite.
+        // In particular, when the item had a trailing newline, delta-based
+        // caret preservation lands *inside* the blank separator. Typing there
+        // removes that separator and reparses as a lazy list continuation.
+        let mut home = from + replacement.len();
+        let following = &source[to..];
+        if !following.trim().is_empty() && !following.starts_with('\n') {
+            if replacement.is_empty() {
+                replacement.push('\n');
+            } else {
+                home = home.saturating_sub(1);
+            }
+        }
+        let before = caret.snapshot();
+        let after = CaretState::collapsed(home);
+        doc.replace_range_tx(
+            from,
+            to,
+            &replacement,
+            TransactionKind::Command,
+            before,
+            after.snapshot(),
+        );
+        *caret = after;
+        engine.sync(doc);
+        return Ok(RichOutcome::Changed);
     }
     let new_line = format!("{quote}{rest}");
     rewrite_range(doc, engine, caret, start..start + line.len(), &new_line)
@@ -6141,6 +6422,64 @@ fn sanitize_info(info: &str) -> String {
         .to_string()
 }
 
+fn set_link_destination(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    destination: Range<usize>,
+    url: &str,
+) -> Result<RichOutcome, RichError> {
+    let source = doc.buffer.content();
+    if url.chars().any(char::is_control)
+        || source.get(destination.clone()).is_none()
+        || source.as_bytes().get(destination.start) != Some(&b'(')
+        || source.as_bytes().get(destination.end.saturating_sub(1)) != Some(&b')')
+    {
+        return Err(RichError::InvalidRange);
+    }
+    let parts = markdown_link_dest_parts(&source, destination).ok_or(RichError::InvalidRange)?;
+    let mut form = parts.url.clone();
+    let angled = form.start > parts.outer.start
+        && source.as_bytes().get(form.start - 1) == Some(&b'<')
+        && source.as_bytes().get(form.end) == Some(&b'>');
+    if angled {
+        form.start -= 1;
+        form.end += 1;
+    }
+    let mut escaped = String::new();
+    for ch in url.chars() {
+        if ch == '&' {
+            escaped.push_str("&amp;");
+            continue;
+        }
+        if matches!(ch, '\\' | '<' | '>' | '(' | ')') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    let text = if angled {
+        format!("<{escaped}>")
+    } else {
+        super::serialize::printable_url(&escaped, parts.title.is_some())
+    };
+    let after = CaretState::collapsed(parts.outer.start.saturating_sub(1));
+    if source.get(form.clone()) == Some(text.as_str()) {
+        *caret = after;
+        return Ok(RichOutcome::Noop);
+    }
+    doc.replace_range_tx(
+        form.start,
+        form.end,
+        &text,
+        TransactionKind::Command,
+        caret.snapshot(),
+        after.snapshot(),
+    );
+    *caret = after;
+    engine.sync(doc);
+    Ok(RichOutcome::Changed)
+}
+
 fn set_image_alt(
     doc: &mut Document,
     engine: &mut RichEngine,
@@ -6175,6 +6514,92 @@ fn set_image_alt(
         return Ok(RichOutcome::Noop);
     }
     splice_serialized(doc, engine, caret, &top, &rewritten)
+}
+
+fn set_image(
+    doc: &mut Document,
+    engine: &mut RichEngine,
+    caret: &mut CaretState,
+    image_range: Range<usize>,
+    alt: &str,
+    url: &str,
+) -> Result<RichOutcome, RichError> {
+    if alt.chars().any(char::is_control) || url.chars().any(char::is_control) {
+        return Err(RichError::InvalidRange);
+    }
+    engine.sync(doc);
+    let source = doc.buffer.content();
+    let Some(block) = engine
+        .block_at(image_range.start)
+        .and_then(|id| engine.block(id))
+    else {
+        return Err(RichError::InvalidRange);
+    };
+    let Some(title) = block.inlines.iter().find_map(|inline| match inline {
+        Inline::Image {
+            source_range,
+            title,
+            ..
+        } if *source_range == image_range => Some(title.clone()),
+        _ => None,
+    }) else {
+        return Err(RichError::InvalidRange);
+    };
+    if !source
+        .get(image_range.clone())
+        .is_some_and(|text| text.starts_with("!["))
+    {
+        return Err(RichError::InvalidRange);
+    }
+    let in_table = engine.in_table(image_range.start);
+    let escaped_alt = escape_text(
+        alt,
+        EscapeContext {
+            in_table,
+            at_line_start: false,
+        },
+    );
+    let mut escaped_url = String::new();
+    for ch in url.chars() {
+        if ch == '&' {
+            escaped_url.push_str("&amp;");
+        } else {
+            if matches!(ch, '\\' | '<' | '>' | '(' | ')') || in_table && ch == '|' {
+                escaped_url.push('\\');
+            }
+            escaped_url.push(ch);
+        }
+    }
+    let destination = super::serialize::printable_url(&escaped_url, title.is_some());
+    let title = title
+        .map(|text| {
+            let mut text = text
+                .replace('&', "&amp;")
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            if in_table {
+                text = text.replace('|', "\\|");
+            }
+            format!(" \"{text}\"")
+        })
+        .unwrap_or_default();
+    let replacement = format!("![{escaped_alt}]({destination}{title})");
+    let after = CaretState::collapsed(image_range.start);
+    if source.get(image_range.clone()) == Some(replacement.as_str()) {
+        *caret = after;
+        return Ok(RichOutcome::Noop);
+    }
+    doc.replace_range_tx(
+        image_range.start,
+        image_range.end,
+        &replacement,
+        TransactionKind::Command,
+        caret.snapshot(),
+        after.snapshot(),
+    );
+    *caret = after;
+    engine.sync(doc);
+    Ok(RichOutcome::Changed)
 }
 
 fn set_frontmatter(
@@ -6642,6 +7067,423 @@ mod tests {
     ) -> String {
         apply_rich_command(doc, engine, caret, cmd).unwrap();
         doc.buffer.content()
+    }
+
+    #[test]
+    fn enter_at_nonempty_paragraph_end_opens_an_editable_paragraph() {
+        for body in ["Это прекрасно аффы", "Это прекрасно аффы  "] {
+            for suffix in ["", "\n", "\r\n", "\n\nСледующий абзац", "\n\n# Heading"] {
+                let source = format!("{body}{suffix}");
+                let offset = body.len();
+                let (mut doc, mut engine, mut caret) = setup(&source);
+                caret.collapse_to(offset);
+                assert!(
+                    blank_caret_gap_at(engine.tree(), offset).is_none(),
+                    "the visible paragraph end is not an empty paragraph: {source:?}",
+                );
+                assert_eq!(
+                    apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock,)
+                        .unwrap(),
+                    RichOutcome::Changed,
+                    "Enter must change a nonempty paragraph: {source:?}",
+                );
+                assert_eq!(doc.buffer.content(), format!("{body}\n\n{suffix}"));
+                assert_eq!(caret.cursor(), offset + 2);
+                let empty = blank_caret_gap_at(engine.tree(), caret.cursor())
+                    .expect("the insertion caret belongs to the new empty paragraph");
+                for bias in [Bias::Left, Bias::Right] {
+                    let snapped = engine.snap_caret(caret.cursor(), bias);
+                    assert_eq!(
+                        blank_caret_gap_at(engine.tree(), snapped),
+                        Some(empty.clone()),
+                        "snapping must not send the new caret into a neighboring paragraph",
+                    );
+                }
+
+                let revision = doc.revision();
+                let first_enter = doc.buffer.content();
+                assert_eq!(
+                    apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock,)
+                        .unwrap(),
+                    RichOutcome::Noop,
+                );
+                assert_eq!(doc.buffer.content(), first_enter);
+                assert_eq!(doc.revision(), revision);
+                assert_eq!(caret.cursor(), offset + 2);
+
+                apply(
+                    &mut doc,
+                    &mut engine,
+                    &mut caret,
+                    RichCommand::InsertText("Новый".into()),
+                );
+                assert_eq!(doc.buffer.content(), format!("{body}\n\nНовый{suffix}"));
+                assert_eq!(caret.cursor(), offset + 2 + "Новый".len());
+                let new_paragraph = engine
+                    .block(
+                        engine
+                            .block_at(caret.cursor())
+                            .expect("new text caret block"),
+                    )
+                    .expect("new text paragraph");
+                assert_eq!(new_paragraph.kind, BlockKind::Paragraph);
+                assert!(new_paragraph.source_range.start >= offset + 2);
+            }
+        }
+    }
+
+    #[test]
+    fn enter_replacing_a_paragraph_end_selection_targets_the_new_paragraph() {
+        for reversed in [false, true] {
+            let source = "Это прекрасно аффы\n\nСледующий абзац";
+            let start = source.find("аффы").expect("selected word");
+            let end = start + "аффы".len();
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.range = start..end;
+            caret.reversed = reversed;
+            assert_eq!(
+                apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock,)
+                    .unwrap(),
+                RichOutcome::Changed,
+            );
+            assert_eq!(
+                doc.buffer.content(),
+                "Это прекрасно \n\n\n\nСледующий абзац"
+            );
+            assert_eq!(caret.range, start + 2..start + 2);
+            assert!(!caret.reversed);
+            assert!(blank_caret_gap_at(engine.tree(), caret.cursor()).is_some());
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("Новый".into()),
+            );
+            assert_eq!(
+                doc.buffer.content(),
+                "Это прекрасно \n\nНовый\n\nСледующий абзац",
+            );
+            assert_eq!(caret.cursor(), start + 2 + "Новый".len());
+        }
+    }
+
+    #[test]
+    fn enter_at_eof_after_one_line_terminator_still_opens_a_paragraph() {
+        for terminator in ["\n", "\r\n"] {
+            let source = format!("Это прекрасно аффы{terminator}");
+            let (mut doc, mut engine, mut caret) = setup(&source);
+            caret.collapse_to(source.len());
+            assert!(blank_caret_gap_at(engine.tree(), caret.cursor()).is_none());
+            assert_eq!(
+                apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock,)
+                    .unwrap(),
+                RichOutcome::Changed,
+            );
+            assert_eq!(doc.buffer.content(), format!("{source}\n\n"));
+            assert_eq!(caret.cursor(), source.len() + 2);
+            let empty = blank_caret_gap_at(engine.tree(), caret.cursor())
+                .expect("EOF now belongs to an empty paragraph");
+            for bias in [Bias::Left, Bias::Right] {
+                assert_eq!(
+                    blank_caret_gap_at(engine.tree(), engine.snap_caret(caret.cursor(), bias)),
+                    Some(empty.clone()),
+                );
+            }
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("Новый".into()),
+            );
+            assert_eq!(doc.buffer.content(), format!("{source}\n\nНовый"));
+            let new_paragraph = engine
+                .block(
+                    engine
+                        .block_at(caret.cursor())
+                        .expect("new text caret block"),
+                )
+                .expect("new text paragraph");
+            assert_eq!(new_paragraph.kind, BlockKind::Paragraph);
+            assert!(new_paragraph.source_range.start >= source.len());
+        }
+    }
+
+    #[test]
+    fn typing_spaces_then_enter_keeps_one_empty_paragraph_and_undo_history() {
+        let original = "café 🌍";
+        let (mut doc, mut engine, mut caret) = setup(original);
+        caret.collapse_to(original.len());
+        for _ in 0..2 {
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(" ".into()),
+            );
+        }
+        let spaced = format!("{original}  ");
+        assert_eq!(doc.buffer.content(), spaced);
+        assert_eq!(caret.cursor(), spaced.len());
+
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        let empty_paragraph = format!("{spaced}\n\n");
+        assert_eq!(doc.buffer.content(), empty_paragraph);
+        assert_eq!(caret.cursor(), empty_paragraph.len());
+        assert!(blank_caret_gap_at(engine.tree(), caret.cursor()).is_some());
+        let revision = doc.revision();
+        assert_eq!(
+            apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock).unwrap(),
+            RichOutcome::Noop,
+        );
+        assert_eq!(doc.buffer.content(), empty_paragraph);
+        assert_eq!(doc.revision(), revision);
+        assert_eq!(caret.cursor(), empty_paragraph.len());
+
+        let undo = doc.undo_tx().expect("one paragraph insertion undo step");
+        caret.restore(undo.selection_after);
+        engine.sync(&doc);
+        assert_eq!(doc.buffer.content(), spaced);
+        assert_eq!(caret.cursor(), spaced.len());
+        let redo = doc.redo_tx().expect("paragraph insertion redo");
+        caret.restore(redo.selection_after);
+        engine.sync(&doc);
+        assert_eq!(doc.buffer.content(), empty_paragraph);
+        assert_eq!(caret.cursor(), empty_paragraph.len());
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("次".into()),
+        );
+        assert_eq!(doc.buffer.content(), format!("{empty_paragraph}次"));
+        assert_eq!(engine.tree().blocks.len(), 2);
+    }
+
+    #[test]
+    fn enter_on_an_existing_plain_blank_preserves_every_source_byte() {
+        for (source, position) in [
+            ("", 0),
+            (" \t", 2),
+            ("\n\n\n", 2),
+            ("one\n\n\n\ntwo", 5),
+            ("one\r\n\r\n", 7),
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            caret.collapse_to(position);
+            let revision = doc.revision();
+            assert_eq!(
+                apply_rich_command(
+                    &mut doc,
+                    &mut engine,
+                    &mut caret,
+                    RichCommand::InsertText("\n".into())
+                )
+                .unwrap(),
+                RichOutcome::Noop,
+                "source={source:?}",
+            );
+            assert_eq!(doc.buffer.content(), source);
+            assert_eq!(doc.revision(), revision);
+            assert_eq!(caret.cursor(), position);
+        }
+    }
+
+    #[test]
+    fn enter_deleting_the_last_plain_text_reports_changed_without_extra_blanks() {
+        let source = "🌍";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.range = 0..source.len();
+        assert_eq!(
+            apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock).unwrap(),
+            RichOutcome::Changed,
+        );
+        assert_eq!(doc.buffer.content(), "");
+        assert_eq!(caret.cursor(), 0);
+        assert!(doc.undo());
+        assert_eq!(doc.buffer.content(), source);
+        assert!(doc.redo());
+        assert_eq!(doc.buffer.content(), "");
+    }
+
+    #[test]
+    fn repeated_enter_keeps_code_literal_and_list_exit_structural() {
+        let (mut doc, mut engine, mut caret) = setup("```\nhello\n```\n");
+        caret.collapse_to("```\nhello".len());
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert_eq!(doc.buffer.content(), "```\nhello\n\n\n```\n");
+
+        let (mut doc, mut engine, mut caret) = setup("- hello");
+        caret.collapse_to("- hello".len());
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert_eq!(doc.buffer.content(), "- hello\n- ");
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        let exited = doc.buffer.content();
+        assert!(
+            blank_caret_gap_at(engine.tree(), caret.cursor()).is_some(),
+            "{exited:?}"
+        );
+        assert_eq!(
+            apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock).unwrap(),
+            RichOutcome::Noop,
+        );
+        assert_eq!(doc.buffer.content(), exited);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("After".into()),
+        );
+        assert_eq!(engine.tree().blocks.len(), 2);
+    }
+
+    #[test]
+    fn enter_then_spaces_then_first_letter_preserves_one_plain_paragraph() {
+        let original = "café 🌍";
+        let (mut doc, mut engine, mut caret) = setup(original);
+        caret.collapse_to(original.len());
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        for count in 1..=2 {
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(" ".into()),
+            );
+            let expected = format!("{original}\n\n{}", " ".repeat(count));
+            assert_eq!(doc.buffer.content(), expected);
+            assert_eq!(caret.cursor(), expected.len());
+            assert!(blank_caret_gap_at(engine.tree(), caret.cursor()).is_some());
+            assert_eq!(engine.next_caret(&expected, caret.cursor()), caret.cursor());
+        }
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("i".into()),
+        );
+        let expected = format!("{original}\n\n  i");
+        assert_eq!(doc.buffer.content(), expected);
+        assert_eq!(caret.cursor(), expected.len());
+        assert_eq!(engine.tree().blocks.len(), 2);
+        assert_eq!(
+            engine.tree().blocks[1].source_range.start,
+            original.len() + 2
+        );
+        let undo = doc.undo_tx().expect("typed paragraph undo");
+        caret.restore(undo.selection_after);
+        engine.sync(&doc);
+        let redo = doc.redo_tx().expect("typed paragraph redo");
+        caret.restore(redo.selection_after);
+        engine.sync(&doc);
+        assert_eq!(doc.buffer.content(), expected);
+        assert_eq!(caret.cursor(), expected.len());
+    }
+
+    #[test]
+    fn newly_typed_table_boundary_spaces_survive_as_semantic_spaces_and_undo() {
+        let original = "| Header |\n| --- |\n| café 🌍 |\n";
+        let (mut doc, mut engine, mut caret) = setup(original);
+        let word_end = original.find("café 🌍").unwrap() + "café 🌍".len();
+        caret.collapse_to(word_end);
+        for count in 1..=2 {
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(" ".into()),
+            );
+            let expected =
+                original.replacen("café 🌍", &format!("café 🌍{}", "&#32;".repeat(count)), 1);
+            assert_eq!(doc.buffer.content(), expected);
+            assert_eq!(caret.cursor(), word_end + 5 * count);
+            assert_eq!(engine.next_caret(&expected, caret.cursor()), caret.cursor());
+            let previous = caret.cursor() - 5;
+            assert_eq!(
+                engine.prev_caret(&expected, caret.cursor()),
+                previous,
+                "{:?}",
+                engine.tree().blocks[0].children[1].children[0]
+            );
+            assert_eq!(engine.next_caret(&expected, previous), caret.cursor());
+            let cell = engine.tree().blocks[0].children[1].children[0].clone();
+            let text: String = cell
+                .inlines
+                .iter()
+                .filter_map(|inline| match inline {
+                    Inline::Run { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, format!("café 🌍{}", " ".repeat(count)));
+        }
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("i".into()),
+        );
+        let edited = original.replacen("café 🌍", "café 🌍&#32;&#32;i", 1);
+        assert_eq!(doc.buffer.content(), edited);
+        let end = caret.cursor();
+        let undo = doc.undo_tx().expect("space/letter burst undo");
+        caret.restore(undo.selection_after);
+        engine.sync(&doc);
+        assert_eq!(doc.buffer.content(), original);
+        assert_eq!(caret.cursor(), word_end);
+        let redo = doc.redo_tx().expect("semantic space redo");
+        caret.restore(redo.selection_after);
+        engine.sync(&doc);
+        assert_eq!(doc.buffer.content(), edited);
+        assert_eq!(caret.cursor(), end);
+    }
+
+    #[test]
+    fn table_space_encoding_is_boundary_only_and_keeps_existing_padding() {
+        let original = "| Header |\n| --- |\n|   hello world   |\n";
+        let body = original.find("hello world").unwrap();
+        for (offset, inserted, replacement) in [
+            (body, " ", "&#32;hello world"),
+            (body + "hello world".len(), " ", "hello world&#32;"),
+            (body + 5, " ", "hello  world"),
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(original);
+            caret.collapse_to(offset);
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(inserted.into()),
+            );
+            assert_eq!(
+                doc.buffer.content(),
+                original.replacen("hello world", replacement, 1)
+            );
+        }
+        let original = "| Header |\n| --- |\n|   |\n";
+        let (mut doc, mut engine, mut caret) = setup(original);
+        let table = engine.tree().blocks[0].id;
+        caret.collapse_to(engine.cell_caret(table, 1, 0).unwrap());
+        let offset = caret.cursor();
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("  i".into()),
+        );
+        let mut expected = original.to_owned();
+        expected.insert_str(offset, "&#32;&#32;i");
+        assert_eq!(doc.buffer.content(), expected);
+        let source = "| Header |\n| --- |\n| `hello` |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("hello").unwrap() + 3);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText(" ".into()),
+        );
+        assert_eq!(doc.buffer.content(), source.replacen("hello", "hel lo", 1));
     }
 
     #[test]
@@ -7960,6 +8802,117 @@ mod tests {
     }
 
     #[test]
+    fn link_destination_edit_preserves_label_title_and_undo_caret() {
+        let source = "Before [**label**](old 'Keep title') after\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("label").unwrap() + 2);
+        let before = caret.clone();
+        let start = source.find("(old").unwrap();
+        let end = source.find(") after").unwrap() + 1;
+        let changed = apply_rich_command(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetLinkDestination {
+                destination: start..end,
+                url: "https://example.test/new".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(changed, RichOutcome::Changed);
+        assert_eq!(
+            doc.buffer.content(),
+            "Before [**label**](https://example.test/new 'Keep title') after\n"
+        );
+        assert_eq!(
+            caret.cursor(),
+            start - 1,
+            "Return from the URL field must leave the body caret at the label edge"
+        );
+        let committed = caret.clone();
+        let transaction = doc.undo_tx().expect("one URL edit transaction");
+        assert_eq!(doc.buffer.content(), source);
+        assert_eq!(transaction.selection_after, before.snapshot());
+        let transaction = doc.redo_tx().expect("redo URL edit");
+        assert_eq!(transaction.selection_after, committed.snapshot());
+    }
+
+    #[test]
+    fn link_destination_edit_round_trips_empty_unicode_and_syntax_characters() {
+        for source in [
+            "[label]()\n",
+            "[label](old)\n",
+            "[label](<old> \"title\")\n",
+        ] {
+            for url in [
+                "",
+                "https://example.test",
+                "https://example.test/with space",
+                "https://example.test/(part",
+                "https://example.test/a)b<c>d\\e&copy;",
+                "https://example.test/🦀/é",
+            ] {
+                let (mut doc, mut engine, mut caret) = setup(source);
+                let destination = source.find('(').unwrap()..source.rfind(')').unwrap() + 1;
+                apply_rich_command(
+                    &mut doc,
+                    &mut engine,
+                    &mut caret,
+                    RichCommand::SetLinkDestination {
+                        destination,
+                        url: url.into(),
+                    },
+                )
+                .unwrap();
+                let link = engine.tree().blocks[0]
+                    .inlines
+                    .iter()
+                    .find_map(|inline| match inline {
+                        Inline::Run {
+                            link: Some(link), ..
+                        } => Some(link),
+                        _ => None,
+                    })
+                    .expect("edited link remains parsed");
+                assert_eq!(
+                    link.url,
+                    url,
+                    "source {source:?}, output {:?}",
+                    doc.buffer.content()
+                );
+                assert_eq!(
+                    link.title.as_deref(),
+                    source.contains("title").then_some("title")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn link_destination_edit_rejects_invalid_ranges_and_control_characters() {
+        for (destination, url) in [
+            (0..3, "url"),
+            (8..100, "url"),
+            (7..12, "bad\nurl"),
+            (7..12, "bad\turl"),
+        ] {
+            let source = "[label](old)\n";
+            let (mut doc, mut engine, mut caret) = setup(source);
+            assert!(apply_rich_command(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::SetLinkDestination {
+                    destination,
+                    url: url.into()
+                }
+            )
+            .is_err());
+            assert_eq!(doc.buffer.content(), source);
+        }
+    }
+
+    #[test]
     fn toggle_link_on_word_wraps_the_word() {
         let (mut doc, mut engine, mut caret) = setup("hello");
         caret.collapse_to(2);
@@ -7993,6 +8946,33 @@ mod tests {
             "[hello](https://e.com)",
             "typing a URL must fill (), not leave <>"
         );
+    }
+
+    #[test]
+    fn paragraph_1_cmd_k_wraps_the_first_word_not_the_whole_run() {
+        let (mut doc, mut engine, mut caret) = setup("Paragraph 1.\n");
+        caret.collapse_to(3);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        assert_eq!(doc.buffer.content(), "[Paragraph]() 1.\n");
+        assert_eq!(caret.cursor(), "[Paragraph](".len());
+    }
+
+    #[test]
+    fn link_partial_selection_across_marked_runs_preserves_unselected_edges() {
+        let source = "Before plain **bold** after.\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.range = source.find("plain").unwrap() + 2..source.find("after").unwrap() + 2;
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::ToggleLink);
+        assert_eq!(doc.buffer.content(), "Before pl[ain **bold** af]()ter.\n");
+        assert_eq!(caret.cursor(), "Before pl[ain **bold** af](".len());
+        let inlines = &engine.tree().blocks[0].inlines;
+        assert!(inlines.iter().any(|inline| matches!(inline, Inline::Run { text, marks, link: Some(_), .. } if text == "bold" && marks.contains(MarkSet::BOLD))));
+        assert!(inlines.iter().any(
+            |inline| matches!(inline, Inline::Run { text, link: None, .. } if text == "Before pl")
+        ));
+        assert!(inlines.iter().any(
+            |inline| matches!(inline, Inline::Run { text, link: None, .. } if text == "ter.")
+        ));
     }
 
     #[test]
@@ -8996,6 +9976,100 @@ mod tests {
             !after.trim_end().ends_with('-'),
             "empty marker should be gone: {after:?}"
         );
+    }
+
+    #[test]
+    fn enter_empty_list_exit_keeps_a_separator_when_typing_the_next_paragraph() {
+        for initial in [
+            "- item 1\n",
+            "1. item 1\n",
+            "- [x] item 1\n",
+            "- [ ] item 1\n",
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(initial);
+            caret.collapse_to(initial.len() - 1);
+            apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("Second".into()),
+            );
+            apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            let typed = apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("After list".into()),
+            );
+            assert!(
+                typed.contains("\n\nAfter list"),
+                "lost list separator: {typed:?}"
+            );
+            assert_eq!(
+                engine.tree().blocks.len(),
+                2,
+                "new paragraph became lazy continuation: {typed:?}"
+            );
+            assert!(matches!(engine.tree().blocks[1].kind, BlockKind::Paragraph));
+            assert_eq!(
+                &typed[engine.tree().blocks[1].source_range.clone()],
+                "After list"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_list_exit_without_trailing_newline_places_caret_after_separator() {
+        let (mut doc, mut engine, mut caret) = setup("- hello\n- ");
+        caret.collapse_to(doc.buffer.len_bytes());
+        let before = caret.snapshot();
+        let after = apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert_eq!(after, "- hello\n\n");
+        assert_eq!(caret.cursor(), after.len());
+        let exited = caret.snapshot();
+        let undo = doc.undo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), "- hello\n- ");
+        assert_eq!(undo.selection_after, before);
+        let redo = doc.redo_tx().unwrap();
+        assert_eq!(doc.buffer.content(), after);
+        assert_eq!(redo.selection_after, exited);
+    }
+
+    #[test]
+    fn quoted_empty_list_exit_types_a_separate_paragraph_inside_the_quote() {
+        for initial in [
+            "> - hello\n> - \n",
+            "> > 1. hello\n> > 1. \n",
+            "> - [x] hello\n> - [ ] \n",
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(initial);
+            caret.collapse_to(initial.len() - 1);
+            apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            let typed = apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("After list".into()),
+            );
+            let mut quote = &engine.tree().blocks[0];
+            while quote.children.len() == 1
+                && matches!(quote.children[0].kind, BlockKind::BlockQuote)
+            {
+                quote = &quote.children[0];
+            }
+            assert!(
+                matches!(quote.kind, BlockKind::BlockQuote),
+                "lost quote: {typed:?}"
+            );
+            assert_eq!(
+                quote.children.len(),
+                2,
+                "quoted paragraph became list continuation: {typed:?}"
+            );
+            assert!(matches!(quote.children[1].kind, BlockKind::Paragraph));
+        }
     }
 
     #[test]
@@ -15444,6 +16518,319 @@ mod tests {
     }
 
     #[test]
+    fn typed_hyphen_stays_literal_until_a_space_completes_the_marker() {
+        for initial in ["", "before\n\n", "- first\n\n", "> "] {
+            let (mut doc, mut engine, mut caret) = setup(initial);
+            caret.collapse_to(initial.len());
+            let after = apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("-".into()),
+            );
+            assert_eq!(after, format!("{initial}\\-"));
+            let leaf = engine
+                .block(engine.block_at(caret.cursor()).expect("literal marker"))
+                .expect("literal paragraph");
+            assert!(matches!(leaf.kind, BlockKind::Paragraph));
+            assert_eq!(
+                engine.snap_caret(caret.cursor(), Bias::Left),
+                caret.cursor()
+            );
+            assert_eq!(
+                engine.snap_caret(caret.cursor(), Bias::Right),
+                caret.cursor()
+            );
+            let typed = apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("вавав".into()),
+            );
+            assert_eq!(typed, format!("{initial}\\-вавав"));
+            assert!(matches!(
+                engine
+                    .block(engine.block_at(caret.cursor()).unwrap())
+                    .unwrap()
+                    .kind,
+                BlockKind::Paragraph
+            ));
+        }
+    }
+
+    #[test]
+    fn backspace_cancels_a_just_typed_list_marker_without_erasing_the_marker() {
+        for (typed_marker, literal) in
+            [("-", "\\- "), ("*", "\\* "), ("+", "\\+ "), ("1.", "1\\. ")]
+        {
+            for initial in ["", "before\n\n", "> ", "- outer\n  "] {
+                let (mut doc, mut engine, mut caret) = setup(initial);
+                caret.collapse_to(initial.len());
+                for ch in typed_marker.chars().chain(std::iter::once(' ')) {
+                    apply(
+                        &mut doc,
+                        &mut engine,
+                        &mut caret,
+                        RichCommand::InsertText(ch.to_string()),
+                    );
+                }
+                let formatted = doc.buffer.content();
+                let formatted_caret = caret.snapshot();
+                let cancelled = apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+                assert_eq!(cancelled, format!("{initial}{literal}"));
+                assert_eq!(caret.cursor(), cancelled.len());
+                let cancelled_caret = caret.snapshot();
+                assert_eq!(doc.undo_tx().unwrap().selection_after, formatted_caret);
+                assert_eq!(doc.buffer.content(), formatted);
+                assert_eq!(doc.redo_tx().unwrap().selection_after, cancelled_caret);
+                assert_eq!(doc.buffer.content(), cancelled);
+                engine.sync(&doc);
+                let typed = apply(
+                    &mut doc,
+                    &mut engine,
+                    &mut caret,
+                    RichCommand::InsertText("literal".into()),
+                );
+                assert_eq!(typed, format!("{initial}{literal}literal"));
+            }
+        }
+    }
+
+    #[test]
+    fn auto_list_cancellation_expires_after_body_typing_or_source_edits() {
+        let (mut doc, mut engine, mut caret) = setup("");
+        for text in ["-", " ", "a"] {
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(text.into()),
+            );
+        }
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert_eq!(doc.buffer.content(), "- ");
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert_eq!(
+            doc.buffer.content(),
+            "",
+            "established empty items still exit normally"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("");
+        for text in ["-", " "] {
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(text.into()),
+            );
+        }
+        doc.replace_range(2, 2, "external");
+        caret.collapse_to(2);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert_eq!(
+            doc.buffer.content(),
+            "external",
+            "source edits invalidate transient input rules"
+        );
+
+        let (mut doc, mut engine, mut caret) = setup("");
+        for text in ["-", " "] {
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(text.into()),
+            );
+        }
+        engine.invalidate();
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::Backspace);
+        assert_eq!(
+            doc.buffer.content(),
+            "",
+            "explicit resync does not revive input-rule state"
+        );
+    }
+
+    #[test]
+    fn exiting_empty_list_before_another_paragraph_keeps_both_paragraphs_separate() {
+        let source = "- First\n- \n\nFollowing";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        caret.collapse_to(source.find("- \n").unwrap() + 2);
+        apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+        assert!(
+            blank_caret_gap_at(engine.tree(), caret.cursor()).is_some(),
+            "caret={} source={:?} tree={:?}",
+            caret.cursor(),
+            doc.buffer.content(),
+            engine.tree()
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock)
+                    .unwrap(),
+                RichOutcome::Noop
+            );
+        }
+        let after = apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("New".into()),
+        );
+        assert_eq!(
+            engine.tree().blocks.len(),
+            3,
+            "new text must not merge into a following paragraph: {after:?}"
+        );
+        assert_eq!(&after[engine.tree().blocks[1].source_range.clone()], "New");
+        assert_eq!(
+            &after[engine.tree().blocks[2].source_range.clone()],
+            "Following"
+        );
+    }
+
+    #[test]
+    fn exiting_empty_item_between_same_marker_siblings_keeps_an_editable_plain_home() {
+        for (initial, exited, typed) in [
+            (
+                "- First\n- \n- Following",
+                "- First\n\n- Following",
+                "- First\n\nNew\n\n- Following",
+            ),
+            (
+                "1. First\n1. \n1. Following",
+                "1. First\n\n1. Following",
+                "1. First\n\nNew\n\n1. Following",
+            ),
+            (
+                "- [x] First\n- [ ] \n- [ ] Following",
+                "- [x] First\n\n- [ ] Following",
+                "- [x] First\n\nNew\n\n- [ ] Following",
+            ),
+        ] {
+            let (mut doc, mut engine, mut caret) = setup(initial);
+            let first_end = initial.find('\n').unwrap();
+            let empty_end = initial[first_end + 1..].find('\n').unwrap() + first_end + 1;
+            caret.collapse_to(empty_end);
+            apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            assert_eq!(doc.buffer.content(), exited);
+            let exit_caret = caret.snapshot();
+            let home = caret.cursor();
+            assert!(
+                blank_caret_gap_at(engine.tree(), home).is_some(),
+                "source={exited:?} caret={home}"
+            );
+            assert_eq!(engine.snap_caret(home, Bias::Left), home);
+            assert_eq!(engine.snap_caret(home, Bias::Right), home);
+            assert!(engine.block_at(home).is_none());
+            for _ in 0..3 {
+                assert_eq!(
+                    apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock)
+                        .unwrap(),
+                    RichOutcome::Noop
+                );
+                assert_eq!(doc.buffer.content(), exited);
+                assert_eq!(caret.cursor(), home);
+            }
+            // Native text input delivers separate keystrokes. The separator
+            // and all three characters must remain one typing undo step.
+            for ch in "New".chars() {
+                apply(
+                    &mut doc,
+                    &mut engine,
+                    &mut caret,
+                    RichCommand::InsertText(ch.to_string()),
+                );
+            }
+            assert_eq!(doc.buffer.content(), typed);
+            assert_eq!(engine.tree().blocks.len(), 3);
+            assert!(matches!(engine.tree().blocks[1].kind, BlockKind::Paragraph));
+            let new_caret = caret.snapshot();
+            let undo = doc.undo_tx().unwrap();
+            assert_eq!(
+                doc.buffer.content(),
+                exited,
+                "new paragraph and separator are one undo step"
+            );
+            assert_eq!(undo.selection_after, exit_caret);
+            let redo = doc.redo_tx().unwrap();
+            assert_eq!(doc.buffer.content(), typed);
+            assert_eq!(redo.selection_after, new_caret);
+        }
+    }
+
+    #[test]
+    fn auto_list_enter_continue_exit_then_repeated_enter_keeps_one_plain_home() {
+        for (marker, continued) in [("-", "-"), ("+", "+"), ("*", "*"), ("1.", "1.")] {
+            let (mut doc, mut engine, mut caret) = setup("");
+            for ch in marker
+                .chars()
+                .chain(std::iter::once(' '))
+                .chain("Item".chars())
+            {
+                apply(
+                    &mut doc,
+                    &mut engine,
+                    &mut caret,
+                    RichCommand::InsertText(ch.to_string()),
+                );
+            }
+            assert_eq!(doc.buffer.content(), format!("{marker} Item"));
+            apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            assert_eq!(doc.buffer.content(), format!("{marker} Item\n{continued} "));
+            apply(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock);
+            let exited = format!("{marker} Item\n\n");
+            assert_eq!(doc.buffer.content(), exited);
+            let exit_caret = engine.snap_caret(caret.cursor(), Bias::Left);
+            caret.collapse_to(exit_caret);
+            assert!(blank_caret_gap_at(engine.tree(), exit_caret).is_some());
+            for _ in 0..4 {
+                assert_eq!(
+                    apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock)
+                        .unwrap(),
+                    RichOutcome::Noop
+                );
+                assert_eq!(doc.buffer.content(), exited);
+                assert_eq!(caret.cursor(), exit_caret);
+            }
+            apply(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText("After".into()),
+            );
+            assert_eq!(doc.buffer.content(), format!("{marker} Item\n\nAfter"));
+            assert_eq!(engine.tree().blocks.len(), 2);
+            assert!(matches!(engine.tree().blocks[1].kind, BlockKind::Paragraph));
+        }
+    }
+
+    #[test]
+    fn typing_characters_into_retained_eof_blank_creates_a_new_paragraph_and_undo_restores_it() {
+        for source in ["First\n\n", "- First\n\n"] {
+            let (mut doc, mut engine, mut caret) = setup(source);
+            let gap = blank_caret_gap_after_last(engine.tree()).unwrap();
+            caret.collapse_to(gap.start);
+            let before = caret.snapshot();
+            for ch in "New".chars() {
+                apply(
+                    &mut doc,
+                    &mut engine,
+                    &mut caret,
+                    RichCommand::InsertText(ch.to_string()),
+                );
+            }
+            assert_eq!(doc.buffer.content(), format!("{source}New"));
+            assert_eq!(engine.tree().blocks.len(), 2);
+            assert!(matches!(engine.tree().blocks[1].kind, BlockKind::Paragraph));
+            let undo = doc.undo_tx().unwrap();
+            assert_eq!(doc.buffer.content(), source);
+            assert_eq!(undo.selection_after, before);
+        }
+    }
+
+    #[test]
     fn input_rule_fence_and_thematic_break() {
         let (mut doc, mut engine, mut caret) = setup("");
         for _ in 0..3 {
@@ -15569,6 +16956,91 @@ mod tests {
             "{}",
             doc.buffer.content()
         );
+    }
+
+    #[test]
+    fn image_panel_edit_preserves_surrounding_source_and_link() {
+        let source =
+            "Odd   spacing [![old](old.png \"original title\")](https://example.com) remains.\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        engine.sync(&doc);
+        let range = first_image_range(&engine);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetImage {
+                source_range: range,
+                alt: "new [caption]".into(),
+                url: "images/cat photo.png".into(),
+            },
+        );
+        assert_eq!(doc.buffer.content(), "Odd   spacing [![new \\[caption\\]](<images/cat photo.png> \"original title\")](https://example.com) remains.\n");
+        assert!(tree_has_image(
+            &engine.tree().blocks,
+            "images/cat photo.png"
+        ));
+        assert!(doc.undo());
+        assert_eq!(doc.buffer.content(), source);
+    }
+
+    #[test]
+    fn image_panel_edit_rejects_stale_range_and_controls() {
+        let (mut doc, mut engine, mut caret) = setup("![alt](old.png)\n");
+        engine.sync(&doc);
+        for (range, url) in [(0..1, "new.png"), (first_image_range(&engine), "new\n.png")] {
+            let before = doc.buffer.content();
+            assert!(apply_rich_command(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::SetImage {
+                    source_range: range,
+                    alt: "alt".into(),
+                    url: url.into()
+                }
+            )
+            .is_err());
+            assert_eq!(doc.buffer.content(), before);
+        }
+    }
+
+    #[test]
+    fn image_panel_literal_alt_and_pipes_keep_a_table_intact() {
+        let source = "| Image | Other |\n| --- | --- |\n| ![old](old.png) | untouched |\n";
+        let (mut doc, mut engine, mut caret) = setup(source);
+        engine.sync(&doc);
+        let range = first_image_range(&engine);
+        apply(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::SetImage {
+                source_range: range,
+                alt: "cat *one* &amp; | two".into(),
+                url: "images/cat|one.png".into(),
+            },
+        );
+        assert!(matches!(
+            engine.tree().blocks[0].kind,
+            BlockKind::Table { .. }
+        ));
+        assert!(tree_has_image(&engine.tree().blocks, "images/cat|one.png"));
+        fn alt(blocks: &[Block]) -> Option<&str> {
+            for block in blocks {
+                for inline in &block.inlines {
+                    if let Inline::Image { alt, .. } = inline {
+                        return Some(alt);
+                    }
+                }
+                if let Some(found) = alt(&block.children) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        assert_eq!(alt(&engine.tree().blocks), Some("cat *one* &amp; | two"));
+        assert!(doc.buffer.content().contains("| untouched |"));
     }
 
     #[test]
@@ -16174,7 +17646,7 @@ mod tests {
                 "{label}: piped header must keep pipes after {typed:?}, got {after:?}"
             );
         }
-        let visible = header.replace('\\', "");
+        let visible = header.replace('\\', "").replace("&#32;", " ");
         assert!(
             visible.contains(typed) || header.contains(typed),
             "{label}: cell must contain {typed:?}, got {after:?}"

@@ -271,7 +271,11 @@ impl<'s> Importer<'s> {
         let value = &node.data.borrow().value;
 
         let (kind, container) = match value {
-            NodeValue::Paragraph => (BlockKind::Paragraph, false),
+            NodeValue::Paragraph => {
+                source_range =
+                    recover_cm_opening_indent(self.source, source_range, self.consumed.get());
+                (BlockKind::Paragraph, false)
+            }
             NodeValue::Heading(h) => {
                 source_range =
                     recover_cm_opening_indent(self.source, source_range, self.consumed.get());

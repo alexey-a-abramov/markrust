@@ -1907,6 +1907,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3474,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "markrust"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "assert_cmd",
  "markrust-app",
@@ -3483,20 +3493,29 @@ dependencies = [
 
 [[package]]
 name = "markrust-app"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "flate2",
  "futures",
  "gpui",
  "gpui_platform",
  "image",
+ "libc",
  "markrust-core",
  "markrust-editor",
  "notify",
+ "plist",
+ "reqwest",
+ "semver",
  "serde",
  "serde_json",
+ "sha2",
+ "similar",
+ "tar",
  "thiserror 2.0.20",
+ "time",
  "toml 0.8.23",
  "unicode-segmentation",
  "url",
@@ -3504,7 +3523,7 @@ dependencies = [
 
 [[package]]
 name = "markrust-core"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "comrak",
  "criterion",
@@ -3519,7 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "markrust-editor"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "base64",
  "criterion",
@@ -5738,9 +5757,12 @@ dependencies = [
 
 [[package]]
 name = "similar"
-version = "2.7.0"
+version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+checksum = "4f66ca1f7aca2474dc10c942eb22feffc897735f54cd1db90138c2fddb490987"
+dependencies = [
+ "bstr",
+]
 
 [[package]]
 name = "simplecss"
@@ -6165,6 +6187,17 @@ dependencies = [
  "core-foundation-sys",
  "libc",
  "objc",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
 ]
 
 [[package]]
@@ -7817,6 +7850,16 @@ checksum = "502da5464ccd04011667b11c435cb992822c2c0dbde1770c988480d312a0db2e"
 dependencies = [
  "libc",
  "pkg-config",
+]
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]

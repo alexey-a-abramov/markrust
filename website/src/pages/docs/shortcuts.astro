@@ -3,22 +3,37 @@ import DocsLayout from '../../layouts/DocsLayout.astro';
 ---
 
 <DocsLayout title="Keyboard shortcuts">
+  <p>Use Command (⌘), Option (⌥), and Shift (⇧) on macOS. Windows/Linux equivalents use Ctrl and Alt; native GUI acceptance on those experimental platforms remains pending.</p>
   <table>
     <thead>
-      <tr><th>Action</th><th>macOS</th><th>Linux</th></tr>
+      <tr><th>Action</th><th>macOS</th><th>Windows / Linux</th></tr>
     </thead>
     <tbody>
       <tr><td>New document</td><td><kbd>⌘N</kbd></td><td><kbd>Ctrl+N</kbd></td></tr>
+      <tr><td>New tab</td><td><kbd>⌘T</kbd></td><td><kbd>Ctrl+T</kbd></td></tr>
+      <tr><td>New window</td><td><kbd>⌘⇧N</kbd></td><td><kbd>Ctrl+Shift+N</kbd></td></tr>
       <tr><td>Open file</td><td><kbd>⌘O</kbd></td><td><kbd>Ctrl+O</kbd></td></tr>
       <tr><td>Open folder</td><td><kbd>⌘⇧O</kbd></td><td><kbd>Ctrl+Shift+O</kbd></td></tr>
+      <tr><td>Open location (paste a file or folder path)</td><td><kbd>⌘⇧L</kbd></td><td><kbd>Ctrl+Shift+L</kbd></td></tr>
       <tr><td>Save</td><td><kbd>⌘S</kbd></td><td><kbd>Ctrl+S</kbd></td></tr>
+      <tr><td>Save as</td><td><kbd>⌘⇧S</kbd></td><td><kbd>Ctrl+Shift+S</kbd></td></tr>
       <tr><td>Close tab</td><td><kbd>⌘W</kbd></td><td><kbd>Ctrl+W</kbd></td></tr>
+      <tr><td>Next / previous tab</td><td><kbd>Ctrl+Tab</kbd> / <kbd>Ctrl+Shift+Tab</kbd></td><td><kbd>Ctrl+Tab</kbd> / <kbd>Ctrl+Shift+Tab</kbd></td></tr>
+      <tr><td>Cut / copy / paste</td><td><kbd>⌘X</kbd> / <kbd>⌘C</kbd> / <kbd>⌘V</kbd></td><td><kbd>Ctrl+X</kbd> / <kbd>Ctrl+C</kbd> / <kbd>Ctrl+V</kbd></td></tr>
+      <tr><td>Select all</td><td><kbd>⌘A</kbd></td><td><kbd>Ctrl+A</kbd></td></tr>
       <tr><td>Undo</td><td><kbd>⌘Z</kbd></td><td><kbd>Ctrl+Z</kbd></td></tr>
-      <tr><td>Redo</td><td><kbd>⌘⇧Z</kbd></td><td><kbd>Ctrl+Shift+Z</kbd></td></tr>
+      <tr><td>Redo</td><td><kbd>⌘⇧Z</kbd></td><td><kbd>Ctrl+Shift+Z</kbd> or <kbd>Ctrl+Y</kbd></td></tr>
+      <tr><td>Find in document</td><td><kbd>⌘F</kbd></td><td><kbd>Ctrl+F</kbd></td></tr>
+      <tr><td>Next match</td><td><kbd>⌘G</kbd></td><td><kbd>Ctrl+G</kbd> or <kbd>F3</kbd></td></tr>
+      <tr><td>Previous match</td><td><kbd>⌘⇧G</kbd></td><td><kbd>Ctrl+Shift+G</kbd> or <kbd>Shift+F3</kbd></td></tr>
       <tr><td>Command palette</td><td><kbd>⌘P</kbd></td><td><kbd>Ctrl+P</kbd></td></tr>
       <tr><td>Cycle WYSIWYG / Source / Split</td><td><kbd>⌘⇧M</kbd></td><td><kbd>Ctrl+Shift+M</kbd></td></tr>
       <tr><td>Toggle WYSIWYG markup hints</td><td><kbd>⌘⌥4</kbd></td><td><kbd>Ctrl+Alt+4</kbd></td></tr>
+      <tr><td>Toggle light / dark appearance</td><td><kbd>⌘⌥⇧T</kbd></td><td><kbd>Ctrl+Alt+Shift+T</kbd></td></tr>
       <tr><td>Bold / italic / inline code / link</td><td><kbd>⌘B</kbd> / <kbd>⌘I</kbd> / <kbd>⌘E</kbd> / <kbd>⌘K</kbd></td><td><kbd>Ctrl+B</kbd> / <kbd>Ctrl+I</kbd> / <kbd>Ctrl+E</kbd> / <kbd>Ctrl+K</kbd></td></tr>
     </tbody>
   </table>
+  <p>In the find field, <kbd>Enter</kbd> moves to the next match, <kbd>Shift+Enter</kbd> moves to the previous match, and <kbd>Escape</kbd> closes find and returns focus to the editor. Theme switching does not occupy the conventional Reopen Closed Tab shortcut.</p>
+  <h2>Related</h2>
+  <p><a href="/docs/search">Search</a> · <a href="/docs/workspace">Opening files and folders</a> · <a href="/docs/themes">Themes</a></p>
 </DocsLayout>

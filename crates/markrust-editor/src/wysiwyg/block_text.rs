@@ -23,15 +23,17 @@ use markrust_core::html_visual::{
     project_html_block, HtmlBlockVisual, HtmlPaintRun,
 };
 use markrust_core::rich::{
-    code_body_source_map, code_span_visible_range, expand_link_and_html_chrome,
-    grow_mark_delimiters, html_block_literal_source_map, import_markdown,
-    is_decoded_backslash_escape, is_decoded_character_reference, line_prefix_parts,
-    link_reference_def_chrome, markdown_link_chrome, tagfilter_widget_ranges_in, Block, BlockKind,
-    BreakStyle, HeadingStyle, IdGen, Inline, LinkAttrs, MarkFidelity, MarkSet, MarkdownLinkChrome,
-    NodeId, PrefixBlank, RichTree,
+    blank_gap_whitespace_range, code_body_source_map, code_span_visible_range,
+    expand_link_and_html_chrome, grow_mark_delimiters, html_block_literal_source_map,
+    import_markdown, is_decoded_backslash_escape, is_decoded_character_reference,
+    leading_prose_whitespace_range, line_prefix_parts, link_reference_def_chrome,
+    markdown_link_chrome, tagfilter_widget_ranges_in, trailing_prose_whitespace_range, Block,
+    BlockKind, BreakStyle, HeadingStyle, IdGen, Inline, LinkAttrs, MarkFidelity, MarkSet,
+    MarkdownLinkChrome, NodeId, PrefixBlank, RichTree,
 };
 
 use crate::theme::EditorTheme;
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::ime::{VisualCaretStop, VisualLine};
 
@@ -42,6 +44,7 @@ pub enum OverlayTarget {
     ImageAlt { range: Range<usize>, stored: String },
     Frontmatter { key: &'static str, stored: String },
     FrontmatterYaml { stored: String },
+    LinkDestination { range: Range<usize> },
 }
 
 /// Map a shaped-text visible index onto the overlay draft.
@@ -81,15 +84,45 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     fn drag_source(&mut self, source: usize, cx: &mut Context<Self>);
     fn end_drag(&mut self, cx: &mut Context<Self>);
     fn selected_range(&self) -> Range<usize>;
+    fn shadow_selection(&self) -> Option<&crate::shadow::ShadowSelection> {
+        None
+    }
+    fn search_highlights(&self) -> Option<&crate::search::SearchHighlights> {
+        None
+    }
+    fn search_reveal_offset(&self) -> Option<usize> {
+        None
+    }
+    fn report_search_match_bounds(
+        &mut self,
+        _offset: usize,
+        _bounds: Bounds<Pixels>,
+        _cx: &mut Context<Self>,
+    ) {
+    }
     fn caret_offset(&self) -> usize;
     fn caret_visible(&self) -> bool;
     fn is_selecting(&self) -> bool;
     fn focused(&self, window: &Window) -> bool;
     fn widget_editing(&self) -> bool;
+    fn editing_context_enabled(&self) -> bool {
+        false
+    }
     fn input_focus_handle(&self) -> FocusHandle;
     fn toggle_task(&mut self, id: NodeId, cx: &mut Context<Self>);
     fn edit_code_info(&mut self, id: NodeId, cx: &mut Context<Self>);
     fn edit_image_alt(&mut self, source_range: Range<usize>, alt: &str, cx: &mut Context<Self>);
+    fn open_image_editor(
+        &mut self,
+        source_range: Range<usize>,
+        alt: &str,
+        _url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_source_range(source_range.clone(), window, cx);
+        self.edit_image_alt(source_range, alt, cx);
+    }
     fn edit_frontmatter_field(&mut self, key: &'static str, current: &str, cx: &mut Context<Self>);
     fn edit_frontmatter_yaml(&mut self, current: &str, cx: &mut Context<Self>);
     fn open_table_menu(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>);
@@ -111,6 +144,10 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     fn end_overlay_drag(&mut self, cx: &mut Context<Self>);
     fn report_widget_bounds(&mut self, bounds: Bounds<Pixels>);
     fn report_widget_caret(&mut self, caret: Bounds<Pixels>);
+    fn ensure_widget_caret_visible(&mut self, _cx: &mut Context<Self>) {}
+    /// Fresh prepaint geometry for caret-safe, out-of-flow editing controls.
+    /// This is separate from the IME's actual paint observations.
+    fn report_body_caret_prepaint(&mut self, _caret: Bounds<Pixels>, _source_span: usize) {}
     fn report_leaf(
         &mut self,
         layout: Arc<LeafLayout>,
@@ -122,6 +159,7 @@ pub trait WysiwygHost: gpui::Render + EntityInputHandler + 'static {
     );
     fn ensure_pending_caret_visible(&mut self, cx: &mut Context<Self>);
     fn report_painted_bounds(&mut self, bounds: Bounds<Pixels>);
+    fn report_image_bounds(&mut self, _range: Range<usize>, _bounds: Bounds<Pixels>) {}
     /// Push the resolved IME origin to the platform (not only `bounds_for_range`).
     fn sync_ime_cursor(&mut self, window: &mut Window);
 }
@@ -134,6 +172,9 @@ pub struct LeafLayout {
     /// Source byte for each UTF-8 offset in `text` (length `text.len() + 1`).
     pub source_at: Vec<usize>,
     pub block_start: usize,
+    /// Logical caret ownership can include hidden delimiters without changing
+    /// the visible glyph-to-source map. Partial mixed-image segments use None.
+    pub caret_range: Option<Range<usize>>,
 }
 
 impl LeafLayout {
@@ -165,7 +206,11 @@ impl LeafLayout {
     pub fn contains_source(&self, src: usize) -> bool {
         let start = *self.source_at.first().unwrap_or(&self.block_start);
         let end = *self.source_at.last().unwrap_or(&self.block_start);
-        src >= start && src <= end
+        (src >= start && src <= end)
+            || self
+                .caret_range
+                .as_ref()
+                .is_some_and(|range| src >= range.start && src <= range.end)
     }
 
     pub fn source_span_len(&self) -> usize {
@@ -1317,6 +1362,7 @@ fn paint_table_pipes(
 
 /// Alignment row (`|---|---|`) inside a GFM table, without a leading quote
 /// prefix. `None` when the table has no delimiter line.
+#[cfg(test)]
 pub fn table_alignment_line(source: &str, table: &Block) -> Option<Range<usize>> {
     if !matches!(table.kind, BlockKind::Table { .. }) {
         return None;
@@ -1583,6 +1629,7 @@ pub fn build_html_block_layout(
             text_style,
             theme,
         );
+        layout.caret_range = Some(block.source_range.clone());
         paint_html_block_wrapper_tags(&mut layout, source, block, text_style, theme, reveal);
         return layout;
     }
@@ -1609,6 +1656,7 @@ pub fn build_html_block_layout(
             text_style,
             theme,
         );
+        layout.caret_range = Some(block.source_range.clone());
         paint_html_block_wrapper_tags(&mut layout, source, block, text_style, theme, reveal);
         return layout;
     }
@@ -1619,6 +1667,7 @@ pub fn build_html_block_layout(
         block_start,
         text.len(),
     );
+    layout.caret_range = Some(block.source_range.clone());
     tint_layout_with_html_css(&mut layout, paints);
     paint_html_block_wrapper_tags(&mut layout, source, block, text_style, theme, reveal);
     layout
@@ -1639,6 +1688,7 @@ pub fn layout_html_block(
             runs: Vec::new(),
             source_at: vec![block.source_range.start],
             block_start: block.source_range.start,
+            caret_range: None,
         };
     };
     match project_html_block(raw) {
@@ -1665,6 +1715,7 @@ pub fn layout_html_block(
             runs: Vec::new(),
             source_at: vec![block.source_range.start],
             block_start: block.source_range.start,
+            caret_range: None,
         },
     }
 }
@@ -1683,6 +1734,7 @@ fn build_hidden_html_block_layout(
         runs: Vec::new(),
         source_at: vec![start],
         block_start: start,
+        caret_range: None,
     };
     if !reveal.intersects(&block.source_range) {
         return layout;
@@ -1813,6 +1865,7 @@ fn html_flow_layout(
         runs,
         source_at: mapped,
         block_start,
+        caret_range: None,
     }
 }
 
@@ -1981,6 +2034,10 @@ fn remap_html_sources(
         *slot = doc_offset_for_html_literal(literal_map, html, block_start);
     }
     layout.block_start = block_start;
+    // Inner Markdown was parsed in its own 0-based synthetic document. Its
+    // caret domain must not escape into the real document after remapping.
+    // The full-block caller assigns the actual HTML block's ownership range.
+    layout.caret_range = None;
 }
 
 pub fn block_paints_as_thematic_break(block: &Block) -> bool {
@@ -2031,6 +2088,7 @@ pub fn build_thematic_break_layout(
         runs: Vec::new(),
         source_at: vec![start],
         block_start: start,
+        caret_range: None,
     };
     if reveal.intersects(&block.source_range) {
         if let Some(slice) = source.get(marker.clone()).filter(|s| !s.is_empty()) {
@@ -2072,10 +2130,58 @@ pub fn build_leaf_layout_revealed(
         hosts,
         def_chrome.as_ref(),
     );
+    project_leading_horizontal_whitespace(&mut layout, block, source, text_style);
+    project_trailing_horizontal_whitespace(&mut layout, block, source, text_style);
     paint_atx_chrome(block, source, reveal, text_style, theme, &mut layout);
     paint_setext_chrome(block, source, reveal, text_style, theme, &mut layout);
     apply_structural_chrome(&mut layout, block, source, reveal, hosts, text_style, theme);
     layout
+}
+
+pub fn project_leading_horizontal_whitespace(
+    layout: &mut LeafLayout,
+    block: &Block,
+    source: &str,
+    text_style: &TextStyle,
+) {
+    if layout.text.is_empty() {
+        return;
+    }
+    let Some(range) = leading_prose_whitespace_range(block, source) else {
+        return;
+    };
+    if layout
+        .source_at
+        .first()
+        .is_some_and(|start| *start <= range.start)
+    {
+        return;
+    }
+    let text = &source[range.clone()];
+    prepend_source_slice(layout, text, range, text_style.to_run(text.len()));
+}
+
+/// Comrak omits trailing spaces/tabs from prose inlines, but these bytes are
+/// live editing positions. Project only a proven suffix after the complete
+/// final inline, never hidden link/mark syntax, table padding, or a newline.
+/// The same repair applies to the final text segment of a mixed paragraph.
+pub fn project_trailing_horizontal_whitespace(
+    layout: &mut LeafLayout,
+    block: &Block,
+    source: &str,
+    text_style: &TextStyle,
+) {
+    if layout.text.is_empty() {
+        return;
+    }
+    let Some(range) = trailing_prose_whitespace_range(block, source) else {
+        return;
+    };
+    if layout.source_at.last().is_some_and(|end| *end >= range.end) {
+        return;
+    }
+    let suffix = &source[range.clone()];
+    append_source_slice(layout, suffix, range, text_style.to_run(suffix.len()));
 }
 
 pub fn apply_structural_chrome(
@@ -2905,6 +3011,7 @@ pub fn build_leaf_layout_inlines(
         runs,
         source_at,
         block_start: block_range.start,
+        caret_range: (paint_start == 0 && paint_end == inlines.len()).then_some(block_range),
     }
 }
 
@@ -2930,7 +3037,11 @@ pub fn build_code_block_layout(
 ) -> LeafLayout {
     let source_at = code_body_source_map(source, block, body.len());
     let block_start = block.code_body_range(source).start;
-    finish_code_layout(body, source_at, block_start, text_style, theme)
+    let mut layout = finish_code_layout(body, source_at, block_start, text_style, theme);
+    // Fence/info bytes stay out of text flow, but a source-position caret on
+    // that hidden chrome still needs a visible home at the nearest body edge.
+    layout.caret_range = Some(block.source_range.clone());
+    layout
 }
 
 /// Opening/closing fence ticks (and the info string) when the caret or a
@@ -2974,6 +3085,7 @@ fn finish_code_layout(
         runs,
         source_at,
         block_start,
+        caret_range: None,
     }
 }
 
@@ -2988,7 +3100,25 @@ pub fn build_blank_gap_layout(range: Range<usize>) -> LeafLayout {
         runs: Vec::new(),
         source_at: vec![start, last],
         block_start: start,
+        caret_range: None,
     }
+}
+
+/// Source-aware empty paragraph: typed spaces/tabs shape immediately, while
+/// untouched separator newlines still occupy exactly one visual row.
+pub fn build_blank_gap_layout_with_source(
+    range: Range<usize>,
+    source: &str,
+    text_style: &TextStyle,
+) -> LeafLayout {
+    let mut layout = build_blank_gap_layout(range.clone());
+    if let Some(whitespace) = blank_gap_whitespace_range(source, range) {
+        let text = &source[whitespace.clone()];
+        layout.text = text.to_owned();
+        layout.runs = vec![text_style.to_run(text.len())];
+        layout.source_at = (whitespace.start..=whitespace.end).collect();
+    }
+    layout
 }
 
 /// Empty `[^1]: ` / `: ` (and quoted forms) paint opener chrome when the
@@ -3061,7 +3191,7 @@ pub fn hit_test_leaf(
         line_height,
         theme,
     );
-    visible_index_at(&lines, bounds, position, px(line_height))
+    visible_index_at(layout, &lines, bounds, position, px(line_height))
 }
 
 pub struct BlockTextElement<H: WysiwygHost> {
@@ -3080,6 +3210,10 @@ pub struct Prepaint<H: WysiwygHost> {
     cursor: Option<PaintQuad>,
     caret_bounds: Option<Bounds<Pixels>>,
     selection: Vec<PaintQuad>,
+    shadow_selection: Vec<PaintQuad>,
+    shadow_cursor: Vec<PaintQuad>,
+    search_matches: Vec<PaintQuad>,
+    search_reveal: Option<(usize, Bounds<Pixels>)>,
     _host: std::marker::PhantomData<H>,
 }
 
@@ -3121,6 +3255,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
             self.line_height,
             self.theme.clone(),
             self.hug_width,
+            false,
             window,
         )
     }
@@ -3143,6 +3278,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
         let caret = host.caret_offset();
         let selected = host.selected_range();
         let focused = host.focused(window);
+        let shadow = host.shadow_selection().filter(|_| !focused);
         let caret_visible = host.caret_visible();
         let vis_caret = self.layout.visible_for_source(caret);
         let vis_sel = self.layout.visible_for_source(selected.start)
@@ -3159,11 +3295,90 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
             vis_sel,
             self.layout.text.len(),
             caret_in_leaf,
-            focused && caret_visible && caret_in_leaf,
-            selected.start != selected.end && ranges_touch_leaf(&self.layout, &selected),
+            focused && caret_visible && caret_in_leaf && !host.widget_editing(),
+            shadow.is_none()
+                && selected.start != selected.end
+                && ranges_touch_leaf(&self.layout, &selected),
             self.theme.caret,
             self.theme.selection,
         );
+        let (shadow_selection, shadow_cursor) = shadow.map_or_else(
+            || (Vec::new(), Vec::new()),
+            |shadow| {
+                let (selection, _, bounds) = paint_carets(
+                    &lines,
+                    bounds,
+                    line_height,
+                    self.layout.visible_for_source(shadow.caret()),
+                    self.layout.visible_for_source(shadow.range.start)
+                        ..self.layout.visible_for_source(shadow.range.end),
+                    self.layout.text.len(),
+                    source_in_leaf(&self.layout, shadow.caret()),
+                    false,
+                    !shadow.range.is_empty() && ranges_touch_leaf(&self.layout, &shadow.range),
+                    crate::shadow::cursor_color(),
+                    crate::shadow::selection_color(),
+                );
+                (
+                    selection,
+                    bounds.map_or_else(Vec::new, crate::shadow::cursor_quads),
+                )
+            },
+        );
+        let search_matches = host.search_highlights().map_or_else(Vec::new, |search| {
+            search
+                .ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, range)| ranges_touch_leaf(&self.layout, range))
+                .flat_map(|(index, range)| {
+                    paint_carets(
+                        &lines,
+                        bounds,
+                        line_height,
+                        0,
+                        self.layout.visible_for_source(range.start)
+                            ..self.layout.visible_for_source(range.end),
+                        self.layout.text.len(),
+                        false,
+                        false,
+                        true,
+                        self.theme.caret,
+                        crate::search::match_color(search.active == Some(index)),
+                    )
+                    .0
+                })
+                .collect()
+        });
+        let search_reveal = host.search_reveal_offset().and_then(|offset| {
+            if !source_in_leaf(&self.layout, offset) {
+                return None;
+            }
+            let visible = self.layout.visible_for_source(offset);
+            paint_carets(
+                &lines,
+                bounds,
+                line_height,
+                visible,
+                visible..visible,
+                self.layout.text.len(),
+                true,
+                false,
+                false,
+                self.theme.caret,
+                self.theme.selection,
+            )
+            .2
+            .map(|bounds| (offset, bounds))
+        });
+
+        if caret_in_leaf {
+            if let Some(caret) = caret_bounds {
+                self.editor.update(cx, |host, _cx| {
+                    host.report_body_caret_prepaint(caret, self.layout.source_span_len());
+                });
+            }
+        }
 
         Prepaint {
             visual_lines: visual_lines_for_paint(&self.layout, &lines, bounds, line_height),
@@ -3171,6 +3386,10 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
             cursor,
             caret_bounds,
             selection,
+            shadow_selection,
+            shadow_cursor,
+            search_matches,
+            search_reveal,
             _host: std::marker::PhantomData,
         }
     }
@@ -3189,10 +3408,20 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
         let caret = self.editor.read(cx).caret_offset();
         let preedit = self.editor.read(cx).preedit().map(str::to_string);
         let layout = self.layout.clone();
+        let hit_rows = Rc::new(prepaint.visual_lines.clone());
         let font_size = self.font_size;
         let line_height_px = self.line_height;
         let caret_in_leaf = source_in_leaf(&self.layout, caret);
         let widget_editing = self.editor.read(cx).widget_editing();
+        if caret_in_leaf
+            && !widget_editing
+            && self.editor.read(cx).focused(window)
+            && self.editor.read(cx).editing_context_enabled()
+        {
+            // Context is paint-only: it cannot change wrapping, glyph columns,
+            // hit testing, or the height of the item being edited.
+            window.paint_quad(fill(bounds, self.theme.editing_context));
+        }
         if caret_in_leaf && !widget_editing {
             window.handle_input(
                 &focus,
@@ -3206,7 +3435,7 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
                 bounds,
                 font_size,
                 line_height_px,
-                if caret_in_leaf {
+                if caret_in_leaf && !widget_editing {
                     prepaint.caret_bounds
                 } else {
                     None
@@ -3214,10 +3443,19 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
                 std::mem::take(&mut prepaint.visual_lines),
             );
             host.ensure_pending_caret_visible(cx);
+            if let Some((offset, bounds)) = prepaint.search_reveal {
+                host.report_search_match_bounds(offset, bounds, cx);
+            }
             host.sync_ime_cursor(window);
         });
 
+        for selection in prepaint.search_matches.drain(..) {
+            window.paint_quad(selection);
+        }
         for selection in prepaint.selection.drain(..) {
+            window.paint_quad(selection);
+        }
+        for selection in prepaint.shadow_selection.drain(..) {
             window.paint_quad(selection);
         }
 
@@ -3272,72 +3510,66 @@ impl<H: WysiwygHost> Element for BlockTextElement<H> {
             window.paint_quad(cursor);
         }
 
+        for cursor in prepaint.shadow_cursor.drain(..) {
+            window.paint_quad(cursor);
+        }
+
         let editor = self.editor.clone();
         let layout = self.layout.clone();
-        let line_height = self.line_height;
-        let font_size = self.font_size;
-        let theme = self.theme.clone();
+        let clip_bounds = window.content_mask().bounds;
         window.on_mouse_event({
             let editor = editor.clone();
             let layout = layout.clone();
-            let theme = theme.clone();
+            let rows = hit_rows.clone();
             move |event: &MouseDownEvent, phase, window, cx| {
                 if !phase.bubble() || event.button != MouseButton::Left {
                     return;
                 }
-                if !bounds.contains(&event.position) {
+                if !pointer_is_in_leaf(bounds, clip_bounds, event.position) {
                     return;
                 }
-                let element = BlockTextElement {
-                    editor: editor.clone(),
-                    layout: layout.clone(),
-                    font_size,
-                    line_height,
-                    theme: theme.clone(),
-                    hug_width: false,
-                };
-                let lines = element.shape(window, bounds.size.width);
-                let vis = visible_index_at(&lines, bounds, event.position, px(line_height));
+                let vis = visible_index_at_visual_lines(&rows, event.position);
                 let source = layout.source_for_visible(vis);
                 editor.update(cx, |host, cx| {
-                    host.click_source(source, event.modifiers.shift, window, cx);
+                    if event.click_count >= 2 && !event.modifiers.shift {
+                        host.select_source_range(
+                            leaf_range_for_mouse_click(&layout, vis, event.click_count),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        host.click_source(source, event.modifiers.shift, window, cx);
+                    }
                 });
                 window.prevent_default();
+                cx.stop_propagation();
             }
         });
         window.on_mouse_event({
             let editor = editor.clone();
             let layout = layout.clone();
-            let theme = theme.clone();
+            let rows = hit_rows;
             move |event: &MouseMoveEvent, phase, window, cx| {
                 if !phase.bubble() {
                     return;
                 }
                 let selecting = editor.read(cx).is_selecting();
-                if !selecting || !event.pressed_button.is_some_and(|b| b == MouseButton::Left) {
+                if !selecting
+                    || !editor.read(cx).focused(window)
+                    || event.pressed_button != Some(MouseButton::Left)
+                    || !pointer_is_in_leaf(bounds, clip_bounds, event.position)
+                {
                     return;
                 }
-                let element = BlockTextElement {
-                    editor: editor.clone(),
-                    layout: layout.clone(),
-                    font_size,
-                    line_height,
-                    theme: theme.clone(),
-                    hug_width: false,
-                };
-                let lines = element.shape(window, bounds.size.width);
-                let vis = visible_index_at(&lines, bounds, event.position, px(line_height));
+                let vis = visible_index_at_visual_lines(&rows, event.position);
                 let source = layout.source_for_visible(vis);
                 editor.update(cx, |host, cx| host.drag_source(source, cx));
+                window.prevent_default();
+                cx.stop_propagation();
             }
         });
-        window.on_mouse_event({
-            move |event: &MouseUpEvent, phase, _, cx| {
-                if phase.bubble() && event.button == MouseButton::Left {
-                    editor.update(cx, |host, cx| host.end_drag(cx));
-                }
-            }
-        });
+        // The body owner finalizes the release against all fresh painted
+        // rows. An unrelated leaf must not end a drag before that hit test.
     }
 }
 
@@ -3364,22 +3596,39 @@ fn request_leaf_text_layout(
     line_height: f32,
     theme: EditorTheme,
     hug_width: bool,
+    single_line: bool,
     window: &mut Window,
 ) -> (LayoutId, MeasuredLeafText) {
     let mut style = Style::default();
     if !hug_width {
         style.size.width = relative(1.).into();
     }
-    style.min_size.width = px(0.).into();
+    style.min_size.width = px(if single_line { 1. } else { 0. }).into();
+    if single_line {
+        // Unwrapped glyphs need a real child width for horizontal scrolling,
+        // not the field width supplied as a definite measurement constraint.
+        let width = shape_layout_with_wrap(&layout, window, None, font_size, line_height, &theme)
+            .iter()
+            .map(|line| line.size(px(line_height)).width)
+            .fold(px(1.), Pixels::max)
+            .ceil();
+        style.size.width = width.into();
+        style.min_size.width = width.into();
+        style.flex_shrink = 0.;
+    }
     style.min_size.height = px(line_height).into();
     let measured_text = MeasuredLeafText::default();
     let shared_text = measured_text.clone();
     let layout_id = window.request_measured_layout(style, move |known, available, window, _cx| {
-        let wrap_width = known.width.or(match available.width {
-            AvailableSpace::Definite(width) => Some(width),
-            AvailableSpace::MinContent => Some(px(1.)),
-            AvailableSpace::MaxContent => None,
-        });
+        let wrap_width = (!single_line)
+            .then(|| {
+                known.width.or(match available.width {
+                    AvailableSpace::Definite(width) => Some(width),
+                    AvailableSpace::MinContent => Some(px(1.)),
+                    AvailableSpace::MaxContent => None,
+                })
+            })
+            .flatten();
         let lines =
             shape_layout_with_wrap(&layout, window, wrap_width, font_size, line_height, &theme);
         let lh = px(line_height);
@@ -3397,7 +3646,10 @@ fn request_leaf_text_layout(
             }
         });
         *shared_text.0.borrow_mut() = Some(lines);
-        size(width.max(px(0.)), measured.height.max(lh))
+        size(
+            width.max(px(if single_line { 1. } else { 0. })),
+            measured.height.max(lh),
+        )
     });
     (layout_id, measured_text)
 }
@@ -3482,29 +3734,70 @@ fn ranges_touch_leaf(layout: &LeafLayout, sel: &Range<usize>) -> bool {
 }
 
 fn visible_index_at(
+    layout: &LeafLayout,
     lines: &[WrappedLine],
     bounds: Bounds<Pixels>,
     position: Point<Pixels>,
     line_height: Pixels,
 ) -> usize {
-    let mut y = bounds.origin.y;
-    let mut offset = 0usize;
-    for line in lines {
-        let h = line.size(line_height).height.max(line_height);
-        let next_y = y + h;
-        if position.y < next_y || std::ptr::eq(line, lines.last().unwrap()) {
-            let max_y = (h - px(0.5)).max(px(0.));
-            let local_y = (position.y - y).max(px(0.)).min(max_y);
-            let local = point(position.x - bounds.origin.x, local_y);
-            let idx = line
-                .closest_index_for_position(local, line_height)
-                .unwrap_or_else(|e| e);
-            return offset + idx;
-        }
-        offset += line.len();
-        y = next_y;
-    }
-    offset
+    visible_index_at_visual_lines(
+        &visual_lines_for_paint(layout, lines, bounds, line_height),
+        position,
+    )
+}
+
+fn visible_index_at_visual_lines(lines: &[VisualLine], position: Point<Pixels>) -> usize {
+    let x = f32::from(position.x);
+    let y = f32::from(position.y);
+    // GPUI's closest_index_for_x jumps straight to EOF after the last glyph
+    // starts. Compare all painted caret stops, including the terminal stop,
+    // so a click just inside the final letter lands before that letter.
+    lines
+        .iter()
+        .find(|line| y < line.top + line.height)
+        .or_else(|| lines.last())
+        .and_then(|line| {
+            line.stops.iter().min_by(|left, right| {
+                (left.x - x)
+                    .abs()
+                    .total_cmp(&(right.x - x).abs())
+                    .then_with(|| left.visible.cmp(&right.visible))
+            })
+        })
+        .map_or(0, |stop| stop.visible)
+}
+
+/// Global GPUI callbacks run for every painted leaf. Only the clipped leaf
+/// under the pointer owns an in-pane drag step; earlier paragraphs must not
+/// overwrite its source offset, and offscreen leaves must not intercept it.
+fn pointer_is_in_leaf(
+    bounds: Bounds<Pixels>,
+    clip_bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+) -> bool {
+    bounds.intersect(&clip_bounds).contains(&position)
+}
+
+fn leaf_range_for_mouse_click(
+    layout: &LeafLayout,
+    visible: usize,
+    click_count: usize,
+) -> Range<usize> {
+    let visible = visible.min(layout.text.len());
+    let range = if click_count >= 3 {
+        0..layout.text.len()
+    } else {
+        layout
+            .text
+            .split_word_bound_indices()
+            .find_map(|(start, word)| {
+                let end = start + word.len();
+                (start <= visible && (visible < end || visible == end && end == layout.text.len()))
+                    .then_some(start..end)
+            })
+            .unwrap_or(visible..visible)
+    };
+    layout.source_for_visible(range.start)..layout.source_for_visible(range.end)
 }
 
 /// Capture the real glyph columns produced by GPUI's wrapping pass.
@@ -3547,7 +3840,7 @@ fn visual_lines_for_paint(
             let mut visible_offsets = vec![visible_start];
             if let Some(text) = layout.text.get(visible_start..visible_end) {
                 visible_offsets.extend(
-                    text.char_indices()
+                    text.grapheme_indices(true)
                         .skip(1)
                         .map(|(relative, _)| visible_start + relative),
                 );
@@ -3700,6 +3993,8 @@ pub struct WidgetOverlay<H: WysiwygHost> {
     pub italic: bool,
     pub monospace: bool,
     pub hug_width: bool,
+    /// Keep a URL editor on one horizontally scrollable line.
+    pub single_line: bool,
     pub target: OverlayTarget,
 }
 
@@ -3745,6 +4040,7 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
             self.line_height,
             self.theme.clone(),
             self.hug_width,
+            self.single_line,
             window,
         )
     }
@@ -3787,11 +4083,12 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
             self.theme.caret,
             self.theme.selection,
         );
-        self.editor.update(cx, |host, _cx| {
+        self.editor.update(cx, |host, cx| {
             host.report_widget_bounds(bounds);
             if let Some(caret) = caret_bounds {
                 host.report_widget_caret(caret);
             }
+            host.ensure_widget_caret_visible(cx);
         });
         OverlayPrepaint {
             lines,
@@ -3871,6 +4168,8 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
             .read(cx)
             .widget_caret_offset()
             .min(self.text.len());
+        let editing = self.editing;
+        let clip_bounds = window.content_mask().bounds;
 
         window.on_mouse_event({
             let editor = editor.clone();
@@ -3882,7 +4181,7 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
                 if !phase.bubble() || event.button != MouseButton::Left {
                     return;
                 }
-                if !bounds.contains(&event.position) {
+                if !pointer_is_in_leaf(bounds, clip_bounds, event.position) {
                     return;
                 }
                 let layout = overlay_leaf_layout(&display, style.clone(), italic);
@@ -3894,13 +4193,15 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
                     line_height_px,
                     &theme,
                 );
-                let vis = visible_index_at(&lines, bounds, event.position, px(line_height_px));
+                let vis =
+                    visible_index_at(&layout, &lines, bounds, event.position, px(line_height_px));
                 let offset =
                     overlay_draft_offset(prefix_len, vis, draft_len, vis_caret_draft, preedit_len);
                 editor.update(cx, |host, cx| {
                     host.click_overlay(target.clone(), offset, event.modifiers.shift, window, cx);
                 });
                 window.prevent_default();
+                cx.stop_propagation();
             }
         });
         window.on_mouse_event({
@@ -3913,7 +4214,11 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
                     return;
                 }
                 let selecting = editor.read(cx).is_widget_selecting();
-                if !selecting || !event.pressed_button.is_some_and(|b| b == MouseButton::Left) {
+                if !editing
+                    || !selecting
+                    || !editor.read(cx).focused(window)
+                    || event.pressed_button != Some(MouseButton::Left)
+                {
                     return;
                 }
                 let layout = overlay_leaf_layout(&display, style.clone(), italic);
@@ -3925,10 +4230,13 @@ impl<H: WysiwygHost> Element for WidgetOverlay<H> {
                     line_height_px,
                     &theme,
                 );
-                let vis = visible_index_at(&lines, bounds, event.position, px(line_height_px));
+                let vis =
+                    visible_index_at(&layout, &lines, bounds, event.position, px(line_height_px));
                 let offset =
                     overlay_draft_offset(prefix_len, vis, draft_len, vis_caret_draft, preedit_len);
                 editor.update(cx, |host, cx| host.drag_overlay(offset, cx));
+                window.prevent_default();
+                cx.stop_propagation();
             }
         });
         window.on_mouse_event({
@@ -4005,6 +4313,7 @@ fn overlay_leaf_layout(text: &str, style: TextStyle, italic: bool) -> LeafLayout
         runs: vec![run],
         source_at,
         block_start: 0,
+        caret_range: None,
     }
 }
 
@@ -4015,6 +4324,131 @@ mod tests {
         blank_caret_gap_after_last, blank_caret_gap_before, import_markdown, AlertKind, Block,
         BlockKind, IdGen, Inline, RichTree,
     };
+
+    #[test]
+    fn only_leaf_under_pointer_can_own_drag_extent_in_split_view() {
+        let pane = Bounds::new(point(px(700.), px(100.)), size(px(400.), px(500.)));
+        let heading = Bounds::new(point(px(720.), px(120.)), size(px(360.), px(48.)));
+        let paragraph = Bounds::new(point(px(720.), px(250.)), size(px(360.), px(24.)));
+        let word = point(px(900.), px(262.));
+        assert!(!pointer_is_in_leaf(heading, pane, word));
+        assert!(pointer_is_in_leaf(paragraph, pane, word));
+        let source_pane = point(px(300.), px(262.));
+        assert!(!pointer_is_in_leaf(paragraph, pane, source_pane));
+        let offscreen = Bounds::new(point(px(720.), px(50.)), size(px(360.), px(80.)));
+        assert!(!pointer_is_in_leaf(
+            offscreen,
+            pane,
+            point(px(900.), px(80.))
+        ));
+    }
+
+    #[test]
+    fn last_glyph_click_compares_its_start_with_terminal_caret_stop() {
+        let rows = vec![VisualLine {
+            visible_start: 0,
+            visible_end: 15,
+            top: 170.,
+            height: 49.6,
+            stops: vec![
+                VisualCaretStop {
+                    visible: 13,
+                    source: 15,
+                    x: 292.95316,
+                },
+                VisualCaretStop {
+                    visible: 14,
+                    source: 16,
+                    x: 300.53128,
+                },
+                VisualCaretStop {
+                    visible: 15,
+                    source: 17,
+                    x: 324.20316,
+                },
+            ],
+        }];
+        assert_eq!(
+            visible_index_at_visual_lines(&rows, point(px(300.731_3), px(194.8))),
+            14
+        );
+        assert_eq!(
+            visible_index_at_visual_lines(&rows, point(px(315.), px(194.8))),
+            15
+        );
+        assert_eq!(
+            visible_index_at_visual_lines(&rows, point(px(500.), px(194.8))),
+            15
+        );
+    }
+
+    #[test]
+    fn wrapped_unicode_click_uses_current_row_and_byte_boundary_stops() {
+        let rows = vec![
+            VisualLine {
+                visible_start: 0,
+                visible_end: 4,
+                top: 100.,
+                height: 24.,
+                stops: vec![
+                    VisualCaretStop {
+                        visible: 0,
+                        source: 0,
+                        x: 48.,
+                    },
+                    VisualCaretStop {
+                        visible: 4,
+                        source: 4,
+                        x: 80.,
+                    },
+                ],
+            },
+            VisualLine {
+                visible_start: 4,
+                visible_end: 8,
+                top: 124.,
+                height: 24.,
+                stops: vec![
+                    VisualCaretStop {
+                        visible: 4,
+                        source: 4,
+                        x: 48.,
+                    },
+                    VisualCaretStop {
+                        visible: 6,
+                        source: 6,
+                        x: 64.,
+                    },
+                    VisualCaretStop {
+                        visible: 8,
+                        source: 8,
+                        x: 80.,
+                    },
+                ],
+            },
+        ];
+        assert_eq!(
+            visible_index_at_visual_lines(&rows, point(px(48.2), px(124.))),
+            4
+        );
+        assert_eq!(
+            visible_index_at_visual_lines(&rows, point(px(64.2), px(136.))),
+            6
+        );
+        assert_eq!(
+            visible_index_at_visual_lines(&rows, point(px(48.), px(500.))),
+            4
+        );
+    }
+
+    #[test]
+    fn double_click_word_uses_visible_cyrillic_not_markdown_delimiters() {
+        let source = "Это прекрасно **аффы**";
+        let layout = layout_for(source);
+        let visible = layout.text.find("аффы").unwrap();
+        let range = leaf_range_for_mouse_click(&layout, visible + 2, 2);
+        assert_eq!(&source[range], "аффы");
+    }
 
     #[test]
     fn selection_is_split_at_each_visual_row_without_filling_unselected_text() {
@@ -4068,6 +4502,252 @@ mod tests {
         assert!(layout.contains_source(source.len()));
         assert_eq!(layout.visible_for_source(source.len()), layout.text.len());
         assert_eq!(layout.source_for_visible(layout.text.len()), source.len());
+    }
+
+    #[test]
+    fn trailing_horizontal_whitespace_has_immediate_visible_caret_stops() {
+        for (source, expected) in [
+            ("hello ", "hello "),
+            ("hello  ", "hello  "),
+            ("hello \t", "hello \t"),
+            ("🌍 ", "🌍 "),
+            ("**hello** ", "hello "),
+            ("[hello](https://example.com) ", "hello "),
+            ("[**hello**](https://example.com)  ", "hello  "),
+            ("`hello` ", "hello "),
+            ("# hello ", "hello "),
+            ("<b>hello</b> ", "hello "),
+        ] {
+            let mut ids = IdGen::default();
+            let tree = import_markdown(source, &mut ids);
+            let block = &tree.blocks[0];
+            let layout = layout_of_source(block, source, &RevealState::HIDDEN);
+            assert_eq!(layout.text, expected, "source={source:?}, block={block:?}");
+            assert_eq!(layout.visible_for_source(source.len()), expected.len());
+            assert_eq!(layout.source_for_visible(expected.len()), source.len());
+            assert_eq!(layout.source_at.len(), expected.len() + 1);
+        }
+    }
+
+    #[test]
+    fn prose_suffix_whitespace_is_not_table_or_setext_chrome() {
+        for source in [
+            "hello \n",
+            "hello \r\n",
+            "hello \n===\n",
+            "- hello \n",
+            "> hello \n",
+        ] {
+            let mut ids = IdGen::default();
+            let tree = import_markdown(source, &mut ids);
+            let block = first_kind(&tree.blocks, |kind| {
+                matches!(kind, BlockKind::Paragraph | BlockKind::Heading { .. })
+            })
+            .expect("prose leaf");
+            let layout = layout_of_source(block, source, &RevealState::HIDDEN);
+            assert_eq!(layout.text, "hello ", "source={source:?}, block={block:?}");
+            let whitespace_end = source.find("hello ").unwrap() + "hello ".len();
+            assert_eq!(layout.source_for_visible(layout.text.len()), whitespace_end);
+            assert_eq!(
+                layout.visible_for_source(whitespace_end - 1),
+                layout.text.len() - 1
+            );
+        }
+        let source = "| hello |\n| --- |\n";
+        let tree = import_markdown(source, &mut IdGen::default());
+        let cell = first_kind(&tree.blocks, |kind| matches!(kind, BlockKind::TableCell))
+            .expect("table cell");
+        assert_eq!(
+            layout_of_source(cell, source, &RevealState::HIDDEN).text,
+            "hello"
+        );
+        assert_eq!(layout_for("# hello ## ").text, "hello");
+        assert_eq!(layout_for("hello  \nworld").text, "hello\nworld");
+    }
+
+    #[test]
+    fn mixed_image_final_text_segment_projects_only_its_own_prose_suffix() {
+        let source = "Before ![alt](image.png) café 🌍  ";
+        let tree = import_markdown(source, &mut IdGen::default());
+        let block = &tree.blocks[0];
+        let image = block
+            .inlines
+            .iter()
+            .position(|inline| matches!(inline, Inline::Image { .. }))
+            .expect("image inline");
+        let theme = EditorTheme::dark();
+        let style = TextStyle {
+            color: theme.text,
+            ..Default::default()
+        };
+        let mut layout = build_leaf_layout_inlines(
+            &block.inlines,
+            image + 1,
+            block.inlines.len(),
+            block.source_range.clone(),
+            source,
+            &style,
+            &theme,
+            gpui::FontWeight::NORMAL,
+            &RevealState::HIDDEN,
+            &ChromeHosts::NONE,
+            None,
+        );
+        project_trailing_horizontal_whitespace(&mut layout, block, source, &style);
+        assert_eq!(layout.text, " café 🌍  ");
+        assert_eq!(layout.source_for_visible(layout.text.len()), source.len());
+        assert_eq!(
+            layout.visible_for_source(source.len() - 1),
+            layout.text.len() - 1
+        );
+        let expected_map = layout.source_at.clone();
+        project_trailing_horizontal_whitespace(&mut layout, block, source, &style);
+        assert_eq!(
+            layout.source_at, expected_map,
+            "suffix projection is idempotent"
+        );
+    }
+
+    #[test]
+    fn real_trailing_space_edits_project_each_caret_and_survive_undo_redo() {
+        use markrust_core::rich::{apply_rich_command, CaretState, RichCommand, RichEngine};
+        let mut doc = markrust_core::Document::new("café 🌍");
+        let mut engine = RichEngine::new();
+        engine.sync(&doc);
+        let mut caret = CaretState::collapsed(doc.buffer.len_bytes());
+        for suffix in [" ", " ", "次"] {
+            apply_rich_command(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(suffix.into()),
+            )
+            .expect("real edit");
+            let source = doc.buffer.content();
+            let layout = layout_for(&source);
+            assert_eq!(layout.text, source);
+            assert_eq!(layout.visible_for_source(caret.cursor()), layout.text.len());
+            assert_eq!(layout.source_for_visible(layout.text.len()), caret.cursor());
+        }
+        let edited = doc.buffer.content();
+        let undo = doc.undo_tx().expect("typing undo");
+        caret.restore(undo.selection_after);
+        let source = doc.buffer.content();
+        assert_eq!(layout_for(&source).text, source);
+        let redo = doc.redo_tx().expect("typing redo");
+        caret.restore(redo.selection_after);
+        assert_eq!(doc.buffer.content(), edited);
+        assert_eq!(
+            layout_for(&edited).visible_for_source(caret.cursor()),
+            edited.len()
+        );
+    }
+
+    #[test]
+    fn empty_paragraph_spaces_and_the_first_letter_keep_the_same_source_stops() {
+        use markrust_core::rich::{
+            apply_rich_command, blank_caret_gap_after_last, CaretState, RichCommand, RichEngine,
+        };
+        let mut doc = markrust_core::Document::new("café 🌍");
+        let mut engine = RichEngine::new();
+        engine.sync(&doc);
+        let mut caret = CaretState::collapsed(doc.buffer.len_bytes());
+        apply_rich_command(&mut doc, &mut engine, &mut caret, RichCommand::SplitBlock).unwrap();
+        let paragraph_start = caret.cursor();
+        let style = TextStyle::default();
+        for count in 1..=2 {
+            apply_rich_command(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(" ".into()),
+            )
+            .unwrap();
+            let source = doc.buffer.content();
+            let gap = blank_caret_gap_after_last(engine.tree()).expect("empty paragraph row");
+            let layout = build_blank_gap_layout_with_source(gap, &source, &style);
+            assert_eq!(layout.text, " ".repeat(count));
+            assert_eq!(layout.source_for_visible(0), paragraph_start);
+            assert_eq!(layout.visible_for_source(caret.cursor()), count);
+            assert_eq!(layout.source_for_visible(count), caret.cursor());
+        }
+        apply_rich_command(
+            &mut doc,
+            &mut engine,
+            &mut caret,
+            RichCommand::InsertText("i".into()),
+        )
+        .unwrap();
+        let source = doc.buffer.content();
+        let block = engine.tree().blocks.last().expect("new plain paragraph");
+        let layout = layout_of_source(block, &source, &RevealState::HIDDEN);
+        assert_eq!(layout.text, "  i");
+        assert_eq!(layout.source_for_visible(0), paragraph_start);
+        assert_eq!(layout.visible_for_source(caret.cursor()), 3);
+        assert_eq!(layout.source_for_visible(3), caret.cursor());
+    }
+
+    #[test]
+    fn real_table_boundary_space_edits_have_individual_glyph_caret_stops() {
+        use markrust_core::rich::{apply_rich_command, CaretState, RichCommand, RichEngine};
+        let original = "| Header |\n| --- |\n|   café 🌍   |\n";
+        let mut doc = markrust_core::Document::new(original);
+        let mut engine = RichEngine::new();
+        engine.sync(&doc);
+        let start = original.find("café 🌍").unwrap();
+        let mut caret = CaretState::collapsed(start + "café 🌍".len());
+        for count in 1..=2 {
+            apply_rich_command(
+                &mut doc,
+                &mut engine,
+                &mut caret,
+                RichCommand::InsertText(" ".into()),
+            )
+            .unwrap();
+            let source = doc.buffer.content();
+            let cell = &engine.tree().blocks[0].children[1].children[0];
+            let layout = layout_of_source(cell, &source, &RevealState::HIDDEN);
+            assert_eq!(layout.text, format!("café 🌍{}", " ".repeat(count)));
+            assert_eq!(layout.visible_for_source(caret.cursor()), layout.text.len());
+            assert_eq!(layout.source_for_visible(layout.text.len()), caret.cursor());
+            let previous = engine.prev_caret(&source, caret.cursor());
+            assert_eq!(layout.visible_for_source(previous), layout.text.len() - 1);
+            assert_eq!(layout.source_for_visible(layout.text.len() - 1), previous);
+            assert_eq!(
+                source,
+                original.replacen("café 🌍", &format!("café 🌍{}", "&#32;".repeat(count)), 1)
+            );
+        }
+        let undo = doc.undo_tx().expect("semantic spaces undo");
+        caret.restore(undo.selection_after);
+        engine.sync(&doc);
+        assert_eq!(doc.buffer.content(), original);
+        let redo = doc.redo_tx().expect("semantic spaces redo");
+        caret.restore(redo.selection_after);
+        engine.sync(&doc);
+        let source = doc.buffer.content();
+        let cell = &engine.tree().blocks[0].children[1].children[0];
+        assert_eq!(
+            layout_of_source(cell, &source, &RevealState::HIDDEN).text,
+            "café 🌍  "
+        );
+    }
+
+    #[test]
+    fn unfinished_hidden_html_cannot_reveal_its_own_suffix_whitespace() {
+        for source in ["hello <script>secret ", "hello <iframe>secret "] {
+            let layout = layout_for(source);
+            assert_eq!(layout.text, "hello ", "hidden suffix in {source:?}");
+        }
+        let source = "hello <script>secret</script> ";
+        assert_eq!(
+            layout_for(source).text,
+            "hello  ",
+            "outside whitespace remains visible"
+        );
+        for source in ["  hello", "   **hello**", "  [hello](url)"] {
+            assert!(layout_for(source).text.starts_with("  "), "{source:?}");
+        }
     }
 
     fn layout_of(block: &Block) -> LeafLayout {
@@ -4159,6 +4839,32 @@ mod tests {
         assert_eq!(layout.source_for_visible(0), 2);
         assert_eq!(layout.visible_for_source(2), 0);
         assert_eq!(layout.visible_for_source(6), 4);
+    }
+
+    #[test]
+    fn hidden_delimiters_keep_a_caret_without_changing_glyph_source_mapping() {
+        let source = "**bold**";
+        let layout = layout_for(source);
+        assert_eq!(layout.text, "bold");
+        assert_eq!(layout.source_for_visible(0), 2);
+        for caret in 0..=source.len() {
+            assert!(
+                layout.contains_source(caret),
+                "hidden delimiter caret {caret} lost its leaf"
+            );
+            assert!(layout.visible_for_source(caret) <= layout.text.len());
+        }
+    }
+
+    #[test]
+    fn trailing_blank_caret_ownership_includes_eof_without_inserting_glyphs() {
+        let mut layout = build_blank_gap_layout(8..9);
+        layout.caret_range = Some(8..9);
+        assert!(layout.text.is_empty());
+        assert!(layout.contains_source(8));
+        assert!(layout.contains_source(9));
+        assert_eq!(layout.visible_for_source(9), 0);
+        assert_eq!(layout.source_for_visible(0), 8);
     }
 
     #[test]
@@ -6110,6 +6816,23 @@ mod tests {
     }
 
     #[test]
+    fn hidden_fence_edges_keep_a_caret_without_changing_code_glyph_mapping() {
+        for source in ["```rust\ncode\n```", "```\n```"] {
+            let layout = fenced_code_layout(source);
+            let expected_body = if source.contains("code") { "code" } else { "" };
+            assert_eq!(layout.text, expected_body);
+            assert_eq!(layout.source_for_visible(0), source.find('\n').unwrap() + 1);
+            for caret in 0..=source.len() {
+                assert!(
+                    layout.contains_source(caret),
+                    "missing code caret at {caret}"
+                );
+                assert!(layout.visible_for_source(caret) <= layout.text.len());
+            }
+        }
+    }
+
+    #[test]
     fn list_nested_fence_click_maps_past_indent() {
         let source = "- item\n  ```\n  code\n  ```\n";
         let layout = fenced_code_layout(source);
@@ -6197,6 +6920,84 @@ mod tests {
         reveal: &RevealState,
     ) -> LeafLayout {
         layout_html_block(source, block, style, theme, reveal)
+    }
+
+    #[test]
+    fn html_flow_caret_ownership_uses_real_block_offsets_not_synthetic_markdown() {
+        let prefix = "Earlier paragraph.\n\n";
+        for html in [
+            "<div>**body**</div>\n",
+            "<div><b>bold</b> plain <i>italic</i></div>\n",
+            "<pre>code</pre>\n",
+        ] {
+            let source = format!("{prefix}{html}");
+            let tree = import_markdown(&source, &mut IdGen::default());
+            let block = first_kind(&tree.blocks, |kind| {
+                matches!(kind, BlockKind::Opaque { .. })
+            })
+            .unwrap();
+            let layout = html_block_layout_from_source(&source);
+            assert!(!layout.text.is_empty());
+            assert_eq!(layout.caret_range, Some(block.source_range.clone()));
+            for caret in 0..prefix.len() {
+                assert!(
+                    !layout.contains_source(caret),
+                    "HTML claimed preceding paragraph at {caret}: {html:?}"
+                );
+            }
+            for caret in block.source_range.start..=block.source_range.end {
+                assert!(
+                    layout.contains_source(caret),
+                    "missing hidden wrapper caret at {caret}: {html:?}"
+                );
+                assert!(layout.visible_for_source(caret) <= layout.text.len());
+            }
+            for visible in layout.text.char_indices().map(|(offset, _)| offset) {
+                let mapped = layout.source_for_visible(visible);
+                assert!(mapped >= block.source_range.start && mapped <= block.source_range.end);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_image_text_segments_never_claim_the_whole_paragraph() {
+        let source = "before **bold** ![](missing.png) after *italic*\n";
+        let tree = import_markdown(source, &mut IdGen::default());
+        let block = &tree.blocks[0];
+        let image_index = block
+            .inlines
+            .iter()
+            .position(|inline| matches!(inline, Inline::Image { .. }))
+            .unwrap();
+        let image_range = block.inlines[image_index].source_range();
+        let theme = EditorTheme::dark();
+        let style = TextStyle {
+            color: theme.text,
+            ..Default::default()
+        };
+        let segment = |start, end| {
+            build_leaf_layout_inlines(
+                &block.inlines,
+                start,
+                end,
+                block.source_range.clone(),
+                source,
+                &style,
+                &theme,
+                gpui::FontWeight::NORMAL,
+                &RevealState::HIDDEN,
+                &ChromeHosts::NONE,
+                None,
+            )
+        };
+        let before = segment(0, image_index);
+        let after = segment(image_index + 1, block.inlines.len());
+        assert_eq!(before.caret_range, None);
+        assert_eq!(after.caret_range, None);
+        assert!(!before.contains_source(image_range.start + 2));
+        assert!(!after.contains_source(image_range.start + 2));
+        assert!(!after.contains_source(0));
+        assert!(!before.contains_source(source.find("italic").unwrap()));
     }
 
     #[test]
