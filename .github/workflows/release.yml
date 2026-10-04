@@ -156,6 +156,7 @@ jobs:
           RELEASE_NOTES: |
             Native macOS (Apple Silicon + Intel), Linux x86_64, and **experimental Windows x86_64** builds.
             Each archive includes compiled version/build time, source commit, license notices, and a SHA-256 sidecar.
+            macOS 0.8+ includes GitHub release checks with explicit download/restart and all-window private draft checkpoints.
             macOS is ad-hoc signed, not Developer-ID signed or notarized. Windows is not Authenticode signed.
             Windows native editor, clipboard, IME, and recovery-directory ACL/locking acceptance remain pending.
             Linux requires a compatible X11/Wayland desktop, Vulkan graphics, and shared system libraries; it is not an AppImage.

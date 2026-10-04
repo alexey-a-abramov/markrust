@@ -3484,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "markrust"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "assert_cmd",
  "markrust-app",
@@ -3493,7 +3493,7 @@ dependencies = [
 
 [[package]]
 name = "markrust-app"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3523,7 +3523,7 @@ dependencies = [
 
 [[package]]
 name = "markrust-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "comrak",
  "criterion",
@@ -3538,7 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "markrust-editor"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "base64",
  "criterion",

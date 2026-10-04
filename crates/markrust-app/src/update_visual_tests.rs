@@ -578,8 +578,12 @@ fn check_notice_geometry_and_dismissal(
             let (panel, later) = cx
                 .update(|cx| crate::update_ui::test_notice_bounds(cx))
                 .context("update notice did not paint panel and Later hit targets")?;
-            let window_bounds = cx.update_window(handle.into(), |_, window, _| window.bounds())?;
-            ensure_inside(panel, window_bounds, "compact update notice")?;
+            // Painted Div bounds and dispatched pointer events use client
+            // coordinates. Window::bounds includes the desktop screen origin.
+            let client_bounds = cx.update_window(handle.into(), |_, window, _| {
+                Bounds::new(point(px(0.), px(0.)), window.viewport_size())
+            })?;
+            ensure_inside(panel, client_bounds, "compact update notice")?;
             ensure_inside(later, panel, "translated Later hit target")?;
             let visible = body_state(cx, handle, &workspace)?;
             ensure!(
@@ -607,6 +611,8 @@ fn check_notice_geometry_and_dismissal(
                     &directory.join(format!("{label}.png")),
                 )?;
             }
+            // The actual Later center is already client-relative; do not add
+            // or subtract the desktop origin when dispatching native input.
             click_at(cx, handle, later.center())?;
             ensure!(
                 !cx.update(|cx| crate::update_ui::test_notice_visible(cx))

@@ -52,6 +52,7 @@ struct Options {
     images_only: bool,
     open_path_only: bool,
     locale_only: bool,
+    update_only: bool,
     journeys: Option<String>,
 }
 
@@ -71,6 +72,7 @@ impl Options {
             images_only: false,
             open_path_only: false,
             locale_only: false,
+            update_only: false,
             journeys: None,
         };
         let mut args = args.peekable();
@@ -91,6 +93,7 @@ impl Options {
                 "--images-only" => options.images_only = true,
                 "--open-path-only" => options.open_path_only = true,
                 "--locale-only" => options.locale_only = true,
+                "--update-only" => options.update_only = true,
                 "--journeys" => options.journeys = Some(args.next().context("--journeys needs a scenario-name substring")?),
                 "--usecases-seed" => {
                     options.usecases_seed = Some(
@@ -109,10 +112,23 @@ impl Options {
                     );
                 }
                 _ => bail!(
-                    "Unknown argument {arg}. Use --output PATH, --baseline PATH, --update-baselines, --geometry-only, --record-frames, --concurrent-only, --notepad-only, --images-only, --open-path-only, --locale-only, --journeys NAME, --filter NAME, --usecases-seed N, or --usecases-count N."
+                    "Unknown argument {arg}. Use --output PATH, --baseline PATH, --update-baselines, --geometry-only, --record-frames, --concurrent-only, --notepad-only, --images-only, --open-path-only, --locale-only, --update-only, --journeys NAME, --filter NAME, --usecases-seed N, or --usecases-count N."
                 ),
             }
         }
+        ensure!(
+            !options.update_only
+                || (options.baseline.is_none()
+                    && options.journeys.is_none()
+                    && options.filter.is_none()
+                    && !options.record_frames
+                    && !options.concurrent_only
+                    && !options.notepad_only
+                    && !options.images_only
+                    && !options.open_path_only
+                    && !options.locale_only),
+            "--update-only is an isolated diagnostic subset, not a complete GUI or baseline gate"
+        );
         ensure!(
             options.journeys.is_none()
                 || (options.baseline.is_none()
@@ -239,6 +255,16 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     }
     if options.concurrent_only {
         crate::concurrent_visual_tests::check(&mut cx, &options.output, options.geometry_only)?;
+        println!("Artifacts: {}", options.output.display());
+        return Ok(());
+    }
+    if options.update_only {
+        let states = crate::update_visual_tests::run_update_ui_checks(
+            &mut cx,
+            &options.output,
+            options.geometry_only,
+        )?;
+        println!("PASS: {states} isolated update states; not a complete GUI gate");
         println!("Artifacts: {}", options.output.display());
         return Ok(());
     }
@@ -3511,6 +3537,31 @@ fn check_application_command_routing(
 #[cfg(test)]
 mod screenshot_tests {
     use super::*;
+
+    #[test]
+    fn update_subset_cannot_replace_the_complete_gui_gate() {
+        let parsed = Options::parse(
+            ["--update-only", "--geometry-only"]
+                .map(str::to_owned)
+                .into_iter(),
+        )
+        .unwrap();
+        assert!(parsed.update_only && parsed.geometry_only);
+        for conflicting in ["--notepad-only", "--locale-only", "--concurrent-only"] {
+            assert!(Options::parse(
+                ["--update-only", conflicting]
+                    .map(str::to_owned)
+                    .into_iter()
+            )
+            .is_err());
+        }
+        assert!(Options::parse(
+            ["--update-only", "--baseline", "goldens"]
+                .map(str::to_owned)
+                .into_iter()
+        )
+        .is_err());
+    }
 
     #[test]
     fn preview_raster_probe_cannot_count_body_or_controls_outside_its_box() {

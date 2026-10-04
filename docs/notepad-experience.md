@@ -32,6 +32,41 @@ Actual installation, remote publication and draft-restoring startup are separate
 acceptance results, not inferred from these fixtures. See
 [deployment](deployment.md#in-app-macos-updates) for safety and signing limits.
 
+### Local seed evidence, 2026-10-04
+
+- Workspace all-feature tests: 1,503 passed; strict all-target/all-feature Clippy,
+  formatting, 16 packaging contracts, pinned-workflow actionlint, three website
+  unit tests, 16 Chromium tests and the 25-page production build passed.
+- The fresh Metal run matched all 32 reviewed references and passed both themes'
+  262 journeys plus existing native recovery/navigation states. Its new notice
+  probe initially compared client coordinates to a desktop-positioned window;
+  that test-only error was corrected. A separate Metal run passed all 12 update
+  states, including real Later clicks. Evidence: `target/auto-update-native-seed.log`
+  and `target/auto-update-native-isolated.log`. The complete CI-style geometry
+  gate is recorded separately, rather than calling the interrupted first run a pass.
+  That complete run passed 109 states and 262 journeys with screenshots explicitly
+  disabled: `target/auto-update-native-geometry.log` and
+  `target/gui-auto-update-seed-geometry`.
+- A real Python-packaged, ad-hoc signed `0.8.0` archive passed the production
+  bounded extractor, tar/PAX handling, plist/Mach-O validation and strict codesign
+  checks without execution or installation. Evidence:
+  `target/auto-update-real-archive-probe.json`; SHA-256
+  `561354c6e6565574b0859268fee2c66b17ee023ba76cd7f678fef1d609b6a9b1`.
+- With the user's explicit approval and the old app closed, `/Applications/MarkRust.app`
+  was replaced by `0.8.0`, built at `2026-10-04T17:59:46Z`, signature-verified and
+  launched (PID 32489 observed). The previous `0.5.0` bundle remains at
+  `/Applications/.MarkRust-install.qbrALa/Previous-MarkRust.app`.
+  The installer did not edit document/recovery data; ordinary startup resumed
+  the user's recovered session. Evidence: `target/auto-update-seed-install.log`.
+
+Public `0.8.1` publication and an actual updater-driven restart remain distinct
+pending results until the remote gates, new process identity and recovery are observed.
+The version-only `0.8.1` candidate passed 1,504 all-feature Rust tests, strict
+all-target/all-feature Clippy, packaging contracts and the exact `v0.8.1` tag
+guard. The additional test protects the isolated updater probe from being
+misreported as a complete GUI gate. Logs: `target/auto-update-081-rust.log`,
+`target/auto-update-081-clippy.log` and `target/auto-update-081-packaging.log`.
+
 ## Version 0.7.0 navigation, locations and live UI language
 
 Find uses a real auxiliary native text field, Cmd/Ctrl-F, next/previous shortcuts,
