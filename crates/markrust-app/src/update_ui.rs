@@ -18,13 +18,15 @@ enum Status {
     Idle,
     Checking,
     Current,
-    Available(updater::Release),
+    Available(Box<updater::Release>),
     Downloading,
-    Ready {
-        _staged: updater::StagedUpdate,
-        prepared: update_install::PreparedInstall,
-    },
+    Ready(Box<ReadyUpdate>),
     Error(String),
+}
+
+struct ReadyUpdate {
+    _staged: updater::StagedUpdate,
+    prepared: update_install::PreparedInstall,
 }
 
 struct Updates {
@@ -72,9 +74,7 @@ pub(crate) fn initialize(automatic: bool, cx: &mut App) {
             }
             cx.update(|cx| {
                 if cx.try_global::<Updates>().is_some_and(|state| {
-                    state.automatic
-                        && !state.busy()
-                        && !matches!(state.status, Status::Ready { .. })
+                    state.automatic && !state.busy() && !matches!(state.status, Status::Ready(_))
                 }) {
                     check(false, cx);
                 }
@@ -102,7 +102,7 @@ pub(crate) fn check(manual: bool, cx: &mut App) {
     if state.handoff.is_some() {
         return;
     }
-    if state.busy() || matches!(state.status, Status::Ready { .. }) {
+    if state.busy() || matches!(state.status, Status::Ready(_)) {
         if manual {
             cx.update_global::<Updates, _>(|state, _| state.visible = true);
             cx.refresh_windows();
@@ -135,7 +135,7 @@ pub(crate) fn check(manual: bool, cx: &mut App) {
                         state.visible = false;
                     }
                     Ok(Some(release)) => {
-                        state.status = Status::Available(release);
+                        state.status = Status::Available(Box::new(release));
                         state.visible = true;
                     }
                     Ok(None) => {
@@ -187,10 +187,10 @@ fn download(cx: &mut App) {
                 }
                 cx.update_global::<Updates, _>(|state, _| {
                     state.status = match result {
-                        Ok((staged, prepared)) => Status::Ready {
+                        Ok((staged, prepared)) => Status::Ready(Box::new(ReadyUpdate {
                             _staged: staged,
                             prepared,
-                        },
+                        })),
                         Err(error) => Status::Error(error.to_string()),
                     }
                 });
@@ -212,13 +212,16 @@ fn restart(cx: &mut App) {
     let Some(state) = cx.try_global::<Updates>() else {
         return;
     };
-    let Status::Ready { prepared, .. } = &state.status else {
+    let Status::Ready(ready) = &state.status else {
         return;
     };
-    let result = update_install::spawn_apply(prepared);
+    let result = update_install::spawn_apply(&ready.prepared);
     match result {
         Ok(mut handle) => {
             if !crate::app::checkpoint_application(cx) {
+                // Only macOS can create the RAII installer handle. Other
+                // platforms return an error before reaching this branch.
+                #[cfg(target_os = "macos")]
                 drop(handle);
                 fail(
                     "Private draft checkpoint failed. The application has not been closed.",
@@ -290,7 +293,7 @@ pub(crate) fn render(theme: &EditorTheme, window_width: f32, cx: &mut App) -> An
         Status::Current => ("No newer stable release is available.", String::new(), 0),
         Status::Available(release) => ("New version available", release.version().to_owned(), 1),
         Status::Downloading => ("Downloading and verifying update…", String::new(), 0),
-        Status::Ready { prepared, .. } => ("Update is ready", prepared.version().to_owned(), 2),
+        Status::Ready(ready) => ("Update is ready", ready.prepared.version().to_owned(), 2),
         Status::Error(message) => ("Update failed", theme.ui_text(message), 3),
     };
     let button_theme = theme.clone();
@@ -428,6 +431,11 @@ pub(crate) fn test_notice_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_keeps_large_platform_payloads_indirect() {
+        assert!(std::mem::size_of::<Status>() <= 2 * std::mem::size_of::<String>());
+    }
 
     #[test]
     fn update_owner_never_starts_a_second_network_job_while_busy() {
